@@ -29,7 +29,7 @@ from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     decode_csf_scales,
 )
-from freetoken.layers.quantization import get_quant_config
+from freetoken.layers.quantization import QuantKind, get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, download_hf_weight
@@ -67,6 +67,14 @@ _NVFP4_LOCAL_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+# Scale tensor names the modelopt dialect stores per scheme role; nvidia's MIXED_PRECISION
+# exports name them after the role, while the model's linears keep the role's FreeToken name
+# (MXFP8 block scales arrive as weight_scale_inv, NVFP4 globals as weight_global).
+_MODEL_SCALE_ROLE = (
+    (QuantKind.MXFP8, ".weight_scale", "weight_scale_inv"),
+    (QuantKind.NVFP4, ".weight_scale", "weight_scale"),
+    (QuantKind.NVFP4, ".weight_scale_2", "weight_global"),
+)
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -115,8 +123,73 @@ def _rename(raw_name: str) -> str | None:
     if _EXPERT_RE.search(raw_name):
         return None  # routed experts: offload source banks
     if raw_name.endswith(_SCALE_SUFFIXES):
-        return None
+        return _rename_scaled(raw_name)
     return rename_vl_prefix(raw_name)
+
+
+def _rename_scaled(raw_name: str) -> str | None:
+    """Keep a checkpoint scale when the scheme that stores it names it after the model's role.
+
+    nvidia's MIXED_PRECISION exports call the MXFP8 block scale ``weight_scale`` and the NVFP4
+    per-tensor global ``weight_scale_2``; the model's linears keep the role names ``weight_scale_inv``
+    / ``weight_global``, so rename along the module prefix. Routed experts read their scales
+    through the bank readers, so a scheme there keeps nothing.
+    """
+    quant = get_quant_config()
+    if quant is None or _EXPERT_RE.search(raw_name):
+        return None
+    module, suffix = _split_scale_suffix(raw_name)
+    if suffix is None:
+        return None
+    scheme = quant.scheme_for_name(module)
+    if scheme is None:
+        return None
+    for kind, csuf, role in _MODEL_SCALE_ROLE:
+        if scheme.kind is kind and suffix == csuf:
+            return rename_vl_prefix(module) + "." + role
+    return None
+
+
+def _split_scale_suffix(raw_name: str) -> tuple[str, str | None]:
+    for suffix in _SCALE_SUFFIXES:
+        if raw_name.endswith(suffix):
+            return raw_name[: -len(suffix)], suffix
+    return raw_name, None
+
+
+class _GlobalExpander:
+    """Expand a scalar NVFP4 ``weight_global`` to the model's ``[out]`` fp16 buffer.
+
+    nvidia's W4A16 exports store the per-tensor global as a scalar fp32, while the linear's
+    buffer holds one entry per output row (load_state_dict asserts the exact shape). The global
+    and its ``.weight`` arrive in either order, so the expansion is flushed once both are seen.
+    """
+
+    def __init__(self) -> None:
+        self._scalars: dict[str, torch.Tensor] = {}
+        self._rows: dict[str, int] = {}
+
+    def on_weight(self, module: str, rows: int) -> tuple[str, torch.Tensor] | None:
+        self._rows[module] = rows
+        scalar = self._scalars.pop(module, None)
+        return None if scalar is None else self._expand(module, scalar, rows)
+
+    def on_global(self, name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor] | None:
+        """A ready pair, or None for a scalar still waiting for its weight."""
+        if tensor.numel() != 1:
+            return name, tensor
+        module = name[: -len(".weight_global")]
+        if module in self._rows:
+            return self._expand(module, tensor, self._rows[module])
+        self._scalars[module] = tensor
+        return None
+
+    def check_complete(self) -> None:
+        assert not self._scalars, f"scalar weight_global without a weight: {sorted(self._scalars)}"
+
+    @staticmethod
+    def _expand(module: str, scalar: torch.Tensor, rows: int) -> tuple[str, torch.Tensor]:
+        return module + ".weight_global", scalar.reshape(-1).to(torch.float16).expand(rows).contiguous()
 
 
 def _split_kind(name: str) -> tuple[str, str]:
@@ -221,7 +294,7 @@ def iter_weights(
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the model's state dict minus the routed experts.
-    A dense projection is bf16 or 128x128 block-fp8 (``.weight`` e4m3 + ``.weight_scale_inv``) as the checkpoint's QuantConfig says: the official releases skip everything but the routed experts, the community NVFP4-FP8 requants quantize the attention / GDN projections.
+    A dense projection is bf16, 128x128 block-fp8, or MXFP8 per-32 (``.weight`` e4m3 + ``.weight_scale``) as the checkpoint's QuantConfig says; the vision MLP is W4A16 NVFP4 in the FP4-Local release.
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
@@ -233,6 +306,7 @@ def iter_weights(
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    globals_ = _GlobalExpander()
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -246,24 +320,49 @@ def iter_weights(
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
                 tensor = f.get_tensor(raw_name)
+                if name.endswith(".weight_global"):
+                    pair = globals_.on_global(name, tensor)
+                    if pair is None:
+                        continue
+                    yield pair
+                    continue
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
                     yield name, tensor
                 else:
                     yield from fused
+                if name.endswith(".weight"):
+                    pair = globals_.on_weight(name.rpartition(".")[0], tensor.shape[0])
+                    if pair is not None:
+                        yield pair
 
+    globals_.check_complete()
     assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
+    globals_ = _GlobalExpander()
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
-                if name is not None and name.startswith(VISION_KEY_PREFIXES):
-                    yield name, f.get_tensor(raw_name)
+                if name is None or not name.startswith(VISION_KEY_PREFIXES):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                if name.endswith(".weight_global"):
+                    pair = globals_.on_global(name, tensor)
+                    if pair is None:
+                        continue
+                    yield pair
+                    continue
+                yield name, tensor
+                if name.endswith(".weight"):
+                    pair = globals_.on_weight(name.rpartition(".")[0], tensor.shape[0])
+                    if pair is not None:
+                        yield pair
+    globals_.check_complete()
 
 
 # ======================================================================================

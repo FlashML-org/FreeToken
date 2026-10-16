@@ -120,6 +120,70 @@ def test_csf_decode_roundtrip():
         assert torch.equal(no_exc.view(torch.uint8), target)
 
 
+def test_rename_scaled_maps_the_checkpoint_scale_names_to_the_model_roles(monkeypatch):
+    """FP4-Local stores dense projections as MXFP8 and the vision MLP as W4A16 NVFP4.
+
+    The checkpoint names the block scale ``weight_scale`` while the engine's buffers are
+    ``weight_scale_inv`` (and the per-tensor global ``weight_scale_2``), so the reader must
+    rename along the module prefix -- and only for modules the quant config actually names.
+    """
+    from freetoken.layers.quantization import ModelOptConfig
+
+    quant = ModelOptConfig({
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "MXFP8"},
+            "model.visual.blocks.0.mlp.linear_fc1": {"quant_algo": "W4A16_NVFP4"},
+            "model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+        },
+    })
+    monkeypatch.setattr(qwen4_exp_weight, "get_quant_config", lambda: quant)
+
+    # MXFP8 block scale: checkpoint role name -> the engine's buffer name
+    got = qwen4_exp_weight._rename_scaled("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale")
+    assert got == "model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv"
+    # W4A16 per-tensor global: the vision prefix lands under visual., the role under weight_global
+    got = qwen4_exp_weight._rename_scaled("model.visual.blocks.0.mlp.linear_fc1.weight_scale_2")
+    assert got == "visual.blocks.0.mlp.linear_fc1.weight_global"
+    # a scale whose module the config leaves unquantized stays noise
+    assert qwen4_exp_weight._rename_scaled("model.language_model.layers.1.self_attn.q_proj.weight_scale") is None
+    # routed experts read their scales through the bank readers, never the dense path
+    assert qwen4_exp_weight._rename_scaled(
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_fixed"
+    ) is None
+
+
+def test_global_expander_broadcasts_the_scalar_once_its_weight_is_seen():
+    """The W4A16 global is a scalar fp32; the model buffer is one fp16 entry per output row.
+
+    The pair may arrive in either order, so the expansion is flushed only once both are known.
+    """
+    g = qwen4_exp_weight._GlobalExpander()
+    module = "visual.blocks.0.mlp.linear_fc1"
+    scalar = torch.tensor(0.0625)
+    # global first: buffered until the weight fixes the row count
+    assert g.on_global(module + ".weight_global", scalar) is None
+    name, tensor = g.on_weight(module, 256)
+    assert name == module + ".weight_global"
+    assert tensor.shape == (256,) and tensor.dtype is torch.float16
+    assert torch.all(tensor == 0.0625)
+    # weight first: the global flushes on the spot
+    g2 = qwen4_exp_weight._GlobalExpander()
+    assert g2.on_weight(module, 64) is None
+    name, tensor = g2.on_global(module + ".weight_global", scalar)
+    assert name == module + ".weight_global" and tensor.shape == (64,)
+    # a non-scalar global passes through untouched
+    row = torch.arange(3, dtype=torch.float16)
+    assert g2.on_global(module + ".weight_global", row) == (module + ".weight_global", row)
+    g.check_complete()
+    g2.check_complete()
+    # a scalar that never met its weight fails the completeness assert
+    g3 = qwen4_exp_weight._GlobalExpander()
+    g3.on_global(module + ".weight_global", scalar)
+    with pytest.raises(AssertionError, match="without a weight"):
+        g3.check_complete()
+
+
 def test_nvfp4_expert_spec_selects_the_csf_checkpoint(monkeypatch):
     monkeypatch.setattr(qwen4_exp_weight, "download_hf_weight", lambda path: "<csf-ckpt>")
     weight_map = {
