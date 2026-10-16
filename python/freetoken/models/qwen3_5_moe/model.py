@@ -46,6 +46,8 @@ class Qwen3_5DecoderLayer(BaseOP):
                 layer_id=layer_id,
                 quant_config=config.quant,
                 prefix=f"{prefix}.linear_attn",
+                # llama.cpp stores every qwen35 ssm_out with tiled value-head columns
+                out_heads_tiled=config.quant is not None and config.quant.dialect == "gguf",
             )
         else:
             self.self_attn = Qwen3_5Attention(config, layer_id, prefix=f"{prefix}.self_attn")
@@ -79,6 +81,8 @@ class Qwen3_5Model(BaseOP):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
+            quant_config=config.quant,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = OPList(
             [
