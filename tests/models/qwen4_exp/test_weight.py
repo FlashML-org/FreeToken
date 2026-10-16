@@ -91,10 +91,11 @@ def _csf_encode(target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
         fixed[slab, row] = base
         for j in range(row_bytes):
             fixed[slab, 16 + row * row_bytes + j] = (target[r, 2 * j + 1] & 0xF) << 4 | (target[r, 2 * j] & 0xF)
-    # absolute records: (value << 24) | row-major position, as Python ints (uint8 would wrap)
+    # absolute records: (value << 24) | row-major position, U32 bit patterns stored as int32
     for pos in (3, rows * cols - 1):
         value = 0xFF - target.ravel()[pos].item()
-        exceptions.append((value << 24) | pos)
+        rec = (value << 24) | pos
+        exceptions.append(rec - 0x100000000 if rec >= 0x80000000 else rec)
     exc = torch.tensor(exceptions, dtype=torch.int32)
     ref = target.clone()
     for rec in exceptions:
