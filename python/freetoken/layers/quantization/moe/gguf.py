@@ -32,9 +32,37 @@ def expert_types(cfg: MoEConfig) -> tuple[int, int]:
     gate, up, down = gguf_types(cfg.scheme)
     if gate != up:
         raise NotImplementedError(f"GGUF experts with gate {type_name(gate)} and up {type_name(up)} need one gate_up bank type")
-    if is_quantized(gate) != is_quantized(down):
-        raise NotImplementedError(f"GGUF experts with gate_up {type_name(gate)} and down {type_name(down)} mix float and quantized rows")
     return gate, down
+
+
+def _bank_spec(ggml_type: int, rows: int, k: int) -> BankSpec:
+    dtype = float_dtype(ggml_type)
+    return BankSpec((rows, k), dtype) if dtype is not None else BankSpec((rows, row_bytes(ggml_type, k)), torch.uint8)
+
+
+_DECODE_CONFIG = {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "num_warps": 8}
+
+
+def float_mul_mat_id(w: torch.Tensor, x: torch.Tensor, ids: torch.Tensor, topk_weights: torch.Tensor, config: dict | None) -> torch.Tensor:
+    """``ggml.mul_mat_id`` for float experts ``w[E, N, K]``: same ``x`` and ``ids``, same ``[T, k, N]`` output in ``x``'s dtype, no router weights.
+
+    ``config`` runs the sorted-route kernel (prefill, resident layers); None runs the per-route decode kernel."""
+    from freetoken.kernel import fused_moe_decode_kernel_triton, fused_moe_kernel_triton
+    from freetoken.moe.fused import moe_align_block_size
+
+    t, top_k = ids.shape
+    per_route = x.dim() == 3
+    # f16 experts take f16 activations, as llama.cpp's f16 path does
+    a = x.reshape(-1, x.shape[-1]).to(w.dtype).contiguous()
+    out = torch.empty(t, top_k, w.shape[1], dtype=w.dtype, device=x.device)
+    if config is None:
+        fused_moe_decode_kernel_triton(a, w, out, topk_weights, ids, False, per_route, _DECODE_CONFIG, compute_type=w.dtype)
+    else:
+        sorted_ids, expert_ids, num_post_padded = moe_align_block_size(ids, config["BLOCK_SIZE_M"], w.shape[0])
+        fused_moe_kernel_triton(
+            a, w, out, topk_weights, ids, sorted_ids, expert_ids, num_post_padded, False, 1 if per_route else top_k, config, compute_type=w.dtype
+        )
+    return out.to(x.dtype)
 
 
 
@@ -52,13 +80,7 @@ class GgmlMoEKernel(MoEKernel):
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)
         i, h = cfg.local_intermediate, cfg.hidden
-        dtype = float_dtype(gate_up)
-        if dtype is not None:
-            return {"gate_up": BankSpec((2 * i, h), dtype), "down": BankSpec((h, i), dtype)}
-        return {
-            "gate_up": BankSpec((2 * i, row_bytes(gate_up, h)), torch.uint8),
-            "down": BankSpec((h, row_bytes(down, i)), torch.uint8),
-        }
+        return {"gate_up": _bank_spec(gate_up, 2 * i, h), "down": _bank_spec(down, h, i)}
 
     def pack(self, pieces, cfg: MoEConfig, out):
         i = cfg.local_intermediate
@@ -71,23 +93,37 @@ class GgmlMoEKernel(MoEKernel):
         from freetoken.kernel import ggml
         from freetoken.layers.activation import gated_act_and_mul
 
-        gate_up_type, down_type = expert_types(layer.quant_method.cfg)
-        if not is_quantized(gate_up_type):
+        cfg = layer.quant_method.cfg
+        gate_up_type, down_type = expert_types(cfg)
+        if not is_quantized(gate_up_type) and not is_quantized(down_type):
             return self._apply_float(layer, x, topk_weights, topk_ids, view, gate_up_type, is_prefill=is_prefill)
         assert not layer.apply_router_weight_on_input, "GGUF experts apply the router weights on the output"
         ids = topk_ids.to(torch.int32)
         gate_up = view.tensors["gate_up"]
+        # a float half runs on the bf16 fused MoE's grouped GEMM, with its config for this layer's shape
+        config = None
+        if not (is_quantized(gate_up_type) and is_quantized(down_type)) and (is_prefill or is_resident(layer)):
+            from freetoken.moe.fused import try_get_optimal_moe_config
+
+            e, inter_size, hidden = gate_up.shape[0], cfg.local_intermediate, cfg.hidden
+            config = try_get_optimal_moe_config((e, 2 * inter_size, hidden), (e, hidden, inter_size), ids.shape[1], x.shape[0])
+
+        def mul_mat_id(w: torch.Tensor, ggml_type: int, a: torch.Tensor) -> torch.Tensor:
+            if is_quantized(ggml_type):
+                return ggml.mul_mat_id(w, ggml_type, a, ids)
+            return float_mul_mat_id(w, a, ids, topk_weights, config)
+
         glu = fused_glu(layer)
-        small = x.shape[0] <= min(ggml.mmvq_max_tokens(gate_up_type), ggml.mmvq_max_tokens(down_type))
-        if glu is not None and small:
+        small = x.shape[0] <= min(ggml.mmvq_max_tokens(t) for t in (gate_up_type, down_type) if is_quantized(t))
+        if glu is not None and small and is_quantized(gate_up_type):
             inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu)
         else:
-            h = ggml.mul_mat_id(gate_up, gate_up_type, x, ids)
+            h = mul_mat_id(gate_up, gate_up_type, x)
             t, k, two_i = h.shape
             inter = torch.empty(t, k, two_i // 2, dtype=h.dtype, device=h.device)
             gated_act_and_mul(layer.activation, h.view(-1, two_i), inter.view(-1, two_i // 2), alpha=float(layer.alpha), limit=limit_or_inf(layer))
             del h  # free the gate_up output before the down GEMM allocates its own
-        y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids)
+        y = mul_mat_id(view.tensors["down"], down_type, inter)
         return ggml.moe_weighted_sum(y, topk_weights)
 
     @staticmethod
