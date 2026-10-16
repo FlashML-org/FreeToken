@@ -19,6 +19,8 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
     "llama": "LlamaGGUFForCausalLM",
+    "minimax-m2": "MiniMaxM2GGUFForCausalLM",
+    "minimax-m3": "MiniMaxM3GGUFForCausalLM",
     "muse-glimmer": "MuseGlimmerGGUFForCausalLM",
     "qwen2": "Qwen2GGUFForCausalLM",
     "qwen3": "Qwen3GGUFForCausalLM",

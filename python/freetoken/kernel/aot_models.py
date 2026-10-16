@@ -300,6 +300,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=1536,  # experts reuse the dense intermediate_size
         expert_formats=_NVFP4_FORMATS,
         aliases=("MiniMaxAI/MiniMax-M2.5",),
+        arch_aliases=("MiniMaxM2GGUFForCausalLM",),
     ),
     AotModel(
         # GQA block-sparse (BSA): the BSAKVCache stores K/V through store_cache
@@ -318,7 +319,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=3072,
         expert_formats=("nvfp4",),
         aliases=("MiniMaxAI/MiniMax-M3",),
-        arch_aliases=("MiniMaxM3SparseForCausalLM",),
+        arch_aliases=("MiniMaxM3SparseForCausalLM", "MiniMaxM3GGUFForCausalLM"),
     ),
     AotModel(
         name="deepseek-ai/DeepSeek-V4-Flash",

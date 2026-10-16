@@ -48,6 +48,8 @@ _DENSE_PACKED = (
 # per-expert checkpoints: probe the first expert's projections for the experts container
 _EXPERTS_PACKED = (("experts", ("experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj")),)
 _EXPERTS_W123_PACKED = (("experts", ("experts.0.w1", "experts.0.w2", "experts.0.w3")),)
+# the GGUF scheme reads expert types in (gate, up, down) order
+_EXPERTS_W132_PACKED = (("experts", ("experts.0.w1", "experts.0.w3", "experts.0.w2")),)
 # pre-stacked expert checkpoints (Qwen3-VL-MoE): the container's own two tensors are the probe
 _STACKED_EXPERTS_PACKED = (("experts", ("experts.gate_up_proj", "experts.down_proj")),)
 _QWEN3_5_PACKED = _DENSE_PACKED + (
@@ -86,6 +88,7 @@ _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
     ("index_qk_proj", ("index_q_proj", "index_k_proj")),
 ) + _EXPERTS_W123_PACKED
+_MINIMAX_M3_GGUF_PACKED = _DENSE_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),) + _EXPERTS_W132_PACKED
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 # DeepSeek-V4's vision dims sit at the top level of the checkpoint config, next to the
@@ -166,6 +169,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "MiniMaxM2ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_W123_PACKED,
     ),
+    # llama.cpp minimax-m2 GGUF: the same model classes with every tensor in its packed ggml type
+    "MiniMaxM2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.minimax_m2",
+        "MiniMaxM2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_W132_PACKED,
+    ),
     # MiniMax-M3 (model_type minimax_m3_vl): multimodal wrapper config (text tower in
     # text_config, weights under language_model.); the CLIP-style tower under vision_tower.
     # serves image input. GQA + block-sparse attention (lightning indexer, top-k 128-token
@@ -184,6 +195,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.minimax_m3",
         "MiniMaxM3ForCausalLM",
         packed_modules_mapping=_MINIMAX_M3_PACKED,
+    ),
+    # llama.cpp minimax-m3 GGUF (text only): the same model classes with every tensor in its packed ggml type
+    "MiniMaxM3GGUFForCausalLM": ModelSpec(
+        "freetoken.models.minimax_m3",
+        "MiniMaxM3ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_MINIMAX_M3_GGUF_PACKED,
     ),
     "DeepseekV4ForCausalLM": ModelSpec(
         "freetoken.models.deepseek_v4",
