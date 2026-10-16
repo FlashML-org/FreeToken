@@ -179,6 +179,33 @@ def test_mixed_dummy_banks_merge_the_roles_with_placeholders():
 
 
 @cuda
+def test_mixed_banks_give_each_reader_its_layers_and_resolve_every_reader_first(monkeypatch):
+    from freetoken.moe import expert_pieces
+    from freetoken.moe.expert_banks import _mixed_expert_banks
+
+    pieces = _pieces(seed=2)
+    methods = [_layer(layer, fmt).quant_method for layer, fmt in enumerate(FORMATS)]
+    events = []
+
+    def fake_reader(model_path, config, kind, *, layers=None, parallel=False, workers=8, chunk=0):
+        events.append(("resolve", sorted(layers)))
+
+        def read():
+            events.append(("read", sorted(layers)))
+            for layer in layers:
+                yield layer, 0, E, pieces[layer]
+
+        return read()
+
+    monkeypatch.setattr(expert_pieces, "iter_expert_pieces", fake_reader)
+    config = SimpleNamespace(num_moe_layers=L, num_experts=E)
+    banks = _mixed_expert_banks("", config, methods, torch.device("cpu"), False, False, 8, 0)
+    assert sorted(layers for step, layers in events if step == "resolve") == [[0, 4], [1, 2, 3]]
+    assert [step for step, _ in events[:2]] == ["resolve", "resolve"]
+    assert banks.layer_formats == FORMATS
+
+
+@cuda
 def test_mixed_layers_decode_and_prefill_through_their_pools():
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -221,7 +248,7 @@ def test_cpu_executor_computes_each_layer_in_its_format():
     cache, layers, _ = _mixed_cache(device, pieces, decode_target="hybrid")
     ex = CpuMoeExecutor(
         cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False, num_threads=2,
-        max_tokens=4, device=device, fmt="nvfp4", layer_formats=[(f, {}) for f in FORMATS],
+        max_tokens=4, device=device, layer_formats=[(f, {}) for f in FORMATS],
     )
     cache.set_cpu_executor(ex)
     bs = 3

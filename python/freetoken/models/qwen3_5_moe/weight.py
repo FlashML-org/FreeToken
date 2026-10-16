@@ -344,7 +344,7 @@ def _moe_dims(model_config):
     )
 
 
-def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
@@ -355,6 +355,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     L, E, H, I, dense = _moe_dims(config)
+    keep = None if layers is None else set(layers)
     scale = get_quant_config().stored_tensors(QuantKind.FP8_BLOCK)["weight_scale_inv"].name
     key_re = re.compile(_FP8_EXPERT_KEY_RE.format(scale=re.escape(scale)))
     suffix = {"weight": "", scale: "_scale"}
@@ -366,20 +367,22 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
         li = int(m["layer"]) - dense
         if not 0 <= li < L:
             raise ValueError(f"unexpected routed-expert layer in {raw_name}")
+        if keep is not None and li not in keep:
+            return None
         return li, int(m["expert"]), m["proj"] + suffix[m["kind"]]
 
     if parallel is None:
         parallel = experts_scattered(model_path)
     if parallel:
         tensors = iter_expert_tensors_parallel(
-            model_path, lambda n: key_re.match(n) is not None, workers=workers, chunk=chunk
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
         )
         return per_expert_pieces(tensors, locate, tensors_per_expert=6)
 
     def _serial():
         reader = ShardReader(model_path, torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+            for li in tqdm(range(L) if keep is None else sorted(keep), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(E):
                     base = f"model.language_model.layers.{dense + li}.mlp.experts.{e}"
                     for proj in ("gate", "up", "down"):

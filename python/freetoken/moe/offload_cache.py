@@ -173,9 +173,7 @@ class OffloadMoeCache:
         if self.layer_layouts is not None:
             assert self.layout is None, "pass layout or layer_layouts, not both"
             assert len(self.layer_layouts) == self.num_layers, (len(self.layer_layouts), self.num_layers)
-            if len({tuple(layout) for layout in self.layer_layouts}) > 1 and any(
-                spec.resident for layout in self.layer_layouts for spec in layout.values()
-            ):
+            if any(spec.resident for layout in self.layer_layouts for spec in layout.values()):
                 raise ValueError("experts of several formats cannot use a kernel with GPU-resident alphas (marlin, b12x)")
         elif self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"

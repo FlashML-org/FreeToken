@@ -201,3 +201,22 @@ def test_stacked_expert_pieces_pair_each_layer_in_arrival_order():
     assert torch.equal(pieces[1][3]["gate_up"], torch.full((2, 3, 4), 2.0))
     with pytest.raises(ValueError, match="Missing MoE expert source layers"):
         list(stacked_expert_pieces(tensors[:3], config))
+
+
+def test_stacked_expert_pieces_skip_the_layers_of_other_formats():
+    from freetoken.moe.expert_pieces import stacked_expert_pieces
+
+    config = SimpleNamespace(num_layers=3, num_experts=2)
+    tensors = [
+        ("model.layers.0.mlp.experts.gate_up_proj", torch.full((2, 3, 4), 2.0)),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight_scale", torch.zeros(3, 1)),
+        ("model.layers.0.mlp.experts.down_proj", torch.full((2, 4, 3), 10.0)),
+        ("model.layers.2.mlp.experts.gate_up_proj", torch.full((2, 3, 4), 3.0)),
+        ("model.layers.2.mlp.experts.down_proj", torch.full((2, 4, 3), 11.0)),
+    ]
+
+    pieces = list(stacked_expert_pieces(tensors, config, layers=[0]))
+
+    assert [(layer, e0, e1) for layer, e0, e1, _ in pieces] == [(0, 0, 2)]
+    with pytest.raises(ValueError, match="Unexpected expert weight key"):
+        list(stacked_expert_pieces(tensors, config))

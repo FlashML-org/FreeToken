@@ -126,7 +126,7 @@ def build_expert_banks(
         for alpha in alphas.values():
             alpha.fill_(1.0)
         if hb is not None and torch.cuda.is_available():
-            pin_banks({role: [per_layer[l] for l in ids] for role, per_layer in hb.items()})
+            pin_banks(hb)
         return ExpertBanks(
             legacy_format_for(method.kind, kernel.name), _sources(),
             gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
@@ -218,11 +218,16 @@ def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, 
 
     num_layers = model_config.num_moe_layers
     assert len(layer_methods) == num_layers, (len(layer_methods), num_layers)
-    parts = []
-    for method, layers in method_groups(layer_methods):
-        pieces = None if dummy else iter_expert_pieces(
-            model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
+    groups = method_groups(layer_methods)
+    # resolve every format's reader before any bank exists, so a missing parallel reader falls back to serial with nothing allocated
+    readers = [
+        None if dummy else iter_expert_pieces(
+            model_path, model_config, method.kind, layers=layers, parallel=parallel, workers=workers, chunk=chunk
         )
+        for method, layers in groups
+    ]
+    parts = []
+    for (method, layers), pieces in zip(groups, readers):
         parts.append(build_expert_banks(
             method, num_layers, pieces, device=device, layer_sink=layer_sink, dummy=dummy, layers=layers,
         ))

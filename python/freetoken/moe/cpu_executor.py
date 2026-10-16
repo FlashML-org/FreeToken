@@ -163,16 +163,14 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
-        fmt: str | tuple[str, dict[str, int]] | None = None,
         layer_formats: list[tuple[str, dict[str, int]]] | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
-        # layer_formats[l] = (format, options) of layer l; fmt, a name or (name, options), stands for every layer
+        # layer_formats[l] = (format, options) of layer l; None runs every layer in cache.quant_format
         if layer_formats is None:
-            spec = fmt or cache.quant_format
-            layer_formats = [spec if isinstance(spec, tuple) else (spec, {})] * int(cache.num_layers)
+            layer_formats = [(cache.quant_format, {})] * int(cache.num_layers)
         assert len(layer_formats) == cache.num_layers, (len(layer_formats), cache.num_layers)
         keys = [(name, tuple(sorted(opts.items()))) for name, opts in layer_formats]
         specs = list(dict.fromkeys(keys))

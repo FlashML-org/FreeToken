@@ -476,7 +476,7 @@ def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: in
         cache, top_k=wl.top_k, activation=wl.activation,
         apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=1,
         device=torch.device("cuda"), swiglu_alpha=wl.swiglu_alpha,
-        swiglu_limit=wl.swiglu_limit, fmt=(fmt, {"act_block": wl.act_block} if wl.act_block is not None else {}),
+        swiglu_limit=wl.swiglu_limit, layer_formats=[(fmt, {"act_block": wl.act_block} if wl.act_block is not None else {})] * cache.num_layers,
     )
 
 

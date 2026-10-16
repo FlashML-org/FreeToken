@@ -507,6 +507,8 @@ def test_nvfp4_expert_pieces_read_either_dialect_from_a_single_file(checkpoint):
     spec = nvfp4_expert_spec(folder, config)
     pieces = list(iter_nvfp4_expert_pieces(folder, config, spec))
     assert len(pieces) == 2 * E
+    only = list(iter_nvfp4_expert_pieces(folder, config, spec, layers=[1]))
+    assert len(only) == E and {p[0] for p in only} == {1}
     layer, e0, e1, piece = next(p for p in pieces if p[0] == 1 and p[1] == 2)
     assert (e0, e1) == (2, 3)
     base = f"{LM}.layers.1.mlp.experts.2.gate_proj"
@@ -529,6 +531,8 @@ def test_block_fp8_expert_pieces_read_either_dialect(checkpoint, parallel):
     config = parse_config(cached_load_hf_config(folder))
     pieces = list(iter_expert_pieces(folder, config, QuantKind.FP8_BLOCK, parallel=parallel))
     assert len(pieces) == 2 * E
+    only = list(iter_expert_pieces(folder, config, QuantKind.FP8_BLOCK, layers=[1], parallel=parallel))
+    assert len(only) == E and {p[0] for p in only} == {1}
     layer, e0, e1, piece = next(p for p in pieces if p[0] == 1 and p[1] == 2)
     base = f"{LM}.layers.1.mlp.experts.2"
     scale = "weight_scale_inv" if name == "fp8_block" else "weight_scale"
