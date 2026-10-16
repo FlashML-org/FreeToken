@@ -831,6 +831,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-prefill-demand-tokens",
+        type=int,
+        default=ServerArgs.moe_prefill_demand_tokens,
+        help=(
+            "A prefill chunk of at most this many tokens loads only the experts it routes to, "
+            "through the expert cache as decode does, instead of every expert of each layer. "
+            "0 streams whole layers for every chunk."
+        ),
+    )
+
+    parser.add_argument(
         "--enable-special-token-ckpt",
         action="store_true",
         dest="special_token_ckpt",
