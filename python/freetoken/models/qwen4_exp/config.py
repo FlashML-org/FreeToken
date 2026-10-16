@@ -103,9 +103,11 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
-        # HF Qwen4ExpTextConfig rewrites full_attention to indexed_attention in __post_init__.
+        # HF Qwen4ExpTextConfig rewrites full_attention to a non-"full" token in
+        # __post_init__: indexed_attention in transformers 5.18+, qwen_sparse_attention in 5.16.
         return [
-            "full_attention" if t == "indexed_attention" else t for t in layer_types
+            "full_attention" if t in ("indexed_attention", "qwen_sparse_attention") else t
+            for t in layer_types
         ]
     # Fall back to full_attention_interval: every Nth layer (1-indexed) is full.
     interval = int(getattr(text, "full_attention_interval", 4))
