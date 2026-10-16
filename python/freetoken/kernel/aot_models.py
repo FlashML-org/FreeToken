@@ -375,6 +375,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="LlamaForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
+        arch_aliases=("LlamaGGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen2-7B",

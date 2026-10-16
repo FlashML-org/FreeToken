@@ -6,6 +6,8 @@ So we run only its tokenizer half: ``get_gguf_tokenizer`` and ``convert_gguf_tok
 
 from __future__ import annotations
 
+import json
+
 from .reader import load_gguf_metadata
 
 # end-of-generation token names from llama.cpp (llama_vocab::impl::load in src/llama-vocab.cpp): a GGUF stores one eos id and no stop list
@@ -15,6 +17,57 @@ _EOG_NAMES = frozenset((
     "<eos>", "<turn|>", "<|tool_response>", "<\uff5cend\u2581of\u2581sentence\uff5c>", "[e~[", "<|ifm|im_end|>",
 ))
 
+# BPE pre-tokenizers that llama.cpp adds a bos for when the file has no add_bos_token key (llama_vocab::impl::load)
+_BOS_PRE = frozenset((
+    "llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2", "jina-v5-nano", "tekken", "chameleon",
+))
+
+
+def _add_bos(meta: dict) -> bool:
+    if "tokenizer.ggml.add_bos_token" in meta:
+        return bool(meta["tokenizer.ggml.add_bos_token"])
+    model = meta.get("tokenizer.ggml.model")
+    return model == "llama" or (model == "gpt2" and meta.get("tokenizer.ggml.pre") in _BOS_PRE)
+
+
+def _fix_added_tokens(fast, meta: dict):
+    """Register the control and user-defined tokens that transformers skipped at their file ids, and drop added tokens past the file's vocabulary."""
+    from tokenizers import Tokenizer
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    tokens = meta["tokenizer.ggml.tokens"]
+    spelling = bytes_to_unicode()
+    alphabet = set(spelling.values())
+    # transformers' byte-level vocabulary spells a token with characters outside the byte alphabet in bytes and then skips it (DeepSeek's full-width-bar tokens, MiniMax's tokens with spaces)
+    skipped = [
+        (i, text, kind == 3)
+        for i, (text, kind) in enumerate(zip(tokens, meta.get("tokenizer.ggml.token_type") or ()))
+        if kind in (3, 4) and meta.get("tokenizer.ggml.model") == "gpt2" and not set(text) <= alphabet and fast.token_to_id(text) != i
+    ]
+    # its GPT2Tokenizer also adds a default <|endoftext|> when the vocabulary lacks one
+    if not skipped and fast.get_vocab_size(with_added_tokens=True) <= len(tokens):
+        return fast
+    # a piece the merges use or build stays a plain BPE token, since renaming it breaks the merges (unsloth's MiniMax-M3 marks U+FFFD as control)
+    pieces = {p for m in meta.get("tokenizer.ggml.merges") or () for p in (*m.split(" "), m.replace(" ", ""))}
+    state = json.loads(fast.to_str())
+    vocab = state["model"]["vocab"]
+    added = [t for t in state["added_tokens"] if t["id"] < len(tokens)]
+    for i, text, special in skipped:
+        spelled = "".join(spelling[b] for b in text.encode("utf-8"))
+        if spelled in pieces or vocab.get(spelled) != i:
+            continue
+        # renamed so the added token keeps the file id instead of taking a new one
+        vocab[text] = vocab.pop(spelled)
+        added.append({"id": i, "content": text, "single_word": False, "lstrip": False, "rstrip": False, "normalized": False, "special": special})
+    state["added_tokens"] = sorted(added, key=lambda t: t["id"])
+    return Tokenizer.from_str(json.dumps(state))
+
+
+def _known_specials(special: dict, fast) -> dict:
+    """Drop a bos/eos/unk/pad the vocabulary lacks, which PreTrainedTokenizerFast would add past it (unsloth's MiniMax-M3 unk is U+FFFD stored decoded)."""
+    vocab = fast.get_vocab(with_added_tokens=True)
+    return {k: v for k, v in special.items() if k == "chat_template" or v is None or v in vocab}
+
 
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
@@ -23,11 +76,12 @@ def load_gguf_tokenizer(model_path: str):
     arch, tok_dict, special = get_gguf_tokenizer(model_path)
     fast, _ = convert_gguf_tokenizer(arch, tok_dict)
     meta = load_gguf_metadata(model_path)
+    fast = _fix_added_tokens(fast, meta)
     # special: bos/eos/unk/pad as the file names them (None when absent) and the chat template
     return PreTrainedTokenizerFast(
         tokenizer_object=fast,
-        **special,
-        add_bos_token=bool(meta.get("tokenizer.ggml.add_bos_token")),
+        **_known_specials(special, fast),
+        add_bos_token=_add_bos(meta),
         add_eos_token=bool(meta.get("tokenizer.ggml.add_eos_token")),
     )
 
