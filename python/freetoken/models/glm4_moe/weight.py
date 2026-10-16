@@ -35,6 +35,24 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     ),
     desc="GLM NVFP4 experts",
 )
+# llm-compressor export (gesong2077/GLM-4.5-Air-NVFP4): weight_packed | weight_scale |
+# weight_global_scale (quant-side global -> reciprocal at ingest). Same treatment glm5_next
+# gives its compressed-tensors release. ``input_global_scale`` (the calibrated W4A4 activation
+# scale) deliberately does not match: the routed-expert path is W4A16 and never quantizes
+# activations.
+_ROUTED_EXPERT_CT_KEY_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+)
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_ROUTED_EXPERT_CT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=_NVFP4_SOURCE_SPEC.layer_to_bank,
+    desc="GLM NVFP4 experts (compressed-tensors)",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -193,6 +211,12 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
 # Routed expert host banks (NVFP4) for the offload cache.
 # --------------------------------------------------------------------------------------
 def nvfp4_expert_spec(model_path: str, config):
+    """The expert reader for this checkpoint's dialect: modelopt names, or the
+    compressed-tensors ones folded back onto them."""
+    quant = getattr(cached_load_hf_config(model_path), "quantization_config", None) or {}
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    if str(get("quant_method") or "").lower() == "compressed-tensors":
+        return _NVFP4_CT_SOURCE_SPEC
     return _NVFP4_SOURCE_SPEC
 
 
