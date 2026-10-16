@@ -234,15 +234,13 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
-def _prefill_config(M: int) -> Dict[str, int]:
-    # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
-    # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
-    # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
-    if M <= 64:
-        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                    GROUP_SIZE_M=1, num_warps=8, num_stages=4)
-    return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                GROUP_SIZE_M=8, num_warps=8, num_stages=4)
+def _prefill_config(M: int, top_k: int, num_experts: int) -> Dict[str, int]:
+    # moe_align_block_size pads each expert's token count to a multiple of BLOCK_SIZE_M, so triton.autotune cannot pick it.
+    # BLOCK_SIZE_M follows the mean tokens per expert; the thresholds and the other fields come from an H100 sweep.
+    per_expert = M * top_k / num_experts
+    block_m = 128 if per_expert >= 64 else 64 if per_expert >= 24 else 32 if per_expert >= 12 else 16
+    return dict(BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=64 if block_m == 16 else 32,
+                GROUP_SIZE_M=8, num_warps=4, num_stages=3)
 
 
 def _prefill_gemm(
@@ -270,7 +268,6 @@ def _prefill_gemm(
     _prefill_nvfp4_moe_kernel[grid](
         a, packed, scale, glob, c, topk_weights_flat, sorted_ids, expert_ids,
         num_tokens_post_padded,
-        _e2m1_lut(a.device.index),
         N, K, EM, num_valid_tokens,
         a.stride(0), a.stride(1),
         packed.stride(0), packed.stride(1), packed.stride(2),
@@ -309,7 +306,7 @@ def fused_experts_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = _prefill_config(M)
+    cfg = _prefill_config(M, top_k, num_experts)
 
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
     tw = topk_weights.reshape(-1).contiguous()

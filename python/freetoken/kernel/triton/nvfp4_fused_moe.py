@@ -293,17 +293,23 @@ def _decode_nvfp4_marlin_kernel(
 
 
 @triton.jit
+def _e2m1_f16_x2p14(code):
+    """e2m1 code (low 4 bits) -> fp16 value * 2^-14: magnitude bits go to fp16 [11:9], the sign to [15]; fp16 subnormals line up the e == 0 codes."""
+    bits = ((code & 7) << 9) | ((code & 8) << 12)
+    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
+
+
+@triton.jit
 def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
     packed_ptr,        # [S, N, K // 2] uint8
-    scale_ptr,         # [S, N, K // 16] fp8-e4m3
+    scale_ptr,         # [S, N, K // 16] fp8-e4m3 (uint8 view before sm_89)
     global_ptr,        # [S, N] fp16
     c_ptr,             # [num_valid_tokens, N] output (flat over M*top_k)
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,    # cache slot per M-block
     num_tokens_post_padded_ptr,
-    lut_ptr,
     N,
     K,
     EM,
@@ -314,14 +320,16 @@ def _prefill_nvfp4_moe_kernel(
     stride_ge, stride_gn,
     stride_cm, stride_cn,
     stride_tw,
-    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,   # tokens per block, the moe_align padding
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_KB: tl.constexpr,
+    BLOCK_SIZE_KB: tl.constexpr,  # packed bytes per K step (2 values each)
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
 ):
+    # out^T = W @ X^T: wgmma reads its A operand (the decoded weights) from registers, while B must be in shared memory.
+    # The token block is the MMA N dimension, so a 16-token block still fills the MMA.
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -342,51 +350,50 @@ def _prefill_nvfp4_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_kb = tl.arange(0, BLOCK_SIZE_KB)
-    a_ptrs_lo = a_ptr + (offs_token[:, None] // top_k * stride_am + (2 * offs_kb)[None, :] * stride_ak)
-    a_ptrs_hi = a_ptr + (offs_token[:, None] // top_k * stride_am + (2 * offs_kb + 1)[None, :] * stride_ak)
+    offs_k = tl.arange(0, 2 * BLOCK_SIZE_KB)
+    offs_sb = tl.arange(0, BLOCK_SIZE_KB // 8)
+    xt_ptrs = a_ptr + (offs_token[None, :] // top_k * stride_am + offs_k[:, None] * stride_ak)
 
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    packed_base = packed_ptr + slot * stride_pe + offs_bn[None, :] * stride_pn
-    scale_base = scale_ptr + slot * stride_se + offs_bn[None, :] * stride_sn
+    p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kb[None, :] * stride_pkb
+    s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sb[None, :] * stride_sblk
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     K_BYTES = K // 2
     for kb in range(0, tl.cdiv(K_BYTES, BLOCK_SIZE_KB)):
-        byte_idx = kb * BLOCK_SIZE_KB + offs_kb
-        byte_mask = byte_idx < K_BYTES
-
-        p_ptrs = packed_base + byte_idx[:, None] * stride_pkb
-        bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
-        lo = bytes_ & 0xF
-        hi = (bytes_ >> 4) & 0xF
-        sblk = byte_idx // 8
-        s_ptrs = scale_base + sblk[:, None] * stride_sblk
+        byte_mask = kb * BLOCK_SIZE_KB + offs_kb < K_BYTES
+        sblk_mask = kb * (BLOCK_SIZE_KB // 8) + offs_sb < K_BYTES // 8
+        k_mask = kb * 2 * BLOCK_SIZE_KB + offs_k < K
+        v = tl.load(p_ptrs, mask=byte_mask[None, :], other=0).to(tl.int32)
         if e4m3_native_cx():
-            scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
+            s = tl.load(s_ptrs, mask=sblk_mask[None, :], other=0.0).to(tl.float32)
         else:
-            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
-        b_hi = tl.load(lut_ptr + hi) * scale
-
-        a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
-        a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
-        accumulator += tl.dot(a_lo, b_lo.to(a_lo.dtype))
-        accumulator += tl.dot(a_hi, b_hi.to(a_hi.dtype))
-
-        a_ptrs_lo += BLOCK_SIZE_KB * 2 * stride_ak
-        a_ptrs_hi += BLOCK_SIZE_KB * 2 * stride_ak
+            s = e4m3_u8_to_f32(tl.load(s_ptrs, mask=sblk_mask[None, :], other=0))
+        # one scale per 16 values; the 2^14 undoes the decode's 2^-14
+        s = tl.reshape(tl.broadcast_to((s * 16384.0)[:, :, None], (BLOCK_SIZE_N, BLOCK_SIZE_KB // 8, 8)), (BLOCK_SIZE_N, BLOCK_SIZE_KB))
+        s = s.to(tl.bfloat16)
+        # exact in bf16: e2m1 has <= 2 significant bits and e4m3 <= 4
+        w_lo = _e2m1_f16_x2p14(v & 0xF).to(tl.bfloat16) * s
+        w_hi = _e2m1_f16_x2p14(v >> 4).to(tl.bfloat16) * s
+        # interleave back to k = 2 * byte + {0, 1} so one dot covers the K step
+        w = tl.reshape(tl.join(w_lo, w_hi), (BLOCK_SIZE_N, 2 * BLOCK_SIZE_KB))
+        xt = tl.load(xt_ptrs, mask=k_mask[:, None] & token_mask[None, :], other=0.0)
+        accumulator = tl.dot(w.to(xt.dtype), xt, accumulator)
+        xt_ptrs += 2 * BLOCK_SIZE_KB * stride_ak
+        p_ptrs += BLOCK_SIZE_KB * stride_pkb
+        s_ptrs += (BLOCK_SIZE_KB // 8) * stride_sblk
 
     g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32)
-    accumulator = accumulator * g[None, :]
+    accumulator = accumulator * g[:, None]
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token * stride_tw, mask=token_mask, other=0)
-        accumulator = accumulator * moe_weight[:, None]
+        accumulator = accumulator * moe_weight[None, :]
 
     accumulator = accumulator.to(compute_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    c_ptrs = c_ptr + stride_cm * offs_token[None, :] + stride_cn * offs_cn[:, None]
+    c_mask = token_mask[None, :] & (offs_cn[:, None] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
