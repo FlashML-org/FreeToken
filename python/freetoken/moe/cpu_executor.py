@@ -459,13 +459,14 @@ class CpuMoeExecutor:
         return banks, {}, (H, I)
 
     def _resolve_gguf_banks(self, banks: dict, rep: int, gate_up_type: int, down_type: int) -> tuple[dict, dict, tuple[int, int]]:
-        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each."""
-        from freetoken.layers.quantization.ggml_types import row_bytes, type_name
+        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each; float rows keep their dtype."""
+        from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes, type_name
 
         gate_up, down = banks["gate_up"], banks["down"]
         H, I = int(down[rep].shape[1]), int(gate_up[rep].shape[1] // 2)
         for role, t, ggml_type, k in (("gate_up", gate_up[rep], gate_up_type, H), ("down", down[rep], down_type, I)):
-            if t.dtype != torch.uint8 or t.shape[-1] != row_bytes(ggml_type, k):
+            dtype = float_dtype(ggml_type) if float_dtype(ggml_type) is not None else torch.uint8
+            if t.dtype != dtype or t.shape[-1] * t.element_size() != row_bytes(ggml_type, k):
                 raise ValueError(f"MoE layer {rep} {role} bank {tuple(t.shape)} {t.dtype} is not {type_name(ggml_type)} rows of {k} values")
         banks = self._tables(gate_up=gate_up, down=down)
         return banks, {"gate_up_type": gate_up_type, "down_type": down_type}, (H, I)

@@ -144,6 +144,7 @@ class GGUFMoEMethod(MoEMethod):
 
     def cpu_spec(self) -> tuple[str | None, dict[str, int]]:
         gate_up, down = expert_types(self.cfg)
-        if not is_quantized(gate_up):
+        # BF16 experts keep the executor's bf16 kernels, which use AVX512-BF16 where the CPU has it; ggml-cpu is built for AVX2 only
+        if float_dtype(gate_up) is torch.bfloat16 and float_dtype(down) is torch.bfloat16:
             return "bf16", {}
         return "gguf", {"gate_up_type": gate_up, "down_type": down}

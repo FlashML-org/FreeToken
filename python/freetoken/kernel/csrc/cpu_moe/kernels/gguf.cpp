@@ -72,7 +72,7 @@ std::string gguf_cpu_unavailable() {
 
 namespace {
 
-// Packed ggml rows of the layers whose experts have this gate_up type and this down type, dotted by ggml-cpu against the activation quantized to each type's vec_dot input (q8_0, q8_1 or q8_K).
+// Packed ggml rows of the layers whose experts have this gate_up type and this down type, dotted by ggml-cpu against the activation converted to each type's vec_dot input (q8_0, q8_1 or q8_K, or the float type itself).
 class GgufFormat final : public MoeFormat {
  public:
   GgufFormat(const MoeParams& p, const FormatArgs& a)

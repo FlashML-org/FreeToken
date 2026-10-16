@@ -6,10 +6,12 @@
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu/quants.h"
 #include "ggml-cpu/simd-mappings.h"
+#include "ggml-cpu/vec.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 float ggml_table_f32_f16[1 << 16];
 float ggml_table_f32_e8m0_half[1 << 8];
@@ -84,6 +86,9 @@ struct dot_info {
 
 // The weight types of type_traits_cpu in ggml-cpu.c, with their vec_dot and vec_dot_type.
 static const struct dot_info k_dots[GGML_TYPE_COUNT] = {
+    [GGML_TYPE_F32] = {(ft_ggml_vec_dot_t) ggml_vec_dot_f32, GGML_TYPE_F32},
+    [GGML_TYPE_F16] = {(ft_ggml_vec_dot_t) ggml_vec_dot_f16, GGML_TYPE_F16},
+    [GGML_TYPE_BF16] = {(ft_ggml_vec_dot_t) ggml_vec_dot_bf16, GGML_TYPE_BF16},
     [GGML_TYPE_Q1_0] = {ggml_vec_dot_q1_0_q8_0, GGML_TYPE_Q8_0},
     [GGML_TYPE_Q2_0] = {ggml_vec_dot_q2_0_q8_0, GGML_TYPE_Q8_0},
     [GGML_TYPE_Q4_0] = {ggml_vec_dot_q4_0_q8_0, GGML_TYPE_Q8_0},
@@ -111,8 +116,27 @@ static const struct dot_info k_dots[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ4_XS] = {ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K},
 };
 
+static void fp32_to_fp32_row(const float * x, void * y, int64_t k) { memcpy(y, x, (size_t) k * sizeof(float)); }
+
+static void fp32_to_fp16_row(const float * x, void * y, int64_t k) {
+    ggml_fp16_t * out = y;
+    for (int64_t i = 0; i < k; ++i) {
+        out[i] = GGML_CPU_FP32_TO_FP16(x[i]);
+    }
+}
+
+static void fp32_to_bf16_row(const float * x, void * y, int64_t k) {
+    ggml_bf16_t * out = y;
+    for (int64_t i = 0; i < k; ++i) {
+        out[i] = GGML_FP32_TO_BF16(x[i]);
+    }
+}
+
 static ft_ggml_from_float_t act_quantizer(int act_type) {
     switch (act_type) {
+        case GGML_TYPE_F32: return fp32_to_fp32_row;
+        case GGML_TYPE_F16: return fp32_to_fp16_row;
+        case GGML_TYPE_BF16: return fp32_to_bf16_row;
         case GGML_TYPE_Q8_0: return quantize_row_q8_0;
         case GGML_TYPE_Q8_1: return quantize_row_q8_1;
         case GGML_TYPE_Q8_K: return quantize_row_q8_K;

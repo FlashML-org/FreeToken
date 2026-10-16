@@ -97,14 +97,20 @@ else:
 
 _check_toolchain()
 
-# ggml-cpu's quant kernels for GGUF experts on the CPU MoE executor, as a static C library linked into _cpu_moe.
+# ggml-cpu's row kernels for GGUF experts on the CPU MoE executor, as static libraries linked into _cpu_moe.
 # They are built for AVX2 only; the executor checks the CPU before it calls them.
 GGML_DIR = "python/freetoken/kernel/csrc/ggml"
 GGML_CPU = platform.machine().lower() in ("x86_64", "amd64")
 if sys.platform == "win32":
-    ggml_cpu_cflags = ["/O2", "/DNDEBUG", "/std:c11", "/utf-8", "/arch:AVX2", "/D__BMI2__", "/D_CRT_SECURE_NO_WARNINGS"]
+    ggml_cpu_cflags = ["/O2", "/DNDEBUG", "/utf-8", "/arch:AVX2", "/D__BMI2__", "/D_CRT_SECURE_NO_WARNINGS"]
+    ggml_c_std, ggml_cxx_std = "/std:c11", "/std:c++20"
 else:
-    ggml_cpu_cflags = ["-O3", "-fPIC", "-fvisibility=hidden", "-DNDEBUG", "-std=c11", "-mavx", "-mavx2", "-mfma", "-mf16c", "-mbmi2"]
+    ggml_cpu_cflags = ["-O3", "-fPIC", "-fvisibility=hidden", "-DNDEBUG", "-mavx", "-mavx2", "-mfma", "-mf16c", "-mbmi2"]
+    ggml_c_std, ggml_cxx_std = "-std=c11", "-std=c++20"
+ggml_cpu_build = {
+    "include_dirs": [f"{GGML_DIR}/include", f"{GGML_DIR}/src", f"{GGML_DIR}/ggml-cpu", GGML_DIR],
+    "obj_deps": {"": sorted(str(p.relative_to(ROOT)) for d in ("include", "src", "ggml-cpu", "freetoken") for p in (ROOT / GGML_DIR / d).rglob("*.h"))},
+}
 ggml_cpu_libraries = [
     ("freetoken_ggml_cpu", {
         "sources": [
@@ -113,10 +119,15 @@ ggml_cpu_libraries = [
             f"{GGML_DIR}/ggml-cpu/arch/x86/quants.c",
             f"{GGML_DIR}/freetoken/cpu_kernels.c",
         ],
-        "include_dirs": [f"{GGML_DIR}/include", f"{GGML_DIR}/src", f"{GGML_DIR}/ggml-cpu", GGML_DIR],
-        "obj_deps": {"": sorted(str(p.relative_to(ROOT)) for d in ("include", "src", "ggml-cpu", "freetoken") for p in (ROOT / GGML_DIR / d).rglob("*.h"))},
-        "cflags": ggml_cpu_cflags,
-    })
+        "cflags": [*ggml_cpu_cflags, ggml_c_std],
+        **ggml_cpu_build,
+    }),
+    # the float row kernels; C++, so a library of their own
+    ("freetoken_ggml_cpu_vec", {
+        "sources": [f"{GGML_DIR}/ggml-cpu/vec.cpp"],
+        "cflags": [*ggml_cpu_cflags, ggml_cxx_std],
+        **ggml_cpu_build,
+    }),
 ] if GGML_CPU else []
 
 
@@ -135,13 +146,15 @@ class BuildExt(BuildExtension):
     def build_extension(self, ext):
         if ext.name == "freetoken.kernel._cpu_moe" and GGML_CPU:
             build_clib = self.get_finalized_command("build_clib")
-            if "freetoken_ggml_cpu" not in ext.libraries:
-                ext.libraries.append("freetoken_ggml_cpu")
+            if build_clib.build_clib not in ext.library_dirs:
                 ext.library_dirs.append(build_clib.build_clib)
-            lib = os.path.join(build_clib.build_clib, self.compiler.library_filename("freetoken_ggml_cpu"))
-            # relink when only the static library changed
-            if lib not in ext.depends:
-                ext.depends.append(lib)
+            for name, _ in ggml_cpu_libraries:
+                if name not in ext.libraries:
+                    ext.libraries.append(name)
+                lib = os.path.join(build_clib.build_clib, self.compiler.library_filename(name))
+                # relink when only a static library changed
+                if lib not in ext.depends:
+                    ext.depends.append(lib)
         super().build_extension(ext)
 
 
