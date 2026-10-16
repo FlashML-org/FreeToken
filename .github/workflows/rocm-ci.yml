@@ -1,0 +1,353 @@
+name: ROCm CI
+run-name: ROCm CI / manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      aime:
+        description: Run AIME end-to-end evaluation (disable for a shorter run)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-ci
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: w7900d / gfx1100
+    runs-on: [self-hosted, linux, x64, rocm-ci, gfx1100, w7900d]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/freetoken:rocm10.1.0-ci-gh-proxy
+      volumes:
+        - /nvme0/data/FreeToken:/assets:ro
+      options: >-
+        --device=/dev/kfd
+        --device=/dev/dri
+        --shm-size=32g
+    env:
+      CI: "true"
+      ROCM_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/freetoken:rocm10.1.0-ci-gh-proxy
+      FREETOKEN_ROCM_ARCH: gfx1100
+      ROCR_VISIBLE_DEVICES: "6"
+      CI_ASSET_ROOT: /assets
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple
+      UV_DEFAULT_INDEX: https://mirrors.aliyun.com/pypi/simple
+      ROCM_CI_AIME: ${{ inputs.aime }}
+      FREETOKEN_AIME_MIN_FREE_GIB: "40"
+      PYTORCH_ROCM_ARCH: gfx1100
+      FREETOKEN_DISABLE_KERNEL_CACHE: "1"
+      MAX_JOBS: "16"
+      PYTHONUNBUFFERED: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      FREETOKEN_REBUILD_TEST_MODEL: /assets/models/Qwen3.5-0.8B
+      FREETOKEN_REBUILD_MIN_FREE_GIB: "20"
+      FREETOKEN_REBUILD_BOOT_TIMEOUT: "600"
+      FREETOKEN_TEST_MODEL: /assets/models/Qwen3.5-35B-A3B-FP8
+      FREETOKEN_AIME25_JSONL: /assets/datasets/aime25/test-freetoken.jsonl
+      FREETOKEN_AIME_SERIES: aime25
+      FREETOKEN_AIME_REQ: "1"
+      FREETOKEN_AIME_SAMPLES: "3"
+      FREETOKEN_AIME_MAX_TOKENS: "16384"
+      FREETOKEN_TEST_MOE_CACHE_AUTO: "1"
+      FREETOKEN_TEST_MOE_CACHE_SIZE: "0"
+      FREETOKEN_TEST_MOE_STRATEGY: offload
+    steps:
+      - name: Prepare results
+        env:
+          ROCM_CI_RESULTS_DIR: ${{ runner.temp }}/rocm-ci
+        run: |
+          umask 022
+          rm -rf -- "$ROCM_CI_RESULTS_DIR"
+          mkdir -p -- "$ROCM_CI_RESULTS_DIR"
+          chmod 755 "$ROCM_CI_RESULTS_DIR"
+          printf 'ROCM_CI_RESULTS_DIR=%s\n' "$ROCM_CI_RESULTS_DIR" >> "$GITHUB_ENV"
+          printf 'FREETOKEN_QWEN4_HF_PYTHON=%s\n' "$(command -v python)" >> "$GITHUB_ENV"
+          for entry in UV_CACHE_DIR:uv PIP_CACHE_DIR:pip TORCH_EXTENSIONS_DIR:torch TVM_FFI_CACHE_DIR:tvm-ffi TRITON_CACHE_DIR:triton XDG_CACHE_HOME:xdg; do
+            printf '%s=%s/cache/%s\n' "${entry%%:*}" "$ROCM_CI_RESULTS_DIR" "${entry#*:}" >> "$GITHUB_ENV"
+          done
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record source
+        run: |
+          umask 022
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import runpy
+          import subprocess
+
+          results = Path(os.environ["ROCM_CI_RESULTS_DIR"])
+          def git(*args):
+              command = ["git", "-c", f"safe.directory={Path.cwd()}", *args]
+              return subprocess.check_output(command, text=True).strip()
+
+          source = {
+              "commit": git("rev-parse", "HEAD"),
+              "version": runpy.run_path("python/freetoken/version.py")["__version__"],
+              "platform": platform.platform(),
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "status": git("status", "--porcelain"),
+              "github_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "configuration": {key: os.environ.get(key) for key in (
+                  "ROCM_CI_IMAGE", "FREETOKEN_ROCM_ARCH", "ROCR_VISIBLE_DEVICES", "CI_ASSET_ROOT",
+                  "ROCM_CI_AIME",
+                  "FREETOKEN_REBUILD_TEST_MODEL", "FREETOKEN_TEST_MODEL", "FREETOKEN_AIME25_JSONL",
+                  "FREETOKEN_AIME_REQ", "FREETOKEN_AIME_SAMPLES", "FREETOKEN_AIME_MAX_TOKENS")},
+          }
+          text = json.dumps(source, indent=2) + "\n"
+          (results / "source.json").write_text(text)
+          print(text, end="")
+          diff = git("diff", "HEAD")
+          if diff:
+              print(diff)
+          if source["commit"] != source["github_sha"]:
+              raise RuntimeError("Checkout does not match GITHUB_SHA")
+          PY
+      - name: Validate and install environment
+        run: |
+          umask 022
+          ulimit -c 0
+          unset PYTEST_ADDOPTS
+          python - <<'PY'
+          import importlib.metadata as metadata
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import torch
+          import torchvision
+          import triton
+
+          versions = {module.__name__: metadata.version(module.__name__)
+                      for module in (torch, torchvision, triton)}
+          if not torch.version.hip or torch.version.cuda is not None:
+              raise RuntimeError("Expected HIP PyTorch without CUDA")
+          if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+              raise RuntimeError("Expected one visible ROCm GPU")
+          props = torch.cuda.get_device_properties(0)
+          arch = props.gcnArchName.split(":", 1)[0]
+          if arch != os.environ["FREETOKEN_ROCM_ARCH"]:
+              raise RuntimeError(f"Unexpected GPU target: {arch}")
+          runtime = {"python": sys.version, "versions": versions, "hip": torch.version.hip,
+                     "cuda": torch.version.cuda, "devices": [{"name": props.name, "arch": arch}]}
+          results = Path(os.environ["ROCM_CI_RESULTS_DIR"])
+          text = json.dumps(runtime, indent=2) + "\n"
+          (results / "runtime-before.json").write_text(text)
+          (results / "runtime.constraints.txt").write_text(
+              "".join(f"{name}=={version}\n" for name, version in versions.items()))
+          print(text, end="")
+          PY
+          uv pip install --python "$(command -v python)" --no-sources --no-build-isolation \
+            --constraint "$ROCM_CI_RESULTS_DIR/runtime.constraints.txt" -e .
+          uv pip check --python "$(command -v python)"
+          uv pip freeze --python "$(command -v python)"
+          python - <<'PY'
+          import importlib.metadata as metadata
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import torch
+          import torchvision
+          import triton
+
+          versions = {module.__name__: metadata.version(module.__name__)
+                      for module in (torch, torchvision, triton)}
+          devices = []
+          for index in range(torch.cuda.device_count()):
+              props = torch.cuda.get_device_properties(index)
+              devices.append({"name": props.name, "arch": props.gcnArchName.split(":", 1)[0]})
+          runtime = {"python": sys.version, "versions": versions, "hip": torch.version.hip,
+                     "cuda": torch.version.cuda, "devices": devices}
+          results = Path(os.environ["ROCM_CI_RESULTS_DIR"])
+          text = json.dumps(runtime, indent=2) + "\n"
+          (results / "runtime-after.json").write_text(text)
+          print(text, end="")
+          if runtime != json.loads((results / "runtime-before.json").read_text()):
+              raise RuntimeError("Installation changed the Python/AMD runtime or visible GPUs")
+          PY
+      - name: Check test assets
+        run: |
+          umask 022
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          assets = Path(os.environ["CI_ASSET_ROOT"])
+          optional = {
+              "FREETOKEN_GEMMA4_GGUF_GLOB": assets / "models/gemma-4-26B-A4B-GGUF/gemma-4-26B-A4B-Q8_0.gguf",
+              "FREETOKEN_QWEN4EXP_MODEL": assets / "models/Qwen3.8-Flash-Next-NVFP4",
+          }
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              for name, path in optional.items():
+                  if path.exists():
+                      output.write(f"{name}={path}\n")
+                      print(f"{name}: {path}")
+
+          def require_model(name):
+              model = Path(os.environ[name])
+              config = model / "config.json"
+              weights = [*model.glob("*.safetensors"), *model.glob("*.bin")]
+              if not config.is_file() or not config.stat().st_size or not any(
+                      path.is_file() and path.stat().st_size for path in weights):
+                  raise RuntimeError(f"Required checkpoint missing config or weights: {model}")
+              print(f"Checkpoint: {model}")
+
+          require_model("FREETOKEN_REBUILD_TEST_MODEL")
+          if os.environ["ROCM_CI_AIME"] == "true":
+              require_model("FREETOKEN_TEST_MODEL")
+              dataset = Path(os.environ["FREETOKEN_AIME25_JSONL"])
+              if not dataset.is_file() or not dataset.stat().st_size:
+                  raise RuntimeError(f"Required AIME dataset missing: {dataset}")
+              print(f"AIME dataset: {dataset}")
+          PY
+      - name: Run tests
+        id: tests
+        run: |
+          umask 022
+          ulimit -c 0
+          unset PYTEST_ADDOPTS
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import shlex
+          import subprocess
+          import sys
+
+          results = Path(os.environ["ROCM_CI_RESULTS_DIR"])
+          pytest_args = ["-o", "addopts=", "-o", "junit_family=xunit1", "-ra", "--durations=30"]
+          excluded = {Path("tests/e2e/test_aime.py"), Path("tests/e2e/test_cache_rebuild.py")}
+          scopes = sorted({Path(*path.parts[:2]) for path in Path("tests").rglob("test_*.py")
+                           if path not in excluded})
+          targets = [(f"base-{scope.stem}", scope) for scope in scopes]
+          targets.append(("rebuild", Path("tests/e2e/test_cache_rebuild.py")))
+          if os.environ["ROCM_CI_AIME"] == "true":
+              targets.append(("aime", Path("tests/e2e/test_aime.py")))
+
+          failed = False
+          for name, path in targets:
+              command = [sys.executable, "-m", "pytest", str(path), *pytest_args,
+                         f"--basetemp={results / (name + '-temp')}", f"--junitxml={results / (name + '.xml')}"]
+              if name.startswith("base-"):
+                  command.extend(f"--ignore={path}" for path in sorted(excluded))
+              print("Running " + name + ": " + shlex.join(command), flush=True)
+              returncode = subprocess.run(command).returncode
+              if returncode != 0:
+                  print(f"::error::pytest failed for {path} (exit status {returncode}); see the output above.", flush=True)
+                  failed = True
+          sys.exit(int(failed))
+          PY
+      - name: Write summary
+        if: ${{ always() && steps.tests.outcome != 'skipped' }}
+        env:
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          python - <<'PY'
+          from collections import Counter, defaultdict
+          import html
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import quote
+          import xml.etree.ElementTree as ET
+
+          results = Path(os.environ["ROCM_CI_RESULTS_DIR"])
+          source = json.loads((results / "source.json").read_text())
+          runtime = json.loads((results / "runtime-after.json").read_text())
+          cases = {}
+          priority = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
+          for report in sorted(results.glob("*.xml")):
+              for case in ET.parse(report).iter("testcase"):
+                  classname, name = case.get("classname", ""), case.get("name", "")
+                  file = case.get("file", classname.replace(".", "/") + ".py")
+                  module = file.removesuffix(".py").replace("/", ".")
+                  qualifier = classname.removeprefix(module).lstrip(".").replace(".", "::")
+                  nodeid = "::".join(part for part in (file, qualifier, name) if part)
+                  outcome, message = "passed", ""
+                  for tag, category in [("skipped", "skipped"), ("failure", "failed"), ("error", "error")]:
+                      entry = case.find(tag)
+                      if entry is not None:
+                          outcome, message = category, entry.get("message", entry.text or "")
+                  if nodeid not in cases or priority[outcome] > priority[cases[nodeid]["outcome"]]:
+                      cases[nodeid] = {"nodeid": nodeid, "file": file, "line": case.get("line"),
+                                       "outcome": outcome, "message": message}
+          counts = Counter(case["outcome"] for case in cases.values())
+          result = {"success": "PASSED", "failure": "FAILED", "cancelled": "INTERRUPTED"}[os.environ["TEST_OUTCOME"]]
+
+
+          def text(value):
+              return html.escape(str(value)).replace("|", "&#124;").replace("`", "&#96;").replace("\n", " ")
+
+
+          sha, repository = source["commit"], source["repository"]
+          versions = runtime["versions"]
+          gpus = ", ".join(f"{device['name']} ({device['arch']})" for device in runtime["devices"])
+          image = source["configuration"]["ROCM_CI_IMAGE"].rsplit("/", 1)[-1]
+          lines = ["# ROCm test results", "", f"**Result: {result}**", "",
+                   f"- FreeToken: **{text(source['version'])}**, commit [`{sha[:12]}`](https://github.com/{repository}/commit/{sha})",
+                   f"- Platform: {text(source['platform'])}; GPU: {text(gpus)}",
+                   f"- Runtime: Python {text(runtime['python'].split()[0])}; Torch {text(versions['torch'])}; HIP {text(runtime['hip'])}",
+                   f"- Libraries: torchvision {text(versions['torchvision'])}; Triton {text(versions['triton'])}",
+                   f"- Image: `{text(image)}`",
+                   f"- [Actions logs](https://github.com/{repository}/actions/runs/{source['run_id']})", "",
+                   "| Reported tests | Passed | Failed | Errors | Skipped |",
+                   "| ---: | ---: | ---: | ---: | ---: |",
+                   f"| {len(cases)} | {counts['passed']} | {counts['failed']} | {counts['error']} | {counts['skipped']} |"]
+          if os.environ["ROCM_CI_AIME"] != "true":
+              lines.extend(["", "AIME was disabled by the manual input."])
+          for outcome, heading in [("failed", "Failed"), ("error", "Errors")]:
+              selected = [case for case in cases.values() if case["outcome"] == outcome]
+              if not selected:
+                  continue
+              lines.extend(["", f"## {heading} ({len(selected)})", ""])
+              by_file = defaultdict(list)
+              for case in selected:
+                  by_file[case["file"]].append(case)
+              for file, entries in sorted(by_file.items()):
+                  lines.extend([f"<details><summary>{text(file)} ({len(entries)})</summary>", "",
+                                "| Function / parameter ID | Reason |", "| --- | --- |"])
+                  for case in sorted(entries, key=lambda case: case["nodeid"]):
+                      link = f"https://github.com/{repository}/blob/{sha}/{quote(file, safe='/')}"
+                      if case["line"] is not None:
+                          link += f"#L{int(case['line']) + 1}"
+                      function = case["nodeid"].split("::", 1)[-1]
+                      reason = " ".join(case["message"].splitlines())[:240]
+                      lines.append(f"| [<code>{text(function)}</code>]({link}) | {text(reason)} |")
+                  lines.extend(["", "</details>"])
+          skipped = [case for case in cases.values() if case["outcome"] == "skipped"]
+          if skipped:
+              groups = defaultdict(list)
+              for case in skipped:
+                  groups[case["message"]].append(case["file"])
+              lines.extend(["", f"## Skipped ({len(skipped)})", "", "<details><summary>Reasons</summary>", "",
+                            "| Reason | Cases | Example file |", "| --- | ---: | --- |"])
+              for reason, files in sorted(groups.items(), key=lambda item: -len(item[1])):
+                  lines.append(f"| {text(reason)} | {len(files)} | <code>{text(files[0])}</code> |")
+              lines.extend(["", "</details>"])
+          lines.extend(["", "Full tracebacks and pytest commands are in the Actions logs."])
+          summary = "\n".join(lines) + "\n"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(summary)
+          print(f"Test results: {len(cases)} reported, {counts['passed']} passed, {counts['failed']} failed, {counts['error']} errors, {counts['skipped']} skipped.")
+          PY
+      - name: Clean container-created results
+        if: always()
+        env:
+          ROCM_CI_RESULTS_DIR: ${{ runner.temp }}/rocm-ci
+        run: |
+          rm -rf -- "$ROCM_CI_RESULTS_DIR"
