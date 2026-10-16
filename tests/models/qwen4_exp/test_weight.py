@@ -91,14 +91,14 @@ def _csf_encode(target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
         fixed[slab, row] = base
         for j in range(row_bytes):
             fixed[slab, 16 + row * row_bytes + j] = (target[r, 2 * j + 1] & 0xF) << 4 | (target[r, 2 * j] & 0xF)
-    # absolute records: (value << 24) | row-major position
+    # absolute records: (value << 24) | row-major position, as Python ints (uint8 would wrap)
     for pos in (3, rows * cols - 1):
-        value = 0xFF - (target.ravel()[pos] & 0xFF)
+        value = 0xFF - target.ravel()[pos].item()
         exceptions.append((value << 24) | pos)
     exc = torch.tensor(exceptions, dtype=torch.int32)
-    ref = target.reshape(-1).clone()
+    ref = target.clone()
     for rec in exceptions:
-        ref[rec & 0xFFFFFF] = rec >> 24
+        ref.view(-1)[rec & 0xFFFFFF] = (rec >> 24) & 0xFF
     return fixed, exc, ref
 
 
@@ -116,7 +116,7 @@ def test_csf_decode_roundtrip():
         assert torch.equal(decode_csf_scales(fixed, exc.view(torch.uint8)).view(torch.uint8), ref)
         # with no exceptions the slab decode is the target itself (rows share a high nibble)
         no_exc = decode_csf_scales(fixed, torch.zeros(0, dtype=torch.int32))
-        assert torch.equal(no_exc.view(torch.uint8), target.reshape(-1))
+        assert torch.equal(no_exc.view(torch.uint8), target)
 
 
 def test_nvfp4_expert_spec_selects_the_csf_checkpoint(monkeypatch):
@@ -168,7 +168,7 @@ def test_csf_expert_reader_expands_the_scale_pieces(tmp_path):
                 piece[f"{role}_global"].reshape(-1), raw[f"{base}.weight_scale_2"].reshape(-1).to(torch.float16)
             )
             assert piece[f"{role}_scale"].shape == (1, raw[f"{base}.weight"].shape[0], raw[f"{base}.weight"].shape[1] // 8)
-            assert torch.equal(piece[f"{role}_scale"].view(torch.uint8)[0].reshape(-1), refs[(e0, proj)])
+            assert torch.equal(piece[f"{role}_scale"].view(torch.uint8)[0], refs[(e0, proj)])
 
 
 def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
