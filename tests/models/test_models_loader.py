@@ -31,6 +31,51 @@ def test_shard_tensor_splits_vocab_with_ceil_partition():
     assert rank1.tolist() == value[3:5].tolist()
 
 
+def test_iter_weight_files_reads_shards_from_an_indexed_subdirectory(tmp_path):
+    """FP4-Local releases keep shards in tensors/; the root glob alone finds nothing."""
+    import json
+    import os
+    from freetoken.models.loader import iter_weight_files
+
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    for i in (1, 2):
+        (sub / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "tensors/model-00001-of-00002.safetensors",
+                    "lm_head.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+
+    files = iter_weight_files(str(tmp_path))
+
+    assert len(files) == 2
+    assert all(os.path.exists(f) for f in files)
+
+
+def test_iter_weight_files_prefers_root_shards_over_the_index(tmp_path):
+    """Root-level shards keep the historical path; the index fallback is only for subdirectory layouts."""
+    import json
+    from freetoken.models.loader import iter_weight_files
+
+    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"")
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    (sub / "model-00001-of-00002.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.embed_tokens.weight": "tensors/model-00001-of-00002.safetensors"}})
+    )
+
+    files = iter_weight_files(str(tmp_path))
+
+    assert files == [str(tmp_path / "model-00001-of-00001.safetensors")]
+
+
 def test_iter_root_safetensor_files_from_index_keeps_only_root_index_shards(tmp_path):
     import json
     from freetoken.models.loader import iter_root_safetensor_files_from_index
