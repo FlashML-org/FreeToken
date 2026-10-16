@@ -356,6 +356,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    # llama.cpp glm5-next GGUF (unsloth GLM-5.3-Flash-GGUF; text only): the same model
+    # classes with every tensor in its packed ggml type
+    "Glm5NextGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_GLM5_NEXT_PACKED,
+    ),
 }
 
 

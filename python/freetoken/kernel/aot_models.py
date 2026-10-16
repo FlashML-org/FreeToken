@@ -152,7 +152,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
-        arch_aliases=("Qwen3_5MoeForCausalLM",),  # text-only release of the same tower
+        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeGGUFForCausalLM"),  # text-only release; its llama.cpp qwen35moe GGUF
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -280,7 +280,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         # KDA conv/recurrent state lives in the LinearStatePool, not paged KV.
         name="RedHatAI/GLM-5.3-Flash-NVFP4",
         architecture="Glm5NextForCausalLM",
-        arch_aliases=("Glm5NextForConditionalGeneration",),
+        arch_aliases=("Glm5NextForConditionalGeneration", "Glm5NextGGUFForCausalLM"),  # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
         hidden_size=4096,
         kv_groups=(),
         top_k=8,
@@ -348,7 +348,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((4, 256),),
         aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
-        arch_aliases=("Qwen3_5ForCausalLM",),  # text-only release of the same tower
+        arch_aliases=("Qwen3_5ForCausalLM", "Qwen3_5GGUFForCausalLM"),  # text-only release of the same tower
     ),
     AotModel(
         name="google/gemma-4-12B-it",
