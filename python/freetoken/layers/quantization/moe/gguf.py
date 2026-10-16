@@ -54,15 +54,15 @@ def float_mul_mat_id(w: torch.Tensor, x: torch.Tensor, ids: torch.Tensor, topk_w
     per_route = x.dim() == 3
     # f16 experts take f16 activations, as llama.cpp's f16 path does
     a = x.reshape(-1, x.shape[-1]).to(w.dtype).contiguous()
-    out = torch.empty(t, top_k, w.shape[1], dtype=w.dtype, device=x.device)
+    out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if config is None:
-        fused_moe_decode_kernel_triton(a, w, out, topk_weights, ids, False, per_route, _DECODE_CONFIG, compute_type=w.dtype)
+        fused_moe_decode_kernel_triton(a, w, out, topk_weights, ids, False, per_route, _DECODE_CONFIG, compute_type=x.dtype)
     else:
         sorted_ids, expert_ids, num_post_padded = moe_align_block_size(ids, config["BLOCK_SIZE_M"], w.shape[0])
         fused_moe_kernel_triton(
-            a, w, out, topk_weights, ids, sorted_ids, expert_ids, num_post_padded, False, 1 if per_route else top_k, config, compute_type=w.dtype
+            a, w, out, topk_weights, ids, sorted_ids, expert_ids, num_post_padded, False, 1 if per_route else top_k, config, compute_type=x.dtype
         )
-    return out.to(x.dtype)
+    return out
 
 
 
