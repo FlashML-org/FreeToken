@@ -1161,8 +1161,12 @@ class Engine:
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if getattr(batch, "layer_major", False) and batch.is_prefill:
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
+                logits = self._forward_layer_major(batch)
+        else:
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1177,6 +1181,100 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _build_layer_major_chunks(self, batch: Batch) -> list:
+        """Split one admitted long prefill into ordinary eager-forward shaped chunks."""
+        import types
+
+        from freetoken.attention.linear import build_fla_metadata
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+        req = batch.reqs[0]
+        origin = req.cached_len
+        outer_fla = getattr(batch, "fla_metadata", None)
+        if outer_fla is None:
+            outer_fla = build_fla_metadata(batch, self.device)
+            batch.fla_metadata = outer_fla
+        track = None
+        if outer_fla.track_dst is not None:
+            assert outer_fla.track_dst.numel() == 1
+            boundary = origin + int(outer_fla.track_boundary_row[0])
+            assert origin < boundary < origin + req.extend_len
+            assert req.mamba_last_track_seqlen == boundary
+            assert req.linear_slot_idx == int(outer_fla.cache_indices[0])
+            track = {
+                "boundary": boundary,
+                "src": int(outer_fla.cache_indices[0]),
+                "dst": int(outer_fla.track_dst[0]),
+                "h_row": int(outer_fla.track_h_row[0]),
+                "conv_src": outer_fla.track_conv_src[0:1],
+                "boundary_row": int(outer_fla.track_boundary_row[0]),
+            }
+        carry = (
+            "table_idx", "uid", "linear_slot_idx", "max_device_len", "mamba_ping_pong",
+            "mamba_next_track_idx", "mamba_restore_src", "swa_evicted_seqlen",
+            "sampling_params", "mrope_delta",
+        )
+        chunks, lo, projections = [], 0, 0
+        while lo < req.extend_len:
+            hi = min(lo + self.config.max_extend_tokens, req.extend_len)
+            if track is not None:
+                boundary = track["boundary"]
+                if origin + lo < boundary < origin + hi and (boundary - origin - lo) % CHUNK_SIZE:
+                    hi = boundary - origin
+            child_req = types.SimpleNamespace(**{key: getattr(req, key, None) for key in carry})
+            child_req.cached_len = origin + lo
+            child_req.device_len = origin + hi
+            child_req.extend_len = hi - lo
+            child_req.mm_items = None
+            child_req.mrope_positions_full = None
+            child = types.SimpleNamespace(
+                phase="prefill",
+                input_ids=batch.input_ids[lo:hi],
+                positions=batch.positions[lo:hi],
+                out_loc=batch.out_loc[lo:hi],
+                mrope_positions=(batch.mrope_positions[:, lo:hi] if getattr(batch, "mrope_positions", None) is not None else None),
+                mm_embeds=None,
+                mm_rows=None,
+                mm_block_ends=None,
+                linear_table_idx=getattr(batch, "linear_table_idx", None),
+                reqs=[child_req],
+                padded_reqs=[child_req],
+            )
+            child.is_decode = False
+            child.is_prefill = True
+            child.size = 1
+            child.get_attn_positions = lambda child=child: (
+                child.mrope_positions if child.mrope_positions is not None else child.positions
+            )
+            child.fla_metadata = build_fla_metadata(child, self.device, include_track=False)
+            child.track_initial_src = child.track_initial_dst = None
+            if track is not None:
+                boundary = track["boundary"]
+                if boundary == origin + lo:
+                    child.track_initial_src, child.track_initial_dst = track["src"], track["dst"]
+                    projections += 1
+                elif origin + lo < boundary < origin + hi:
+                    local_boundary = boundary - origin - lo
+                    assert local_boundary % CHUNK_SIZE == 0
+                    child.fla_metadata.track_dst = torch.tensor([track["dst"]], dtype=torch.int64, device=self.device)
+                    child.fla_metadata.track_h_row = torch.tensor([track["h_row"] - lo // CHUNK_SIZE], dtype=torch.int64, device=self.device)
+                    child.fla_metadata.track_conv_src = (track["conv_src"] - lo).to(self.device)
+                    child.fla_metadata.track_boundary_row = torch.tensor([track["boundary_row"] - lo], dtype=torch.int64, device=self.device)
+                    projections += 1
+            self.attn_backend.prepare_metadata(child)
+            child.skip_begin_prefill = True
+            chunks.append(child)
+            lo = hi
+        if track is not None:
+            assert projections == 1, f"layer-major track projected {projections} times"
+        return chunks
+
+    def _forward_layer_major(self, batch: Batch) -> torch.Tensor:
+        chunks = self._build_layer_major_chunks(batch)
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.begin_prefill()
+        return self.model.forward_layer_major(chunks)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

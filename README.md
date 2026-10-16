@@ -82,4 +82,7 @@ learned the design and reused code from the following projects:
 
 ## License
 
+For the optional Qwen3.8 pinned-PLE long-prefill execution path, see
+[layer-major prefill](docs/layer_major_prefill.md).
+
 [Apache License 2.0](https://github.com/FlashML-org/FreeToken/blob/main/LICENSE).

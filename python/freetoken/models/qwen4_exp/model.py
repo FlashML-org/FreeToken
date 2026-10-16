@@ -35,6 +35,23 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
+def _copy_layer_major_track_state(pool, layer, batch) -> None:
+    """Seed a child at the one outer prefix-checkpoint boundary."""
+    src = getattr(batch, "track_initial_src", None)
+    if src is None:
+        return
+    dst = batch.track_initial_dst
+    if layer._is_linear:
+        index = pool.local_index(layer.linear_attn.layer_id)
+        pool.recurrent_states[index, dst].copy_(pool.recurrent_states[index, src])
+        pool.conv_states[index, dst].copy_(pool.conv_states[index, src])
+    if layer.ple is not None:
+        from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
+
+        pool.slot_state(PLE_CONV_STATE, layer.ple.layer_id)[dst].copy_(pool.slot_state(PLE_CONV_STATE, layer.ple.layer_id)[src])
+        pool.slot_state(PLE_NGRAM_STATE)[dst].copy_(batch.ple_meta.ngram_context[0])
+
+
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
     from .gdn import Qwen4ExpGatedDeltaNet
@@ -129,6 +146,30 @@ class Qwen4ExpModel(BaseOP):
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
         return self.hyper_connection_mixer.mix(hidden)[0]
 
+    def forward_layer_major(self, chunk_batches: List[Batch]) -> torch.Tensor:
+        """Run decoder layers outermost, retaining the normal chunk order within each layer."""
+        from .ple import build_ple_metadata, commit_ngram_context
+
+        ctx = get_global_ctx()
+        full_batch = ctx.batch
+        hidden = []
+        try:
+            for child in chunk_batches:
+                ctx._batch = child
+                hidden.append(embed_input_ids(self.embed_tokens, child.input_ids, child).repeat(1, self.hc_count))
+            for layer in self.layers.op_list:
+                for index, child in enumerate(chunk_batches):
+                    ctx._batch = child
+                    if layer.ple is not None:
+                        child.ple_meta = build_ple_metadata(child, layer.ple.args, child.input_ids.device)
+                    _copy_layer_major_track_state(ctx.linear_state_pool, layer, child)
+                    hidden[index] = layer.forward(hidden[index], child)
+                    if layer.ple is not None:
+                        commit_ngram_context(child.ple_meta, child.fla_metadata)
+            return self.hyper_connection_mixer.mix(hidden[-1])[0]
+        finally:
+            ctx._batch = full_batch
+
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
@@ -211,6 +252,16 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+
+    def forward_layer_major(self, chunk_batches: List[Batch]) -> torch.Tensor:
+        ctx = get_global_ctx()
+        previous_batch = ctx.batch
+        try:
+            hidden = self.model.forward_layer_major(chunk_batches)
+            ctx._batch = chunk_batches[-1]
+            return self.lm_head.forward(hidden)
+        finally:
+            ctx._batch = previous_batch
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
