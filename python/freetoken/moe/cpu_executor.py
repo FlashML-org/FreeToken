@@ -192,8 +192,15 @@ class CpuMoeExecutor:
                     f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
                     f"{f!r}; use --moe-strategy offload (GPU-side dequant) instead."
                 )
-            if f == "gguf" and (why := _cpu_moe.gguf_cpu_unavailable()):
-                raise NotImplementedError(f"--moe-strategy cpu/hybrid cannot compute GGUF experts here: {why}; use --moe-strategy offload instead.")
+            if f == "gguf":
+                from freetoken.kernel import ggml_cpu
+
+                if (variant := ggml_cpu.select()) is None:
+                    raise NotImplementedError(
+                        "--moe-strategy cpu/hybrid cannot compute GGUF experts here: this build has no ggml-cpu kernels (x86-64 only); "
+                        "use --moe-strategy offload instead."
+                    )
+                _cpu_moe.set_ggml_cpu(variant.api)
         if activation not in _ACT_IDS:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
         if apply_router_weight_on_input and (output_only := {"mxfp4_triton", "ds_fp4"} & set(names)):

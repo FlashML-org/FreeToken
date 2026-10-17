@@ -1,15 +1,8 @@
-#ifdef FT_GGML_CPU
-
+#include <atomic>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#if defined(_MSC_VER)
-#include <intrin.h>
-#elif defined(__x86_64__) || defined(__i386__)
-#include <cpuid.h>
-#endif
 
 #include "../format.h"
 #include "cpu_kernels.h"
@@ -17,57 +10,22 @@
 namespace freetoken::cpu_moe {
 namespace {
 
-#if CPU_MOE_X86
-void cpuid(unsigned leaf, unsigned sub, unsigned r[4]) {
-#if defined(_MSC_VER)
-  int v[4];
-  __cpuidex(v, static_cast<int>(leaf), static_cast<int>(sub));
-  for (int i = 0; i < 4; ++i) r[i] = static_cast<unsigned>(v[i]);
-#else
-  __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
-#endif
-}
+std::atomic<const ft_ggml_cpu_api*> g_ggml{nullptr};
 
-unsigned long long xcr0() {
-#if defined(_MSC_VER)
-  return _xgetbv(0);
-#else
-  unsigned lo, hi;
-  __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-  return (static_cast<unsigned long long>(hi) << 32) | lo;
-#endif
+const ft_ggml_cpu_api& ggml_api() {
+  const ft_ggml_cpu_api* api = g_ggml.load();
+  if (api == nullptr) throw std::logic_error("CPU MoE gguf experts need a ggml-cpu variant; call _cpu_moe.set_ggml_cpu first");
+  return *api;
 }
-#endif  // CPU_MOE_X86
 
 }  // namespace
 
-std::string gguf_cpu_unavailable() {
-#if CPU_MOE_X86
-  unsigned r[4];
-  cpuid(0, 0, r);
-  const unsigned max_leaf = r[0];
-  cpuid(1, 0, r);
-  const unsigned ecx1 = r[2];
-  unsigned ebx7 = 0;
-  if (max_leaf >= 7) {
-    cpuid(7, 0, r);
-    ebx7 = r[1];
-  }
-  // xgetbv faults unless the OS enabled XSAVE (OSXSAVE)
-  const bool os_ymm = (ecx1 >> 27 & 1) && (xcr0() & 6) == 6;
-  std::string missing;
-  const auto need = [&](bool ok, const char* name) {
-    if (!ok) missing += (missing.empty() ? "" : ", ") + std::string(name);
-  };
-  need((ecx1 >> 28 & 1) && os_ymm, "AVX");
-  need((ebx7 >> 5 & 1) && os_ymm, "AVX2");
-  need(ecx1 >> 12 & 1, "FMA");
-  need(ecx1 >> 29 & 1, "F16C");
-  need(ebx7 >> 8 & 1, "BMI2");
-  return missing.empty() ? "" : "the ggml-cpu kernels are built for AVX2 and this CPU lacks " + missing;
-#else
-  return "the ggml-cpu kernels are built for x86-64 only";
-#endif
+void set_ggml_cpu(uintptr_t addr) {
+  const auto* api = reinterpret_cast<const ft_ggml_cpu_api*>(addr);
+  if (api == nullptr || api->abi != FT_GGML_CPU_ABI) throw std::invalid_argument("set_ggml_cpu: not a ggml-cpu kernel table of this build");
+  const ft_ggml_cpu_api* prev = nullptr;
+  if (!g_ggml.compare_exchange_strong(prev, api) && prev != api)
+    throw std::invalid_argument(std::string("set_ggml_cpu: this process already uses the ") + prev->name + " ggml-cpu variant");
 }
 
 namespace {
@@ -76,10 +34,9 @@ namespace {
 class GgufFormat final : public MoeFormat {
  public:
   GgufFormat(const MoeParams& p, const FormatArgs& a)
-      : MoeFormat(p), gate_up_(a.bank("gate_up")), down_(a.bank("down")) {
-    if (const std::string why = gguf_cpu_unavailable(); !why.empty()) throw std::runtime_error(why);
+      : MoeFormat(p), ggml_(ggml_api()), gate_up_(a.bank("gate_up")), down_(a.bank("down")) {
     static std::once_flag tables;
-    std::call_once(tables, ft_ggml_cpu_init);
+    std::call_once(tables, ggml_.init);
     gu_ = kernel(static_cast<int>(a.option("gate_up_type")), p.H, "gate_up");
     dn_ = kernel(static_cast<int>(a.option("down_type")), p.I, "down");
     xf_.resize(p.H);
@@ -87,7 +44,7 @@ class GgufFormat final : public MoeFormat {
     gq_.resize(static_cast<size_t>(p.max_tokens) * p.top_k * dn_.act_row_bytes);
   }
 
-  std::string isa_name() const override { return "avx2(ggml-cpu)"; }
+  std::string isa_name() const override { return std::string(ggml_.name) + "(ggml-cpu)"; }
 
   void prep_input(int tok, const bf16_t* x) override {
     for (int i = 0; i < p.H; ++i) xf_[i] = bf16_to_f32(x[i]);
@@ -122,16 +79,17 @@ class GgufFormat final : public MoeFormat {
   }
 
  private:
-  static ft_ggml_row_kernel kernel(int type, int k, const char* role) {
+  ft_ggml_row_kernel kernel(int type, int k, const char* role) const {
     ft_ggml_row_kernel out{};
-    const int rc = ft_ggml_cpu_row_kernel(type, k, &out);
-    const std::string name = ft_ggml_type_name(type);
+    const int rc = ggml_.row_kernel(type, k, &out);
+    const std::string name = ggml_.type_name(type);
     if (rc == FT_GGML_NO_KERNEL) throw std::invalid_argument("ggml-cpu has no dot product for " + name + " experts");
     if (rc != FT_GGML_OK)
       throw std::invalid_argument("CPU MoE " + name + " " + role + " rows of " + std::to_string(k) + " values are not whole blocks");
     return out;
   }
 
+  const ft_ggml_cpu_api& ggml_;
   const uint64_t* gate_up_;
   const uint64_t* down_;
   ft_ggml_row_kernel gu_{}, dn_{};
@@ -147,5 +105,3 @@ std::unique_ptr<MoeFormat> make_gguf_format(const MoeParams& p, const FormatArgs
 }
 
 }  // namespace freetoken::cpu_moe
-
-#endif  // FT_GGML_CPU

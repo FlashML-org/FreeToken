@@ -7,7 +7,8 @@ from pathlib import Path
 
 import sys
 
-from setuptools import setup
+from setuptools import Extension, setup
+from setuptools.command.build_clib import build_clib
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension, ROCM_HOME
 
 
@@ -97,38 +98,116 @@ else:
 
 _check_toolchain()
 
-# ggml-cpu's row kernels for GGUF experts on the CPU MoE executor, as static libraries linked into _cpu_moe.
-# They are built for AVX2 only; the executor checks the CPU before it calls them.
+# ggml-cpu's row kernels for GGUF experts on the CPU MoE executor: one module per x86 variant of llama.cpp's GGML_CPU_ALL_VARIANTS (ggml/src/CMakeLists.txt), freetoken.kernel.ggml_cpu._<variant>.
+# freetoken.kernel.ggml_cpu.select() imports the best one this CPU runs; each module's entry is built without the variant's ISA flags so that check is safe on any CPU.
 GGML_DIR = "python/freetoken/kernel/csrc/ggml"
 GGML_CPU = platform.machine().lower() in ("x86_64", "amd64")
-if sys.platform == "win32":
-    ggml_cpu_cflags = ["/O2", "/DNDEBUG", "/utf-8", "/arch:AVX2", "/D__BMI2__", "/D_CRT_SECURE_NO_WARNINGS"]
-    ggml_c_std, ggml_cxx_std = "/std:c11", "/std:c++20"
-else:
-    ggml_cpu_cflags = ["-O3", "-fPIC", "-fvisibility=hidden", "-DNDEBUG", "-mavx", "-mavx2", "-mfma", "-mf16c", "-mbmi2"]
-    ggml_c_std, ggml_cxx_std = "-std=c11", "-std=c++20"
-ggml_cpu_build = {
-    "include_dirs": [f"{GGML_DIR}/include", f"{GGML_DIR}/src", f"{GGML_DIR}/ggml-cpu", GGML_DIR],
-    "obj_deps": {"": sorted(str(p.relative_to(ROOT)) for d in ("include", "src", "ggml-cpu", "freetoken") for p in (ROOT / GGML_DIR / d).rglob("*.h"))},
+_HASWELL = ("SSE42", "AVX", "F16C", "FMA", "AVX2", "BMI2")
+GGML_CPU_VARIANTS = {
+    "x64": (),
+    "sse42": ("SSE42",),
+    "sandybridge": ("SSE42", "AVX"),
+    "ivybridge": ("SSE42", "AVX", "F16C"),
+    "piledriver": ("SSE42", "AVX", "F16C", "FMA"),
+    "haswell": _HASWELL,
+    "skylakex": (*_HASWELL, "AVX512"),
+    "cannonlake": (*_HASWELL, "AVX512", "AVX512_VBMI"),
+    "cascadelake": (*_HASWELL, "AVX512", "AVX512_VNNI"),
+    "icelake": (*_HASWELL, "AVX512", "AVX512_VBMI", "AVX512_VNNI"),
+    "cooperlake": (*_HASWELL, "AVX512", "AVX512_VNNI", "AVX512_BF16"),
+    "zen4": (*_HASWELL, "AVX512", "AVX512_VBMI", "AVX512_VNNI", "AVX512_BF16"),
+    "alderlake": (*_HASWELL, "AVX_VNNI"),
+    "sapphirerapids": (*_HASWELL, "AVX512", "AVX512_VBMI", "AVX512_VNNI", "AVX512_BF16", "AMX_TILE", "AMX_INT8"),
 }
-ggml_cpu_libraries = [
-    ("freetoken_ggml_cpu", {
-        "sources": [
-            f"{GGML_DIR}/src/ggml-quants.c",
-            f"{GGML_DIR}/ggml-cpu/quants.c",
-            f"{GGML_DIR}/ggml-cpu/arch/x86/quants.c",
-            f"{GGML_DIR}/freetoken/cpu_kernels.c",
-        ],
-        "cflags": [*ggml_cpu_cflags, ggml_c_std],
-        **ggml_cpu_build,
-    }),
-    # the float row kernels; C++, so a library of their own
-    ("freetoken_ggml_cpu_vec", {
-        "sources": [f"{GGML_DIR}/ggml-cpu/vec.cpp"],
-        "cflags": [*ggml_cpu_cflags, ggml_cxx_std],
-        **ggml_cpu_build,
-    }),
-] if GGML_CPU else []
+_GGML_GCC_FLAGS = {
+    "SSE42": ["-msse4.2"], "F16C": ["-mf16c"], "FMA": ["-mfma"], "BMI2": ["-mbmi2"], "AVX": ["-mavx"], "AVX2": ["-mavx2"],
+    "AVX_VNNI": ["-mavxvnni"], "AVX512": ["-mavx512f", "-mavx512cd", "-mavx512vl", "-mavx512dq", "-mavx512bw"],
+    "AVX512_VBMI": ["-mavx512vbmi"], "AVX512_VNNI": ["-mavx512vnni"], "AVX512_BF16": ["-mavx512bf16"],
+    "AMX_TILE": ["-mamx-tile"], "AMX_INT8": ["-mamx-int8"],
+}
+
+
+def _ggml_variant_flags(feats: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """(ISA flags, macros) of one variant, as upstream's ggml-cpu/CMakeLists.txt sets them; the macros also tell cpu-feats.cpp what to check."""
+    if sys.platform != "win32":
+        return [f for feat in feats for f in _GGML_GCC_FLAGS[feat]], [f"GGML_{feat}" for feat in feats]
+    # cl takes one /arch: level and does not define the macros of the extensions above it
+    if "AVX512" in feats:
+        flags, macros = ["/arch:AVX512"], ["GGML_AVX512"]
+        if "AVX512_VBMI" in feats:
+            macros.append("__AVX512VBMI__")
+        if "AVX512_VNNI" in feats:
+            macros += ["__AVX512VNNI__", "GGML_AVX512_VNNI"]
+    elif "AVX2" in feats:
+        flags, macros = ["/arch:AVX2"], ["GGML_AVX2", "GGML_FMA", "GGML_F16C"]
+    elif "AVX" in feats:
+        flags, macros = ["/arch:AVX"], ["GGML_AVX"]
+    elif "SSE42" in feats:
+        flags, macros = ["/arch:SSE4.2"], ["GGML_SSE42"]
+    else:
+        flags, macros = [], []
+    if "AVX_VNNI" in feats:
+        macros += ["__AVXVNNI__", "GGML_AVX_VNNI"]
+    if "BMI2" in feats:
+        macros += ["__BMI2__", "GGML_BMI2"]
+    return flags, macros
+
+
+def _ggml_cpu_targets() -> tuple[list, list, dict[str, list[str]]]:
+    """(build_clib libraries, variant modules, the static libraries each module links in link order)."""
+    if not GGML_CPU:
+        return [], [], {}
+    if sys.platform == "win32":
+        cflags, c_std, cxx_std, define = ["/O2", "/DNDEBUG", "/utf-8", "/D_CRT_SECURE_NO_WARNINGS"], "/std:c11", "/std:c++20", "/D"
+        # upstream builds these variants only with GCC or Clang
+        variants = {k: v for k, v in GGML_CPU_VARIANTS.items() if k not in ("ivybridge", "piledriver", "cooperlake", "zen4", "sapphirerapids")}
+    else:
+        cflags, c_std, cxx_std, define = ["-O3", "-fPIC", "-fvisibility=hidden", "-DNDEBUG"], "-std=c11", "-std=c++20", "-D"
+        variants = GGML_CPU_VARIANTS
+    build = {
+        "include_dirs": [f"{GGML_DIR}/include", f"{GGML_DIR}/src", f"{GGML_DIR}/ggml-cpu", GGML_DIR],
+        "obj_deps": {"": sorted(str(p.relative_to(ROOT)) for d in ("include", "src", "ggml-cpu", "freetoken") for p in (ROOT / GGML_DIR / d).rglob("*.h"))},
+    }
+    # ggml-base, built once without ISA flags like upstream's; arch/x86/quants.c calls its quantize_row_*_ref
+    libraries = [("freetoken_ggml_base", {"sources": [f"{GGML_DIR}/src/ggml-quants.c"], "cflags": [*cflags, c_std], **build})]
+    modules, module_libs = [], {}
+    for variant, feats in variants.items():
+        flags, macros = _ggml_variant_flags(feats)
+        defines = [define + m for m in macros]
+        libraries += [
+            (f"freetoken_ggml_cpu_{variant}", {
+                "sources": [f"{GGML_DIR}/ggml-cpu/quants.c", f"{GGML_DIR}/ggml-cpu/arch/x86/quants.c", f"{GGML_DIR}/freetoken/cpu_kernels.c"],
+                "cflags": [*cflags, *flags, *defines, c_std],
+                **build,
+            }),
+            # the float row kernels; C++, so a library of their own
+            (f"freetoken_ggml_cpu_vec_{variant}", {"sources": [f"{GGML_DIR}/ggml-cpu/vec.cpp"], "cflags": [*cflags, *flags, *defines, cxx_std], **build}),
+        ]
+        name = f"freetoken.kernel.ggml_cpu._{variant}"
+        module_libs[name] = [f"freetoken_ggml_cpu_{variant}", f"freetoken_ggml_cpu_vec_{variant}", "freetoken_ggml_base"]
+        modules.append(Extension(
+            name=name,
+            sources=[f"{GGML_DIR}/freetoken/variant_module.cpp"],
+            # absolute: ninja compiles from the build directory
+            include_dirs=[str(ROOT / d) for d in (*build["include_dirs"], f"{GGML_DIR}/freetoken")],
+            extra_compile_args=[*cflags, *defines, f"{define}FT_GGML_VARIANT={variant}", cxx_std],
+        ))
+    return libraries, modules, module_libs
+
+
+ggml_cpu_libraries, ggml_cpu_modules, ggml_cpu_module_libs = _ggml_cpu_targets()
+
+
+class BuildClib(build_clib):
+    def build_libraries(self, libraries):
+        # the variants compile the same sources with different flags, so each library gets its own object directory
+        build_temp = self.build_temp
+        try:
+            for lib in libraries:
+                self.build_temp = os.path.join(build_temp, lib[0])
+                super().build_libraries([lib])
+        finally:
+            self.build_temp = build_temp
 
 
 class BuildExt(BuildExtension):
@@ -136,7 +215,7 @@ class BuildExt(BuildExtension):
         # build_ext alone (`setup.py build_ext --inplace`) does not run build_clib
         if self.distribution.has_c_libraries():
             self.run_command("build_clib")
-        # build_ext would link every build_clib library into every extension; build_extension adds it to _cpu_moe only
+        # build_ext would link every build_clib library into every extension; build_extension adds each module's own
         libraries, self.distribution.libraries = self.distribution.libraries, None
         try:
             super().run()
@@ -144,17 +223,24 @@ class BuildExt(BuildExtension):
             self.distribution.libraries = libraries
 
     def build_extension(self, ext):
-        if ext.name == "freetoken.kernel._cpu_moe" and GGML_CPU:
-            build_clib = self.get_finalized_command("build_clib")
-            if build_clib.build_clib not in ext.library_dirs:
-                ext.library_dirs.append(build_clib.build_clib)
-            for name, _ in ggml_cpu_libraries:
+        if ext.name in ggml_cpu_module_libs:
+            build_clib_dir = self.get_finalized_command("build_clib").build_clib
+            if build_clib_dir not in ext.library_dirs:
+                ext.library_dirs.append(build_clib_dir)
+            for name in ggml_cpu_module_libs[ext.name]:
                 if name not in ext.libraries:
                     ext.libraries.append(name)
-                lib = os.path.join(build_clib.build_clib, self.compiler.library_filename(name))
+                lib = os.path.join(build_clib_dir, self.compiler.library_filename(name))
                 # relink when only a static library changed
                 if lib not in ext.depends:
                     ext.depends.append(lib)
+            # every variant module compiles the same source, so each gets its own object directory
+            build_temp, self.build_temp = self.build_temp, os.path.join(self.build_temp, ext.name)
+            try:
+                super().build_extension(ext)
+            finally:
+                self.build_temp = build_temp
+            return
         super().build_extension(ext)
 
 
@@ -189,7 +275,6 @@ setup(
                 ),
             ],
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
-            define_macros=[("FT_GGML_CPU", "1")] if GGML_CPU else [],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
             extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
@@ -205,6 +290,7 @@ setup(
                 extra_compile_args=["-O3", "-std=c++20"],
             )
         ] if sys.platform == "linux" else []),
+        *ggml_cpu_modules,
     ],
-    cmdclass={"build_ext": BuildExt.with_options(use_ninja=True)},
+    cmdclass={"build_clib": BuildClib, "build_ext": BuildExt.with_options(use_ninja=True)},
 )

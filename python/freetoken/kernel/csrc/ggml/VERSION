@@ -2,7 +2,7 @@ llama.cpp 8c2134a8755d8a9792af513dab20282affe903e4 (2026-10-14)
 
 Only the ggml files that FreeToken compiles or includes:
 - the GGUF ops (freetoken/ggml_ops.cu, built by kernel/ggml.py): ggml/include -> include, ggml/src -> src, ggml/src/ggml-cuda -> ggml-cuda.
-- the CPU MoE row kernels (freetoken/cpu_kernels.c, linked into _cpu_moe by setup.py): ggml/src/ggml-quants.c/.h -> src, ggml/include/ggml-cpu.h -> include, ggml/src/ggml-cpu/{quants.c,quants.h,vec.cpp,vec.h,ggml-cpu-impl.h,simd-mappings.h,arch-fallback.h,arch/x86/quants.c} -> ggml-cpu. These have no local changes.
+- the CPU MoE row kernels (freetoken/cpu_kernels.c and freetoken/variant_module.cpp, one freetoken.kernel.ggml_cpu module per x86 variant, built by setup.py): ggml/src/{ggml-quants.c,ggml-quants.h,ggml-backend-impl.h} -> src, ggml/include/ggml-cpu.h -> include, ggml/src/ggml-cpu/{quants.c,quants.h,vec.cpp,vec.h,ggml-cpu-impl.h,simd-mappings.h,arch-fallback.h,arch/x86/quants.c,arch/x86/cpu-feats.cpp} -> ggml-cpu. These have no local changes.
 
 Local changes, kept in freetoken.patch (already applied):
 - quantize.cu/.cuh: the q8_1 quantize kernels read fp32, bf16 or fp16 activations.

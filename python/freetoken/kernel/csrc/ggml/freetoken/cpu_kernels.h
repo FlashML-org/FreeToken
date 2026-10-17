@@ -1,4 +1,4 @@
-// ggml-cpu row kernels for the CPU MoE executor. setup.py builds them for AVX2 (FMA, F16C, BMI2), so call them only on a CPU that has those.
+// ggml-cpu row kernels for the CPU MoE executor. setup.py builds them once per x86 variant into freetoken.kernel.ggml_cpu._<variant>; call them only through the table of a variant whose score() is not 0.
 #pragma once
 
 #include <stddef.h>
@@ -27,6 +27,16 @@ void ft_ggml_cpu_init(void);
 int ft_ggml_cpu_row_kernel(int type, int64_t k, struct ft_ggml_row_kernel * out);
 
 const char * ft_ggml_type_name(int type);
+
+// One variant's functions, as its module's api() hands them to _cpu_moe.set_ggml_cpu.
+#define FT_GGML_CPU_ABI 1
+struct ft_ggml_cpu_api {
+    int abi;           // FT_GGML_CPU_ABI of the module that built it
+    const char * name; // the variant, e.g. "haswell"
+    void (*init)(void);
+    int (*row_kernel)(int type, int64_t k, struct ft_ggml_row_kernel * out);
+    const char * (*type_name)(int type);
+};
 
 #ifdef __cplusplus
 }

@@ -47,10 +47,8 @@ std::unique_ptr<MoeFormat> make_nvfp4_format(const MoeParams& p, const FormatArg
 std::unique_ptr<MoeFormat> make_mxfp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_ds_fp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_fp8_block_format(const MoeParams& p, const FormatArgs& a);
-#ifdef FT_GGML_CPU
 std::unique_ptr<MoeFormat> make_gguf_format(const MoeParams& p, const FormatArgs& a);
-std::string gguf_cpu_unavailable();
-#endif
+void set_ggml_cpu(uintptr_t addr);
 
 namespace {
 
@@ -98,10 +96,7 @@ inline MoeTask from_word(uint64_t w) {
 // Every weight format this module serves, keyed by the name cpu_executor.py passes; weight_formats() exports the names.
 const std::pair<const char*, std::unique_ptr<MoeFormat> (*)(const MoeParams&, const FormatArgs&)> kFormats[] = {
     {"bf16", make_bf16_format},     {"nvfp4", make_nvfp4_format},         {"mxfp4_triton", make_mxfp4_format},
-    {"ds_fp4", make_ds_fp4_format}, {"fp8_block", make_fp8_block_format},
-#ifdef FT_GGML_CPU
-    {"gguf", make_gguf_format},
-#endif
+    {"ds_fp4", make_ds_fp4_format}, {"fp8_block", make_fp8_block_format}, {"gguf", make_gguf_format},
 };
 
 std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams& p, const FormatArgs& a) {
@@ -579,14 +574,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(freetoken::cpu_moe::ACT_SWIGLU_CLAMP); });
-  // Why this build or CPU cannot run the gguf format; empty when it can.
-  m.def("gguf_cpu_unavailable", []() -> std::string {
-#ifdef FT_GGML_CPU
-    return freetoken::cpu_moe::gguf_cpu_unavailable();
-#else
-    return "this build has no ggml-cpu kernels (x86-64 only)";
-#endif
-  });
+  // The ggml-cpu variant the gguf format calls: the kernel table address that freetoken.kernel.ggml_cpu.select() returns.
+  m.def("set_ggml_cpu", &freetoken::cpu_moe::set_ggml_cpu, py::arg("api"));
   m.def("weight_formats", []() {
     py::list names;
     for (const auto& f : freetoken::cpu_moe::kFormats) names.append(f.first);
