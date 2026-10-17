@@ -110,6 +110,16 @@ def e4m3_u8_to_f16_x128(v):
 
 
 @jit
+def e4m3_to_f16_x128(raw):
+    """An e4m3 value as a branched kernel loads it (fp8 on sm_89+, its uint8 bits
+    before) -> fp16 pre-scaled by 128, the same value on both."""
+    if e4m3_native_cx():
+        return raw.to(tl.float16) * 128.0
+    else:
+        return e4m3_u8_to_f16_x128(raw)
+
+
+@jit
 def e4m3_f32_to_u8(x):
     """Encode an fp32 value that already sits on the e4m3 grid (see :func:`round_e4m3`, |x| <= 448)
     into its e4m3 bit pattern (uint8). Normals: fp32 exponent rebased 127 -> 7 with the top three
