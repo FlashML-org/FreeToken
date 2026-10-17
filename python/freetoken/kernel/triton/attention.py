@@ -15,6 +15,14 @@ _MIN_SPLIT_LEN = 128
 # a short request still takes up to this many splits of _MIN_BLOCK_KV keys, so tiny requests stay parallel
 _MIN_SPLITS = 8
 _MAX_KV_SPLITS = 64
+# stage 2 merges at most this many fp32 partial elements per step
+_STAGE2_TILE_ELEMS = 8192
+
+
+def _stage2_launch(max_kv_splits: int, block_dv: int) -> tuple[int, int]:
+    """(splits merged per step, num_warps) for stage 2; the tile is at most the split cap rounded up to a power of two."""
+    tile = min(triton.next_power_of_2(max_kv_splits), max(4, _STAGE2_TILE_ELEMS // block_dv), 64)
+    return tile, max(1, min(8, tile * block_dv // 2048))
 
 
 def _max_request_splits(keys: int) -> int:
@@ -324,6 +332,7 @@ def _decode_stage2_kernel(
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    SPLIT_TILE: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -343,6 +352,7 @@ def _decode_stage2_kernel(
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < DV
+    offs_s = tl.arange(0, SPLIT_TILE)
     if HAS_SINKS:
         m_i = tl.load(sinks_ptr + q_head).to(tl.float32)
         l_i = 1.0
@@ -351,26 +361,27 @@ def _decode_stage2_kernel(
         l_i = 0.0
     acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
 
-    mid_base = batch_id * stride_mid_ob + q_head * stride_mid_oh + offs_d
+    mid_base = batch_id * stride_mid_ob + q_head * stride_mid_oh
     lse_base = batch_id * stride_lse_b + q_head * stride_lse_h
 
-    for split_id in tl.range(0, kv_splits, num_stages=2):
-        split_start = kv_len_per_split * split_id
-        split_end = tl.minimum(split_start + kv_len_per_split, effective_len)
-
-        if split_end > split_start:
-            partial = tl.load(
-                mid_o_ptr + mid_base + split_id * stride_mid_os,
-                mask=mask_d,
-                other=0.0,
-            )
-            partial_lse = tl.load(mid_lse_ptr + lse_base + split_id * stride_lse_s)
-            m_new = tl.maximum(partial_lse, m_i)
-            alpha = tl.exp(m_i - m_new)
-            beta = tl.exp(partial_lse - m_new)
-            acc = acc * alpha + partial * beta
-            l_i = l_i * alpha + beta
-            m_i = m_new
+    # one load round trip per SPLIT_TILE splits
+    for s0 in range(0, kv_splits, SPLIT_TILE):
+        split_id = s0 + offs_s
+        valid = (split_id < kv_splits) & (kv_len_per_split * split_id < effective_len)
+        partial_lse = tl.load(mid_lse_ptr + lse_base + split_id * stride_lse_s, mask=valid, other=-float("inf"))
+        partial = tl.load(
+            mid_o_ptr + mid_base + split_id[:, None] * stride_mid_os + offs_d[None, :],
+            mask=valid[:, None] & mask_d[None, :],
+            other=0.0,
+        )
+        m_new = tl.maximum(m_i, tl.max(partial_lse, axis=0))
+        # a tile of empty splits with no sink leaves m at -inf, where exp(-inf - -inf) is nan
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        beta = tl.exp(partial_lse - m_safe)
+        acc = acc * alpha + tl.sum(partial * beta[:, None], axis=0)
+        l_i = l_i * alpha + tl.sum(beta, axis=0)
+        m_i = m_new
 
     out = tl.where(l_i == 0.0, 0.0, acc / l_i)
     tl.store(
@@ -491,6 +502,7 @@ def decode_paged_attention(
         num_warps=4,
         num_stages=num_stages,
     )
+    split_tile, stage2_warps = _stage2_launch(max_kv_splits, block_dv)
     _decode_stage2_kernel[(batch, num_q_heads)](
         attn_logits,
         attn_lse,
@@ -514,8 +526,8 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
-        num_warps=4,
-        num_stages=2,
+        SPLIT_TILE=split_tile,
+        num_warps=stage2_warps,
     )
     return o
 
