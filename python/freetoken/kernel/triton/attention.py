@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.utils.arch import is_arch_supported
+
 
 _MAX_KV_SPLITS = 8
 _MIN_BLOCK_KV = 32
@@ -38,6 +40,15 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     def fits(block_m: int, block_n: int) -> bool:
         return (block_m + 2 * block_n) * block_d * 2 <= budget
 
+    if not is_arch_supported(7, 0) and head_dim <= 256:
+        # Pre-Volta: 48 KiB smem per block with no opt-in, so the generic picks do not
+        # fit ((128,64) and (64,32) both overflow even at head_dim 128). (32,16) fits
+        # ((32 + 2*16) * block_d * 2 = 32 KiB at head_dim 256) and halves the query-block
+        # count that re-reads the whole prefix K/V versus the (16,16) floor: 1.66x at a
+        # 120k prefix (4656 -> 2797 ms/layer, q=1536, 16Q/2KV GQA, D=256, GP102), with
+        # bit-identical outputs -- BLOCK_N is unchanged and M-blocking only partitions
+        # independent query rows. (32,32)+ or BLOCK_M >= 64 overflow the 48 KiB limit.
+        return 32, 16
     if head_dim <= 128:
         return 128, 64
     if head_dim <= 256:
@@ -835,6 +846,39 @@ def extend_paged_attention(
 
     if block_ends is not None:
         assert block_ends.is_cuda and block_ends.dtype == torch.int32 and block_ends.numel() == num_q_tokens
+    # Pre-sm70 GQA-fused CUDA path: the triton split kernel cannot fuse the GROUP query
+    # heads onto one K/V pass (64 fused rows need ~80 KiB of staging vs the 48 KiB block
+    # limit; triton hoists the loop-invariant q tile wholesale), the hand-written kernel
+    # can: q (8 heads x 8 tokens, 32 KiB) lives in shared memory, K/V walk in BN=8 tiles
+    # and the fp32 accumulator in registers -- every K/V tile serves all 8 heads once.
+    # 1.8x at long prefixes, bit-comparable outputs (fp16-accumulation order differs).
+    # FREETOKEN_GQA_CUDA=0 disables; any build failure falls back to triton.
+    import os
+
+    if (
+        os.environ.get("FREETOKEN_GQA_CUDA", "1") == "1"
+        and not is_arch_supported(7, 0)
+        and num_kv_heads < num_q_heads
+        and num_q_heads // num_kv_heads == 8
+        and head_dim == 256
+        and q.dtype == torch.float16
+        and not sliding_window
+        and sinks is None
+        and block_ends is None
+        and k_extend is not None
+        and v_extend is not None
+        and out is None
+    ):
+        try:
+            from freetoken.kernel.cuda.gqa_extend import gqa_extend_paged
+
+            return gqa_extend_paged(
+                q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, prefix_lens,
+                max_q_len, sm_scale, k_extend=k_extend, v_extend=v_extend,
+            )
+        except Exception:
+            pass
+
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     block_ends_arg = block_ends if block_ends is not None else qo_indptr
