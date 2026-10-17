@@ -45,6 +45,7 @@ dependencies = [
     "modelscope>=1.37,<2",
     "numpy>=2.0,<3",
     "openai>=2.0,<3",
+    "packaging>=22,<26",
     "partial-json-parser>=0.2,<1",
     "pillow>=10,<13",
     "prompt_toolkit>=3.0,<4",
