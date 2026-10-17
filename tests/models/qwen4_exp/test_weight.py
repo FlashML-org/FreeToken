@@ -25,7 +25,15 @@ from freetoken.models.qwen4_exp.weight import (
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 
-from .common import LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict, mixed_precision_quant
+from .common import (
+    LM,
+    RADIXARK_NVFP4,
+    hf_config,
+    install_quant_config,
+    meta_state_dict,
+    mixed_precision_quant,
+    mxfp8_dense_quant,
+)
 
 H = 128  # hidden_size; every block-fp8 projection needs in/out multiples of 128
 HC = 4  # hc_count
@@ -64,10 +72,12 @@ def _fp8_scale(weight: torch.Tensor) -> torch.Tensor:
     return torch.rand(weight.shape[0] // BLOCK, weight.shape[1] // BLOCK) + 0.5
 
 
-def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
+def _raw_checkpoint(dense_fp8: bool = False, dense_mxfp8: bool = False) -> dict[str, torch.Tensor]:
     """Layer 0 = GDN + PLE, layer 1 = QSA; plus the mtp / visual / routed-expert noise.
 
     ``dense_fp8`` stores the attention and GDN qkv|z / out projections as 128x128 block-fp8 (e4m3 ``.weight`` + fp32 ``.weight_scale_inv``) like the community NVFP4-FP8 requants.
+
+    ``dense_mxfp8`` stores them (plus GDN b|a, which these checkpoints do quantize) as MXFP8: e4m3 ``.weight`` + U8 e8m0 ``.weight_scale`` per 32 columns, like local-inference-lab/Qwen3.8-Flash-Next-NVFP4.
     """
     lm = "model.language_model"
     raw: dict[str, torch.Tensor] = {
@@ -146,10 +156,21 @@ def _raw_checkpoint(dense_fp8: bool = False) -> dict[str, torch.Tensor]:
             weight = raw[f"{module}.weight"]
             raw[f"{module}.weight"] = weight.to(torch.float8_e4m3fn)
             raw[f"{module}.weight_scale_inv"] = _fp8_scale(weight)
+    if dense_mxfp8:
+        for module in (f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z", f"{gdn}.in_proj_b", f"{gdn}.in_proj_a",
+                       f"{gdn}.out_proj", *(f"{attn}.{p}_proj" for p in "qkvo")):
+            weight = raw[f"{module}.weight"]
+            raw[f"{module}.weight"] = weight.to(torch.float8_e4m3fn)
+            # e8m0 bytes around 127 = sane powers of two; dtype is exactly what the real shards carry
+            raw[f"{module}.weight_scale"] = torch.randint(
+                121, 135, (weight.shape[0], weight.shape[1] // 32), dtype=torch.uint8
+            )
     return raw
 
 
 FP8_DENSE_QUANT = mixed_precision_quant(gdn_layers=(0,), attn_layers=(1,), moe_layers=(0, 1))
+
+MXFP8_DENSE_QUANT = mxfp8_dense_quant(gdn_layers=(0,), attn_layers=(1,), moe_layers=(0, 1))
 
 
 def _config_json(quantization_config) -> dict:
@@ -225,6 +246,19 @@ def checkpoint_fp8(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
 @pytest.fixture(scope="module")
 def loaded_fp8(checkpoint_fp8) -> dict[str, torch.Tensor]:
     return _load(checkpoint_fp8[0])
+
+
+@pytest.fixture(scope="module")
+def checkpoint_mxfp8(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    torch.manual_seed(3)
+    return _write_checkpoint(
+        tmp_path_factory.mktemp("qwen4_exp_mxfp8_ckpt"), _raw_checkpoint(dense_mxfp8=True), MXFP8_DENSE_QUANT
+    )
+
+
+@pytest.fixture(scope="module")
+def loaded_mxfp8(checkpoint_mxfp8) -> dict[str, torch.Tensor]:
+    return _load(checkpoint_mxfp8[0])
 
 
 def test_tower_keys_come_out_under_the_prefix_load_weight_filters(loaded):
@@ -457,27 +491,48 @@ FP8_MODULES = (
 )
 
 
-@pytest.mark.parametrize("fixture", ["checkpoint", "checkpoint_nvfp4", "checkpoint_fp8"])
+@pytest.mark.parametrize("fixture", ["checkpoint", "checkpoint_nvfp4", "checkpoint_fp8", "checkpoint_mxfp8"])
 def test_emitted_keys_are_the_model_state_dict(fixture, request):
     """The reader fills exactly the buffers the engine builds from the same config, block-fp8 ones with the stored dtypes."""
     folder, _raw = request.getfixturevalue(fixture)
     loaded, state = _load(folder, vision=False), meta_state_dict(folder)
     assert set(loaded) == set(state)
-    if fixture != "checkpoint_fp8":
+    if fixture == "checkpoint_fp8":
+        stored_scale = torch.float32  # the engine casts it to the bf16 buffer at load
+        quantized = FP8_MODULES
+    elif fixture == "checkpoint_mxfp8":
+        stored_scale = torch.uint8  # e8m0 bytes: the buffer itself is uint8
+        quantized = (*FP8_MODULES, "model.layers.0.linear_attn.in_proj_ba")
+    else:
         assert loaded["model.layers.0.linear_attn.in_proj.weight"].dtype is torch.bfloat16
         return
-    for module in FP8_MODULES:
+    for module in quantized:
         for kind in (".weight", ".weight_scale_inv"):
             assert loaded[module + kind].shape == state[module + kind].shape, module + kind
         assert loaded[module + ".weight"].dtype is state[module + ".weight"].dtype is torch.float8_e4m3fn
-        assert loaded[module + ".weight_scale_inv"].dtype is torch.float32  # the engine casts it to the bf16 buffer at load
+        assert loaded[module + ".weight_scale_inv"].dtype is stored_scale
 
 
-def _assert_fused_per_kind(loaded, raw, fused: str, parts: list[str]) -> None:
+def test_mxfp8_scales_are_found_under_the_stored_suffix(loaded_mxfp8, checkpoint_mxfp8):
+    """modelopt exports the MXFP8 e8m0 block scales as ``.weight_scale``; the reader renames them per the dialect's storage table and fuses them like any block scale."""
+    _folder, raw = checkpoint_mxfp8
+    attn, gdn = f"{LM}.layers.1.self_attn", f"{LM}.layers.0.linear_attn"
+    _assert_fused_per_kind(loaded_mxfp8, raw, "model.layers.1.self_attn.qkv_proj", [f"{attn}.{p}_proj" for p in "qkv"], ".weight_scale")
+    _assert_fused_per_kind(loaded_mxfp8, raw, "model.layers.0.linear_attn.in_proj_qkvz", [f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z"], ".weight_scale")
+    _assert_fused_per_kind(loaded_mxfp8, raw, "model.layers.0.linear_attn.in_proj_ba", [f"{gdn}.in_proj_b", f"{gdn}.in_proj_a"], ".weight_scale")
+    assert torch.equal(
+        loaded_mxfp8["model.layers.0.linear_attn.out_proj.weight_scale_inv"],
+        raw[f"{gdn}.out_proj.weight_scale"],
+    )
+    assert loaded_mxfp8["model.layers.0.linear_attn.in_proj_ba.weight"].dtype is torch.float8_e4m3fn
+
+
+def _assert_fused_per_kind(loaded, raw, fused: str, parts: list[str], stored_scale: str = ".weight_scale_inv") -> None:
     for kind in (".weight", ".weight_scale_inv"):
-        sources = [raw[f"{p}{kind}"].view(torch.uint8) for p in parts]
+        raw_kind = stored_scale if kind == ".weight_scale_inv" else kind
+        sources = [raw[f"{p}{raw_kind}"].view(torch.uint8) for p in parts]
         merged = loaded[fused + kind]
-        assert merged.dtype is raw[f"{parts[0]}{kind}"].dtype
+        assert merged.dtype is raw[f"{parts[0]}{raw_kind}"].dtype
         for source, back in zip(sources, torch.split(merged.view(torch.uint8), [s.shape[0] for s in sources], dim=0)):
             assert torch.equal(source, back)
 
