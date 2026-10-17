@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused
+from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 class Glm4MoeDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
-        self.self_attn = Glm4MoeAttention(config, layer_id)
+        self.self_attn = Glm4MoeAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         if layer_id >= config.first_k_dense_replace:
             self.mlp: BaseOP = Glm4MoeSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
         else:
@@ -45,10 +45,15 @@ class Glm4MoeDecoderLayer(BaseOP):
 
 class Glm4MoeModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
-        self.embed_tokens = EmbeddingDF11(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-        )
+        if config.quant is not None and config.quant.dialect == "gguf":
+            self.embed_tokens: BaseOP = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, quant_config=config.quant, prefix=f"{prefix}.embed_tokens"
+            )
+        else:
+            self.embed_tokens = EmbeddingDF11(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
         self.layers = OPList(
             [
                 Glm4MoeDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")

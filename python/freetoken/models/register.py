@@ -387,6 +387,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm4MoeForCausalLM",
         packed_modules_mapping=_EXPERTS_PACKED,
     ),
+    # llama.cpp glm4moe GGUF (GLM-4.5, 4.5-Air, 4.6, 4.7): the same model classes with every tensor in its packed ggml type
+    "Glm4MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm4_moe",
+        "Glm4MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_EXPERTS_PACKED,
+    ),
     # GLM-5.2 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse attention
     # with GLM-4-style sigmoid/noaux_tc MoE routing; NVFP4 routed experts served from
     # the offload cache.
