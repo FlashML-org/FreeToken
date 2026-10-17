@@ -159,7 +159,12 @@ class _DenseReader:
             )
         if stored is None and tensor.dtype in _QUANT_DTYPES:
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
-        if stored is not None and role == "weight" and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]:
+        if (
+            stored is not None
+            and role == "weight"
+            and stored.kind is not QuantKind.FP8_BLOCK_QAT  # QAT weight ships bf16; quantized at load
+            and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]
+        ):
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}")
         target, idx, count = self.target(module)
         _, parts, expected, _ = self.pending.setdefault(target, (count, {}, {}, stored))
@@ -185,7 +190,8 @@ class _DenseReader:
         return lines
 
     def _emit(self, target: str, parts: list[dict[str, torch.Tensor]], stored: QuantScheme | None):
-        if stored is not None:
+        # FP8_BLOCK_QAT ships a bf16 weight with no scale; pass it through and let the layer quantize at finalize
+        if stored is not None and stored.kind is not QuantKind.FP8_BLOCK_QAT:
             parts = [self._check(target, stored, part) for part in parts]
             if self.scheme(target) is None:
                 parts = [{"weight": _dequant(stored, part)} for part in parts]
