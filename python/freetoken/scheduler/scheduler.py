@@ -916,10 +916,10 @@ def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         out = host[:, offset : offset + length]
         full = req.mrope_positions_full
         if full is not None and req.device_len <= full.shape[1]:
-            out.copy_(full[:, req.cached_len : req.device_len])
+            out.copy_(full[:, req.chunk_lo : req.device_len])
         else:
             row = torch.arange(
-                req.cached_len + req.mrope_delta,
+                req.chunk_lo + req.mrope_delta,
                 req.device_len + req.mrope_delta,
                 dtype=torch.int32,
             )
@@ -935,7 +935,7 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     for req in batch.padded_reqs:
         length = req.extend_len
         torch.arange(
-            req.cached_len,
+            req.chunk_lo,
             req.device_len,
             dtype=torch.int32,
             out=indices_host[offset : offset + length],

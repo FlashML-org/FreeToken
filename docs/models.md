@@ -100,10 +100,13 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   the segment. *Encoder* replay rebuilds the encoder SWA KV behind a prefix hit from the global KV
   alone (approximate; the report's fallback when the SWA KV of a hit has been evicted). *Decoder*
   replay runs the decoder layers on each prompt's last `n_win` tokens only; their SWA KV is never
-  prefix-cached and post-training simulated it. FreeToken keeps encoder SWA KV in the radix cache (no
-  encoder replay); `--swa-decoder-replay bounded` (default) is the report's decoder replay, with a
-  prefix hit stopping at least `n_win` tokens before the prompt end so those tokens are prefilled;
-  `exact` runs the decoder on every prompt token (reference numerics).
+  prefix-cached and post-training simulated it. `--swa-decoder-replay bounded` (default) is the
+  report's decoder replay, with a prefix hit stopping at least `n_win` tokens before the prompt end
+  so those tokens are prefilled; `exact` runs the decoder on every prompt token (reference
+  numerics). `--swa-encoder-replay bounded` (default) keeps a radix hit's full global-KV match and
+  replays the hit's last `n_win` tokens through the encoder when that window KV was evicted, so a
+  hit deeper than its live window is not truncated; `exact` truncates the hit to the live window
+  and re-prefills the tail exactly (reference numerics).
   Bounded output differs from exact by construction and does not depend on the prefill chunk size.
   Under expert offload the prefill time is bounded by streaming each layer's experts, so decoder
   replay saves decoder-layer compute, not prefill time.

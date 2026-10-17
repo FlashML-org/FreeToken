@@ -237,3 +237,87 @@ def test_the_sliding_window_pool_cap_cannot_recut_an_image():
         for r in batch.reqs:
             r.complete_one()
     assert ends[0] == 4900 and ends[-1] == 6000
+
+
+def test_an_evicted_prefix_hit_chunks_from_the_encoder_replay_start():
+    """Bounded encoder replay admission on the DSV41 shape (page == window == 128): a hit whose top
+    window page was evicted keeps the FULL match; chunk 1 starts a window below the hit and must
+    reach past it, the dead page is rebound to a fresh window slot, the continuation drops the
+    attach, and the commit revives the replayed nodes so the next hit needs no replay."""
+    from freetoken.core import SamplingParams
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kvcache.dsv4.v41_cost_model import dsv41_pool_sizes
+    from freetoken.kvcache.dsv4.v41_pool import DSV41PagedKVCache
+    from freetoken.models.deepseek_v41.args import DeepseekV41Args
+    from freetoken.scheduler.cache import CacheManager
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    _setup_context()
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    P, num_pages, width = 128, 32, 2048
+    args = DeepseekV41Args(n_layers=5, head_dim=512, index_head_dim=128, window_size=P,
+                           compress_ratios=(0, 2, 2, 1, 1), kv_source_layers=(1, 3), index_source_layers=(1, 3))
+    pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, args, 1.0, P), args, torch.device("cpu"),
+                             n_scratch=MAX_RUNNING + 1)
+    pool._init_paged_state(MAX_RUNNING, True)
+    pt = torch.zeros((MAX_RUNNING + 1, width), dtype=torch.int32)
+    pool.attach_page_table(pt)
+    cm = CacheManager(num_pages=num_pages, page_size=P, page_table=pt, type="swa_radix",
+                      swa_pool=pool, sliding_window_size=P)
+    tm = TableManager(max_running_reqs=MAX_RUNNING, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(P))
+
+    donor_ids = torch.arange(7 * P, dtype=torch.int32)          # a 896-token prompt
+    from freetoken.core import Req
+
+    donor = PendingReq(UID, donor_ids, SamplingParams(max_tokens=1))
+    h = cm.match_req(donor).cuda_handle
+    donor_req = Req(input_ids=donor_ids, table_idx=tm.allocate(), cached_len=0, output_len=1, uid=UID,
+                    sampling_params=SamplingParams(max_tokens=1), cache_handle=h)
+    cm.lock(h)
+    cm.allocate_paged([donor_req])
+    donor_req.complete_one()
+    cm.cache_req(donor_req, finished=True)
+    tm.free(donor_req.table_idx)
+
+    # the radix evicted the donor's top window page under a full-lock holder (evict_swa's
+    # tombstone-in-place branch): window KV gone, full KV kept
+    top = cm.prefix_cache.match_prefix_full(donor_ids).node
+    top.swa_tombstone = True
+    cm.prefix_cache.swa_evictable -= top.length
+    cm.swa_pool.free_swa(top.value)
+
+    pm.pending_list = [PendingReq(UID + 1, torch.cat([donor_ids, torch.arange(7 * P, 7 * P + 40, dtype=torch.int32)]),
+                                  SamplingParams(max_tokens=1))]
+    first = pm.schedule_next_batch(2 * P)
+    r1 = first.reqs[0]
+    assert isinstance(r1, ChunkedReq)
+    assert r1.cache_handle.cached_len == 6 * P and r1.cache_handle.windowed_len == 0   # the full hit, window evicted
+    assert r1.enc_replay_lo == 5 * P and r1.cached_len == 6 * P and r1.device_len == 7 * P  # chunk 1 = [640, 896)
+    assert r1.extend_len == 2 * P and first.log_cached_tokens == 6 * P
+    cm.free_swa_out_of_window_extend(first.reqs)
+    cm.allocate_paged(first.reqs)
+    ws = pool.translate_full_to_window(pt[r1.table_idx, 5 * P : 6 * P].long())
+    assert bool((ws >= 0).all()), "the replayed page was not rebound to a fresh window slot"
+    for r in first.reqs:
+        r.complete_one()
+
+    second = pm.schedule_next_batch(2 * P)
+    r2 = second.reqs[0]
+    assert not isinstance(r2, ChunkedReq)
+    assert r2.enc_replay_lo == -1 and r2.cached_len == 7 * P and r2.extend_len == 40  # an ordinary final chunk
+    cm.allocate_paged(second.reqs)
+    r2.complete_one()
+    cm.cache_req(r2, finished=True)
+    cm.check_integrity()
+
+    # the commit revived the replayed nodes in place: a later hit over the same prefix keeps the
+    # full match with NOTHING evicted -- no second replay
+    probe = PendingReq(UID + 2, torch.cat([donor_ids, torch.arange(7 * P, 7 * P + 40, dtype=torch.int32)]),
+                       SamplingParams(max_tokens=1))
+    h2 = cm.match_req(probe, max_len=len(probe.input_ids) - P).cuda_handle
+    assert h2.cached_len == 6 * P and h2.windowed_len == 6 * P
