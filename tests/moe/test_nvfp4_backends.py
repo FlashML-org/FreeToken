@@ -10,6 +10,7 @@ Coverage by hardware:
     baseline-kernel equality guard. This is the path used on sm_120 + CUDA 12.x.
   - Marlin (sm_80..sm_99, e.g. H100): prefill + decode + overlap.
   - b12x (sm_120 + CUDA>=13): pack + fused decode, skipped where the kernel cannot run.
+  - Gluon (sm_120): the prefill GEMMs it takes over from the Triton kernel, against that kernel.
 Banks are built the way the loader builds them: the bound kernel object packs native pieces.
 """
 
@@ -364,6 +365,52 @@ def test_triton_swigluoai_matches_dequant_reference():
         dec_hidden, *banks, dec_weights, dec_ids, "swigluoai", False, 1.702, 7.0
     )
     _assert_close(out, ref)
+
+
+@cuda
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0), reason="needs sm_120")
+@pytest.mark.parametrize("hidden_size,inter", [(256, 128), (384, 192)])
+@pytest.mark.parametrize("block_m", [64, 128])
+def test_triton_prefill_routes_to_gluon_on_sm120(monkeypatch, hidden_size, inter, block_m):
+    """Both prefill GEMMs go to the Gluon kernel and match the Triton kernel: persistent (BLOCK_SIZE_M 64) and not (128), 256- and 128-row tiles, K % 256 == 0 and not."""
+    import freetoken.moe.fused_nvfp4 as fused_nvfp4
+    from freetoken.kernel import gluon, nvfp4_moe
+
+    if not gluon.available():
+        pytest.skip(f"Gluon is off or needs Triton {'.'.join(map(str, gluon.TRITON_VERSION))}")
+    from freetoken.kernel.gluon.nvfp4.moe import sm120
+
+    # the GPU class picks BLOCK_SIZE_M from tokens per expert; pin it so every sm_120 class runs both kernel modes
+    config = nvfp4_moe.prefill_config
+    monkeypatch.setattr(nvfp4_moe, "prefill_config", lambda *args: {**config(*args), "BLOCK_SIZE_M": block_m})
+
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(0)
+
+    def bank(n, k):
+        packed = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=device, generator=g)
+        scale = (torch.rand(E, n, k // 16, device=device, generator=g) + 0.25).to(torch.float8_e4m3fn)
+        return packed, scale, (torch.rand(E, n, device=device, generator=g) + 0.5).to(torch.float16)
+
+    banks = (*bank(2 * inter, hidden_size), *bank(hidden_size, inter))
+    M = 1024
+    hidden = torch.randn(M, hidden_size, dtype=torch.bfloat16, device=device, generator=g) / 4
+    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device, generator=g)
+    topk_weights = torch.rand(M, TOPK, device=device, generator=g)
+
+    calls = []
+    gluon_gemm = sm120.prefill_gemm
+
+    def counted(*args):
+        calls.append(args)
+        return gluon_gemm(*args)
+
+    monkeypatch.setattr(sm120, "prefill_gemm", counted)
+    out = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
+    assert len(calls) == 2
+    monkeypatch.setattr(nvfp4_moe, "_gluon_prefill", lambda device_index: None)
+    ref = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
 
 
 def _triton_cache(device, *, cache_size=S, prefill_overlap=False):

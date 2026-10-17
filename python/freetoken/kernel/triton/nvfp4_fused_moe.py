@@ -28,6 +28,8 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from triton.language import target_info
+from triton.runtime.jit import constexpr_function
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
 from freetoken.kernel.triton.nvfp4_linear import _nvfp4_pair_f32
@@ -299,6 +301,57 @@ def _e2m1_f16_x2p14(code):
     return bits.to(tl.uint16).to(tl.float16, bitcast=True)
 
 
+@constexpr_function
+def _bf16x2_mul_native():
+    return target_info.cuda_capability_geq(9, 0)
+
+
+@triton.jit
+def _bf16x2_scale(w, s2):
+    if _bf16x2_mul_native():
+        return tl.inline_asm_elementwise("mul.rn.bf16x2 $0, $1, $2;", "=r,r,r", [w, s2], tl.uint32, True, 1)
+    else:
+        # mul.bf16x2 is sm_90+; fma with a -0.0 addend gives the same product
+        return tl.inline_asm_elementwise("{ .reg .b32 z; mov.b32 z, 0x80008000; fma.rn.bf16x2 $0, $1, $2, z; }",
+                                         "=r,r,r", [w, s2], tl.uint32, True, 1)
+
+
+@triton.jit
+def _bf16x2_halves(w):
+    lo = (w & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    hi = (w >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    return lo, hi
+
+
+@triton.jit
+def _e2m1x8_bf16(q, s2, BLOCK_N: tl.constexpr, BLOCK_W: tl.constexpr):
+    """[BLOCK_N, BLOCK_W] uint32 words of 8 e2m1 codes -> [BLOCK_N, 8 * BLOCK_W] bf16 in k order, times s2 * 2^-126."""
+    # each 16-bit half's top nibble becomes a bf16 sign + exponent/mantissa: e2m1 * 2^-126, exact incl. e == 0
+    o0 = _bf16x2_scale((q & 0x80008000) | ((q >> 6) & 0x01C001C0), s2)
+    q1 = q << 4
+    o1 = _bf16x2_scale((q1 & 0x80008000) | ((q1 >> 6) & 0x01C001C0), s2)
+    q2 = q << 8
+    o2 = _bf16x2_scale((q2 & 0x80008000) | ((q2 >> 6) & 0x01C001C0), s2)
+    q3 = q << 12
+    o3 = _bf16x2_scale((q3 & 0x80008000) | ((q3 >> 6) & 0x01C001C0), s2)
+    # o0..o3 hold the k pairs (3, 7), (2, 6), (1, 5), (0, 4); join appends the new axis last
+    k0, k4 = _bf16x2_halves(o3)
+    k1, k5 = _bf16x2_halves(o2)
+    k2, k6 = _bf16x2_halves(o1)
+    k3, k7 = _bf16x2_halves(o0)
+    w = tl.join(tl.join(tl.join(k0, k4), tl.join(k2, k6)), tl.join(tl.join(k1, k5), tl.join(k3, k7)))
+    return tl.reshape(w, (BLOCK_N, 8 * BLOCK_W))
+
+
+@triton.jit
+def _e2m1x2_bf16(v, s2, BLOCK_N: tl.constexpr, BLOCK_KB: tl.constexpr):
+    """[BLOCK_N, BLOCK_KB] bytes of 2 e2m1 codes -> [BLOCK_N, 2 * BLOCK_KB] bf16 in k order, times s2 * 2^-126."""
+    # low nibble -> low bf16, high nibble -> high bf16: sign to bit 15 / 31, exponent and mantissa to bits 8..6 / 24..22
+    pair = ((v & 0x8) << 12) | ((v & 0x7) << 6) | ((v & 0x80) << 24) | ((v & 0x70) << 18)
+    lo, hi = _bf16x2_halves(_bf16x2_scale(pair.to(tl.uint32, bitcast=True), s2))
+    return tl.reshape(tl.join(lo, hi), (BLOCK_N, 2 * BLOCK_KB))
+
+
 @triton.jit
 def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
@@ -310,6 +363,8 @@ def _prefill_nvfp4_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,    # cache slot per M-block
     num_tokens_post_padded_ptr,
+    w_desc,            # TMA descriptor over packed as [S * N, K // 2], or None
+    s_desc,            # TMA descriptor over scale as [S * N, K // 16], or None
     N,
     K,
     EM,
@@ -327,6 +382,9 @@ def _prefill_nvfp4_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    USE_TMA: tl.constexpr = False,     # needs K % 256 == 0
+    TMA_SCALES: tl.constexpr = False,  # with USE_TMA: scales by TMA too, else pointer loads
+    FAST_DECODE: tl.constexpr = 0,     # 0: fp16 pair decode, 1: packed_ptr / w_desc are int32 views of 8 codes, 2: bytes
 ):
     # out^T = W @ X^T: wgmma reads its A operand (the decoded weights) from registers, while B must be in shared memory.
     # The token block is the MMA N dimension, so a 16-token block still fills the MMA.
@@ -352,38 +410,82 @@ def _prefill_nvfp4_moe_kernel(
     offs_kb = tl.arange(0, BLOCK_SIZE_KB)
     offs_k = tl.arange(0, 2 * BLOCK_SIZE_KB)
     offs_sb = tl.arange(0, BLOCK_SIZE_KB // 8)
+    KW: tl.constexpr = BLOCK_SIZE_KB // 4
+    offs_kw = tl.arange(0, KW)
     xt_ptrs = a_ptr + (offs_token[None, :] // top_k * stride_am + offs_k[:, None] * stride_ak)
 
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kb[None, :] * stride_pkb
+    WORDS: tl.constexpr = FAST_DECODE == 1
+    if WORDS:
+        p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kw[None, :] * stride_pkb
+    else:
+        p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kb[None, :] * stride_pkb
     s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sb[None, :] * stride_sblk
 
     accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     K_BYTES = K // 2
+    # rows past N belong to the next slot; their outputs are masked on store
+    w_row = (slot * N + pid_n * BLOCK_SIZE_N).to(tl.int32)
+    SB: tl.constexpr = BLOCK_SIZE_KB // 8
     for kb in range(0, tl.cdiv(K_BYTES, BLOCK_SIZE_KB)):
-        byte_mask = kb * BLOCK_SIZE_KB + offs_kb < K_BYTES
-        sblk_mask = kb * (BLOCK_SIZE_KB // 8) + offs_sb < K_BYTES // 8
         k_mask = kb * 2 * BLOCK_SIZE_KB + offs_k < K
-        v = tl.load(p_ptrs, mask=byte_mask[None, :], other=0).to(tl.int32)
-        if e4m3_native_cx():
+        if USE_TMA and WORDS:
+            v = w_desc.load([w_row, kb * KW])
+        elif USE_TMA:
+            v = w_desc.load([w_row, kb * BLOCK_SIZE_KB]).to(tl.int32)
+        if USE_TMA and TMA_SCALES:
+            # a TMA box row needs >= 16 bytes, so load the 16 scales that hold this step and pick its SB of them
+            s16 = s_desc.load([w_row, (kb * SB) // 16 * 16]).to(tl.uint8, bitcast=True)
+            s3 = tl.reshape(s16, (BLOCK_SIZE_N, 16 // SB, SB))
+            pick = tl.arange(0, 16 // SB) == (kb * SB) % 16 // SB
+            s = tl.sum(tl.where(pick[None, :, None], s3, 0), axis=1).to(tl.uint8)
+            s = s.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        elif USE_TMA:
+            sblk_mask = kb * SB + offs_sb < K_BYTES // 8
             s = tl.load(s_ptrs, mask=sblk_mask[None, :], other=0.0).to(tl.float32)
         else:
-            s = e4m3_u8_to_f32(tl.load(s_ptrs, mask=sblk_mask[None, :], other=0))
-        # one scale per 16 values; the 2^14 undoes the decode's 2^-14
-        s = tl.reshape(tl.broadcast_to((s * 16384.0)[:, :, None], (BLOCK_SIZE_N, BLOCK_SIZE_KB // 8, 8)), (BLOCK_SIZE_N, BLOCK_SIZE_KB))
-        s = s.to(tl.bfloat16)
-        # exact in bf16: e2m1 has <= 2 significant bits and e4m3 <= 4
-        w_lo = _e2m1_f16_x2p14(v & 0xF).to(tl.bfloat16) * s
-        w_hi = _e2m1_f16_x2p14(v >> 4).to(tl.bfloat16) * s
-        # interleave back to k = 2 * byte + {0, 1} so one dot covers the K step
-        w = tl.reshape(tl.join(w_lo, w_hi), (BLOCK_SIZE_N, 2 * BLOCK_SIZE_KB))
+            sblk_mask = kb * SB + offs_sb < K_BYTES // 8
+            if WORDS:
+                v = tl.load(p_ptrs, mask=(kb * KW + offs_kw < K_BYTES // 4)[None, :], other=0)
+            else:
+                byte_mask = kb * BLOCK_SIZE_KB + offs_kb < K_BYTES
+                v = tl.load(p_ptrs, mask=byte_mask[None, :], other=0).to(tl.int32)
+            if e4m3_native_cx():
+                s = tl.load(s_ptrs, mask=sblk_mask[None, :], other=0.0).to(tl.float32)
+            else:
+                s = e4m3_u8_to_f32(tl.load(s_ptrs, mask=sblk_mask[None, :], other=0))
+        if FAST_DECODE:
+            # 2^118 here and the decode's 2^-126 leave 2^-8, undone in the epilogue; every step is exact in bf16
+            s = (s * 3.3230699894622794e35).to(tl.bfloat16).to(tl.uint16, bitcast=True).to(tl.uint32)
+            s = s | (s << 16)
+            if WORDS:
+                # one scale per 16 values, two words
+                s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 2)), (BLOCK_SIZE_N, KW))
+                w = _e2m1x8_bf16(v.to(tl.uint32, bitcast=True), s, BLOCK_SIZE_N, KW)
+            else:
+                # one scale per 16 values, eight bytes
+                s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 8)), (BLOCK_SIZE_N, BLOCK_SIZE_KB))
+                w = _e2m1x2_bf16(v, s, BLOCK_SIZE_N, BLOCK_SIZE_KB)
+        else:
+            # one scale per 16 values; the 2^14 undoes the decode's 2^-14
+            s = tl.reshape(tl.broadcast_to((s * 16384.0)[:, :, None], (BLOCK_SIZE_N, BLOCK_SIZE_KB // 8, 8)), (BLOCK_SIZE_N, BLOCK_SIZE_KB))
+            s = s.to(tl.bfloat16)
+            # exact in bf16: e2m1 has <= 2 significant bits and e4m3 <= 4
+            w_lo = _e2m1_f16_x2p14(v & 0xF).to(tl.bfloat16) * s
+            w_hi = _e2m1_f16_x2p14(v >> 4).to(tl.bfloat16) * s
+            # interleave back to k = 2 * byte + {0, 1} so one dot covers the K step
+            w = tl.reshape(tl.join(w_lo, w_hi), (BLOCK_SIZE_N, 2 * BLOCK_SIZE_KB))
         xt = tl.load(xt_ptrs, mask=k_mask[:, None] & token_mask[None, :], other=0.0)
         accumulator = tl.dot(w.to(xt.dtype), xt, accumulator)
         xt_ptrs += 2 * BLOCK_SIZE_KB * stride_ak
-        p_ptrs += BLOCK_SIZE_KB * stride_pkb
-        s_ptrs += (BLOCK_SIZE_KB // 8) * stride_sblk
+        if not USE_TMA:
+            p_ptrs += (KW if WORDS else BLOCK_SIZE_KB) * stride_pkb
+        if not (USE_TMA and TMA_SCALES):
+            s_ptrs += (BLOCK_SIZE_KB // 8) * stride_sblk
 
     g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32)
+    if FAST_DECODE:
+        g = g * 256.0
     accumulator = accumulator * g[:, None]
 
     if MUL_ROUTED_WEIGHT:
