@@ -356,7 +356,7 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
 
 
 # ======================================================================================
-# read_range_into: the O_DIRECT byte-range read the PLE table load is built on
+# read_range_into: the byte-range read the PLE table load is built on (O_DIRECT where the platform has it)
 # ======================================================================================
 
 
@@ -368,13 +368,23 @@ def blob(tmp_path_factory) -> tuple[str, bytes]:
     return str(path), data
 
 
+@pytest.fixture(params=["platform", "buffered"])
+def range_reader(request, monkeypatch) -> str:
+    """Run each read test through the platform's reader and through the buffered one Windows always takes."""
+    if request.param == "buffered":
+        import freetoken.moe.host_banks as host_banks
+
+        monkeypatch.setattr(host_banks, "O_DIRECT_READS", False)
+    return request.param
+
+
 @pytest.mark.parametrize("file_offset, nbytes, dest_offset", [
     (1, 4095, 0),                 # sub-block, unaligned source
     (2239, 1_000_000, 0),         # the real checkpoint's header-end phase
     (4095, 4097, 1),              # straddles two block boundaries
     (4_999_000, 1003, 123_456),   # runs to EOF
 ])
-def test_read_range_into_matches_the_file(blob, file_offset, nbytes, dest_offset):
+def test_read_range_into_matches_the_file(blob, range_reader, file_offset, nbytes, dest_offset):
     path, data = blob
     bank = HostBank((6_000_000,), torch.uint8)
     view = bank.memoryview()
@@ -384,7 +394,7 @@ def test_read_range_into_matches_the_file(blob, file_offset, nbytes, dest_offset
     assert bytes(view[dest_offset:dest_offset + nbytes]) == data[file_offset:file_offset + nbytes]
 
 
-def test_read_range_into_is_chunk_and_thread_safe(blob):
+def test_read_range_into_is_chunk_and_thread_safe(blob, range_reader):
     path, data = blob
     bank = HostBank((6_000_000,), torch.uint8)
     view = bank.memoryview()
@@ -393,11 +403,52 @@ def test_read_range_into_is_chunk_and_thread_safe(blob):
     assert bytes(view[1024:1024 + 4_000_000]) == data[2239:2239 + 4_000_000]
 
 
-def test_read_range_into_rejects_a_short_destination(blob):
+def test_read_range_into_rejects_a_short_destination(blob, range_reader):
     path, _data = blob
     bank = HostBank((1024,), torch.uint8)
     with pytest.raises(ValueError, match="destination holds"):
         read_range_into(bank.memoryview(), path, file_offset=0, nbytes=1 << 20)
+
+
+# ======================================================================================
+# iter_expert_tensors_parallel: the whole-shard read the expert banks are built from
+# ======================================================================================
+
+
+@pytest.fixture(scope="module")
+def expert_checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor]]:
+    """Two shards, experts beside dense tensors, sizes that leave every shard's tail off a block."""
+    folder = tmp_path_factory.mktemp("experts")
+    generator = torch.Generator().manual_seed(3)
+    shards = {
+        "model-00001-of-00002.safetensors": {
+            f"{LM}.layers.0.mlp.experts.{e}.gate_proj.weight": torch.randint(0, 255, (640, 1281), generator=generator, dtype=torch.uint8)
+            for e in range(3)
+        } | {f"{LM}.layers.0.self_attn.o_proj.weight": torch.randn(64, 32, generator=generator).bfloat16()},
+        "model-00002-of-00002.safetensors": {
+            f"{LM}.layers.1.mlp.experts.{e}.down_proj.weight_scale": torch.randn(33, 7, generator=generator).to(torch.float8_e4m3fn)
+            for e in range(2)
+        },
+    }
+    weight_map = {}
+    for shard, tensors in shards.items():
+        save_file(tensors, str(folder / shard))
+        weight_map.update({name: shard for name in tensors})
+    (folder / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    everything = {name: tensor for tensors in shards.values() for name, tensor in tensors.items()}
+    return str(folder), everything
+
+
+def test_the_parallel_shard_read_yields_every_expert_tensor_exactly(expert_checkpoint, range_reader):
+    from freetoken.models.weight import iter_expert_tensors_parallel
+
+    folder, everything = expert_checkpoint
+    got = dict(iter_expert_tensors_parallel(folder, lambda name: ".experts." in name, workers=4, chunk=64 << 10))
+    expected = {name: tensor for name, tensor in everything.items() if ".experts." in name}
+    assert sorted(got) == sorted(expected)
+    for name, tensor in expected.items():
+        assert got[name].dtype == tensor.dtype and got[name].shape == tensor.shape, name
+        assert torch.equal(got[name].view(torch.uint8), tensor.view(torch.uint8)), name
 
 
 # ======================================================================================
