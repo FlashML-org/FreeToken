@@ -5,10 +5,32 @@ from dataclasses import dataclass, field
 from freetoken.engine import EngineConfig
 
 
-def _get_pid_suffix() -> str:
+ZMQ_LINK_COUNT = 5
+
+
+def _free_loopback_ports(count: int) -> list[int]:
+    import socket
+
+    held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
+    try:
+        for sock in held:
+            sock.bind(("127.0.0.1", 0))
+        return [sock.getsockname()[1] for sock in held]
+    finally:
+        for sock in held:
+            sock.close()
+
+
+def _choose_zmq_links() -> tuple[str, ...]:
+    """The ZMQ endpoints, chosen once in the parent so every spawned worker reads the same ones;
+    loopback TCP ports where libzmq has no ipc transport, as on Windows."""
     import os
 
-    return f".pid={os.getpid()}"
+    import zmq
+
+    if zmq.has("ipc"):
+        return tuple(f"ipc:///tmp/freetoken_{link}.pid={os.getpid()}" for link in range(ZMQ_LINK_COUNT))
+    return tuple(f"tcp://127.0.0.1:{port}" for port in _free_loopback_ports(ZMQ_LINK_COUNT))
 
 
 @dataclass(frozen=True)
@@ -20,19 +42,19 @@ class SchedulerConfig(EngineConfig):
     special_token_ckpt: bool = False
 
     # networking config
-    _unique_suffix: str = field(default_factory=_get_pid_suffix)
+    _zmq_links: tuple[str, ...] = field(default_factory=_choose_zmq_links)
 
     @property
     def zmq_backend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_0" + self._unique_suffix
+        return self._zmq_links[0]
 
     @property
     def zmq_detokenizer_addr(self) -> str:
-        return "ipc:///tmp/freetoken_1" + self._unique_suffix
+        return self._zmq_links[1]
 
     @property
     def zmq_scheduler_broadcast_addr(self) -> str:
-        return "ipc:///tmp/freetoken_2" + self._unique_suffix
+        return self._zmq_links[2]
 
     @property
     def max_forward_len(self) -> int:
