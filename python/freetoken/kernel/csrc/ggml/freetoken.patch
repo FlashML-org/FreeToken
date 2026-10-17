@@ -24,6 +24,16 @@
  }
  
  // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
+@@ -1582,6 +1588,9 @@
+     const void * gate_bias = nullptr;
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
++    // FreeToken: element strides of x_scale / gate_scale, so they can be columns of a per-expert scale bank
++    uint32_t x_scale_stride = 1;
++    uint32_t gate_scale_stride = 1;
+     ggml_glu_op glu_op;
+     float glu_limit = 0.0f;
+     const void * shared_up = nullptr;
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
 @@ -177,3 +177,45 @@
@@ -572,6 +582,19 @@
          stride_col_dst = fusion.shared_stride_col_dst;
      }
  
+@@ -702,10 +706,10 @@
+             }
+             if constexpr (type == GGML_TYPE_NVFP4) {
+                 if (use_scale) {
+-                    x_scales = x_scale[ids ? channel_x : 0];
++                    x_scales = x_scale[(ids ? channel_x : 0) * fusion.x_scale_stride];
+                 }
+                 if (use_gate_scale) {
+-                    gate_scales = gate_scale[ids ? channel_x : 0];
++                    gate_scales = gate_scale[(ids ? channel_x : 0) * fusion.gate_scale_stride];
+                 }
+             }
+         }
 @@ -837,7 +841,7 @@
                          }
                      }
@@ -615,6 +638,24 @@
          stride_col_dst = fusion.shared_stride_col_dst;
      }
  
+@@ -963,7 +969,7 @@
+ 
+             if constexpr (type == GGML_TYPE_NVFP4) {
+                 if (x_scale) {
+-                    result *= x_scale[channel_x];
++                    result *= x_scale[channel_x * fusion.x_scale_stride];
+                 }
+             }
+             if (x_bias) {
+@@ -973,7 +979,7 @@
+                 float gate_value = tmp_gate[threadIdx.x];
+                 if constexpr (type == GGML_TYPE_NVFP4) {
+                     if (gate_scale) {
+-                        gate_value *= gate_scale[channel_x];
++                        gate_value *= gate_scale[channel_x * fusion.gate_scale_stride];
+                     }
+                 }
+                 if (gate_bias) {
 @@ -998,7 +1004,7 @@
                  }
              }
@@ -718,7 +759,30 @@
      GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
  
      GGML_TENSOR_BINARY_OP_LOCALS;
-@@ -1526,12 +1535,22 @@
+@@ -1498,17 +1507,20 @@
+             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+             fusion_local.gate_bias = fusion->gate_bias->data;
+         }
++        // FreeToken: a scale may be a strided vector, read with its element stride
+         if (fusion->x_scale) {
+             GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
+-            GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
++            GGML_ASSERT(ggml_nelements(fusion->x_scale) == fusion->x_scale->ne[0] && fusion->x_scale->nb[0] % sizeof(float) == 0);
+             GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
+             fusion_local.x_scale = fusion->x_scale->data;
++            fusion_local.x_scale_stride = fusion->x_scale->nb[0] / sizeof(float);
+         }
+         if (fusion->gate_scale) {
+             GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
+-            GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
++            GGML_ASSERT(ggml_nelements(fusion->gate_scale) == fusion->gate_scale->ne[0] && fusion->gate_scale->nb[0] % sizeof(float) == 0);
+             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
+             fusion_local.gate_scale = fusion->gate_scale->data;
++            fusion_local.gate_scale_stride = fusion->gate_scale->nb[0] / sizeof(float);
+         }
+         fusion_local.glu_op = fusion->glu_op;
+         fusion_local.glu_limit = fusion->glu_limit;
+@@ -1526,12 +1538,22 @@
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -744,7 +808,7 @@
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1556,11 +1575,23 @@
+@@ -1556,11 +1578,23 @@
  
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  

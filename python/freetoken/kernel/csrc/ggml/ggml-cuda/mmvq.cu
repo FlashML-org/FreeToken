@@ -706,10 +706,10 @@ static __global__ void mul_mat_vec_q(
             }
             if constexpr (type == GGML_TYPE_NVFP4) {
                 if (use_scale) {
-                    x_scales = x_scale[ids ? channel_x : 0];
+                    x_scales = x_scale[(ids ? channel_x : 0) * fusion.x_scale_stride];
                 }
                 if (use_gate_scale) {
-                    gate_scales = gate_scale[ids ? channel_x : 0];
+                    gate_scales = gate_scale[(ids ? channel_x : 0) * fusion.gate_scale_stride];
                 }
             }
         }
@@ -969,7 +969,7 @@ static __global__ void mul_mat_vec_q_moe(
 
             if constexpr (type == GGML_TYPE_NVFP4) {
                 if (x_scale) {
-                    result *= x_scale[channel_x];
+                    result *= x_scale[channel_x * fusion.x_scale_stride];
                 }
             }
             if (x_bias) {
@@ -979,7 +979,7 @@ static __global__ void mul_mat_vec_q_moe(
                 float gate_value = tmp_gate[threadIdx.x];
                 if constexpr (type == GGML_TYPE_NVFP4) {
                     if (gate_scale) {
-                        gate_value *= gate_scale[channel_x];
+                        gate_value *= gate_scale[channel_x * fusion.gate_scale_stride];
                     }
                 }
                 if (gate_bias) {
@@ -1507,17 +1507,20 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
+        // FreeToken: a scale may be a strided vector, read with its element stride
         if (fusion->x_scale) {
             GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
-            GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
+            GGML_ASSERT(ggml_nelements(fusion->x_scale) == fusion->x_scale->ne[0] && fusion->x_scale->nb[0] % sizeof(float) == 0);
             GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.x_scale = fusion->x_scale->data;
+            fusion_local.x_scale_stride = fusion->x_scale->nb[0] / sizeof(float);
         }
         if (fusion->gate_scale) {
             GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
-            GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
+            GGML_ASSERT(ggml_nelements(fusion->gate_scale) == fusion->gate_scale->ne[0] && fusion->gate_scale->nb[0] % sizeof(float) == 0);
             GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             fusion_local.gate_scale = fusion->gate_scale->data;
+            fusion_local.gate_scale_stride = fusion->gate_scale->nb[0] / sizeof(float);
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;

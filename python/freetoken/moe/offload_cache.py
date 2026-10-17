@@ -48,6 +48,8 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "fp8_block": ("gate_up", "gate_up_scale", "down", "down_scale"),
     # GGUF experts in their own ggml type per layer: gate_up [L*E, 2I, row_bytes] (gate rows, then up rows), down [L*E, H, row_bytes]; float experts keep their dtype
     "gguf": ("gate_up", "down"),
+    # GGUF experts whose NVFP4 tensors carry per-expert scales: global [L*E, 4] fp32 (gate, up, down, 1) weight_scale_2
+    "gguf_scaled": ("gate_up", "down", "global"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)

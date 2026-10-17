@@ -1588,6 +1588,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    // FreeToken: element strides of x_scale / gate_scale, so they can be columns of a per-expert scale bank
+    uint32_t x_scale_stride = 1;
+    uint32_t gate_scale_stride = 1;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
     const void * shared_up = nullptr;

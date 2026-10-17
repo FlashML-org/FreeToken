@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import torch
@@ -85,4 +86,33 @@ def segment_param(index: int) -> str:
     return "weight" if index == 0 else f"weight_{index}"
 
 
-__all__ = ["MATRIX_ROW_PADDING", "Segment", "float_dtype", "is_quantized", "mmq_tail_bytes", "pad_rows", "row_bytes", "segment_param", "segments", "type_name"]
+NVFP4 = int(gguf.GGMLQuantizationType.NVFP4)
+
+# per-expert fp32 weight scales llama.cpp reads next to separate gate / up / down expert tensors (llama-model.cpp ffn_*_exps_s)
+_EXPERT_SCALE_RE = re.compile(r"^blk\.\d+\.ffn_(gate|up|down)_exps\.scale$")
+
+
+def scale_name(tensor: str) -> str:
+    """``<name>.scale`` of the GGUF tensor ``<name>`` or ``<name>.weight``."""
+    return f"{tensor.removesuffix('.weight')}.scale"
+
+
+def has_weight_scale(tensor_types: dict[str, int], tensor: str) -> bool:
+    """Whether llama.cpp's converter stored an NVFP4 tensor's weight_scale_2 as ``<name>.scale``; other types keep no weight scale."""
+    weight = tensor if tensor.endswith(".weight") else f"{tensor}.weight"
+    return tensor_types.get(weight, tensor_types.get(tensor)) == NVFP4 and scale_name(tensor) in tensor_types
+
+
+def has_expert_scales(tensor_types: dict[str, int]) -> bool:
+    """Whether any NVFP4 expert tensor of the file carries per-expert scales, which then take a scale bank in every MoE layer."""
+    merged = [n for n in tensor_types if n.endswith("ffn_gate_up_exps.scale") and tensor_types.get(n.replace(".scale", ".weight")) == NVFP4]
+    if merged:
+        # llama.cpp scales only separate gate / up expert tensors and would drop this one
+        raise NotImplementedError(f"per-expert scales of merged gate_up NVFP4 experts are not supported (e.g. {merged[0]})")
+    return any(_EXPERT_SCALE_RE.match(n) and has_weight_scale(tensor_types, n.removesuffix(".scale")) for n in tensor_types)
+
+
+__all__ = [
+    "MATRIX_ROW_PADDING", "NVFP4", "Segment", "float_dtype", "has_expert_scales", "has_weight_scale", "is_quantized", "mmq_tail_bytes",
+    "pad_rows", "row_bytes", "scale_name", "segment_param", "segments", "type_name",
+]

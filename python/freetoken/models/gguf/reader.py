@@ -147,6 +147,8 @@ class GgufTensorInfo:
     nbytes: int
     ggml_type: int
     ne: tuple[int, ...]
+    # the model path the index was built from, which resolves tensors in any split
+    root: str = ""
 
     def data(self) -> np.ndarray:
         """Zero-copy uint8 view of the bytes (memory-mapped)."""
@@ -161,7 +163,7 @@ def gguf_tensor_index(model_path: str) -> dict[str, GgufTensorInfo]:
     for path in gguf_split_paths(model_path):
         for t in _reader(path).tensors:
             index[t.name] = GgufTensorInfo(
-                t.name, path, int(t.data_offset), int(t.n_bytes), int(t.tensor_type), tuple(int(x) for x in t.shape)
+                t.name, path, int(t.data_offset), int(t.n_bytes), int(t.tensor_type), tuple(int(x) for x in t.shape), model_path
             )
     return index
 

@@ -95,24 +95,37 @@ def uses_mmvq(ggml_type: int, m: int) -> bool:
     return _module().uses_mmvq(ggml_type, m)
 
 
-def mul_mat_id(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-    """Per-route expert GEMM over ``w[E, N, row_bytes]``: returns ``[T, k, N]`` in ``x``'s dtype; ``x`` is ``[T, K]`` (shared by the k routes) or ``[T, k, K]``."""
+def mul_mat_id(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+    """Per-route expert GEMM over ``w[E, N, row_bytes]``: returns ``[T, k, N]`` in ``x``'s dtype; ``x`` is ``[T, K]`` (shared by the k routes) or ``[T, k, K]``.
+
+    ``scale`` is an fp32 ``[E]`` view (strided is fine) that multiplies each NVFP4 expert's rows; it needs ``T <= mmvq_max_tokens``.
+    """
     t, top_k = ids.shape
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if t > mmvq_max_tokens(ggml_type):
         _check_mmq_tail(w, ggml_type, x.shape[-1])
-    _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out)
+    _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out, scale)
     return out
 
 
-def mul_mat_id_glu(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor, glu: str, limit: float = 0.0) -> torch.Tensor:
+def mul_mat_id_glu(
+    w: torch.Tensor,
+    ggml_type: int,
+    x: torch.Tensor,
+    ids: torch.Tensor,
+    glu: str,
+    limit: float = 0.0,
+    gate_scale: torch.Tensor | None = None,
+    up_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``glu(gate, up)`` per route in one pass for small ``T``: ``w[E, 2I, row_bytes]`` holds gate rows then up rows; returns ``[T, k, I]`` in ``x``'s dtype.
 
     ``glu`` is one of ``swiglu``, ``geglu`` (tanh GELU), ``swiglu_oai`` (alpha 1.702, limit 7) and ``swiglu_clamp`` (alpha 1, clamped at ``limit``).
+    ``gate_scale`` / ``up_scale`` are fp32 ``[E]`` views that multiply each NVFP4 expert's gate / up results before the glu.
     """
     t, top_k = ids.shape
     out = torch.empty(t, top_k, w.shape[1] // 2, dtype=x.dtype, device=x.device)
-    _module().mul_mat_id_glu(w, ggml_type, x.contiguous(), ids, out, glu, limit)
+    _module().mul_mat_id_glu(w, ggml_type, x.contiguous(), ids, out, glu, limit, gate_scale, up_scale)
     return out
 
 

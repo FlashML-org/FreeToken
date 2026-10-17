@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.gguf.tensors import float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
 
 from .config import parse_config
 
@@ -52,9 +52,7 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
 def _check_supported(shim: GgufConfigShim) -> None:
     if any(k.startswith("prism.hadamard.") for k in shim.metadata):
         raise NotImplementedError(f"{shim.model_path}: Hadamard-rotated (prism) GGUF weights are not supported")
-    scaled = sorted(n for n in gguf_tensor_index(shim.model_path) if n.endswith((".scale", ".input_scale")))
-    if scaled:
-        raise NotImplementedError(f"{shim.model_path}: GGUF tensors with per-tensor scales are not supported (e.g. {scaled[0]})")
+    check_scales(shim.model_path)
 
 
 def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:

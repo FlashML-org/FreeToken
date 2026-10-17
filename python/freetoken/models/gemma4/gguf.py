@@ -24,7 +24,7 @@ from freetoken.models.config import (
     SWAAttentionGroupConfig,
 )
 from freetoken.models.gguf.reader import gguf_tensor_index
-from freetoken.models.gguf.tensors import float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, weight_scale
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -48,6 +48,7 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
+    check_scales(shim.model_path, known=("ffn_gate_inp.scale", "ffn_down_exps.scale"))
     m = shim.metadata
 
     def g(key: str):
@@ -246,6 +247,9 @@ def iter_gguf_weights(
         blk, base = f"blk.{layer}", f"model.layers.{layer}"
         for suffix, rel in scalar_map.items():
             tensor = float_tensor(index[f"{blk}.{suffix}"])
+            if suffix == "ffn_down_exps.scale" and weight_scale(index[f"{blk}.ffn_down_exps.weight"]) is not None:
+                # the converter folds per_expert_scale into the NVFP4 down weight_scale_2, which the expert kernel applies
+                tensor = torch.ones_like(tensor)
             yield f"{base}.{rel}", tensor.reshape(1) if rel.endswith("layer_scalar") else tensor
         if f"{blk}.attn_qkv.weight" in index:
             # convert_hf_to_gguf.py --fuse-qkv stores q, k and v as one attn_qkv matrix

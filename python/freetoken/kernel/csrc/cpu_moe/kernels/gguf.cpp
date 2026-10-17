@@ -31,10 +31,11 @@ void set_ggml_cpu(uintptr_t addr) {
 namespace {
 
 // Packed ggml rows of the layers whose experts have this gate_up type and this down type, dotted by ggml-cpu against the activation converted to each type's vec_dot input (q8_0, q8_1 or q8_K, or the float type itself).
+// With scales, each expert's (gate, up, down, 1) NVFP4 weight_scale_2 multiplies its gate and up rows before the glu and its down rows before the routing weight, as llama.cpp's build_moe_ffn does.
 class GgufFormat final : public MoeFormat {
  public:
-  GgufFormat(const MoeParams& p, const FormatArgs& a)
-      : MoeFormat(p), ggml_(ggml_api()), gate_up_(a.bank("gate_up")), down_(a.bank("down")) {
+  GgufFormat(const MoeParams& p, const FormatArgs& a, bool scaled)
+      : MoeFormat(p), ggml_(ggml_api()), gate_up_(a.bank("gate_up")), down_(a.bank("down")), scales_(scaled ? a.bank("global") : nullptr) {
     static std::once_flag tables;
     std::call_once(tables, ggml_.init);
     gu_ = kernel(static_cast<int>(a.option("gate_up_type")), p.H, "gate_up");
@@ -63,10 +64,11 @@ class GgufFormat final : public MoeFormat {
   void gate_up(int layer, int e, int tok, int i0, int i1, const bf16_t* /*x*/, float w_in, bf16_t* g) const override {
     const uint8_t* w = static_cast<const uint8_t*>(tbl_at(gate_up_, layer)) + static_cast<size_t>(e) * 2 * p.I * gu_.row_bytes;
     const uint8_t* xq = xq_.data() + static_cast<size_t>(tok) * gu_.act_row_bytes;
+    const float* sc = expert_scales(layer, e);
     gated_rows(p, i0, i1, w_in, g, [&](int row) {
       float s;
       gu_.vec_dot(p.H, &s, 0, w + static_cast<size_t>(row) * gu_.row_bytes, 0, xq, 0, 1);
-      return s;
+      return sc == nullptr ? s : s * sc[row < p.I ? 0 : 1];
     });
   }
 
@@ -76,9 +78,19 @@ class GgufFormat final : public MoeFormat {
       for (int j = 0; j < n; ++j)
         dn_.vec_dot(p.I, &out[j * kRowBlock + h - h0], 0, w + (static_cast<size_t>(routes[j].e) * p.H + h) * dn_.row_bytes, 0,
                     gq_.data() + static_cast<size_t>(routes[j].r) * dn_.act_row_bytes, 0, 1);
+    if (scales_ == nullptr) return;
+    for (int j = 0; j < n; ++j) {
+      const float s = expert_scales(layer, routes[j].e)[2];
+      for (int h = h0; h < h1; ++h) out[j * kRowBlock + h - h0] *= s;
+    }
   }
 
  private:
+  // the expert's (gate, up, down, 1) row of the layer's [E, 4] fp32 scale bank, or nullptr without scales
+  const float* expert_scales(int layer, int e) const {
+    return scales_ == nullptr ? nullptr : static_cast<const float*>(tbl_at(scales_, layer)) + static_cast<size_t>(e) * 4;
+  }
+
   ft_ggml_row_kernel kernel(int type, int k, const char* role) const {
     ft_ggml_row_kernel out{};
     const int rc = ggml_.row_kernel(type, k, &out);
@@ -92,6 +104,7 @@ class GgufFormat final : public MoeFormat {
   const ft_ggml_cpu_api& ggml_;
   const uint64_t* gate_up_;
   const uint64_t* down_;
+  const uint64_t* scales_;
   ft_ggml_row_kernel gu_{}, dn_{};
   std::vector<float> xf_;
   // the activation in the vec_dot input type: x per token, g per route
@@ -101,7 +114,11 @@ class GgufFormat final : public MoeFormat {
 }  // namespace
 
 std::unique_ptr<MoeFormat> make_gguf_format(const MoeParams& p, const FormatArgs& a) {
-  return std::make_unique<GgufFormat>(p, a);
+  return std::make_unique<GgufFormat>(p, a, false);
+}
+
+std::unique_ptr<MoeFormat> make_gguf_scaled_format(const MoeParams& p, const FormatArgs& a) {
+  return std::make_unique<GgufFormat>(p, a, true);
 }
 
 }  // namespace freetoken::cpu_moe

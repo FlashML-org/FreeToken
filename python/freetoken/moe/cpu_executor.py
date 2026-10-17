@@ -149,11 +149,11 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
 def _format_label(name: str, opts: tuple) -> str:
     """One format instance as the startup log names it, e.g. ``gguf(gate_up=IQ2_XXS, down=IQ4_NL)``."""
-    if name == "gguf":
+    if name in ("gguf", "gguf_scaled"):
         from freetoken.layers.quantization.ggml_types import type_name
 
         gate_up, down = dict(opts)["gate_up_type"], dict(opts)["down_type"]
-        return f"gguf(gate_up={type_name(gate_up)}, down={type_name(down)})"
+        return f"{name}(gate_up={type_name(gate_up)}, down={type_name(down)})"
     return name + (f"({', '.join(f'{k}={v}' for k, v in opts)})" if opts else "")
 
 
@@ -192,7 +192,7 @@ class CpuMoeExecutor:
                     f"{sorted(_cpu_moe.weight_formats())} formats, but this checkpoint's experts are "
                     f"{f!r}; use --moe-strategy offload (GPU-side dequant) instead."
                 )
-            if f == "gguf":
+            if f in ("gguf", "gguf_scaled"):
                 from freetoken.kernel import ggml_cpu
 
                 if (variant := ggml_cpu.select()) is None:
@@ -423,8 +423,8 @@ class CpuMoeExecutor:
         (see ``_make_table``), not a single bank's -- the C++ side resolves
         ``tbl[layer_id]`` per task.
         """
-        if fmt == "gguf":
-            return self._resolve_gguf_banks(banks, rep, int(opts["gate_up_type"]), int(opts["down_type"]))
+        if fmt in ("gguf", "gguf_scaled"):
+            return self._resolve_gguf_banks(banks, rep, int(opts["gate_up_type"]), int(opts["down_type"]), scaled=fmt == "gguf_scaled")
         if fmt == "bf16":
             gate_up = banks["gate_up"]
             down = banks["down"]
@@ -465,8 +465,10 @@ class CpuMoeExecutor:
         banks = self._tables(gate_up=gup, down=dnp, gate_up_scale=gus, gate_up_global=gug, down_scale=dns, down_global=dng)
         return banks, {}, (H, I)
 
-    def _resolve_gguf_banks(self, banks: dict, rep: int, gate_up_type: int, down_type: int) -> tuple[dict, dict, tuple[int, int]]:
-        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each; float rows keep their dtype."""
+    def _resolve_gguf_banks(self, banks: dict, rep: int, gate_up_type: int, down_type: int, scaled: bool = False) -> tuple[dict, dict, tuple[int, int]]:
+        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each; float rows keep their dtype.
+
+        ``scaled`` adds global [E, 4] fp32, each expert's (gate, up, down, 1) NVFP4 weight_scale_2."""
         from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes, type_name
 
         gate_up, down = banks["gate_up"], banks["down"]
@@ -475,8 +477,13 @@ class CpuMoeExecutor:
             dtype = float_dtype(ggml_type) if float_dtype(ggml_type) is not None else torch.uint8
             if t.dtype != dtype or t.shape[-1] * t.element_size() != row_bytes(ggml_type, k):
                 raise ValueError(f"MoE layer {rep} {role} bank {tuple(t.shape)} {t.dtype} is not {type_name(ggml_type)} rows of {k} values")
-        banks = self._tables(gate_up=gate_up, down=down)
-        return banks, {"gate_up_type": gate_up_type, "down_type": down_type}, (H, I)
+        types = {"gate_up_type": gate_up_type, "down_type": down_type}
+        if not scaled:
+            return self._tables(gate_up=gate_up, down=down), types, (H, I)
+        scales = banks["global"]
+        if scales[rep].dtype != torch.float32 or tuple(scales[rep].shape) != (gate_up[rep].shape[0], 4) or not scales[rep].is_contiguous():
+            raise ValueError(f"MoE layer {rep} global bank {tuple(scales[rep].shape)} {scales[rep].dtype} is not contiguous [experts, 4] fp32")
+        return self._tables(gate_up=gate_up, down=down, **{"global": scales}), types, (H, I)
 
     def _resolve_mxfp4_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """gpt-oss mxfp4 ``mxfp4_triton`` schema: transposed split-K blocks/scales
