@@ -7,13 +7,16 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import functools
+import re
+from typing import Any, Dict, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 from freetoken.kernel import moe_sum_reduce_triton
+from freetoken.kernel.backend import is_rocm
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view
 from freetoken.kernel.triton.nvfp4_fused_moe import (
     _decode_nvfp4_marlin_kernel,
@@ -23,6 +26,9 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
 )
 from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import moe_align_block_size
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 # Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,
 # which benchmarks at run time). Tuned offline against the NVFP4 decode kernels.
@@ -234,13 +240,66 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
-def _prefill_config(M: int, top_k: int, num_experts: int) -> Dict[str, int]:
+# rho = bf16 tensor-core FLOP / fp32 ALU FLOP per SM per clock, with fp32 accumulate (the only accumulator for bf16 MMA).
+# Each M block decodes its weight tile once on the ALUs, and the MMA also runs on the padding up to BLOCK_SIZE_M.
+# High rho makes decode the cost, so big blocks win; low rho makes padded MMA the cost, so small blocks win.
+# Spec, FLOP/clk/SM: GeForce RTX 30/40/50 512 / 256 = 2, as GeForce runs fp32 accumulate at half rate.
+# RTX A, RTX Ada Generation, RTX PRO Blackwell, A10, A40, L4, L40S 1024 / 256 = 4; A100 2048 / 128 = 16; H100 4096 / 256 = 16; H20 148 / 44 TFLOP/s = 3.4.
+# Measured (cuBLAS bf16 / Triton fp32 FMA): RTX PRO 6000 4.5, RTX 5090 2.3, RTX 4090 1.9, RTX 3080 Ti 1.6.
+_PRO_GPU_RE = re.compile(
+    r"RTX\s*A\d{3,4}"                        # RTX A400 .. A6000
+    r"|RTX\s*\d{3,4}E?\s*(SFF\s*)?-?\s*Ada"  # RTX 500 .. 6000 Ada Generation
+    r"|RTX\s*PRO\s*\d{3,4}"                  # RTX PRO 500 .. 6000 Blackwell
+    r"|RTX\s*\d{4}D\b"                       # RTX 6000D
+    r"|Quadro|TITAN"
+    r"|^(NVIDIA\s+)?(GRID\s+)?(A2|A10[GM]?|A16|A40|L2|L20|L4|L40S?)\b",
+    re.I,
+)
+# also matches names without "GeForce", e.g. "NVIDIA RTX 4090"
+_GEFORCE_GPU_RE = re.compile(r"GeForce|RTX\s*[2-6]0[5-9]0(?!\d)", re.I)
+
+
+def _tensor_rho(name: str, major: int, minor: int) -> float:
+    if major not in (8, 12) or (major, minor) == (8, 0):
+        return 3.4 if re.search(r"\bH20\b", name) else 16.0
+    if _PRO_GPU_RE.search(name):
+        return 4.0
+    if _GEFORCE_GPU_RE.search(name):
+        return 2.0
+    logger.warning("unknown GPU %r: NVFP4 MoE prefill assumes full-rate fp32-accumulate tensor cores", name)
+    return 4.0
+
+
+# (min rho, tokens per expert where BLOCK_SIZE_M becomes 32, 64, 128), from sweeps on H100, RTX PRO 6000 and RTX 5090 / 4090 / 3080 Ti
+_PREFILL_BLOCK_M_STEPS = ((8.0, (12, 24, 64)), (3.0, (16, 36, 150)), (0.0, (16, 150, float("inf"))))
+# BLOCK_SIZE_M -> (BLOCK_SIZE_N, BLOCK_SIZE_KB, num_stages)
+_PREFILL_TILES_H100 = {16: (64, 64, 3), 32: (64, 32, 3), 64: (64, 32, 3), 128: (64, 32, 3)}
+_PREFILL_TILES_RTX_PRO = {16: (64, 64, 4), 32: (128, 64, 3), 64: (128, 64, 2), 128: (64, 32, 2)}
+_PREFILL_TILES_GEFORCE = {16: (64, 64, 4), 32: (128, 64, 2), 64: (128, 32, 2)}
+
+
+@functools.lru_cache(maxsize=None)
+def _prefill_tuning(device_index: int) -> Tuple[Tuple[float, float, float], Dict[int, Tuple[int, int, int]]]:
+    if is_rocm():
+        # TODO: tune for AMD GPUs; they keep the H100 tuning
+        return _PREFILL_BLOCK_M_STEPS[0][1], _PREFILL_TILES_H100
+    props = torch.cuda.get_device_properties(device_index)
+    rho = _tensor_rho(props.name, props.major, props.minor)
+    steps = next(s for min_rho, s in _PREFILL_BLOCK_M_STEPS if rho >= min_rho)
+    # the RTX tables come from cc 8.6 / 8.9 / 12.0 sweeps (mma.sync, 99 KB shared memory); other GPUs keep the H100 one
+    if (props.major, props.minor) not in ((8, 6), (8, 9), (12, 0)):
+        return steps, _PREFILL_TILES_H100
+    return steps, _PREFILL_TILES_RTX_PRO if rho >= 3.0 else _PREFILL_TILES_GEFORCE
+
+
+def _prefill_config(M: int, top_k: int, num_experts: int, device_index: int) -> Dict[str, int]:
     # moe_align_block_size pads each expert's token count to a multiple of BLOCK_SIZE_M, so triton.autotune cannot pick it.
-    # BLOCK_SIZE_M follows the mean tokens per expert; the thresholds and the other fields come from an H100 sweep.
+    (to32, to64, to128), tiles = _prefill_tuning(device_index)
     per_expert = M * top_k / num_experts
-    block_m = 128 if per_expert >= 64 else 64 if per_expert >= 24 else 32 if per_expert >= 12 else 16
-    return dict(BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=64 if block_m == 16 else 32,
-                GROUP_SIZE_M=8, num_warps=4, num_stages=3)
+    block_m = 128 if per_expert >= to128 else 64 if per_expert >= to64 else 32 if per_expert >= to32 else 16
+    block_n, block_kb, stages = tiles[block_m]
+    return dict(BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=block_n, BLOCK_SIZE_KB=block_kb,
+                GROUP_SIZE_M=8, num_warps=4, num_stages=stages)
 
 
 def _prefill_gemm(
@@ -306,7 +365,7 @@ def fused_experts_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = _prefill_config(M, top_k, num_experts)
+    cfg = _prefill_config(M, top_k, num_experts, hidden_states.device.index)
 
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
     tw = topk_weights.reshape(-1).contiguous()
