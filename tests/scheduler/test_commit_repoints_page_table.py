@@ -8,9 +8,11 @@ from types import SimpleNamespace
 
 import torch
 
-from freetoken.core import Req, SamplingParams
+from freetoken.core import Context, Req, SamplingParams, get_global_ctx, set_global_ctx
+from freetoken.distributed import set_tp_info, try_get_tp_info
+from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
 from freetoken.kvcache.linear_state_pool import LinearStatePool
-from freetoken.models.config import LinearGatedDeltaGroupConfig
+from freetoken.models.config import KVCacheGroupSpec, LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
 
 PROMPT = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -139,4 +141,72 @@ def test_radix_subspan_commit_repoints_only_the_deduped_slice():
     assert _live_row(page_table, d).isdisjoint(free)
     canonical = d.cache_handle.get_matched_indices()
     assert page_table[2, : d.cache_handle.cached_len].tolist() == canonical[: d.cache_handle.cached_len].tolist()
+    cm.check_integrity()
+
+
+def _swa_cache_manager(window, num_pages=256):
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    try:
+        get_global_ctx()
+    except AssertionError:
+        set_global_ctx(Context(page_size=1))
+    groups = (
+        KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8,
+                         sliding_window=None),
+        KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8,
+                         sliding_window=window),
+    )
+    pool = HybridSWAKVCache(groups=groups, num_layers=2, num_full_pages=num_pages, page_size=1,
+                            dtype=torch.bfloat16, device=torch.device("cpu"),
+                            num_swa_tokens=num_pages)
+    page_table = torch.zeros(4, 128, dtype=torch.int32)
+    cm = CacheManager(num_pages, 1, page_table, "swa_radix", swa_pool=pool,
+                      sliding_window_size=window)
+    return cm, page_table, pool
+
+
+def _admit_swa(cm, page_table, table_idx, ids):
+    handle = cm.match_req(_pend(ids)).cuda_handle
+    req = Req(input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=table_idx,
+              cached_len=handle.cached_len, output_len=0, uid=table_idx,
+              sampling_params=SamplingParams(), cache_handle=handle)
+    cm.lock(handle)
+    page_table[table_idx, : handle.cached_len] = handle.get_matched_indices()
+    cm.allocate_paged([req])
+    req.cached_len = len(ids)
+    return req
+
+
+def test_swa_unfinished_commit_keeps_its_pages_under_a_locked_tombstone():
+    """SWA variant where there is nothing safe to re-point to. c full-locks a shared prefix whose
+    swa a finishing request trims; b then prefills that prefix itself plus a tail shorter than
+    the window. insert keeps the locked tombstone and frees b's copy, but the windowed re-match
+    stops before the tombstone, so b's row named freed pages and b's finish freed them again
+    (issue #204: duplicate pages in free_slots, then the SWA-slot integrity assert)."""
+    window = 16
+    cm, page_table, pool = _swa_cache_manager(window)
+    shared = list(range(100, 164))
+    c = _admit_swa(cm, page_table, 0, shared + list(range(300, 340)))
+    with cm.lazy_free_region():
+        cm.cache_req(c, finished=False)
+    a = _admit_swa(cm, page_table, 1, shared + list(range(400, 440)))
+    assert a.cache_handle.cached_len == len(shared)
+    with cm.lazy_free_region():
+        cm.cache_req(a, finished=True)    # trims the shared head's swa; c still full-locks it
+    assert any(n.swa_tombstone and n.ref_count > 0 for n in cm.prefix_cache._all_nodes())
+
+    b = _admit_swa(cm, page_table, 2, shared + list(range(500, 508)))
+    assert b.cache_handle.cached_len == 0
+    with cm.lazy_free_region():
+        cm.cache_req(b, finished=False)
+
+    assert _live_row(page_table, b).isdisjoint(set(cm.free_slots.tolist())), "b reads freed pages"
+    in_window = page_table[b.table_idx, b.cached_len - window : b.cached_len].long()
+    assert bool((pool.full_to_swa_index_mapping[in_window] != 0).all()), "b's window lost its swa"
+
+    for r in (b, c):
+        with cm.lazy_free_region():
+            cm.cache_req(r, finished=True)
+    assert cm.free_slots.numel() == torch.unique(cm.free_slots).numel(), "pages freed twice"
     cm.check_integrity()
