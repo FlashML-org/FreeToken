@@ -119,4 +119,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   template kwargs with thinking on, `"chat_template_kwargs": {"enable_thinking": true,
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
-- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM. With `--kv-placement host`
+  its paged K/V lives there too, so the context is bounded by host RAM rather than VRAM: decode reads
+  the tokens its indexer selects over PCIe, and a prefill stages each layer's cached pages into a
+  fixed device window.

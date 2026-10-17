@@ -455,6 +455,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-placement",
+        choices=["device", "host"],
+        default=ServerArgs.kv_placement,
+        help="Where the paged K/V lives. 'host' keeps it in pinned host memory the GPU reads "
+        "over PCIe, so the context is bounded by host RAM instead of VRAM; the attention "
+        "backend must read sparsely (qsa_sparse).",
+    )
+
+    parser.add_argument(
         "--page-size",
         type=int,
         default=ServerArgs.page_size,

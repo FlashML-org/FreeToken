@@ -12,6 +12,7 @@ from .base import (
     BaseCacheHandle,
     BaseKVCachePool,
     BasePrefixCache,
+    KVPlacement,
     MatchResult,
     SizeInfo,
 )
@@ -80,6 +81,20 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
+def check_kv_placement(model_config: ModelConfig, placement: KVPlacement) -> None:
+    """Refuse a K/V placement the model's pool family cannot serve: only a sparse attention
+    reads few enough cached tokens per query for host memory to feed it."""
+    if placement == "device":
+        return
+    from .qsa_pool import QSAKVCache
+
+    if resolve_pool_class(model_config) is not QSAKVCache:
+        raise ValueError(
+            f"--kv-placement {placement} is served by the QSA sparse pool only; this model "
+            "attends densely and would read its whole cache over PCIe for every query"
+        )
+
+
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
@@ -136,6 +151,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        placement=config.kv_placement,
+        prefill_rows=config.max_forward_len,
     )
 
 
@@ -147,7 +164,10 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    placement: KVPlacement = "device",
+    prefill_rows: int = 0,
 ) -> BaseKVCachePool:
+    check_kv_placement(model_config, placement)
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -224,6 +244,9 @@ def create_kvcache_pool(
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
+            placement=placement,
+            num_qo_heads=model_config.num_qo_heads,
+            prefill_rows=prefill_rows,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -305,6 +328,7 @@ def create_prefix_cache(
 
 
 __all__ = [
+    "check_kv_placement",
     "create_kv_pool",
     "create_kvcache_pool",
     "create_prefix_cache",

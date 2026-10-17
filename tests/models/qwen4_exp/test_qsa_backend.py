@@ -249,3 +249,110 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+# ------------------------------------------------------------------ K/V in host memory
+
+
+def test_staging_windows_follow_each_request_in_logical_order():
+    from freetoken.attention.qsa_sparse import plan_staging_windows
+
+    # two requests: 3 cached pages at physical 7, 2, 9 and 2 cached pages at 4, 5
+    block_table = torch.tensor([[7, 2, 9, 0], [4, 5, 0, 0]], dtype=torch.int32)
+    whole = plan_staging_windows(block_table, [3, 2], capacity=8)
+    assert len(whole) == 1
+    assert whole[0].source_pages.tolist() == [7, 2, 9, 4, 5]
+    assert whole[0].block_table.tolist() == [[0, 1, 2, -1], [3, 4, -1, -1]]
+
+    split = plan_staging_windows(block_table, [3, 2], capacity=2)
+    assert [w.source_pages.tolist() for w in split] == [[7, 2], [9, 4], [5]]
+    assert [w.block_table.tolist() for w in split] == [
+        [[0, 1, -1, -1], [-1, -1, -1, -1]],
+        [[-1, -1, 0, -1], [1, -1, -1, -1]],
+        [[-1, -1, -1, -1], [-1, 0, -1, -1]],
+    ]
+    # every cached page is staged exactly once across the windows
+    staged = sorted(p for w in split for p in w.source_pages.tolist())
+    assert staged == sorted([7, 2, 9, 4, 5])
+
+
+def test_a_prefill_stages_only_when_its_rows_select_more_than_is_cached():
+    from freetoken.attention.qsa_sparse import staging_moves_less
+
+    select_width = 2051
+    assert staging_moves_less(rows=8192, select_width=select_width, cached_tokens=1 << 20)
+    assert not staging_moves_less(rows=20, select_width=select_width, cached_tokens=1 << 16)
+    assert not staging_moves_less(rows=32, select_width=64, cached_tokens=32 * 64)
+    assert staging_moves_less(rows=33, select_width=64, cached_tokens=32 * 64)
+
+
+@requires_cuda
+def test_a_prefill_folded_over_windows_allocates_nothing_one_window_does_not(monkeypatch):
+    """The startup fit measures one staging window; a prefill folding several must not reach
+    past that peak, or the first long prompt takes the memory the fit kept free."""
+    import freetoken.kvcache.qsa_pool as qsa_pool
+    from freetoken.attention.qsa_sparse import QSASparseAttnBackend
+
+    original = QSASparseAttnBackend._attend
+    peaks: dict[int, int] = {}
+
+    def measured(self, q, layer_id, indices, md):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out = original(self, q, layer_id, indices, md)
+        torch.cuda.synchronize()
+        peaks[len(md.staging)] = torch.cuda.max_memory_allocated() - before
+        return out
+
+    monkeypatch.setattr(QSASparseAttnBackend, "_attend", measured)
+    config = parsed_config()
+    length = 5000
+    for window_tokens in (1 << 17, 128):
+        monkeypatch.setattr(qsa_pool, "STAGING_TOKENS", window_tokens)
+        fixture = Fixture(config, num_pages=128, placement="host")
+        attn = fixture.layer(QSA_LAYER)
+        x = _inputs(fixture, [length])[0]
+        attn.forward(x, fixture.batch([fixture.req(0, 0, length)], "prefill"))
+        del fixture, attn, x
+    assert sorted(peaks) == [1, 40]
+    output_bytes = length * config.num_qo_heads * config.head_dim * 2
+    assert peaks[1] >= output_bytes, "the measured step must include the attend's own output"
+    assert peaks[40] <= peaks[1] + (1 << 20), (
+        f"folding 40 windows peaked at {peaks[40] >> 20} MiB, one window at {peaks[1] >> 20} MiB"
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("window_tokens", [1 << 17, 128], ids=["one-window", "folded-windows"])
+def test_host_placement_matches_device_placement(monkeypatch, window_tokens: int):
+    """K/V in host memory: a prefill staged into device windows -- folded by log-sum-exp when the
+    context spans several -- and a decode read in place both equal the device-placed pool."""
+    import freetoken.kvcache.qsa_pool as qsa_pool
+
+    monkeypatch.setattr(qsa_pool, "STAGING_TOKENS", window_tokens)
+    config = parsed_config()
+    length, steps = 5000, 3
+    outputs = {}
+    for placement in ("device", "host"):
+        fixture = Fixture(config, num_pages=128, placement=placement)
+        attn = fixture.layer(QSA_LAYER)
+        x = _inputs(fixture, [length], extra=steps)[0]
+        req = fixture.req(0, 0, length)
+        prefill = fixture.batch([req], "prefill")
+        got = [attn.forward(x[:length], prefill)]
+        windows = prefill.attn_metadata.staging
+        if placement == "host":
+            pages, window_pages = -(-length // 64), window_tokens // 64
+            assert windows is not None and len(windows) == -(-pages // window_pages)
+        else:
+            assert windows is None
+        for step in range(steps):
+            fixture.step(req)
+            got.append(attn.forward(x[length + step : length + step + 1], fixture.batch([req], "decode")))
+        outputs[placement] = got
+    for step, (device_out, host_out) in enumerate(zip(outputs["device"], outputs["host"])):
+        if window_tokens >= length or step > 0:
+            assert torch.equal(host_out, device_out), f"output {step} differs"
+        else:
+            torch.testing.assert_close(host_out.float(), device_out.float(), rtol=1e-2, atol=1e-2)

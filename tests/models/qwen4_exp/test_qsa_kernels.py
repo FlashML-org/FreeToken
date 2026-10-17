@@ -501,3 +501,110 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+# --------------------------------------------------------------------------------------
+# Passes over disjoint pages of one selection (a host-placed prefill's staging windows)
+# --------------------------------------------------------------------------------------
+
+
+def _attention_pass(scores: torch.Tensor, values: torch.Tensor):
+    """Softmax attention over log2-domain scores [rows, heads, n] and values [rows, n, dim]:
+    the normalized output and each head's log2-sum-exp, as the attend kernel reports them."""
+    lse = torch.logsumexp(scores * math.log(2.0), dim=-1) / math.log(2.0)
+    weights = torch.exp2(scores - lse.unsqueeze(-1)).nan_to_num(0.0)
+    return torch.einsum("rhn,rnd->rhd", weights, values), lse
+
+
+@requires_cuda
+def test_folding_passes_equals_one_pass_over_their_union():
+    from freetoken.kernel.triton.qsa import fold_attention_pass
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(0)
+    rows, heads, tokens, dim = 5, 3, 40, 256
+    scores = torch.randn(rows, heads, tokens, device=device, generator=generator) * 4
+    values = torch.randn(rows, tokens, dim, device=device, generator=generator)
+    # row 0 attends nothing in any pass; row 1 only in the last one
+    scores[0] = -float("inf")
+    scores[1, :, :31] = -float("inf")
+    whole, whole_lse = _attention_pass(scores, values)
+
+    total = torch.zeros(rows, heads, dim, device=device)
+    total_lse = torch.full((rows, heads), -float("inf"), device=device)
+    for part in (slice(0, 7), slice(7, 31), slice(31, 40)):
+        out, lse = _attention_pass(scores[..., part], values[:, part])
+        fold_attention_pass(total, total_lse, out.bfloat16(), lse)
+
+    assert not total.isnan().any()
+    torch.testing.assert_close(total, whole, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(total_lse, whole_lse, rtol=1e-6, atol=1e-6)
+    assert torch.equal(total[0], torch.zeros(heads, dim, device=device))
+    assert (total_lse[0] == -float("inf")).all()
+
+
+@requires_cuda
+def test_the_last_pass_folds_into_its_own_output():
+    """The final fold writes the sum in the output's dtype over the pass it reads, and leaves the
+    accumulator alone: the prefill needs no float32 result and no copy of one."""
+    from freetoken.kernel.triton.qsa import fold_attention_pass
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(1)
+    rows, heads, tokens, dim = 7, 4, 64, 256
+    scores = torch.randn(rows, heads, tokens, device=device, generator=generator) * 4
+    values = torch.randn(rows, tokens, dim, device=device, generator=generator)
+    scores[2] = -float("inf")
+    whole, _ = _attention_pass(scores, values)
+
+    total = torch.zeros(rows, heads, dim, device=device)
+    total_lse = torch.full((rows, heads), -float("inf"), device=device)
+    first, first_lse = _attention_pass(scores[..., :20], values[:, :20])
+    fold_attention_pass(total, total_lse, first.bfloat16(), first_lse)
+    kept, kept_lse = total.clone(), total_lse.clone()
+    last, last_lse = _attention_pass(scores[..., 20:], values[:, 20:])
+    out = last.bfloat16()
+    fold_attention_pass(total, total_lse, out, last_lse, result=out)
+
+    torch.testing.assert_close(out.float(), whole, rtol=2e-2, atol=2e-2)
+    assert torch.equal(out[2], torch.zeros(heads, dim, dtype=out.dtype, device=device))
+    assert torch.equal(total, kept) and torch.equal(total_lse, kept_lse)
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [3, 300], ids=["split-merge", "one-split"])
+def test_attend_reports_the_log2_sum_exp_its_passes_fold_by(rows: int):
+    """The kernel's lse output makes two passes over disjoint pages fold into the pass over all
+    of them, on both its split-and-merge path (few rows) and its unsplit path (many)."""
+    from freetoken.kernel.triton.qsa import fold_attention_pass, qsa_sparse_paged_attention
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(5)
+    pages, kv_heads, q_heads, dim, width = 8, 2, 4, 256, 300
+    k_cache = torch.randn(pages, PAGE_SIZE, kv_heads, dim, device=device, generator=generator).bfloat16()
+    v_cache = torch.randn(pages, PAGE_SIZE, kv_heads, dim, device=device, generator=generator).bfloat16()
+    q = torch.randn(rows, q_heads, dim, device=device, generator=generator).bfloat16()
+    indices = torch.randint(0, pages * PAGE_SIZE, (rows, width), device=device, generator=generator).to(torch.int32)
+    block_table = torch.arange(pages, dtype=torch.int32, device=device).unsqueeze(0)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+
+    whole = qsa_sparse_paged_attention(q, k_cache, v_cache, indices, block_table, token_to_req)
+    whole_lse = torch.empty(rows, q_heads, dtype=torch.float32, device=device)
+    again = qsa_sparse_paged_attention(q, k_cache, v_cache, indices, block_table, token_to_req, lse=whole_lse)
+    assert torch.equal(again, whole)
+
+    keys = k_cache.view(-1, kv_heads, dim)[indices.long()].float()  # [rows, width, kv, dim]
+    group = q_heads // kv_heads
+    scores = torch.einsum("rhd,rnhd->rhn", q.float(), keys.repeat_interleave(group, dim=2))
+    reference_lse = torch.logsumexp(scores * dim**-0.5, dim=-1) / math.log(2.0)
+    torch.testing.assert_close(whole_lse, reference_lse, rtol=1e-3, atol=1e-2)
+
+    total = torch.zeros(q.shape, dtype=torch.float32, device=device)
+    total_lse = torch.full((rows, q_heads), -float("inf"), device=device)
+    part_lse = torch.empty_like(total_lse)
+    for keep in (torch.arange(pages) < 3, torch.arange(pages) >= 3):
+        table = torch.where(keep.to(device), block_table, -1).to(torch.int32)
+        part = qsa_sparse_paged_attention(q, k_cache, v_cache, indices, table, token_to_req, lse=part_lse)
+        fold_attention_pass(total, total_lse, part, part_lse)
+    torch.testing.assert_close(total, whole.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(total_lse, whole_lse, rtol=1e-4, atol=1e-3)
