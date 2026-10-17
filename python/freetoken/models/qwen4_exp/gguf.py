@@ -14,7 +14,7 @@ import torch
 
 from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.gguf.tensors import float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
 
 from .config import parse_config
 
@@ -83,6 +83,8 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
 
 
 def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
+    # NVFP4 weight scales are unvalidated on this arch, so refuse them instead of risking wrong output
+    check_scales(shim.model_path, nvfp4=False)
     md = shim.metadata
 
     def kv(key: str):

@@ -1770,6 +1770,9 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
+        # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
+        raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
     if config.attention_backend == "auto":
         override(
             "attention_backend",

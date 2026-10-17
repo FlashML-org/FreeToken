@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from ..ggml_types import float_dtype, is_quantized, row_bytes, type_name
+from ..ggml_types import NVFP4, float_dtype, is_quantized, row_bytes, type_name
 from ..registry import LayerKind, register_method
 from ..scheme import QuantKind, gguf_types
 from .base import BankSpec, ExpertView, MoEConfig, MoEKernel, MoEMethod, gated_epilogue_reason, is_resident, limit_or_inf
@@ -80,7 +80,11 @@ class GgmlMoEKernel(MoEKernel):
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)
         i, h = cfg.local_intermediate, cfg.hidden
-        return {"gate_up": _bank_spec(gate_up, 2 * i, h), "down": _bank_spec(down, h, i)}
+        banks = {"gate_up": _bank_spec(gate_up, 2 * i, h), "down": _bank_spec(down, h, i)}
+        if cfg.scheme.weight.scale is not None:
+            # each expert's NVFP4 weight_scale_2 as (gate, up, down, 1): a 16-byte row, which the slot cache's copies need
+            banks["global"] = BankSpec((4,), torch.float32)
+        return banks
 
     def pack(self, pieces, cfg: MoEConfig, out):
         i = cfg.local_intermediate
@@ -113,17 +117,29 @@ class GgmlMoEKernel(MoEKernel):
                 return ggml.mul_mat_id(w, ggml_type, a, ids)
             return float_mul_mat_id(w, a, ids, topk_weights, config)
 
+        # llama.cpp's build_moe_ffn: each NVFP4 GEMM result times the expert's weight_scale_2, gate and up before the glu, down before the routing weight
+        scales = view.tensors.get("global")
+        gate_up_scales = scales if scales is not None and gate_up_type == NVFP4 else None
+        down_scales = scales if scales is not None and down_type == NVFP4 else None
         glu = fused_glu(layer)
         small = x.shape[0] <= min(ggml.mmvq_max_tokens(t) for t in (gate_up_type, down_type) if is_quantized(t))
         if glu is not None and small and is_quantized(gate_up_type):
-            inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu)
+            gu = (None, None) if gate_up_scales is None else (gate_up_scales[:, 0], gate_up_scales[:, 1])
+            inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu, *gu)
         else:
             h = mul_mat_id(gate_up, gate_up_type, x)
             t, k, two_i = h.shape
+            if gate_up_scales is not None:
+                h.view(t, k, 2, two_i // 2).mul_(gate_up_scales[ids, :2].unsqueeze(-1))
             inter = torch.empty(t, k, two_i // 2, dtype=h.dtype, device=h.device)
             gated_act_and_mul(layer.activation, h.view(-1, two_i), inter.view(-1, two_i // 2), alpha=float(layer.alpha), limit=limit_or_inf(layer))
             del h  # free the gate_up output before the down GEMM allocates its own
-        y = mul_mat_id(view.tensors["down"], down_type, inter)
+        if down_scales is not None and x.shape[0] <= ggml.mmvq_max_tokens(down_type):
+            y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids, scale=down_scales[:, 2])
+        else:
+            y = mul_mat_id(view.tensors["down"], down_type, inter)
+            if down_scales is not None:
+                topk_weights = topk_weights * down_scales[ids, 2]
         return ggml.moe_weighted_sum(y, topk_weights)
 
     @staticmethod
@@ -147,4 +163,6 @@ class GGUFMoEMethod(MoEMethod):
         # BF16 experts keep the executor's bf16 kernels, which use AVX512-BF16 where the CPU has it; ggml-cpu is built for AVX2 only
         if float_dtype(gate_up) is torch.bfloat16 and float_dtype(down) is torch.bfloat16:
             return "bf16", {}
-        return "gguf", {"gate_up_type": gate_up, "down_type": down}
+        # an NVFP4 layer of a file with weight scales reads the layout's global bank too
+        scaled = self.cfg.scheme.weight.scale is not None and NVFP4 in (gate_up, down)
+        return "gguf_scaled" if scaled else "gguf", {"gate_up_type": gate_up, "down_type": down}

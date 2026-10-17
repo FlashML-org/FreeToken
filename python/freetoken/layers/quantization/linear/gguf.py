@@ -35,6 +35,9 @@ class GgmlLinearKernel(LinearKernel):
                 ggml.mul_mat(w, s.ggml_type, x2, out=out, xq=xq)
             else:
                 torch.mm(x2, w.t(), out=out)
+        # llama.cpp multiplies an NVFP4 result by the tensor's weight_scale_2 (build_lora_mm)
+        if getattr(layer, "ggml_scale", None) is not None:
+            y.mul_(layer.ggml_scale)
         if layer.bias is not None:
             y = y + layer.bias
         return y.reshape(*x.shape[:-1], y.shape[-1])
@@ -54,3 +57,6 @@ class GGUFLinearMethod(LinearMethod):
                 setattr(layer, segment_param(i), torch.empty(s.rows + pad_rows(k), row_bytes(s.ggml_type, k), dtype=torch.uint8))
             else:
                 setattr(layer, segment_param(i), torch.empty(s.rows, k))
+        if g.scheme.weight.scale is not None:
+            # one value per output row: each part's weight_scale_2, 1 for parts without one
+            layer.ggml_scale = torch.empty(sum(s.rows for s in segs), dtype=torch.float32)

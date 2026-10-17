@@ -10,5 +10,6 @@ Local changes, kept in freetoken.patch (already applied):
 - mmvq.cu/.cuh: MMVQ takes bf16 or fp16 activations, can write bf16 or fp16 results, and can reuse activations already quantized to q8_1 (src1_q8_1_pre).
 - mmq.cu/.cuh, mmid.cu/.cuh: MoE MMQ runs a flat grid over only the (expert, column tile) pairs that hold tokens, listed by mm_ids_tile_map; ncols_max > 0 keeps the regular grid.
 - common.cuh: the native fp4 MMA (BLACKWELL_MMA_AVAILABLE, blackwell_mma_available) is off unless GGML_CUDA_FP4_MMA is defined; it needs an sm_120a/sm_120f build.
+- mmvq.cu, common.cuh: the NVFP4 scale fusion (x_scale, gate_scale) reads strided scale vectors, e.g. columns of a per-expert scale bank.
 
 To update: copy the same files from a newer llama.cpp, apply freetoken.patch, and update this file.

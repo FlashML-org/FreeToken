@@ -115,6 +115,14 @@ int64_t check_weight(TensorView w, ggml_type type, int64_t k) {
     return row_bytes;
 }
 
+// one fp32 scale per expert, e.g. a column of a [E, n] scale bank; the MMVQ epilogue multiplies NVFP4 results by it
+ggml_tensor describe_scale(TensorView s, ggml_type type, int64_t e) {
+    RuntimeCheck(type == GGML_TYPE_NVFP4, "per-expert scales apply to NVFP4 weights, not ", ggml_type_name(type));
+    RuntimeCheck(is_dtype(s.dtype(), kDLFloat, 32) && s.ndim() == 1 && s.size(0) == e && s.stride(0) > 0, "a per-expert scale must be an fp32 [E] view");
+    const size_t nb0 = sizeof(float) * s.stride(0);
+    return describe(GGML_TYPE_F32, s.data_ptr(), {e, 1, 1, 1}, {nb0, nb0 * e, nb0 * e, nb0 * e});
+}
+
 int64_t q8_1_row_bytes(int64_t k) { return GGML_PAD(k, MATRIX_ROW_PADDING) / QK8_1 * (int64_t) sizeof(block_q8_1); }
 
 // MMQ tiles read up to MATRIX_ROW_PADDING values past the last row; the caller keeps this many bytes after it
@@ -234,7 +242,8 @@ void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Opt
 }
 
 // out[T, k, N]: row (t, j) multiplies x[t, j or 0] by expert ids[t, j] of W[E, N, K]; the matrix kernel runs a flat grid over the tiles that hold routes
-void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out) {
+// scale[ids[t, j]] multiplies row (t, j); only the vector kernel takes it
+void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out, Optional<TensorView> scale) {
     RuntimeCheck(w.ndim() == 3, "mul_mat_id takes w[E, N, row_bytes]");
     RuntimeCheck(is_dtype(ids.dtype(), kDLInt, 32) && ids.ndim() == 2 && ids.IsContiguous(), "ids must be a contiguous int32 [T, k] tensor");
     const DeviceGuard guard(x.device());
@@ -264,8 +273,15 @@ void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, 
     ggml_tensor src1 = describe(a.type, a.data, {k, ky, t, 1}, {a.esz, a.esz * k, a.esz * k * ky, a.esz * k * ky * t});
     const size_t oe = ggml_type_size(otype);
     ggml_tensor dst = describe(otype, out.data_ptr(), {n, top_k, t, 1}, {oe, oe * n, oe * n * top_k, oe * n * top_k * t});
+    RuntimeCheck(mmvq || !scale.has_value(), "mul_mat_id takes a per-expert scale only on the vector kernel, T=", t);
     if (mmvq) {
-        ggml_cuda_mul_mat_vec_q(ctx, &src0, &src1, &tids, &dst);
+        ggml_cuda_mm_fusion_args_host fusion{};
+        ggml_tensor tscale;
+        if (scale.has_value()) {
+            tscale = describe_scale(scale.value(), type, e);
+            fusion.x_scale = &tscale;
+        }
+        ggml_cuda_mul_mat_vec_q(ctx, &src0, &src1, &tids, &dst, scale.has_value() ? &fusion : nullptr);
     } else {
         ggml_cuda_mul_mat_q(ctx, &src0, &src1, &tids, &dst, 0);
     }
@@ -291,7 +307,9 @@ ggml_glu_op fused_glu_op(const String & name) {
 }  // namespace
 
 // out[T, k, I] = glu(x @ gate^T, x @ up^T) for small T in one MMVQ pass; w[E, 2I, row_bytes] holds each expert's gate rows then its up rows; limit is swiglu_clamp's
-void op_mul_mat_id_glu(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out, String glu, double limit) {
+// gate_scale / up_scale multiply the expert's gate / up results before the glu
+void op_mul_mat_id_glu(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out, String glu, double limit,
+                       Optional<TensorView> gate_scale, Optional<TensorView> up_scale) {
     const ggml_glu_op glu_op = fused_glu_op(glu);
     RuntimeCheck(w.ndim() == 3 && w.size(1) % 2 == 0, "mul_mat_id_glu takes w[E, 2I, row_bytes]");
     RuntimeCheck(is_dtype(ids.dtype(), kDLInt, 32) && ids.ndim() == 2 && ids.IsContiguous(), "ids must be a contiguous int32 [T, k] tensor");
@@ -325,6 +343,15 @@ void op_mul_mat_id_glu(TensorView w, int64_t type_id, TensorView x, TensorView i
     fusion.gate = &gate;
     fusion.glu_op = glu_op;
     fusion.glu_limit = (float) limit;
+    ggml_tensor tgate_scale, tup_scale;
+    if (gate_scale.has_value()) {
+        tgate_scale = describe_scale(gate_scale.value(), type, e);
+        fusion.gate_scale = &tgate_scale;
+    }
+    if (up_scale.has_value()) {
+        tup_scale = describe_scale(up_scale.value(), type, e);
+        fusion.x_scale = &tup_scale;
+    }
     ggml_cuda_mul_mat_vec_q(ctx, &up, &src1, &tids, &dst, &fusion);
 }
 
