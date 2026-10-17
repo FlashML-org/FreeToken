@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -114,6 +115,36 @@ def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
             continue
 
 
+def _run_on_loop(loop: Any, action: Callable[[], None], *, timeout: float = 5.0) -> None:
+    """Run a lifecycle mutation on ``loop`` and acknowledge its terminal outcome.
+
+    A timeout cancels only an unclaimed callback. Once the loop has claimed it, callers wait for
+    its real result so they never infer a failed lifecycle transition after it actually mutated.
+    """
+    if loop is None:
+        action()
+        return
+    done: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+    def _apply() -> None:
+        if not done.set_running_or_notify_cancel():
+            return
+        try:
+            action()
+        except BaseException as exc:  # noqa: BLE001
+            done.set_exception(exc)
+        else:
+            done.set_result(None)
+
+    loop.call_soon_threadsafe(_apply)
+    try:
+        done.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        if done.cancel():
+            raise
+        done.result()
+
+
 def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
     if isinstance(msg, BatchFrontendMsg):
         result = []
@@ -139,6 +170,7 @@ class FrontendManager:
     uid_counter: int = 0
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
+    request_epochs: Dict[int, int] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
     # Stable identity for this serve process. Generated before the backend is ready so every
     # /health state (loading/ok/error) and /v1/stats can identify the same engine generation.
@@ -184,6 +216,10 @@ class FrontendManager:
     # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
     # the shutdown flag before the ensuing deaths. See _terminate_backend_workers.
     backend_processes: List[Any] = field(default_factory=list)
+    backend_epoch: int = 0
+    restart_attempts: int = 0
+    _ready_event: Any = None
+    _restart_waiters: int = 0
     # Event loop the listener runs on, captured when the listener starts (_create_listener_once).
     # Lets a cross-thread caller — the supervisor thread's failure callback — marshal rebuild
     # future resolution back onto the loop (asyncio Futures are not thread-safe). None until the
@@ -234,7 +270,19 @@ class FrontendManager:
 
         threading.Thread(target=_warm, daemon=True, name="frontend-tokenizer-warm").start()
 
-    def new_user(self) -> int:
+    async def new_user(self) -> int:
+        if self.maintenance_state == "restarting":
+            if self._ready_event is None:
+                self._ready_event = asyncio.Event()
+            if self._restart_waiters >= self.config.oom_recovery_wait_queue:
+                raise AdmissionClosedError("server restarting queue is full; retry")
+            self._restart_waiters += 1
+            try:
+                await asyncio.wait_for(self._ready_event.wait(), timeout=self.config.oom_recovery_ready_timeout)
+            except asyncio.TimeoutError as exc:
+                raise AdmissionClosedError("worker restart timed out; retry") from exc
+            finally:
+                self._restart_waiters -= 1
         if self.maintenance_state != "serving":
             raise AdmissionClosedError(
                 f"server unavailable: engine is {self.maintenance_state}"
@@ -242,22 +290,36 @@ class FrontendManager:
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
+        self.request_epochs[uid] = self.backend_epoch
         self.event_map[uid] = asyncio.Event()
         self.stats.on_new_user(uid)
         return uid
+
+    def request_epoch(self, uid: int) -> int:
+        return self.request_epochs.get(uid, self.backend_epoch)
+
+    def wake_failed_restart_waiters(self) -> None:
+        if self._loop is not None and self._ready_event is not None:
+            self._loop.call_soon_threadsafe(self._ready_event.set)
 
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
             if isinstance(msg, CacheRebuildReply):
+                if msg.epoch != self.backend_epoch:
+                    continue
                 self._resolve_rebuild(msg)
                 continue
             for msg in _unwrap_msg(msg):
-                # Global accounting follows actual admitted/sampled work even after the HTTP
-                # client disconnects and abort_user removes its ack queue. Delivery to a live
-                # request remains gated below, but observation must happen first.
+                # Retired-epoch output must not leak into current accounting. Current-epoch
+                # accounting intentionally survives a client disconnect: the scheduler did the
+                # work even if abort_user already removed this request's delivery queue.
+                if msg.epoch != self.backend_epoch:
+                    continue
                 self.stats.observe(msg)
                 if msg.uid not in self.ack_map:
+                    continue
+                if msg.epoch != self.request_epochs.get(msg.uid):
                     continue
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
@@ -318,9 +380,50 @@ class FrontendManager:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
 
+    def fail_dispatched_for_oom(self, message: str) -> None:
+        """Terminally fail live requests once; no partial work is replayed into a new epoch."""
+        if self._loop is None:
+            return
+
+        def _fail() -> None:
+            self.terminalize_oom_inflight(message)
+
+        self._loop.call_soon_threadsafe(_fail)
+
+    def terminalize_oom_inflight(self, message: str) -> None:
+        """Finish every admitted request exactly once on the API event loop.
+
+        ``StatsTracker`` deliberately retains an aborted request until a terminal scheduler
+        acknowledgement arrives.  A CUDA OOM retires that scheduler, so synthesize its terminal
+        acknowledgement for *all* inflight UIDs, including ones whose client has already removed
+        its delivery queue.  Observe before delivery: that is the sole completion/accounting
+        chokepoint and leaves the zero-token OOM reply out of token totals.
+        """
+        for uid in self.stats.inflight_uids:
+            replies = self.ack_map.get(uid)
+            if replies is not None and any(reply.finished for reply in replies):
+                continue
+            reply = UserReply(
+                uid=uid,
+                incremental_output="",
+                finished=True,
+                error=message,
+                error_code="insufficient_workspace",
+                epoch=self.request_epochs.get(uid, self.backend_epoch),
+            )
+            self.stats.observe(reply)
+            if replies is not None:
+                replies.append(reply)
+                event = self.event_map.get(uid)
+                if event is not None:
+                    event.set()
+
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
+            self._ready_event = asyncio.Event()
+            if self.maintenance_state == "serving":
+                self._ready_event.set()
             asyncio.create_task(self.listen())
             self.initialized = True
 
@@ -349,6 +452,7 @@ class FrontendManager:
         finally:
             self.ack_map.pop(uid, None)
             self.event_map.pop(uid, None)
+            self.request_epochs.pop(uid, None)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
@@ -381,7 +485,8 @@ class FrontendManager:
             del self.event_map[uid]
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
-        await self.send_one(AbortMsg(uid=uid))
+        self.request_epochs.pop(uid, None)
+        await self.send_one(AbortMsg(uid=uid, epoch=self.backend_epoch))
 
     def shutdown(self):
         self.send_tokenizer.stop()
@@ -552,6 +657,7 @@ async def dispatch_rebuild(
     through ``POST /v1/cache/rebuild`` (``ft ctl cache``, the desktop panel, the shell's
     ``/cache``), which does the pre-flight maintenance_state checks (409/503 short-circuits)."""
     request_id = str(uuid.uuid4())
+    epoch = state.backend_epoch
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
     state.maintenance_state = "rebuilding"
@@ -564,6 +670,7 @@ async def dispatch_rebuild(
                 num_mamba_slots=num_mamba_slots,
                 num_swa_pages=num_swa_pages,
                 mode=mode,
+                epoch=state.backend_epoch,
             )
         )
     except Exception as e:  # noqa: BLE001
@@ -571,8 +678,14 @@ async def dispatch_rebuild(
         # untouched. Roll the gate back to serving (else a transient ZMQ error would latch
         # maintenance forever with no reply ever arriving to clear it) and surface the error.
         state.rebuild_futures.pop(request_id, None)
-        state.maintenance_state = "serving"
+        if state.backend_epoch == epoch and state.maintenance_state == "rebuilding":
+            state.maintenance_state = "serving"
         return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
+    # send_one yields to the event loop. A restart/prepare-stop may have won while this
+    # rebuild was being queued; never leave its future registered or overwrite that gate.
+    if state.backend_epoch != epoch or state.maintenance_state != "rebuilding":
+        state.rebuild_futures.pop(request_id, None)
+        return {"status": "failed", "error": "cache rebuild superseded by engine lifecycle"}
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
@@ -868,12 +981,15 @@ async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     log_request("/generate", req, request)
     state = get_global_state()
-    if state.maintenance_state != "serving":
+    if state.maintenance_state not in {"serving", "restarting"}:
         detail = "model is still loading" if state.maintenance_state == "loading" else "cache rebuild in progress"
         return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
-    uid = state.new_user()
+    try:
+        uid = await state.new_user()
+    except AdmissionClosedError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
     await state.send_one(
         TokenizeMsg(
             uid=uid,
@@ -882,6 +998,7 @@ async def generate(req: GenerateRequest, request: Request):
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
             ),
+            epoch=state.request_epoch(uid),
         )
     )
 
@@ -1027,40 +1144,101 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # setting _SHUTTING_DOWN) rather than relying on OS signal-delivery order.
     _GLOBAL_STATE.backend_processes = list(getattr(handle, "processes", None) or [])
 
+    def _on_loop(action: Callable[[], None], *, timeout: float = 5.0) -> None:
+        """Serialize supervisor lifecycle mutations with request coroutines.
+
+        Before the listener has captured a loop (initial loading) this server has no admitted
+        work, so direct mutation is safe. Thereafter wait for the loop callback to complete;
+        retirement must not begin until its gate/future transition is visible to handlers.
+        """
+        _run_on_loop(_GLOBAL_STATE._loop, action, timeout=timeout)
+
     def _on_ready() -> None:
         # A stop requested while weights were loading has already sealed admission.  The backend
         # may finish its ready handshake before SIGTERM arrives; never reopen that gate after the
         # daemon has received a final accounting snapshot.
-        if _GLOBAL_STATE.maintenance_state == "loading":
-            _GLOBAL_STATE.maintenance_state = "serving"
-            _GLOBAL_STATE.ready_at = time.monotonic()
-            logger.info(f"API server is ready to serve on {host}:{port}")
+        def _apply() -> None:
+            if _GLOBAL_STATE.maintenance_state in {"loading", "restarting"} and not _SHUTTING_DOWN.is_set():
+                _GLOBAL_STATE.maintenance_state = "serving"
+                _GLOBAL_STATE.ready_at = time.monotonic()
+                logger.info(f"API server is ready to serve on {host}:{port}")
+            if _GLOBAL_STATE._ready_event is not None:
+                _GLOBAL_STATE._ready_event.set()
+        _on_loop(_apply)
+
+    def _restart_backend(epoch: int):
+        fresh = start_backend(epoch)
+        _GLOBAL_STATE.backend_processes = list(getattr(fresh, "processes", None) or [])
+        return fresh
+
+    def _on_restarting(message: str, attempt: int) -> None:
+        def _apply() -> None:
+            if _SHUTTING_DOWN.is_set() or _GLOBAL_STATE.maintenance_state == "stopping":
+                raise RuntimeError("OOM restart cancelled by shutdown")
+            _GLOBAL_STATE.maintenance_state = "restarting"
+            _GLOBAL_STATE.restart_attempts = attempt
+            _GLOBAL_STATE.backend_epoch += 1
+            _GLOBAL_STATE.unit_bytes = None
+            _GLOBAL_STATE.free_vram_bytes = 0
+            _GLOBAL_STATE.cache_floors = None
+            _GLOBAL_STATE.cache_pools = None
+            _GLOBAL_STATE.gpus = []
+            _GLOBAL_STATE.last_rebuild = None
+            _GLOBAL_STATE.stats.clear_runtime_gauges()
+            if _GLOBAL_STATE._ready_event is not None:
+                _GLOBAL_STATE._ready_event.clear()
+            # Resolve all loop-owned state atomically with the epoch transition, before old
+            # workers are retired. No cache rebuild coroutine can re-open this gate afterward.
+            _GLOBAL_STATE.terminalize_oom_inflight(
+                "worker_restarting_after_cuda_oom: " + message
+            )
+            for request_id, future in list(_GLOBAL_STATE.rebuild_futures.items()):
+                _GLOBAL_STATE.rebuild_futures.pop(request_id, None)
+                if not future.done():
+                    future.set_result({"status": "failed", "error": "worker_restarting_after_cuda_oom"})
+        _on_loop(_apply)
 
     def _on_failure(message: str) -> None:
-        _GLOBAL_STATE.fatal_error = message
-        _GLOBAL_STATE.maintenance_state = "failed"
+        def _apply() -> None:
+            if _SHUTTING_DOWN.is_set() or _GLOBAL_STATE.maintenance_state == "stopping":
+                return
+            _GLOBAL_STATE.fatal_error = message
+            _GLOBAL_STATE.maintenance_state = "failed"
+            for request_id, future in list(_GLOBAL_STATE.rebuild_futures.items()):
+                _GLOBAL_STATE.rebuild_futures.pop(request_id, None)
+                if not future.done():
+                    future.set_result({"status": "failed", "error": message})
+            if _GLOBAL_STATE._ready_event is not None:
+                _GLOBAL_STATE._ready_event.set()
         logger.error("Backend supervisor: %s", message)
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
-        _GLOBAL_STATE.fail_pending_rebuilds(message)
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
-        if not run_shell:
-            _exit_after_backend_death(BACKEND_DEATH_EXIT_GRACE_S)
+        # Publishing the failure is loop-serialized, but a wedged loop may reject that callback.
+        # The outer daemon must still receive a finite terminal signal; otherwise it could retain
+        # a ``serving`` frontend backed by workers that are already dead.
+        try:
+            _on_loop(_apply)
+        finally:
+            if not run_shell:
+                _exit_after_backend_death(BACKEND_DEATH_EXIT_GRACE_S)
 
     def _on_meta(meta: dict) -> None:
         # Per-unit cache VRAM costs + the free-VRAM seed + per-pool floors + the actual pool
         # sizes allocated at load, delivered once on the ack path; surfaced by cache_geometry
         # (unit_bytes + the limits block + the pre-first-chat pool seed). Unpack the extras
         # aside so unit_bytes keeps its original three-key shape; unknown keys, if any, are inert.
-        meta = dict(meta or {})
-        _GLOBAL_STATE.free_vram_bytes = int(meta.pop("free_vram_bytes", 0) or 0)
-        _GLOBAL_STATE.cache_floors = meta.pop("floors", None)
-        _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
-        _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
-        _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
-        _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])
-        _GLOBAL_STATE.unit_bytes = meta
+        def _apply() -> None:
+            values = dict(meta or {})
+            _GLOBAL_STATE.free_vram_bytes = int(values.pop("free_vram_bytes", 0) or 0)
+            _GLOBAL_STATE.cache_floors = values.pop("floors", None)
+            _GLOBAL_STATE.cache_pools = values.pop("pools", None)
+            _GLOBAL_STATE.swa_full_tokens_ratio = float(values.pop("swa_full_tokens_ratio", 0.0) or 0.0)
+            _GLOBAL_STATE.cache_budget_bytes = int(values.pop("cache_budget_bytes", 0) or 0)
+            _GLOBAL_STATE.gpus = list(values.pop("gpus", None) or [])
+            _GLOBAL_STATE.unit_bytes = values
+        _on_loop(_apply)
 
     # Early-bind: supervise the backend on a daemon thread so uvicorn can bind
     # immediately and /health can report loading progress. Shell mode wants exactly the same
@@ -1075,6 +1253,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
             # uvicorn's lifespan shutdown sets this on SIGINT/SIGTERM, so the workers'
             # expected exit during stop is not reported as a crash.
             "is_shutting_down": _SHUTTING_DOWN.is_set,
+            "restart_backend": _restart_backend if config.oom_recovery else None,
+            "on_restarting": _on_restarting,
+            "max_restarts": config.oom_recovery_max_restarts if config.oom_recovery else 0,
+            "restart_ready_timeout": config.oom_recovery_ready_timeout,
+            "can_restart": lambda: not _SHUTTING_DOWN.is_set() and _GLOBAL_STATE.maintenance_state != "stopping",
         },
         name="freetoken-backend-supervisor",
         daemon=True,

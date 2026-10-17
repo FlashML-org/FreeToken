@@ -60,7 +60,7 @@ def _setup():
         finished_reqs=set(),
         eos_token_ids=set(),
         toolcall_anchor_id=None,
-        config=SimpleNamespace(page_size=1),
+        config=SimpleNamespace(page_size=1, backend_epoch=0),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
         send_result=sent.extend,
         _kv_usage_pages=cm.page_usage,

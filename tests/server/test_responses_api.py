@@ -351,7 +351,7 @@ class FakeState:
         self._uid = 0
         self.last_sent = None
 
-    def new_user(self):
+    async def new_user(self):
         self._uid += 1
         return self._uid
 

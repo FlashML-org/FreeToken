@@ -125,6 +125,16 @@ def test_loading_engine_can_seal_zero_without_being_reopened():
     assert state.maintenance_state == "stopping"
 
 
+def test_prepare_stop_closes_a_restarting_engine_before_replacement_ready():
+    state = _state(maintenance="restarting")
+
+    result = asyncio.run(prepare_stop_accounting(state))
+
+    assert result["drain_complete"] is True
+    assert state.maintenance_state == "stopping"
+    assert state.stats.active == 0
+
+
 def test_frontend_new_user_refuses_work_after_stop_gate_closes():
     manager = FrontendManager(
         config=SimpleNamespace(served_model_name="model-a"),
@@ -133,7 +143,7 @@ def test_frontend_new_user_refuses_work_after_stop_gate_closes():
         maintenance_state="stopping",
     )
     with pytest.raises(AdmissionClosedError, match="stopping"):
-        manager.new_user()
+        asyncio.run(manager.new_user())
     assert manager.stats.active == 0
 
 

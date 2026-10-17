@@ -41,40 +41,40 @@ def test_inline_system_policy_tokenizer_roundtrip():
 
 
 def test_cache_rebuild_msg_roundtrip():
-    msg = CacheRebuildMsg(request_id="abc", moe_cache_size=8, num_pages=1024, mode="if_idle")
+    msg = CacheRebuildMsg(request_id="abc", moe_cache_size=8, num_pages=1024, mode="if_idle", epoch=9)
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, CacheRebuildMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == ("abc", 8, 1024, "if_idle")
+    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode, out.epoch) == ("abc", 8, 1024, "if_idle", 9)
 
 
 def test_cache_rebuild_backend_msg_roundtrip():
-    msg = CacheRebuildBackendMsg(request_id="r1", moe_cache_size=None, num_pages=256, mode="drain")
+    msg = CacheRebuildBackendMsg(request_id="r1", moe_cache_size=None, num_pages=256, mode="drain", epoch=9)
     out = BaseBackendMsg.decoder(msg.encoder())
     assert isinstance(out, CacheRebuildBackendMsg)
-    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode) == ("r1", None, 256, "drain")
+    assert (out.request_id, out.moe_cache_size, out.num_pages, out.mode, out.epoch) == ("r1", None, 256, "drain", 9)
 
 
 def test_cache_rebuild_result_msg_roundtrip():
-    msg = CacheRebuildResultMsg(request_id="r2", status="ok", moe_cache_size=16, num_pages=512)
+    msg = CacheRebuildResultMsg(request_id="r2", status="ok", moe_cache_size=16, num_pages=512, epoch=9)
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, CacheRebuildResultMsg)
-    assert (out.request_id, out.status, out.moe_cache_size, out.num_pages, out.error) == (
-        "r2", "ok", 16, 512, None,
+    assert (out.request_id, out.status, out.moe_cache_size, out.num_pages, out.error, out.epoch) == (
+        "r2", "ok", 16, 512, None, 9,
     )
 
 
 def test_cache_rebuild_reply_roundtrip():
-    msg = CacheRebuildReply(request_id="r3", status="failed", error="boom")
+    msg = CacheRebuildReply(request_id="r3", status="failed", error="boom", epoch=9)
     out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
     assert isinstance(out, CacheRebuildReply)
-    assert (out.request_id, out.status, out.error) == ("r3", "failed", "boom")
+    assert (out.request_id, out.status, out.error, out.epoch) == ("r3", "failed", "boom", 9)
 
 
 def test_prompt_admitted_msg_roundtrip():
-    msg = PromptAdmittedMsg(uid=42, prompt_tokens=1234, cached_tokens=500)
+    msg = PromptAdmittedMsg(uid=42, prompt_tokens=1234, cached_tokens=500, epoch=9)
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, PromptAdmittedMsg)
-    assert (out.uid, out.prompt_tokens, out.cached_tokens) == (42, 1234, 500)
+    assert (out.uid, out.prompt_tokens, out.cached_tokens, out.epoch) == (42, 1234, 500, 9)
 
 
 def test_user_reply_token_deltas_round_trip():
@@ -88,6 +88,7 @@ def test_user_reply_token_deltas_round_trip():
         kv_used_pages=40,
         kv_total_pages=512,
         gpu_mem_bytes=64 * (1 << 30),
+        epoch=9,
     )
 
     decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
@@ -102,6 +103,7 @@ def test_user_reply_token_deltas_round_trip():
     assert decoded.kv_used_pages == 40
     assert decoded.kv_total_pages == 512
     assert decoded.gpu_mem_bytes == 64 * (1 << 30)
+    assert decoded.epoch == 9
 
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
@@ -110,12 +112,14 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
+        epoch=9,
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+    assert decoded.epoch == 9
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():

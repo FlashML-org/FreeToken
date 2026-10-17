@@ -22,6 +22,7 @@ from .api_models import (
 )
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
+from .accounting import AdmissionClosedError
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     ContentDelta,
@@ -97,7 +98,7 @@ def _maintenance_gate(state: Any) -> JSONResponse | None:
     runtime cache "rebuild"/"failed" so clients (and the desktop) get an actionable message.
     None when serving."""
     mstate = getattr(state, "maintenance_state", "serving")
-    if mstate == "serving":
+    if mstate in {"serving", "restarting"}:
         return None
     if mstate == "loading":
         msg = "model is still loading"
@@ -200,6 +201,8 @@ async def handle_chat_completion(
 
     try:
         uid = await submit_generation(spec, state)
+    except AdmissionClosedError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
 
@@ -409,11 +412,14 @@ async def handle_completion(
     if req.stream:
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
-        uid = state.new_user()
+        try:
+            uid = await state.new_user()
+        except AdmissionClosedError as exc:
+            return create_error_response(str(exc), code="server_restarting", status_code=503)
         await state.send_one(
             TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
                 req, model_sampling, default_max_tokens=default_max_tokens
-            ))
+            ), epoch=getattr(state, "request_epoch", lambda _uid: 0)(uid))
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -425,7 +431,10 @@ async def handle_completion(
     completion_tokens = 0
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
-        uid = state.new_user()
+        try:
+            uid = await state.new_user()
+        except AdmissionClosedError as exc:
+            return create_error_response(str(exc), code="server_restarting", status_code=503)
         await state.send_one(
             TokenizeMsg(
                 uid=uid,
@@ -433,13 +442,14 @@ async def handle_completion(
                 sampling_params=_resolve_sampling(
                     req, model_sampling, default_max_tokens=default_max_tokens
                 ),
+                epoch=getattr(state, "request_epoch", lambda _uid: 0)(uid),
             )
         )
         text = ""
         finish_reason = "stop"
         async for ack in state.wait_for_ack(uid):
             if getattr(ack, "error", None):
-                return create_error_response(ack.error)
+                return create_error_response(ack.error, code=getattr(ack, "error_code", None))
             prompt_tokens += ack.prompt_tokens_delta
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
@@ -466,7 +476,10 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
     finish_reason = "stop"
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
-            yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
+            yield _sse(
+                {"error": {"message": ack.error, "type": "invalid_request_error",
+                           "code": getattr(ack, "error_code", None)}}
+            )
             yield b"data: [DONE]\n\n"
             return
         prompt_tokens += ack.prompt_tokens_delta

@@ -54,7 +54,7 @@ class FakeState:
         )
         self._replies = replies
 
-    def new_user(self) -> int:
+    async def new_user(self) -> int:
         return 42
 
     async def wait_for_ack(self, uid: int):
