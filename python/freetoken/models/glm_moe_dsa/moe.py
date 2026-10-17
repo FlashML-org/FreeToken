@@ -34,9 +34,8 @@ class GlmMoeDsaSparseBlock(BaseOP):
         self.topk_group = config.topk_group
 
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
-        # DeepSeek-style selection bias; kept fp32 in HF, stored in the model dtype and
-        # upcast at use (exact enough for the argmax-style top-k selection).
-        self.e_score_correction_bias = torch.empty(config.num_experts)
+        # Keep selection bias in fp32: rounding can change the selected experts.
+        self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 
         # The offload cache indexes experts by *MoE* layer (global layer minus
         # first_k_dense_replace), matching how the loader packs the expert banks.
