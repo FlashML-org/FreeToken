@@ -253,6 +253,9 @@ def _prefill_fast_decode(block_m: int, per_expert: float, device_index: int) -> 
     if _device_cc(device_index) == (8, 9):
         # RTX 4090 A/B: up to 32 tokens per expert the pair decode streams the weights 2-18% faster, from 51 words win 11-14%
         return 0 if per_expert < 48 else 1
+    if _device_cc(device_index) == (9, 0):
+        # H100 A/B: bytes beat words at BLOCK_SIZE_M 64 / 128 by 1-17% per layer (24-31% on Gemma-4-26B-A4B's K = 704 down GEMM)
+        return 2
     # the word decode halves the loop but stages the decoded tile through shared memory; small tiles keep the byte form
     return 2 if block_m <= 32 else 1
 
