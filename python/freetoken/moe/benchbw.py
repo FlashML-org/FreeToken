@@ -115,9 +115,9 @@ class Workload:
     act_block: int | None = None  # ds_fp4 W4A8 activation quant block
     options: tuple[tuple[str, int], ...] = ()  # CPU executor options of the format, e.g. the GGUF types
 
-    def format_options(self) -> dict[str, int]:
+    def format_options(self, fmt: str) -> dict[str, int]:
         opts = dict(self.options)
-        if self.act_block is not None:
+        if self.act_block is not None and fmt == "ds_fp4":
             opts.setdefault("act_block", self.act_block)
         return opts
 
@@ -363,6 +363,8 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = 
         return alloc_pinned_tensor(*shape, dtype=dtype)
 
     if fmt in ("gguf", "gguf_scaled"):
+        from freetoken.third_party.gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+
         b = {}
         for name, (shape, dtype) in _gguf_bank_shapes(fmt, opts, H, I).items():
             b[name] = pin(E, *shape, dtype=dtype)
@@ -370,6 +372,9 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = 
                 b[name].fill_(1.0)
             elif dtype == torch.uint8:
                 b[name].zero_()  # zero ggml blocks: every fp16 block scale is 0, never denormal
+                if opts["gate_up_type" if name == "gate_up" else "down_type"] == GGMLQuantizationType.MXFP4:
+                    # each block starts with an e8m0 scale byte; 0 decodes to 2^-127, a denormal that slows the CPU kernel
+                    b[name].view(E, -1, GGML_QUANT_SIZES[GGMLQuantizationType.MXFP4][1])[..., 0] = 127
             else:
                 b[name].fill_(0.02)
         return b
@@ -443,7 +448,7 @@ def _build_gather_rig(fmt: str, wl: Workload, device: torch.device):
     bench and the overlapped CPU+PCIe bench."""
     from freetoken.moe.offload_cache import OffloadMoeCache
 
-    H, I, opts = wl.hidden, wl.inter, wl.format_options()
+    H, I, opts = wl.hidden, wl.inter, wl.format_options(fmt)
     E = _synth_experts(wl.experts, _expert_bytes(fmt, H, I, opts))
     specs = _offload_bank_specs(fmt, H, I, opts)
     cache = OffloadMoeCache(num_layers=1, num_experts=E, cache_size=E, device=device, quant_format=fmt)
@@ -472,7 +477,7 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
     (all synth experts, scattered sources). Reusing the cache gives the kernel-correct
     int64 ``num_indices``. Timed with CUDA events.
     """
-    eb = _expert_bytes(fmt, wl.hidden, wl.inter, wl.format_options())
+    eb = _expert_bytes(fmt, wl.hidden, wl.inter, wl.format_options(fmt))
     cache, total_bytes = _build_gather_rig(fmt, wl, device)
     E = cache.num_experts
 
@@ -511,7 +516,7 @@ def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: in
         cache, top_k=wl.top_k, activation=wl.activation,
         apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=1,
         device=torch.device("cuda"), swiglu_alpha=wl.swiglu_alpha,
-        swiglu_limit=wl.swiglu_limit, layer_formats=[(fmt, wl.format_options())] * cache.num_layers,
+        swiglu_limit=wl.swiglu_limit, layer_formats=[(fmt, wl.format_options(fmt))] * cache.num_layers,
     )
 
 
@@ -563,7 +568,7 @@ def measure_cpu_moe_bw(fmt: str, wl: Workload, iters: int = 64, num_threads: int
     the SAME banks (built once) to populate the diagnostic ``isa_sweep`` breakdown; tiers
     above the CPU's support clamp down and dedupe by the resulting isa name.
     """
-    H, I, opts = wl.hidden, wl.inter, wl.format_options()
+    H, I, opts = wl.hidden, wl.inter, wl.format_options(fmt)
     eb = _expert_bytes(fmt, H, I, opts)
     E = _synth_experts(wl.experts, eb)
     banks = _cpu_moe_bank_sources(fmt, H, I, E, opts)
@@ -602,7 +607,7 @@ def measure_overlap_bw(fmt: str, wl: Workload, device: torch.device,
     so the DMA is really in flight, not just enqueued). Each side reports bytes / its own
     elapsed; the two windows differ by at most one CPU step + one gather.
     """
-    H, I, opts = wl.hidden, wl.inter, wl.format_options()
+    H, I, opts = wl.hidden, wl.inter, wl.format_options(fmt)
     eb = _expert_bytes(fmt, H, I, opts)
     E = _synth_experts(wl.experts, eb)
     ex = _build_cpu_moe_executor(fmt, wl, _cpu_moe_bank_sources(fmt, H, I, E, opts), num_threads, E)
@@ -730,7 +735,7 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
 
 def _kind(fmt: str, wl: Workload) -> tuple:
     """A layer kind without the CPU thread count, which the row key adds once the executor has sized its pool."""
-    return (fmt, tuple(sorted(wl.format_options().items())), wl.hidden, wl.inter, wl.top_k)
+    return (fmt, tuple(sorted(wl.format_options(fmt).items())), wl.hidden, wl.inter, wl.top_k)
 
 
 def checkpoint_layer_kinds(model_path: str, device: torch.device) -> dict[tuple, Workload]:
@@ -905,14 +910,16 @@ def run_benchbw(
             _prog(label)
             logger.info(f"benchbw: {label} real kernels ...")
             entry = _bench_format(fmt, wl, device, threshold, cpu_threads, kernel_cpu_iters, kernel_pcie_iters, isas)
-            # without a CPU path the row only records the gather; the thread count the executor would use keys it
-            threads = len(entry["cpu_cores"]) if entry["cpu_cores"] else resolve_threads_and_affinity(cpu_threads)[0]
+            done += 1
+            if not entry["cpu_cores"]:
+                logger.warning(f"benchbw: no CPU MoE result for {label}, so no row: {entry['note']}")
+                continue
+            threads = len(entry["cpu_cores"])
             rows[layer_kind_key(fmt, dict(opts), hidden, inter, top_k, threads)] = {
                 "format": fmt, "options": dict(opts), "hidden": hidden, "inter": inter, "top_k": top_k,
                 "cpu_threads": threads, "activation": wl.activation, "sources": sources,
                 "threshold": threshold, "measured_at": now, "freetoken": build, **entry,
             }
-            done += 1
     finally:
         exec_log.setLevel(prev_level)
     _prog("done")

@@ -644,9 +644,8 @@ def parse_args(
         default=ServerArgs.moe_strategy,
         choices=["auto", *MOE_STRATEGIES],
         help=(
-            "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
-            "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
-            "'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
+            "How the routed experts are served. 'auto' resolves a MoE model to 'offload', and to "
+            "resident 'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )
 
@@ -813,7 +812,8 @@ def parse_args(
             "For --moe-strategy hybrid: max experts fetched over PCIe per (layer, decode "
             "step); the rest of that step's misses are computed on the CPU, overlapped. "
             "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
-            "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
+            "step's misses (perfect overlap; needs the `ft bench bw` row of the layer's kind, "
+            "from `ft bench bw --model <checkpoint>`, else 1). "
             "0 = never fetch (all misses on CPU); large = behaves like plain offload."
         ),
     )
