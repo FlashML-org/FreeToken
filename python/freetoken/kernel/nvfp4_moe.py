@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import re
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Tuple
 
 import torch
@@ -174,12 +175,51 @@ def _tensor_rho(name: str, major: int, minor: int) -> float:
     return 4.0
 
 
-# (min rho, tokens per expert where BLOCK_SIZE_M becomes 32, 64, 128), from sweeps on H100, RTX PRO 6000 and RTX 5090 / 4090 / 3080 Ti
-_PREFILL_BLOCK_M_STEPS = ((8.0, (12, 24, 64)), (3.0, (16, 36, 150)), (0.0, (16, 150, float("inf"))))
 # BLOCK_SIZE_M -> (BLOCK_SIZE_N, BLOCK_SIZE_KB, num_stages)
 _PREFILL_TILES_H100 = {16: (64, 64, 3), 32: (64, 32, 3), 64: (64, 32, 3), 128: (64, 32, 3)}
 _PREFILL_TILES_RTX_PRO = {16: (64, 64, 4), 32: (128, 64, 3), 64: (128, 64, 2), 128: (64, 32, 2)}
 _PREFILL_TILES_GEFORCE = {16: (64, 64, 4), 32: (128, 64, 2), 64: (128, 32, 2)}
+
+
+@dataclass(frozen=True)
+class _PrefillTuning:
+    """Triton prefill GEMM tuning of one GPU class."""
+
+    steps: Tuple[float, float, float]  # tokens per expert where BLOCK_SIZE_M becomes 32, 64, 128
+    tiles: Dict[int, Tuple[int, int, int]]
+    pair_decode_below: float = 0.0  # tokens per expert under which FAST_DECODE stays 0
+    small_tile_decode: int = 2  # FAST_DECODE of BLOCK_SIZE_M <= 32
+    large_tile_decode: int = 1  # FAST_DECODE of BLOCK_SIZE_M >= 64
+    scale_words: bool = False  # SCALE_WORDS on BLOCK_SIZE_M 64 word-decode tiles
+    long_k_warps: int = 4  # num_warps of SCALE_WORDS GEMMs with K >= _LONG_K
+
+
+_INF = float("inf")
+_LONG_K = 2048
+_TUNING_H100 = _PrefillTuning((12, 24, 64), _PREFILL_TILES_H100)
+_TUNING_RTX_PRO = _PrefillTuning((16, 36, 150), _PREFILL_TILES_RTX_PRO)
+_TUNING_GEFORCE = _PrefillTuning((16, 150, _INF), _PREFILL_TILES_GEFORCE)
+# RTX 4090 A/B: up to 32 tokens per expert the pair decode streams the weights 2-18% faster, from 51 words win 11-14%, also on 32-row tiles
+_SM89_DECODE = dict(pair_decode_below=48, small_tile_decode=1)
+# H100 A/B: bytes beat words at BLOCK_SIZE_M 64 / 128 by 1-17% per layer (24-31% on Gemma-4-26B-A4B's K = 704 down GEMM)
+_SM90_DECODE = dict(small_tile_decode=2, large_tile_decode=2)
+# RTX 4090 / 3080 Ti layer A/B: scale words + 8 warps on the long-K GEMM give 1.03-1.09x / 1.05-1.19x; with them sm_86 gains from 64-row tiles at 100 tokens per expert, sm_89 does not
+_GEFORCE_SCALE_WORDS = dict(scale_words=True, long_k_warps=8)
+# (rho class, compute capability) -> tuning, from sweeps on H100, RTX PRO 6000 and RTX 5090 / 4090 / 3080 Ti; (class, None) covers the rest of the class.
+# The RTX tiles come from cc 8.6 / 8.9 / 12.0 sweeps (mma.sync, 99 KB shared memory); other GPUs keep the H100 tiles.
+_PREFILL_TUNING = {
+    ("wide", (9, 0)): replace(_TUNING_H100, **_SM90_DECODE),
+    ("wide", None): _TUNING_H100,
+    ("pro", (8, 6)): _TUNING_RTX_PRO,
+    ("pro", (8, 9)): replace(_TUNING_RTX_PRO, **_SM89_DECODE),
+    ("pro", (9, 0)): replace(_TUNING_RTX_PRO, tiles=_PREFILL_TILES_H100, **_SM90_DECODE),
+    ("pro", (12, 0)): _TUNING_RTX_PRO,
+    ("pro", None): replace(_TUNING_RTX_PRO, tiles=_PREFILL_TILES_H100),
+    ("geforce", (8, 6)): replace(_TUNING_GEFORCE, steps=(16, 100, _INF), **_GEFORCE_SCALE_WORDS),
+    ("geforce", (8, 9)): replace(_TUNING_GEFORCE, **_SM89_DECODE, **_GEFORCE_SCALE_WORDS),
+    ("geforce", (12, 0)): _TUNING_GEFORCE,
+    ("geforce", None): replace(_TUNING_GEFORCE, tiles=_PREFILL_TILES_H100),
+}
 # steps while the Gluon kernel runs BLOCK_SIZE_M >= 64, from an RTX PRO 6000 sweep; classes without an entry keep the Triton steps
 _PREFILL_BLOCK_M_STEPS_GLUON = ((3.0, (16, 36, 96)),)
 
@@ -213,19 +253,29 @@ def _gluon_prefill(device_index: int):
 
 
 @functools.lru_cache(maxsize=None)
-def _prefill_tuning(device_index: int) -> Tuple[Tuple[float, float, float], Dict[int, Tuple[int, int, int]]]:
+def _device_rho(device_index: int) -> float:
+    props = torch.cuda.get_device_properties(device_index)
+    return _tensor_rho(props.name, props.major, props.minor)
+
+
+@functools.lru_cache(maxsize=None)
+def _prefill_tuning(device_index: int) -> _PrefillTuning:
     if is_rocm():
         # TODO: tune for AMD GPUs; they keep the H100 tuning
-        return _PREFILL_BLOCK_M_STEPS[0][1], _PREFILL_TILES_H100
-    props = torch.cuda.get_device_properties(device_index)
-    rho = _tensor_rho(props.name, props.major, props.minor)
-    steps = next(s for min_rho, s in _PREFILL_BLOCK_M_STEPS if rho >= min_rho)
+        return _TUNING_H100
+    rho = _device_rho(device_index)
+    rho_class = "wide" if rho >= 8.0 else "pro" if rho >= 3.0 else "geforce"
+    cc = torch.cuda.get_device_capability(device_index)
+    return _PREFILL_TUNING.get((rho_class, cc), _PREFILL_TUNING[(rho_class, None)])
+
+
+@functools.lru_cache(maxsize=None)
+def _prefill_block_m_steps(device_index: int) -> Tuple[float, float, float]:
+    steps = _prefill_tuning(device_index).steps
     if _gluon_prefill(device_index) is not None:
+        rho = _device_rho(device_index)
         steps = next((s for min_rho, s in _PREFILL_BLOCK_M_STEPS_GLUON if rho >= min_rho), steps)
-    # the RTX tables come from cc 8.6 / 8.9 / 12.0 sweeps (mma.sync, 99 KB shared memory); other GPUs keep the H100 one
-    if (props.major, props.minor) not in ((8, 6), (8, 9), (12, 0)):
-        return steps, _PREFILL_TILES_H100
-    return steps, _PREFILL_TILES_RTX_PRO if rho >= 3.0 else _PREFILL_TILES_GEFORCE
+    return steps
 
 
 @functools.lru_cache(maxsize=None)
@@ -241,31 +291,29 @@ def _prefill_use_tma(packed: torch.Tensor, scale: torch.Tensor, K: int, device_i
             and packed.data_ptr() % 16 == 0 and scale.data_ptr() % 16 == 0)
 
 
-@functools.lru_cache(maxsize=None)
-def _device_cc(device_index: int) -> Tuple[int, int]:
-    return torch.cuda.get_device_capability(device_index)
+def _prefill_use_scale_words(scale: torch.Tensor, K: int, cfg: Dict[str, Any], device_index: int) -> bool:
+    # K // 16 scale bytes per row split into whole int32 words, and a K step reads at least one word
+    return (_prefill_tuning(device_index).scale_words and cfg["BLOCK_SIZE_M"] == 64 and cfg["BLOCK_SIZE_KB"] >= 32
+            and K % 64 == 0 and scale.is_contiguous() and scale.data_ptr() % 4 == 0)
 
 
 def _prefill_fast_decode(block_m: int, per_expert: float, device_index: int) -> int:
     """FAST_DECODE of the prefill kernel: 0 keeps the fp16 pair decode (ROCm: the fast decode is PTX inline asm), 1 words, 2 bytes."""
     if is_rocm():
         return 0
-    if _device_cc(device_index) == (8, 9):
-        # RTX 4090 A/B: up to 32 tokens per expert the pair decode streams the weights 2-18% faster, from 51 words win 11-14%
-        return 0 if per_expert < 48 else 1
-    if _device_cc(device_index) == (9, 0):
-        # H100 A/B: bytes beat words at BLOCK_SIZE_M 64 / 128 by 1-17% per layer (24-31% on Gemma-4-26B-A4B's K = 704 down GEMM)
-        return 2
+    tuning = _prefill_tuning(device_index)
+    if per_expert < tuning.pair_decode_below:
+        return 0
     # the word decode halves the loop but stages the decoded tile through shared memory; small tiles keep the byte form
-    return 2 if block_m <= 32 else 1
+    return tuning.small_tile_decode if block_m <= 32 else tuning.large_tile_decode
 
 
 def prefill_config(M: int, top_k: int, num_experts: int, device_index: int) -> Dict[str, int]:
     # moe_align_block_size pads each expert's token count to a multiple of BLOCK_SIZE_M, so triton.autotune cannot pick it.
-    (to32, to64, to128), tiles = _prefill_tuning(device_index)
+    to32, to64, to128 = _prefill_block_m_steps(device_index)
     per_expert = M * top_k / num_experts
     block_m = 128 if per_expert >= to128 else 64 if per_expert >= to64 else 32 if per_expert >= to32 else 16
-    block_n, block_kb, stages = tiles[block_m]
+    block_n, block_kb, stages = _prefill_tuning(device_index).tiles[block_m]
     return dict(BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=block_n, BLOCK_SIZE_KB=block_kb,
                 GROUP_SIZE_M=8, num_warps=4, num_stages=stages,
                 FAST_DECODE=_prefill_fast_decode(block_m, per_expert, device_index))
@@ -308,6 +356,11 @@ def prefill_gemm(
     use_tma = _prefill_use_tma(packed, scale, K, a.device.index)
     # the 16-byte scale box costs registers that the BLOCK_SIZE_M >= 64 tiles do not have
     tma_scales = cfg["BLOCK_SIZE_M"] <= 32
+    scale_words = not use_tma and fast == 1 and _prefill_use_scale_words(scale, K, cfg, a.device.index)
+    if scale_words:
+        scale = scale.view(torch.int32)
+        if K >= _LONG_K:
+            cfg["num_warps"] = _prefill_tuning(a.device.index).long_k_warps
     w_desc = s_desc = None
     if use_tma:
         rows = packed.shape[0] * N
@@ -332,5 +385,6 @@ def prefill_gemm(
         USE_TMA=use_tma,
         TMA_SCALES=tma_scales,
         FAST_DECODE=fast,
+        SCALE_WORDS=scale_words,
         **cfg,
     )

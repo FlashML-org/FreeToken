@@ -385,6 +385,7 @@ def _prefill_nvfp4_moe_kernel(
     USE_TMA: tl.constexpr = False,     # needs K % 256 == 0
     TMA_SCALES: tl.constexpr = False,  # with USE_TMA: scales by TMA too, else pointer loads
     FAST_DECODE: tl.constexpr = 0,     # 0: fp16 pair decode, 1: packed_ptr / w_desc are int32 views of 8 codes, 2: bytes
+    SCALE_WORDS: tl.constexpr = False,  # with FAST_DECODE == 1 and pointer loads: scale_ptr is an int32 view of 4 scales
 ):
     # out^T = W @ X^T: wgmma reads its A operand (the decoded weights) from registers, while B must be in shared memory.
     # The token block is the MMA N dimension, so a 16-token block still fills the MMA.
@@ -420,7 +421,13 @@ def _prefill_nvfp4_moe_kernel(
         p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kw[None, :] * stride_pkb
     else:
         p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kb[None, :] * stride_pkb
-    s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sb[None, :] * stride_sblk
+    tl.static_assert(not SCALE_WORDS or (WORDS and not USE_TMA and BLOCK_SIZE_KB >= 32))
+    SW: tl.constexpr = BLOCK_SIZE_KB // 32
+    if SCALE_WORDS:
+        offs_sw = tl.arange(0, SW)
+        s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sw[None, :] * stride_sblk
+    else:
+        s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sb[None, :] * stride_sblk
 
     accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     K_BYTES = K // 2
@@ -450,7 +457,16 @@ def _prefill_nvfp4_moe_kernel(
             else:
                 byte_mask = kb * BLOCK_SIZE_KB + offs_kb < K_BYTES
                 v = tl.load(p_ptrs, mask=byte_mask[None, :], other=0).to(tl.int32)
-            if e4m3_native_cx():
+            if SCALE_WORDS:
+                # 4-byte loads can go through the cp.async pipeline, byte loads cannot; spread each word over the 8 weight words it scales
+                sw = tl.load(s_ptrs, mask=(kb * SW + offs_sw < K_BYTES // 32)[None, :], other=0)
+                sw = tl.reshape(tl.broadcast_to(sw[:, :, None], (BLOCK_SIZE_N, SW, KW // SW)), (BLOCK_SIZE_N, KW))
+                s = ((sw >> ((offs_kw // 2 % 4) * 8)[None, :]) & 0xFF).to(tl.uint8)
+                if e4m3_native_cx():
+                    s = s.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                else:
+                    s = e4m3_u8_to_f32(s)
+            elif e4m3_native_cx():
                 s = tl.load(s_ptrs, mask=sblk_mask[None, :], other=0.0).to(tl.float32)
             else:
                 s = e4m3_u8_to_f32(tl.load(s_ptrs, mask=sblk_mask[None, :], other=0))
@@ -459,8 +475,9 @@ def _prefill_nvfp4_moe_kernel(
             s = (s * 3.3230699894622794e35).to(tl.bfloat16).to(tl.uint16, bitcast=True).to(tl.uint32)
             s = s | (s << 16)
             if WORDS:
-                # one scale per 16 values, two words
-                s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 2)), (BLOCK_SIZE_N, KW))
+                if not SCALE_WORDS:
+                    # one scale per 16 values, two words
+                    s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 2)), (BLOCK_SIZE_N, KW))
                 w = _e2m1x8_bf16(v.to(tl.uint32, bitcast=True), s, BLOCK_SIZE_N, KW)
             else:
                 # one scale per 16 values, eight bytes
@@ -481,7 +498,7 @@ def _prefill_nvfp4_moe_kernel(
         if not USE_TMA:
             p_ptrs += (KW if WORDS else BLOCK_SIZE_KB) * stride_pkb
         if not (USE_TMA and TMA_SCALES):
-            s_ptrs += (BLOCK_SIZE_KB // 8) * stride_sblk
+            s_ptrs += (SW if SCALE_WORDS else BLOCK_SIZE_KB // 8) * stride_sblk
 
     g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32)
     if FAST_DECODE:
