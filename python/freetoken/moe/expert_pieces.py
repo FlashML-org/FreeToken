@@ -151,7 +151,7 @@ def per_expert_pieces(
     """Group per-expert tensors into one piece per expert, in whatever order they arrive.
 
     ``locate(name)`` -> ``(bank_layer, expert, role)`` or None to skip; a role tensor is one
-    expert's ``[...]`` row and becomes the piece's ``[1, ...]`` entry. Globals may be scalars.
+    expert's ``[...]`` row and becomes the piece's ``[1, ...]`` entry. Globals and activation scales may be scalars.
     """
     pending: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
     for name, tensor in tensors:
@@ -160,7 +160,7 @@ def per_expert_pieces(
             continue
         bank_layer, expert, role = where
         piece = pending.setdefault((bank_layer, expert), {})
-        piece[role] = tensor.reshape(1, -1) if role.endswith("_global") else tensor.unsqueeze(0)
+        piece[role] = tensor.reshape(1, -1) if role.endswith(("_global", "_input")) else tensor.unsqueeze(0)
         if len(piece) == tensors_per_expert:
             del pending[(bank_layer, expert)]
             yield bank_layer, expert, expert + 1, piece

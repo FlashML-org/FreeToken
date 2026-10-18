@@ -1,6 +1,6 @@
-"""Kernel dispatch for the inline-dequant NVFP4 MoE GEMMs: which kernel runs, with which tiles and switches, and its launch.
+"""Kernel dispatch for the NVFP4 MoE GEMMs: which kernel runs, with which tiles and switches, and its launch.
 
-The kernels are templates (:mod:`freetoken.kernel.triton.nvfp4_fused_moe`, :mod:`freetoken.kernel.gluon.nvfp4.moe.sm120`);
+The kernels are templates (:mod:`freetoken.kernel.triton.nvfp4_fused_moe`, :mod:`freetoken.kernel.gluon.nvfp4.moe.sm120`, :mod:`freetoken.kernel.gluon.nvfp4.moe.sm120_w4a4`);
 :mod:`freetoken.moe.fused_nvfp4` strings the GEMMs into the MoE layer.
 """
 
@@ -388,3 +388,73 @@ def prefill_gemm(
         SCALE_WORDS=scale_words,
         **cfg,
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _w4a4_prefill(device_index: int):
+    """The Gluon module of the W4A4 prefill GEMMs on this GPU, or None."""
+    from freetoken.kernel import gluon
+
+    if torch.cuda.get_device_capability(device_index) != (12, 0) or not gluon.available():
+        return None
+    from freetoken.kernel.gluon.nvfp4.moe import sm120_w4a4
+
+    return sm120_w4a4
+
+
+def w4a4_available(device_index: int) -> bool:
+    return _w4a4_prefill(device_index) is not None
+
+
+# Below this many tokens per expert both prefills stream the weights at the same speed (RTX PRO 6000 and RTX 5090 sweeps over the
+# NVFP4 MoE shapes); W4A16 keeps the exact activations there
+_W4A4_MIN_TOKENS_PER_EXPERT = 4
+# (min rho, tokens per expert where BLOCK_SIZE_M becomes 128), from the same sweeps
+_W4A4_BLOCK_M_STEPS = ((3.0, 128), (0.0, 64))
+
+
+@functools.lru_cache(maxsize=None)
+def _w4a4_device(device_index: int) -> Tuple[float, int]:
+    props = torch.cuda.get_device_properties(device_index)
+    rho = _tensor_rho(props.name, props.major, props.minor)
+    return next(t for min_rho, t in _W4A4_BLOCK_M_STEPS if rho >= min_rho), props.L2_cache_size
+
+
+def w4a4_prefill_config(M: int, top_k: int, num_experts: int, H: int, I: int, activation: str, dtype: torch.dtype,
+                        device_index: int) -> Dict[str, Any] | None:
+    """Tiles of the W4A4 prefill GEMMs, or None where the W4A16 prefill runs instead."""
+    w4a4 = _w4a4_prefill(device_index)
+    if w4a4 is None or dtype != torch.bfloat16 or activation not in w4a4.ACTIVATIONS or not w4a4.supports(H, I):
+        return None
+    to128, l2_bytes = _w4a4_device(device_index)
+    per_expert = M * top_k / num_experts
+    if per_expert < _W4A4_MIN_TOKENS_PER_EXPERT:
+        return None
+    block_m = 128 if per_expert >= to128 else 64
+    common = dict(BLOCK_SIZE_M=block_m, GROUP_SIZE_M=8, MMA_WARPS_N=4, LOAD_WARPS=4, num_warps=8)
+    # the gated tile holds BN / 2 gate rows and their up rows, so I must split into whole half tiles
+    gate_up = dict(common, BLOCK_SIZE_N=256 if I % 128 == 0 else 128, BLOCK_SIZE_K=128 if H % 128 == 0 else 64,
+                   N_GROUP=0, STAGES=3, LOAD_REGS=88)
+    if I < 1024:
+        # short K: the persistent kernel overlaps a tile's atomics with the next mainloop; N strips keep the [M, H] output
+        # in L2 once it outgrows half of it
+        down = dict(common, BLOCK_SIZE_N=256, BLOCK_SIZE_K=64, STAGES=4, N_GROUP=2 if M * H * 2 > l2_bytes // 2 else 0,
+                    LOAD_REGS=56, EPI_WARPS=4, EPI_REGS=72, PERSISTENT=True)
+    else:
+        down = dict(common, BLOCK_SIZE_N=256 if H % 256 == 0 else 128, BLOCK_SIZE_K=128 if I % 128 == 0 else 64,
+                    N_GROUP=0, STAGES=3, LOAD_REGS=88, PERSISTENT=False)
+    return dict(BLOCK_SIZE_M=block_m, gate_up=gate_up, down=down)
+
+
+def w4a4_gate_up_gemm(xq, xs, g_in, packed, scale, glob, q, qs, g_out, sorted_ids, expert_ids, num_tokens_post_padded,
+                      num_valid_tokens, top_k, activation, act_alpha, act_limit, cfg):
+    _w4a4_prefill(xq.device.index).gate_up_gemm(
+        xq, xs, g_in, packed, scale, glob, q, qs, g_out, sorted_ids, expert_ids, num_tokens_post_padded,
+        num_valid_tokens, top_k, activation, act_alpha, act_limit, cfg)
+
+
+def w4a4_down_gemm(xq, xs, g_in, packed, scale, glob, out, topk_weights_flat, sorted_ids, expert_ids,
+                   num_tokens_post_padded, num_valid_tokens, top_k, cfg):
+    _w4a4_prefill(xq.device.index).down_gemm(
+        xq, xs, g_in, packed, scale, glob, out, topk_weights_flat, sorted_ids, expert_ids, num_tokens_post_padded,
+        num_valid_tokens, top_k, cfg)

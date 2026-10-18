@@ -30,12 +30,16 @@ LEGACY_FORMAT = {
     (QuantKind.NONE, "fused"): "bf16",
     (QuantKind.FP8_BLOCK, "triton"): "fp8_block",
     (QuantKind.NVFP4, "triton"): "nvfp4",
+    # same banks as triton, plus the resident input scales; a "nvfp4" file reads back as triton
+    (QuantKind.NVFP4, "w4a4"): "nvfp4",
     (QuantKind.NVFP4, "marlin"): "nvfp4_marlin",
     (QuantKind.NVFP4, "b12x"): "nvfp4_b12x",
     (QuantKind.MXFP4, "triton_gptoss"): "mxfp4_triton",
     (QuantKind.MXFP4, "triton"): "ds_fp4",
 }
-_KIND_KERNEL = {fmt: kk for kk, fmt in LEGACY_FORMAT.items()}
+_KIND_KERNEL: dict[str, tuple[QuantKind, str]] = {}
+for _kk, _fmt in LEGACY_FORMAT.items():
+    _KIND_KERNEL.setdefault(_fmt, _kk)
 
 
 def legacy_format_for(kind: QuantKind, kernel: str) -> str:

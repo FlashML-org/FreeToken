@@ -2,6 +2,11 @@
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language import _core as ttgl
+from triton.experimental.gluon.language._layouts import (
+    DotOperandLayout,
+    NVMMADistributedLayout,
+)
 
 
 @gluon.jit
@@ -41,3 +46,37 @@ def e2m1x8_bf16x2(q, s2):
     w2 = bf16x2_mul(prmt(o3, o2, 0x7632), s2)
     w3 = bf16x2_mul(prmt(o1, o0, 0x7632), s2)
     return w0, w1, w2, w3
+
+
+def scale_layout(op_idx: int, rows: int, kgroups: int, mma_warps: list[int]) -> gl.DistributedLinearLayout:
+    """Layout of a [rows, K / 16] e4m3 scale tile for operand op_idx of an NVFP4 mma_v2; mirrors Triton's getSM120DotScaledScaleLayout."""
+    def bits(n):
+        return n.bit_length() - 1
+
+    w0, w1 = mma_warps
+    reg = [[0, 1 << i] for i in range(bits(kgroups))]
+    if op_idx == 0:
+        lane = [[8, 0], [0, 0], [1, 0], [2, 0], [4, 0]]
+        warp = [[0, 0]] * bits(w1) + [[16 << i, 0] for i in range(bits(w0))]
+        cover = 16 * w0
+    else:
+        lane = [[0, 0], [0, 0], [1, 0], [2, 0], [4, 0]]
+        warp = [[8 << i, 0] for i in range(bits(w1))] + [[0, 0]] * bits(w0)
+        cover = 8 * w1
+    reg += [[cover << i, 0] for i in range(max(0, bits(rows) - bits(cover)))]
+    # bases past the tile's rows broadcast
+    lane = [[b[0] if b[0] < rows else 0, b[1]] for b in lane]
+    warp = [[b[0] if b[0] < rows else 0, b[1]] for b in warp]
+    return gl.DistributedLinearLayout(reg, lane, warp, [], [rows, kgroups])
+
+
+@ttgl.builtin
+def mma_nvf4(a, a_scale, b, b_scale, acc, _semantic=None):
+    """acc += (a * a_scale) @ (b * b_scale) on sm_120 (mma kind::mxf4nvf4, scale_vec::4X).
+
+    a [M, K/2] and b [K/2, N] are packed e2m1 in DotOperandLayout(k_width=4) of acc's mma_v2 layout; the e4m3 scales are [M, K/16] / [N, K/16] in scale_layout.
+    """
+    assert isinstance(acc.type.layout, NVMMADistributedLayout) and acc.type.layout.version == [2, 0]
+    assert isinstance(a.type.layout, DotOperandLayout) and isinstance(b.type.layout, DotOperandLayout)
+    out = _semantic.dot_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1", acc, False, True, True, ttgl.float32)
+    return ttgl.tensor(out.handle, acc.type)
