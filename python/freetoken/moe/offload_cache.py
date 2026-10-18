@@ -152,12 +152,12 @@ class OffloadMoeCache:
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
     hybrid_max_fetch: int = 1
-    # hybrid only: when > 0, replaces the fixed cap with a per-step fraction -- fetch
+    # hybrid only, one per MoE layer: when > 0, replaces the fixed cap with a per-step fraction -- fetch
     # ~fraction * misses experts over PCIe (rounded to whichever integer balances the
     # overlap best), the CPU computes the rest. The engine sets it to the benched
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
-    hybrid_fetch_fraction: float = 0.0
+    hybrid_fetch_fraction: list[float] | None = None
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
@@ -1095,9 +1095,8 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        return ensure_experts_hybrid(
-            self, layer_id, expert_ids, weights, self.hybrid_max_fetch, self.hybrid_fetch_fraction, clamp
-        )
+        fraction = self.hybrid_fetch_fraction[layer_id] if self.hybrid_fetch_fraction is not None else 0.0
+        return ensure_experts_hybrid(self, layer_id, expert_ids, weights, self.hybrid_max_fetch, fraction, clamp)
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer

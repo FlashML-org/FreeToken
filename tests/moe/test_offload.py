@@ -451,7 +451,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     from freetoken.moe import is_offload_moe_strategy
 
     assert config.moe_cache_size == 24
-    # Family, not member: a box with a benchbw profile resolves bf16 experts to hybrid.
+    # Family, not member: which offload-family backend auto picks is not this test's claim.
     assert is_offload_moe_strategy(config.moe_strategy)
 
 

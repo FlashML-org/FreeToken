@@ -409,9 +409,7 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     config = _offload_engine_config()
     _adjust_config(config)
 
-    # Which member of the family gets picked is not this test's claim, and is not ours to
-    # decide: a bare "auto" consults ~/.cache/freetoken/benchbw.json, so a box that has run
-    # `ft bench bw` resolves nvfp4 experts to hybrid instead. Assert the family, not the member.
+    # Which member of the family gets picked is not this test's claim. Assert the family, not the member.
     assert is_offload_moe_strategy(config.moe_strategy)
     assert config.moe_cache_auto is True
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
