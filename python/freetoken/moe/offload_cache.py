@@ -1104,7 +1104,7 @@ class OffloadMoeCache:
         max_fetch, cap = self.hybrid_max_fetch, None
         if layer_id in self.locked_hybrid:
             # a locked layer fetches through the staging, so at most its rows per step
-            max_fetch, fraction, cap = 0, self.locked_fetch.fraction, self.locked_fetch.max_fetch
+            (max_fetch, fraction), cap = self.locked_fetch.plan[layer_id], self.locked_fetch.max_fetch
         return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
 
     def materialize_layer(self, layer_id: int) -> None:

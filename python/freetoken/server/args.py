@@ -827,8 +827,9 @@ def parse_args(
         help=(
             "For --moe-strategy hybrid with locked layers (banks over the pin quota, OS-locked instead of pinned): "
             "the share of a locked layer's misses fetched per decode step into GPU slots of its own pools, through "
-            "pinned staging that CPU threads fill; the rest are computed on the CPU. 0 = locked layers decode on the "
-            "CPU only."
+            "pinned staging that CPU threads fill; the rest are computed on the CPU. -1 (default) = auto: per layer from "
+            "the `ft bench bw` row of its kind, p / (2p + c) of the overlapped PCIe and CPU MoE rates (at most 1 expert "
+            "per step without a row). 0 = locked layers decode on the CPU only."
         ),
     )
 

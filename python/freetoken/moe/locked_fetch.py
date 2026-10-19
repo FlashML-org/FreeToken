@@ -70,14 +70,15 @@ def _copy_cpus(executor, count: int) -> list[int]:
 class LockedLayerFetch:
     """Staging, meta and copy threads for the locked layers of one ``OffloadMoeCache``."""
 
-    def __init__(self, cache, layers: list[int], fraction: float, max_fetch: int, executor, staging: dict[str, torch.Tensor] | None = None) -> None:
+    def __init__(self, cache, layers: list[int], plan: dict[int, tuple[int, float]], max_fetch: int, executor, staging: dict[str, torch.Tensor] | None = None) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
         from freetoken.moe.legacy_format import canonical_role
 
         if not cache._copy_fused_ok:
             raise ValueError("locked layers fetch through the fused multi-bank copy, which this cache could not plan (bank alignment or FREETOKEN_FUSED_COPY=0)")
-        self.fraction = fraction
+        # (max_fetch, fraction) of each locked layer for the hybrid ensure; max_fetch caps any of them
+        self.plan = plan
         self.max_fetch = max_fetch
         roles = [canonical_role(name) for name in cache.bank_schema]
         nbanks = len(cache.banks)
@@ -104,7 +105,7 @@ class LockedLayerFetch:
         cpus = _copy_cpus(executor, _copy_threads())
         self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], self.count.data_ptr(), self.rows.data_ptr(), max_fetch, cpus)
         logger.info_rank0(
-            f"locked layers {layers}: GPU slots + fetch {fraction:g} of each step's misses (at most {max_fetch}) through "
+            f"locked layers {layers}: GPU slots + fetch up to {max_fetch} misses per step through "
             f"{sum(t.numel() for t in self.staging) / 2**20:.1f} MiB of pinned staging, {max(1, len(cpus))} copy thread(s) on cpus {cpus or 'any'}"
         )
 

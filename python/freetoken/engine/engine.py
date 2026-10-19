@@ -738,7 +738,7 @@ class Engine:
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
-        locked_fetch = split_residency and config.moe_strategy == "hybrid" and config.moe_locked_fetch > 0
+        locked_fetch = split_residency and config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0
         layer_tags = banks.layer_tags
         if locked_fetch:
             layer_tags = [(t, "locked") if i in cpu_layer_ids else t for i, t in enumerate(layer_tags or [None] * num_moe_layers)]
@@ -750,7 +750,7 @@ class Engine:
             raise ValueError(
                 "several MoE slot pools (--moe-cache-scope per-layer, or experts in several quant formats) need every MoE "
                 "layer to decode from the GPU slot cache; they combine with --moe-cpu-layers only for locked layers under "
-                "--moe-strategy hybrid with --moe-locked-fetch above 0"
+                "--moe-strategy hybrid unless --moe-locked-fetch is 0"
             )
         self._moe_expert_counts = expert_counts if len(self._moe_pool_groups) > 1 else None
         if len(self._moe_pool_groups) == 1 and config.moe_cache_split != "equal":
@@ -857,8 +857,9 @@ class Engine:
         if cache.locked_hybrid:
             from freetoken.moe.locked_fetch import LockedLayerFetch
 
+            locked = sorted(cache.locked_hybrid)
             cache.locked_fetch = LockedLayerFetch(
-                cache, sorted(cache.locked_hybrid), config.moe_locked_fetch, config.moe_locked_max_fetch, cache.cpu_executor, staging=self._locked_staging
+                cache, locked, self._locked_fetch_plan(config, locked), config.moe_locked_max_fetch, cache.cpu_executor, staging=self._locked_staging
             )
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
@@ -874,7 +875,7 @@ class Engine:
         plan = banks.deferred_plan
         if plan is None:
             return banks, frozenset()  # the loader settled the banks itself (pinned)
-        if config.moe_strategy == "hybrid" and config.moe_locked_fetch > 0:
+        if config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0:
             from freetoken.moe.locked_fetch import alloc_staging, staging_bytes
 
             sizes = staging_bytes(banks.sources, config.moe_locked_max_fetch)
@@ -959,23 +960,15 @@ class Engine:
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
-        from freetoken.moe.bench_profile import fetch_fraction, layer_kind_key, load_layer_kinds
-        from freetoken.moe.cpu_executor import _format_label
+        from freetoken.moe.bench_profile import fetch_fraction
 
         cache.hybrid_max_fetch = 1
-        methods = offload_layer_methods(self.model)
-        if methods is None:
+        layer_rows = self._profile_layer_rows()
+        if layer_rows is None:
             logger.warning_rank0("--moe-hybrid-max-fetch auto: the MoE layers bind no expert method to look up in the `ft bench bw` profile; using a fixed fetch cap of 1")
             return
-        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        rows = load_layer_kinds(gpu_name=gpu_name, gpu_uuid=gpu_uuid) or {}
         executor = self.cpu_moe_executor
-        keys, labels = [], []
-        for m in methods:
-            fmt, opts = m.cpu_spec()
-            c = m.cfg
-            keys.append(layer_kind_key(fmt, opts, c.hidden, c.local_intermediate, c.top_k, executor.num_threads))
-            labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {c.hidden}x{c.local_intermediate}")
+        keys, labels, rows = layer_rows
         fractions = [fetch_fraction(rows.get(key)) for key in keys]
         cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
         groups = collections.Counter(zip(labels, fractions))
@@ -997,6 +990,44 @@ class Engine:
                 f"--moe-hybrid-max-fetch auto: some `ft bench bw` rows were benched on CPU kernels {other}, but this executor runs "
                 f"{executor.isa}; using them anyway"
             )
+
+    def _profile_layer_rows(self):
+        """(row key, label) of each MoE layer's kind in the `ft bench bw` profile, and the profile's rows; None without expert methods."""
+        from freetoken.moe.bench_profile import layer_kind_key, load_layer_kinds
+        from freetoken.moe.cpu_executor import _format_label
+
+        methods = offload_layer_methods(self.model)
+        if methods is None:
+            return None
+        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
+        rows = load_layer_kinds(gpu_name=gpu_name, gpu_uuid=gpu_uuid) or {}
+        keys, labels = [], []
+        for m in methods:
+            fmt, opts = m.cpu_spec()
+            c = m.cfg
+            keys.append(layer_kind_key(fmt, opts, c.hidden, c.local_intermediate, c.top_k, self.cpu_moe_executor.num_threads))
+            labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {c.hidden}x{c.local_intermediate}")
+        return keys, labels, rows
+
+    def _locked_fetch_plan(self, config: EngineConfig, layers: list[int]) -> dict[int, tuple[int, float]]:
+        """(max_fetch, fraction) per locked layer: --moe-locked-fetch, or auto from each layer's `ft bench bw` row (a fixed cap of 1 without one)."""
+        if config.moe_locked_fetch > 0:
+            logger.info_rank0(f"--moe-locked-fetch {config.moe_locked_fetch:g}: locked layers fetch this share of each step's misses")
+            return {layer: (0, config.moe_locked_fetch) for layer in layers}
+        from freetoken.moe.bench_profile import locked_fetch_fraction
+
+        layer_rows = self._profile_layer_rows()
+        keys, labels, rows = layer_rows if layer_rows is not None else ([None] * (max(layers) + 1), [""] * (max(layers) + 1), {})
+        fractions = {layer: locked_fetch_fraction(rows.get(keys[layer])) for layer in layers}
+        groups = collections.Counter((labels[layer], f) for layer, f in fractions.items())
+        if fetched := [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]:
+            logger.info_rank0(f"--moe-locked-fetch auto: locked layers fetch this share of each step's misses (benched p / (2p + c)): {'; '.join(fetched)}")
+        if capped := [layer for layer, f in fractions.items() if f is None]:
+            logger.warning_rank0(
+                f"--moe-locked-fetch auto: no `ft bench bw` row for locked layers {capped}; they fetch at most 1 expert per step. "
+                "`ft bench bw --model <checkpoint>` benches each layer kind"
+            )
+        return {layer: (0, f) if f is not None else (1, 0.0) for layer, f in fractions.items()}
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).
@@ -1688,7 +1719,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
-    "moe_locked_fetch": 0.5,
+    "moe_locked_fetch": -1.0,
     "moe_locked_max_fetch": 8,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,

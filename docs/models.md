@@ -75,7 +75,7 @@ layers are then picked from a size estimate before the load, and a refused pin
 stops the boot.
 
 Under `hybrid`, a locked layer keeps GPU slots of its own pools. Each decode
-step it fetches `--moe-locked-fetch` (default half) of its misses: CPU threads
+step it fetches a share of its misses (`--moe-locked-fetch`, by default from the `ft bench bw` profile): CPU threads
 copy the experts into a small pinned staging buffer
 (`--moe-locked-max-fetch` rows per bank) and the GPU copies them into the
 slots. The CPU computes the remaining misses, as on any hybrid layer. Under

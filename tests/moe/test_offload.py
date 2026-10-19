@@ -1042,7 +1042,7 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
     cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
     cache.decode_target = "hybrid"
     cache.locked_hybrid = frozenset({1})
-    cache.locked_fetch = LockedLayerFetch(cache, [1], fraction=1.0, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1))
+    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1))
 
     top_k = 3
     ids = torch.zeros(top_k, dtype=torch.int32, device="cuda")

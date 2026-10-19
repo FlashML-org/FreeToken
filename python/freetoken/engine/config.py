@@ -76,9 +76,10 @@ class EngineConfig:
     moe_hybrid_max_fetch: int = -1
     # Hybrid with locked layers (banks the pin quota could not take, OS-locked instead): a locked layer keeps GPU
     # slots of its own pools and fetches this share of each decode step's misses through pinned staging; the rest
-    # are computed on the CPU. 0 = locked layers decode on the CPU only. moe_locked_max_fetch caps the fetches per
+    # are computed on the CPU. -1 (default) = auto: per layer from its `ft bench bw` row (bench_profile.locked_fetch_fraction),
+    # a fixed cap of 1 without one. 0 = locked layers decode on the CPU only. moe_locked_max_fetch caps the fetches per
     # (layer, step) and sizes the staging (that many rows of the widest expert, per bank).
-    moe_locked_fetch: float = 0.5
+    moe_locked_fetch: float = -1.0
     moe_locked_max_fetch: int = 8
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
@@ -110,8 +111,8 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
-        if not 0.0 <= self.moe_locked_fetch <= 1.0:
-            raise ValueError(f"moe_locked_fetch must be in [0, 1], got {self.moe_locked_fetch}")
+        if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
+            raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
         if self.moe_locked_max_fetch < 1:
             raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
         if self.moe_backend is None:
