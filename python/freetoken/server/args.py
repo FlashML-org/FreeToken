@@ -870,6 +870,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "With the offload-family strategies: after each decode log line, log the decode MoE stats since the "
+            "previous one (hit rate, and per layer-step the misses, experts fetched to the GPU and experts computed "
+            "on the CPU) for pinned layers, locked layers with GPU slots and CPU-only layers. Adds counter updates "
+            "to every decode step."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",

@@ -1165,6 +1165,29 @@ class OffloadMoeCache:
             "prefill_rows": self.prefill_total_rows,
         }
 
+    def decode_stats_line(self) -> str | None:
+        """Decode stats since the last call by layer group (pinned, locked with slots, CPU-only), as one log line; zeroes the counters."""
+        if self.decode_target == "hybrid":
+            rows = torch.stack([self.stat_steps_layer, self.stat_active_layer, self.stat_missing_layer, self.stat_fetched_layer], 1).tolist()
+        else:
+            # offload copies every miss
+            cols = self.lru_stats.t()
+            rows = torch.stack([cols[Stat.CALLS], cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.MISS]], 1).tolist()
+        self.reset_stats()
+        groups = (("pinned", [l for l in range(self.num_layers) if l not in self.cpu_layer_ids]), ("locked", sorted(self.locked_hybrid)))
+        parts = []
+        for name, layers in groups:
+            steps, active, missing, fetched = (sum(rows[l][k] for l in layers) for k in range(4))
+            if steps and active:
+                parts.append(
+                    f"{name} {len(layers)} layers: hit {1 - missing / active:.1%}, per layer-step "
+                    f"miss {missing / steps:.2f} fetch {fetched / steps:.2f} cpu {(missing - fetched) / steps:.2f}"
+                )
+        cpu_only = self.cpu_layer_ids - self.locked_hybrid
+        if cpu_only:
+            parts.append(f"cpu-only {len(cpu_only)} layers")
+        return "MoE decode, " + "; ".join(parts) if parts else None
+
     def decode_miss_stats_per_layer(self) -> dict:
         """Per-MoE-layer realized decode stats for one (reset_stats-delimited) window.
 

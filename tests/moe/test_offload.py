@@ -1054,6 +1054,7 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
         cache.copy_missing()
         out["slots"], out["cpu"] = slots, cpu_ids
 
+    cache.collect_stats = True
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -1082,6 +1083,10 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
             resident = {e for e, s in enumerate(cache.slot_for_id[1].tolist()) if s >= 0}
 
     replay(graph, 12)
+    # --moe-collect-stats: the locked layer reports as its own group, and each line clears the counters
+    line = cache.decode_stats_line()
+    assert "locked 1 layers: hit" in line and "pinned" not in line, line
+    assert cache.decode_stats_line() is None
     # a runtime rebuild reallocates evict_slots and the slot caches; the fetch follows and a new capture still copies right
     del graph
     cache.rebuild(12)
