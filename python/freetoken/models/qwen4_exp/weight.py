@@ -28,29 +28,29 @@ from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
-from freetoken.layers.quantization import get_quant_config
+from freetoken.layers.quantization import QuantKind, get_quant_config
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
-# Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
-# weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
-# stacked ``mtp.layers.N.mlp.experts.*`` tensors.
-_EXPERT_KEY_RE = re.compile(
+# Routed NVFP4 experts: per-expert, un-fused. Matched against the RAW weight_map key in
+# nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's stacked
+# ``mtp.layers.N.mlp.experts.*`` tensors. The kind names come from the checkpoint's quant
+# dialect (ModelOpt: weight/weight_scale/weight_scale_2; llm-compressor: weight_packed/
+# weight_scale/weight_global_scale), so one template serves both.
+_EXPERT_KEY_TEMPLATE = (
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{kinds})$"
 )
+# role -> the expert bank reader's canonical (ModelOpt) tensor kind
+_BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
-_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
-    key_pattern=_EXPERT_KEY_RE,
-    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
-    desc="Qwen3.8-Flash-Next NVFP4 experts",
-)
-# Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+# Per-tensor modelopt quant scales the engine never reads (the experts' come from the offload
+# source banks). Channel-wise FP8 ``.weight_scale`` vectors ARE read: the community mixed
+# FP8 checkpoint quantizes the attention / GDN projections with one scale per output row.
+_SCALE_SUFFIXES = (".weight_scale_2", ".input_scale")
 
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
@@ -79,7 +79,7 @@ _ZERO_CENTERED_NORM_SUFFIXES = (
 # The top-level hyper_connection_mixer has no injection and never fuses.
 _PAD_TO = {"input_mix_weight_down_block_inject": 16}
 _HC_WITH_INJECT = (".attn_hyper_connection", ".mlp_hyper_connection")
-_KIND_SUFFIXES = (".weight_scale_inv", ".weight")
+_KIND_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".weight")
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
 
@@ -146,6 +146,11 @@ class _DenseFuser:
             if scheme is None or not scheme.has("weight_scale_inv"):
                 raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
             return
+        if name.endswith(".weight_scale"):
+            # channel-wise fp8 scale: one entry per output row; its dtype is the checkpoint's (the layer keeps fp32)
+            if scheme is None or not scheme.has("weight_scale"):
+                raise ValueError(f"{name}: {module} has no weight scale in the checkpoint's quant config ({scheme})")
+            return
         is_fp8 = tensor.dtype in _FP8_DTYPES
         if scheme is None:
             if is_fp8:
@@ -160,7 +165,7 @@ class _DenseFuser:
 
     def check_unfused(self, name: str, tensor: torch.Tensor) -> None:
         module, kind = _split_kind(name)
-        if kind == ".weight_scale_inv" or (kind == ".weight" and tensor.dtype in _FP8_DTYPES):
+        if kind in (".weight_scale_inv", ".weight_scale") or (kind == ".weight" and tensor.dtype in _FP8_DTYPES):
             self.check(module, name, tensor)
 
     def fuse(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]] | None:
@@ -181,6 +186,9 @@ class _DenseFuser:
             return []
         del self.buf[(fused, kind)]
         rows = [slots[i] for i in range(len(parts))]
+        if kind == ".weight_scale":
+            # per-row fp8 scales concatenate like their weights; the layer's buffer is fp32 [rows]
+            return [(fused + kind, torch.cat([t.reshape(-1).to(torch.float32) for t in rows], dim=0))]
         pad_to = _PAD_TO.get(fused.rpartition(".")[2], 0) if kind == ".weight" else 0
         pad = (-sum(t.shape[0] for t in rows)) % pad_to if pad_to else 0
         if pad:
@@ -223,10 +231,18 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
+                if name.endswith(".weight_scale"):
+                    # only the per-row scales of a module the quant config quantizes are read; a
+                    # scale on an unquantized module (modelopt keeps them) must not leak downstream
+                    scheme = fuser.scheme(_split_kind(name)[0])
+                    if scheme is None or not scheme.has("weight_scale"):
+                        continue
                 tensor = f.get_tensor(raw_name)
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
+                    if name.endswith(".weight_scale"):
+                        tensor = tensor.reshape(-1).to(torch.float32)
                     yield name, tensor
                 else:
                     yield from fused
@@ -255,6 +271,9 @@ class PleTable:
 
     bank: HostBank
     weight_scale: torch.Tensor  # scalar, checkpoint dtype (bf16)
+    # per-row fp32 scales of a community per_row_e4m3 export (ples_fp8/); the gather kernel
+    # reads them instead of the scalar when present
+    row_scales: HostBank | None = None
 
     @property
     def tensor(self) -> torch.Tensor:
@@ -325,6 +344,8 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
     """
     folder = download_hf_weight(model_path)
+    if os.path.exists(os.path.join(folder, "ples_fp8", "META.json")):
+        return _load_ple_table_per_row(folder, qwen4_args, pin=pin, workers=workers, chunk=chunk)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
     rows = cols = 0
@@ -377,13 +398,89 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     return PleTable(bank=bank, weight_scale=scale)
 
 
+def _load_ple_table_per_row(
+    folder: str, qwen4_args, *, pin: bool = True, workers: int = 8, chunk: int = 8 << 20
+) -> PleTable:
+    """Read the community ``per_row_e4m3`` PLE export: ``ples_fp8/shard_<i>.safetensors`` holding
+    ``weight_fp8 [rows, head_dim]`` codes and a per-row fp32 ``weight_scale``.
+
+    Fills one pinned codes bank (same layout the official shards produce) plus one pinned fp32
+    scale bank; the gather kernel applies the per-row scale (``PleTable.row_scales``).
+    """
+    sub = os.path.join(folder, "ples_fp8")
+    with open(os.path.join(sub, "META.json"), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    if meta.get("layout") != "per_row_e4m3":
+        raise ValueError(f"ples_fp8 layout {meta.get('layout')!r} is not supported")
+    expected = int(qwen4_args.split_ngram_parts)
+    if int(meta["shards"]) != expected:
+        raise ValueError(f"ples_fp8 has {meta['shards']} shards, the config expects {expected}")
+    rows = cols = 0
+    parts: dict[int, tuple[str, int, int, int, int]] = {}  # shard -> (path, codes off/bytes, scales off/bytes)
+    for shard in range(expected):
+        path = os.path.join(sub, f"shard_{shard}.safetensors")
+        header, base = _safetensors_header(path)
+        codes, scales = header.get("weight_fp8"), header.get("weight_scale")
+        if codes is None or scales is None:
+            raise ValueError(
+                f"{path}: expected weight_fp8 + weight_scale, found {sorted(k for k in header if k != '__metadata__')}"
+            )
+        if codes["dtype"] != _PLE_ST_DTYPE or scales["dtype"] != "F32":
+            raise ValueError(f"{path}: unsupported dtypes {codes['dtype']}/{scales['dtype']}")
+        r, c = codes["shape"]
+        if scales["shape"] != [r]:
+            raise ValueError(f"{path}: weight_scale is {scales['shape']}, expected [{r}]")
+        if rows and (r, c) != (rows, cols):
+            raise ValueError(f"{path}: shard is {[r, c]}, expected {[rows, cols]}")
+        rows, cols = r, c
+        codes_begin, codes_end = codes["data_offsets"]
+        scale_begin, scale_end = scales["data_offsets"]
+        parts[shard] = (path, base + codes_begin, codes_end - codes_begin, base + scale_begin, scale_end - scale_begin)
+    if cols != qwen4_args.ngram_head_dim:
+        raise ValueError(f"PLE table row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
+    if expected * rows != int(meta["rows"]):
+        raise ValueError(f"ples_fp8 row count mismatch: {expected * rows} vs META {meta['rows']}")
+
+    bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
+    scale_bank = HostBank((expected * rows,), torch.float32)
+    shard_bytes = rows * cols
+    bar = byte_bar(expected * (shard_bytes + rows * 4), "Loading PLE table")
+    try:
+        buf, scale_buf = bank.memoryview(), scale_bank.memoryview()
+        for shard in range(expected):
+            path, codes_off, codes_n, scale_off, scale_n = parts[shard]
+            assert codes_n == shard_bytes and scale_n == rows * 4
+            read_range_into(buf, path, file_offset=codes_off, nbytes=codes_n,
+                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
+            read_range_into(scale_buf, path, file_offset=scale_off, nbytes=scale_n,
+                            dest_offset=shard * scale_n, workers=workers, chunk=chunk)
+            bar.update(codes_n + scale_n)
+    finally:
+        bar.close()
+    if pin and torch.cuda.is_available():
+        bank.pin()
+        scale_bank.pin()
+    return PleTable(bank=bank, weight_scale=torch.ones((), dtype=torch.float32), row_scales=scale_bank)
+
+
 # ======================================================================================
 # Routed NVFP4 experts
 # ======================================================================================
 
 
 def nvfp4_expert_spec(model_path: str, config):
-    return _NVFP4_SOURCE_SPEC
+    """The per-expert NVFP4 layout under the checkpoint's dialect names (ModelOpt or llm-compressor)."""
+    quant = get_quant_config()
+    stored = quant.stored_tensors(QuantKind.NVFP4)
+    kind_map = {stored[role].name: kind for role, kind in _BANK_KINDS.items()}
+    return Nvfp4ExpertSourceSpec(
+        key_pattern=re.compile(_EXPERT_KEY_TEMPLATE.format(kinds="|".join(map(re.escape, kind_map)))),
+        proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+        layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+        desc=f"Qwen3.8-Flash-Next NVFP4 experts ({quant.dialect})",
+        kind_map=kind_map,
+        global_reciprocal=stored["weight_global"].reciprocal,
+    )
 
 
 __all__ = [
