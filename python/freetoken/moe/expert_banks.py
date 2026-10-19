@@ -54,6 +54,8 @@ class ExpertBanks:
     row_tail_bytes: dict[str, list[int]] | None = None
     # per-layer quant_format of experts in several formats (``quant_format``/``kind``/``kernel`` then name the most common one); None = every layer is ``quant_format``
     layer_formats: list[str] | None = None
+    # the residency plan holding DEFERRED layers' banks, for host_banks.probe_pin; None when nothing was deferred
+    deferred_plan: object | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -446,6 +448,8 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
     if plan is not None and plan.applied:
         import dataclasses
 
+        if plan.deferred:
+            return dataclasses.replace(banks, layer_residency=list(requested), deferred_plan=plan)
         labels = [plan.actual.get(i, r) for i, r in enumerate(requested)]
         downgraded = [i for i, r in enumerate(requested) if labels[i] != r]
         if downgraded:

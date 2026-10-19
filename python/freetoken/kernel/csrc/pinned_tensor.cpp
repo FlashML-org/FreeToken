@@ -98,8 +98,18 @@ void host_register(int64_t addr, int64_t nbytes) {
   const cudaError_t err =
       cudaHostRegister(reinterpret_cast<void *>(addr), static_cast<size_t>(nbytes),
                        cudaHostRegisterPortable | cudaHostRegisterMapped);
+  if (err != cudaSuccess) {
+    // a refused pin is expected (the pin probe), so clear it before a later launch check reports it
+    (void)cudaGetLastError();
+  }
   TORCH_CHECK(err == cudaSuccess,
               "cudaHostRegister failed: ", cudaGetErrorString(err));
+}
+
+void host_unregister(int64_t addr) {
+  const cudaError_t err = cudaHostUnregister(reinterpret_cast<void *>(addr));
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaHostUnregister failed: ", cudaGetErrorString(err));
 }
 
 int64_t driver_cuda_version() {
@@ -123,6 +133,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Device-visible alias of a pinned+mapped host address");
   m.def("host_register", &host_register,
         "cudaHostRegister an existing host range as portable+mapped");
+  m.def("host_unregister", &host_unregister,
+        "cudaHostUnregister a range host_register pinned");
   m.def("driver_cuda_version", &driver_cuda_version,
         "Max CUDA version the installed NVIDIA driver supports (0 if none)");
 }

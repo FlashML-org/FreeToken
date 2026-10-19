@@ -50,6 +50,34 @@ class HostResidency(str, Enum):
     PINNED = "pinned"
     LOCKED = "locked"
     PAGEABLE = "pageable"
+    # filled but not settled: probe_pin settles the layer after the load (--moe-cpu-layers auto finds the pin limit)
+    DEFERRED = "deferred"
+
+
+# FREETOKEN_SIMULATE_PIN_CAP_GB fails pins past that many GiB, like a driver pin quota (WSL/WDDM), to exercise the pin probe on hosts without one
+_sim_pinned = 0
+
+
+def _sim_pin_cap() -> int | None:
+    value = os.environ.get("FREETOKEN_SIMULATE_PIN_CAP_GB")
+    return int(float(value) * 2**30) if value else None
+
+
+def charge_pin(nbytes: int) -> None:
+    """Count ``nbytes`` against the simulated pin cap; raise PinFailed past it (no-op without the cap)."""
+    global _sim_pinned
+    cap = _sim_pin_cap()
+    if cap is None:
+        return
+    if _sim_pinned + nbytes > cap:
+        raise PinFailed(f"simulated pin cap {cap / 2**30:.1f} GiB reached")
+    _sim_pinned += nbytes
+
+
+def refund_pin(nbytes: int) -> None:
+    global _sim_pinned
+    if _sim_pin_cap() is not None:
+        _sim_pinned -= nbytes
 
 
 _DEFAULT_CHUNK = 8 << 20
@@ -137,11 +165,23 @@ class HostBank:
             return
         from freetoken.kernel.pinned import host_register
 
+        charge_pin(len(self._buf))
         try:
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
+            refund_pin(len(self._buf))
             raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
         self._pinned = True
+
+    def unpin(self) -> None:
+        """Undo ``pin()`` on an mmap bank; its pages stay resident (born-pinned banks cannot unpin)."""
+        if not self._pinned or not isinstance(self._buf, mmap.mmap):
+            return
+        from freetoken.kernel.pinned import host_unregister
+
+        host_unregister(self.addr)
+        refund_pin(len(self._buf))
+        self._pinned = False
 
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
@@ -209,13 +249,15 @@ class _ResidencyPlan:
 
     Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan."""
 
-    __slots__ = ("labels", "applied", "has_unpinned", "actual")
+    __slots__ = ("labels", "applied", "has_unpinned", "actual", "deferred")
 
     def __init__(self, labels: list[str]):
         self.labels = list(labels)
         self.applied = False
         self.has_unpinned = any(r != HostResidency.PINNED.value for r in labels)
         self.actual: dict[int, str] = {}
+        # DEFERRED layers' filled banks, for probe_pin
+        self.deferred: dict[int, list[HostBank]] = {}
 
     def residency_for(self, layer_id: int) -> str:
         self.applied = True
@@ -264,11 +306,53 @@ def pin_banks(banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]])
                     HostResidency.PINNED.value if plan is None
                     else plan.residency_for(layer_id)
                 )
+                if residency == HostResidency.DEFERRED.value:
+                    plan.deferred.setdefault(layer_id, []).append(layer_bank)
+                    continue
                 _settle(layer_bank, residency)
                 if plan is not None and residency == HostResidency.LOCKED.value:
                     plan.record(layer_id, layer_bank.residency.value)
         else:
             bank.pin()
+
+
+def probe_pin(plan: _ResidencyPlan, num_layers: int, margin_bytes: int = 0) -> list[str]:
+    """Settle the DEFERRED layers: pin middle layers first until a pin fails, OS-lock the rest; returns each layer's residency.
+
+    After a refusal, the last pinned layers give back at least ``margin_bytes`` (a pin quota filled to the brim fails later device allocations on WDDM)."""
+    # per-layer decode miss rates are U-shaped, so the head and tail layers are the ones left unpinned
+    order = sorted(plan.deferred, key=lambda l: (abs(l - (num_layers - 1) / 2), l))
+    pinned: list[int] = []
+    refused = None
+    for layer in order:
+        banks = plan.deferred[layer]
+        try:
+            for bank in banks:
+                bank.pin()
+        except PinFailed as exc:
+            for bank in banks:
+                bank.unpin()
+            refused = exc
+            break
+        pinned.append(layer)
+    if refused is not None:
+        freed = 0
+        while pinned and freed < margin_bytes:
+            layer = pinned.pop()
+            for bank in plan.deferred[layer]:
+                freed += len(bank._buf) if bank._pinned else 0
+                bank.unpin()
+    labels = [HostResidency.PINNED.value] * num_layers
+    kept = set(pinned)
+    for layer, banks in plan.deferred.items():
+        if layer in kept:
+            continue
+        for bank in banks:
+            bank.lock()
+        labels[layer] = (
+            HostResidency.LOCKED.value if all(b.residency is HostResidency.LOCKED for b in banks) else HostResidency.PAGEABLE.value
+        )
+    return labels
 
 
 class PinPipeline:
@@ -297,6 +381,9 @@ class PinPipeline:
             if self._exc is not None:
                 continue  # drain without settling after a failure
             bank, residency, plan, layer_id = item
+            if residency == HostResidency.DEFERRED.value:
+                plan.deferred.setdefault(layer_id, []).append(bank)
+                continue
             try:
                 _settle(bank, residency)
                 if plan is not None and residency == HostResidency.LOCKED.value:

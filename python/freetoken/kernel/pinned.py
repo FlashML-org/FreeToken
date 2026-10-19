@@ -50,6 +50,11 @@ def host_register(addr: int, nbytes: int) -> None:
     _load_pinned_extension().host_register(addr, nbytes)
 
 
+def host_unregister(addr: int) -> None:
+    """cudaHostUnregister a range :func:`host_register` pinned."""
+    _load_pinned_extension().host_unregister(addr)
+
+
 @lru_cache(maxsize=1)
 def _host_ptr_identity() -> bool:
     # cached per process: FreeToken pins one CUDA device per process (set at engine launch)

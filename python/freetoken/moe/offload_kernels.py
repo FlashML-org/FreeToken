@@ -58,6 +58,7 @@ def ensure_experts_hybrid(
     max_fetch: int,
     fetch_fraction: float = 0.0,
     clamp: bool = False,
+    fetch_cap: int | None = None,
 ) -> HybridRoutes:
     """Capped-fetch variant of ``ensure_experts`` (hybrid backend).
 
@@ -71,13 +72,15 @@ def ensure_experts_hybrid(
     pre-cap miss count (stats).
 
     The same launch splits the routes: ``expert_ids`` becomes the GPU slots in place, and
-    ``clamp`` gives CPU routes slot 0 instead of -1 for GEMM kernels that read every slot."""
+    ``clamp`` gives CPU routes slot 0 instead of -1 for GEMM kernels that read every slot.
+    ``fetch_cap`` bounds the fetch count after ``max_fetch`` / ``fetch_fraction`` (a fixed-size staging buffer)."""
     assert expert_ids.is_cuda, "the hybrid ensure kernel runs on the GPU"
     # Q16 fixed point: the kernel caps in integers.
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     weights = weights.contiguous()
     routes = HybridRoutes(expert_ids, torch.empty_like(weights), torch.empty_like(expert_ids))
-    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, weights, routes, clamp, max_fetch, frac_q16)
+    cap = cache.num_experts if fetch_cap is None else fetch_cap
+    _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, weights, routes, clamp, max_fetch, frac_q16, cap)
     return routes
 
 
@@ -132,6 +135,7 @@ def _ensure_experts_hybrid_gpu(
     clamp: bool,
     max_fetch: int,
     frac_q16: int,
+    fetch_cap: int,
 ) -> None:
     id_of_slot, usage = cache.pool_state(layer_id)
     num_slots = id_of_slot.numel()
@@ -158,6 +162,7 @@ def _ensure_experts_hybrid_gpu(
         expert_ids.numel(),
         int(max_fetch),
         int(frac_q16),
+        int(fetch_cap),
         cache.num_experts,
         num_slots,
         BLOCK_E=block_e,
@@ -268,7 +273,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "cache_size", "id_of_slot_ptr", "usage_ptr"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "fetch_cap", "cache_size", "id_of_slot_ptr", "usage_ptr"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -290,6 +295,7 @@ def _ensure_experts_hybrid_kernel(
     num_active,
     max_fetch,
     fetch_frac_q16,
+    fetch_cap,
     num_experts: tl.constexpr,
     cache_size,
     BLOCK_E: tl.constexpr,
@@ -342,7 +348,7 @@ def _ensure_experts_hybrid_kernel(
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
     is_hit = is_active & (slot >= 0)
     # a pool smaller than num_experts may hold fewer free slots than misses
-    num_fetch = tl.minimum(tl.minimum(num_missing, max_fetch), cache_size - tl.sum(is_hit.to(tl.int32)))
+    num_fetch = tl.minimum(tl.minimum(num_missing, tl.minimum(max_fetch, fetch_cap)), cache_size - tl.sum(is_hit.to(tl.int32)))
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
     tl.store(usage_ptr + slot, step, mask=is_hit)

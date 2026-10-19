@@ -62,6 +62,25 @@ have no resident path and stay on `offload`. Offload-only flags
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
 warning; pass `--moe-strategy offload` to use them.
 
+### Hosts that cap pinned memory (WSL)
+
+WSL caps CUDA pinned memory near half of RAM, so the expert banks of a large
+model may not all pin. With `--moe-cpu-layers auto`, FreeToken loads the banks
+first, then pins them layer by layer from the middle out until CUDA refuses one;
+the remaining head and tail layers are OS-locked instead (resident, but with no
+device address). After a refusal on WSL it unpins about 4 GiB more
+(`FREETOKEN_PIN_PROBE_MARGIN_GB`) so later CUDA allocations still fit.
+`FREETOKEN_PIN_BUDGET_GB` replaces the probe with a fixed budget: the locked
+layers are then picked from a size estimate before the load, and a refused pin
+stops the boot.
+
+Under `hybrid`, a locked layer keeps GPU slots of its own pools. Each decode
+step it fetches `--moe-locked-fetch` (default half) of its misses: CPU threads
+copy the experts into a small pinned staging buffer
+(`--moe-locked-max-fetch` rows per bank) and the GPU copies them into the
+slots. The CPU computes the remaining misses, as on any hybrid layer. Under
+`offload`, locked layers decode on the CPU.
+
 ### NVLink-C2C hosts (GH200 / GB200)
 
 The host link is ~450 GB/s per direction instead of PCIe's ~32-64 GB/s. The
