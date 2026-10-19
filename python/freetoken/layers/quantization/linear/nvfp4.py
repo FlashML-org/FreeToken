@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,6 +31,155 @@ class TritonNvfp4LinearKernel(LinearKernel):
         from freetoken.kernel.triton.nvfp4_linear import nvfp4_dense_linear_t
 
         return nvfp4_dense_linear_t(x, layer.weight, layer.weight_scale, layer.weight_global, layer.bias)
+
+
+def _fold_globals(layer: Any) -> torch.Tensor:
+    """One tensor-wise weight global: per-part globals of a fused weight are folded into the block scales (<= 1 e4m3 ulp)."""
+    g = layer.weight_global.float()
+    g_max = g.max()
+    if not torch.all(g == g_max):
+        layer.weight_scale = (layer.weight_scale.float() * (g / g_max).unsqueeze(1)).to(FP8)
+    return g_max
+
+
+def _swizzle_128x4(scale: torch.Tensor) -> torch.Tensor:
+    """[N, K/16] block scales -> the flat cuBLAS / CUTLASS 128x4 layout, rows padded to 128 and columns to 4 with zeros."""
+    rows, cols = scale.shape
+    rb, cb = -(-rows // 128), -(-cols // 4)
+    padded = torch.zeros(rb * 128, cb * 4, dtype=scale.dtype, device=scale.device)
+    padded[:rows, :cols] = scale
+    blocks = padded.view(rb, 128, cb, 4).permute(0, 2, 1, 3)
+    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
+
+
+@functools.cache
+def _sm120_gemv(device_index: int):
+    """The row-major W4A16 GEMV / skinny GEMM module for this GPU, or None."""
+    from freetoken.kernel import gluon
+
+    if torch.cuda.get_device_capability(device_index) != (12, 0) or not gluon.available():
+        return None
+    from freetoken.kernel.gluon.nvfp4.linear import sm120_gemv
+
+    return sm120_gemv
+
+
+def _small_batch(layer: Any, x: torch.Tensor, max_tokens: int) -> torch.Tensor | None:
+    """W4A16 on the W4A4 kernels' own weight for decode-sized batches, where the W4A4 GEMMs leave bandwidth unused; None to run the GEMM."""
+    gemv = _sm120_gemv(x.device.index)
+    if gemv is None or x.dtype != torch.bfloat16 or x.shape[0] == 0:
+        return None
+    route = gemv.gemv_config(layer.weight.shape[0], x.shape[1], x.shape[0], max_tokens)
+    if route is None:
+        return None
+    kernel, tile = route
+    return kernel(x if x.stride(1) == 1 else x.contiguous(), layer.weight, layer.weight_scale, layer.weight_global, **tile)
+
+
+def _small_batch_usable() -> bool:
+    return torch.cuda.is_available() and _sm120_gemv(torch.cuda.current_device()) is not None
+
+
+class CublasNvfp4LinearKernel(LinearKernel):
+    """W4A4: activations quantized under the checkpoint's input_scale, then torch's NVFP4 scaled_mm (cuBLASLt) on the row-major weight."""
+
+    name = "cublas"
+
+    def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        if backend.is_rocm() or not torch.cuda.is_available():
+            return "needs CUDA"
+        if cfg.scheme is None or not cfg.scheme.has("input_scale"):
+            return "the weight declares no static activation scale (W4A16 checkpoint)"
+        if backend.device_capability() < (10, 0):
+            return "NVFP4 tensor cores need sm_100+"
+        if not hasattr(torch.nn.functional, "scaled_mm") or not hasattr(torch, "float4_e2m1fn_x2"):
+            return f"torch {torch.__version__} has no NVFP4 scaled_mm"
+        if cfg.out_features % 16 or cfg.in_features % 32:
+            return f"scaled_mm needs N % 16 == 0 and K % 32 == 0, got N={cfg.out_features} K={cfg.in_features}"
+        return None
+
+    def worth_it(self, cfg: LinearConfig) -> bool:
+        # cuBLAS alone runs decode-sized batches up to 1.4x slower than the triton GEMV; the small-batch kernels cover those on sm_120
+        return _small_batch_usable()
+
+    def finalize(self, layer: Any) -> None:
+        g_w = _fold_globals(layer)
+        layer.weight_scale = _swizzle_128x4(layer.weight_scale)
+        layer.weight_global = g_w.reshape(())
+        layer.input_scale = layer.input_scale.float().reshape(())
+
+    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+        from torch.nn import functional as F
+
+        from freetoken.kernel.triton.nvfp4_act_quant import quantize_nvfp4
+
+        *lead, K = x.shape
+        out = _small_batch(layer, x.reshape(-1, K), 16)
+        if out is not None:
+            out = out.reshape(*lead, layer.weight.shape[0])
+            return out + layer.bias.to(out.dtype) if layer.bias is not None else out
+        xq, xs = quantize_nvfp4(x.reshape(-1, K), layer.input_scale.reshape(1), swizzled=True)
+        block, tensor = F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise
+        swizzle = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
+        out = F.scaled_mm(
+            xq.view(torch.float4_e2m1fn_x2), layer.weight.view(torch.float4_e2m1fn_x2).t(),
+            [xs, layer.input_scale], [block, tensor], [layer.weight_scale, layer.weight_global], [block, tensor],
+            swizzle_a=swizzle, swizzle_b=swizzle, output_dtype=x.dtype,
+        ).reshape(*lead, layer.weight.shape[0])
+        return out + layer.bias.to(out.dtype) if layer.bias is not None else out
+
+
+class B12xNvfp4LinearKernel(LinearKernel):
+    """W4A4 through flashinfer alone: its activation quant and its SM12x CuTe-DSL GEMM (mm_fp4 backend b12x) on the row-major weight."""
+
+    name = "b12x"
+
+    def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        if backend.is_rocm() or not torch.cuda.is_available():
+            return "needs CUDA"
+        if cfg.scheme is None or not cfg.scheme.has("input_scale"):
+            return "the weight declares no static activation scale (W4A16 checkpoint)"
+        cc = backend.device_capability()
+        if cc[0] != 12:
+            return f"b12x requires sm_120 / sm_121, got sm_{cc[0]}{cc[1]}"
+        if not backend.is_flashinfer_installed():
+            return "flashinfer is not installed"
+        drv = backend.driver_cuda_version()
+        if drv is not None and drv < 13000:
+            return f"b12x JIT-compiles through the driver and needs CUDA 13+, the driver supports {drv // 1000}.{drv % 1000 // 10}"
+        if cfg.in_features % 32:
+            return f"b12x needs K % 32 == 0, got K={cfg.in_features}"
+        try:
+            from flashinfer import fp4_quantize, mm_fp4, nvfp4_block_scale_interleave  # noqa: F401
+        except Exception as exc:
+            return f"flashinfer FP4 GEMM symbols are unusable ({exc!r})"
+        return None
+
+    def worth_it(self, cfg: LinearConfig) -> bool:
+        return _small_batch_usable()
+
+    def finalize(self, layer: Any) -> None:
+        from flashinfer import nvfp4_block_scale_interleave
+
+        g_w = _fold_globals(layer)
+        layer.weight_scale = nvfp4_block_scale_interleave(layer.weight_scale.view(torch.uint8)).view(FP8)
+        # flashinfer takes the quant-side activation global and alpha = 1 / (that * the weight's quant-side global)
+        layer.input_scale_inv = (1.0 / layer.input_scale.float()).reshape(1)
+        layer.alpha = (layer.input_scale.float() * g_w).reshape(1)
+        layer.weight_global = g_w.reshape(())
+
+    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+        from flashinfer import fp4_quantize, mm_fp4
+
+        *lead, K = x.shape
+        # b12x's W4A4 GEMM beats the W4A16 kernels from 9 tokens on GeForce, where bf16 mma accumulates in fp32 at half rate
+        out = _small_batch(layer, x.reshape(-1, K), 8)
+        if out is not None:
+            out = out.reshape(*lead, layer.weight.shape[0])
+            return out + layer.bias.to(out.dtype) if layer.bias is not None else out
+        xq, xs = fp4_quantize(x.reshape(-1, K), layer.input_scale_inv, is_sf_swizzled_layout=True)
+        out = mm_fp4(xq, layer.weight.T, xs, layer.weight_scale, layer.alpha, x.dtype, backend="b12x").reshape(*lead, layer.weight.shape[0])
+        return out + layer.bias.to(out.dtype) if layer.bias is not None else out
 
 
 class MarlinNvfp4LinearKernel(LinearKernel):
@@ -113,7 +263,7 @@ class EmulationNvfp4LinearKernel(LinearKernel):
 
 @register_method(QuantKind.NVFP4, LayerKind.LINEAR)
 class Nvfp4LinearMethod(LinearMethod):
-    candidates = (TritonNvfp4LinearKernel, MarlinNvfp4LinearKernel, EmulationNvfp4LinearKernel)
+    candidates = (B12xNvfp4LinearKernel, CublasNvfp4LinearKernel, TritonNvfp4LinearKernel, MarlinNvfp4LinearKernel, EmulationNvfp4LinearKernel)
 
     def create_weights(self, layer: Any) -> None:
         g = self.cfg
