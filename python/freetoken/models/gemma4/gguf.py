@@ -63,7 +63,12 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     hidden = int(g("embedding_length"))
     num_experts = int(m.get("gemma4.expert_count", 0))
     num_qo_heads = int(g("attention.head_count"))
-    kv_per_layer = g("attention.head_count_kv")  # per-layer list
+    # Per-layer list, or a single value when every layer shares it: llama.cpp collapses
+    # a uniform array to a scalar, which the official gemma-4 E2B QAT q4_0 GGUF hits
+    # (head_count_kv == 1 for all 35 blocks). Broadcast so the indexing below holds.
+    kv_per_layer = g("attention.head_count_kv")
+    if isinstance(kv_per_layer, (int, float)):
+        kv_per_layer = [int(kv_per_layer)] * num_layers
     # True -> sliding-window (SWA) layer, False -> full attention.
     swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
