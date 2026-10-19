@@ -340,6 +340,26 @@ def mixed_precision_quant(gdn_layers, attn_layers, moe_layers) -> dict:
 LOVEDHEART_NVFP4_FP8 = mixed_precision_quant(gdn_layers=(0,), attn_layers=(3,), moe_layers=(0, 3))
 
 
+def mxfp8_dense_quant(gdn_layers, attn_layers, moe_layers) -> dict:
+    """modelopt MIXED_PRECISION with NVFP4 routed experts and MXFP8 attention / GDN projections (all four in_proj parts, not just qkv|z), as in local-inference-lab/Qwen3.8-Flash-Next-NVFP4."""
+    return {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            **{f"{LM}.layers.{i}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for i in moe_layers},
+            **{f"{LM}.layers.{i}.linear_attn.{p}": {"quant_algo": "MXFP8", "group_size": 32}
+               for i in gdn_layers for p in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")},
+            **{f"{LM}.layers.{i}.self_attn.{p}_proj": {"quant_algo": "MXFP8", "group_size": 32}
+               for i in attn_layers for p in "qkvo"},
+        },
+        "ignore": [
+            "model.embed_tokens", "mtp.*", "model.mtp.*", "*.mlp.gate*", "*.mlp.shared_expert.*",
+            "*.mlp.shared_expert_gate*", "*hyper_connection*", "*.ple.*", "model.visual.*",
+            "model.language_model.embed_tokens", "lm_head", "*.self_attn.indexer*",
+        ],
+    }
+
+
 def install_quant_config(model_path: str) -> None:
     """Install ``model_path``'s QuantConfig process-wide, as EngineConfig does before the reader runs."""
     from freetoken.layers.quantization import set_quant_config
