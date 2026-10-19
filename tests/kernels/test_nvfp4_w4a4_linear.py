@@ -69,11 +69,12 @@ def test_swizzled_scales_are_the_cublas_128x4_layout(rows, K):
 
 @pytest.mark.parametrize("kernel_name", ["cublas", "b12x"])
 @pytest.mark.parametrize("M", [1, 2, 7, 16, 300])
-@pytest.mark.parametrize("N,K", [(512, 1024), (528, 2080)])
+@pytest.mark.parametrize("N,K", [(512, 1024), (528, 2080), (12, 2048)])
 @pytest.mark.parametrize("parts_differ", [False, True])
 def test_w4a4_linear_matches_nvfp4_activation_reference(kernel_name, M, N, K, parts_differ):
     """finalize + apply against a torch emulation: W4A4, or W4A16 where the sm_120 small-batch kernels take the batch (M <= 16 for cublas,
-    M <= 8 for b12x, at 512 x 1024; 528 x 2080 fits neither and keeps the GEMM); parts_differ gives the halves of a fused weight different globals."""
+    M <= 8 for b12x, at 512 x 1024; 528 x 2080 fits neither and keeps the GEMM; N = 12 must be refused, b12x returns garbage there);
+    parts_differ gives the halves of a fused weight different globals."""
     from freetoken.layers.quantization.linear.base import LinearConfig
     from freetoken.layers.quantization.linear.nvfp4 import Nvfp4LinearMethod
     from freetoken.layers.quantization.scheme import nvfp4_scheme
@@ -131,3 +132,28 @@ def test_sm120_gemv_tiles_match_dequant_reference(N, K, T):
     kernel, tile = route
     out = kernel(x, weight, _swizzle_128x4(scale), g_w, **tile)
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
+
+
+@pytest.mark.parametrize("kernel_name", ["cublas", "b12x"])
+@pytest.mark.parametrize("M", [0, 4, 64])
+def test_w4a4_linear_takes_row_strided_and_empty_inputs(kernel_name, M):
+    """A row-strided slice and an empty batch give the same output as a contiguous input, on both the small-batch and the GEMM route."""
+    from freetoken.layers.quantization.linear.base import LinearConfig
+    from freetoken.layers.quantization.linear.nvfp4 import Nvfp4LinearMethod
+    from freetoken.layers.quantization.scheme import nvfp4_scheme
+
+    N, K = 512, 1024
+    kernel = next(c for c in Nvfp4LinearMethod.candidates if c.name == kernel_name)()
+    reason = kernel.unusable_reason(LinearConfig(K, N, (N,), nvfp4_scheme(input_scale=True)))
+    if reason:
+        pytest.skip(reason)
+    g = torch.Generator(device="cuda").manual_seed(0)
+    layer = SimpleNamespace(weight=torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device="cuda", generator=g),
+                            weight_scale=(torch.rand(N, K // 16, device="cuda", generator=g) + 0.25).to(torch.float8_e4m3fn),
+                            weight_global=torch.full((N,), 1e-3, dtype=torch.float16, device="cuda"),
+                            input_scale=torch.tensor(0.01, device="cuda"), bias=None)
+    kernel.finalize(layer)
+    buf = torch.randn(M, K + 64, device="cuda", dtype=torch.bfloat16, generator=g)
+    out = kernel.apply(layer, buf[:, :K])
+    assert out.shape == (M, N)
+    torch.testing.assert_close(out, kernel.apply(layer, buf[:, :K].contiguous()), rtol=0, atol=0)

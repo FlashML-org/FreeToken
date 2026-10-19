@@ -76,6 +76,14 @@ def _small_batch(layer: Any, x: torch.Tensor, max_tokens: int) -> torch.Tensor |
     return kernel(x if x.stride(1) == 1 else x.contiguous(), layer.weight, layer.weight_scale, layer.weight_global, **tile)
 
 
+@functools.cache
+def _flashinfer_cuda_major() -> int:
+    """The CUDA version flashinfer's b12x GEMM checks at call time: nvcc's, else torch's."""
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    return get_cuda_version().major
+
+
 def _small_batch_usable() -> bool:
     return torch.cuda.is_available() and _sm120_gemv(torch.cuda.current_device()) is not None
 
@@ -147,12 +155,17 @@ class B12xNvfp4LinearKernel(LinearKernel):
         drv = backend.driver_cuda_version()
         if drv is not None and drv < 13000:
             return f"b12x JIT-compiles through the driver and needs CUDA 13+, the driver supports {drv // 1000}.{drv % 1000 // 10}"
-        if cfg.in_features % 32:
-            return f"b12x needs K % 32 == 0, got K={cfg.in_features}"
+        if cfg.in_features % 32 or cfg.out_features % 8:
+            # flashinfer checks only K; N % 8 != 0 returns wrong output
+            return f"b12x needs K % 32 == 0 and N % 8 == 0, got K={cfg.in_features} N={cfg.out_features}"
         try:
             from flashinfer import fp4_quantize, mm_fp4, nvfp4_block_scale_interleave  # noqa: F401
+
+            cuda_major = _flashinfer_cuda_major()
         except Exception as exc:
             return f"flashinfer FP4 GEMM symbols are unusable ({exc!r})"
+        if cuda_major < 13:
+            return f"flashinfer's b12x GEMM needs a CUDA 13 toolkit (nvcc, else torch), got CUDA {cuda_major}"
         return None
 
     def worth_it(self, cfg: LinearConfig) -> bool:
@@ -172,12 +185,15 @@ class B12xNvfp4LinearKernel(LinearKernel):
         from flashinfer import fp4_quantize, mm_fp4
 
         *lead, K = x.shape
+        x2 = x.reshape(-1, K)
+        if x2.shape[0] == 0:
+            return x.new_empty(*lead, layer.weight.shape[0])
         # b12x's W4A4 GEMM beats the W4A16 kernels from 9 tokens on GeForce, where bf16 mma accumulates in fp32 at half rate
-        out = _small_batch(layer, x.reshape(-1, K), 8)
+        out = _small_batch(layer, x2, 8)
         if out is not None:
             out = out.reshape(*lead, layer.weight.shape[0])
             return out + layer.bias.to(out.dtype) if layer.bias is not None else out
-        xq, xs = fp4_quantize(x.reshape(-1, K), layer.input_scale_inv, is_sf_swizzled_layout=True)
+        xq, xs = fp4_quantize(x2.contiguous(), layer.input_scale_inv, is_sf_swizzled_layout=True)
         out = mm_fp4(xq, layer.weight.T, xs, layer.weight_scale, layer.alpha, x.dtype, backend="b12x").reshape(*lead, layer.weight.shape[0])
         return out + layer.bias.to(out.dtype) if layer.bias is not None else out
 
