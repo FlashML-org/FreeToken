@@ -80,10 +80,6 @@ _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
 _GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
-_MUSE_GLIMMER_PACKED = (
-    ("qkvg_proj", ("q_proj", "k_proj", "v_proj", "gate_proj")),
-    ("gate_up_proj", ("gate_proj", "up_proj")),
-)
 _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
     ("index_qk_proj", ("index_q_proj", "index_k_proj")),
@@ -316,7 +312,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.muse_glimmer",
         "MuseGlimmerForConditionalGeneration",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
-        packed_modules_mapping=_MUSE_GLIMMER_PACKED,
+        packed_modules_mapping=_DENSE_PACKED,
         mm_processor=_MUSE_GLIMMER_PROCESSOR,
         encoders=_MUSE_GLIMMER_ENCODERS,
     ),
@@ -326,7 +322,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "MuseGlimmerForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
-        packed_modules_mapping=_MUSE_GLIMMER_PACKED,
+        packed_modules_mapping=_DENSE_PACKED,
     ),
     "MistralForCausalLM": ModelSpec(
         "freetoken.models.mistral",
