@@ -9,12 +9,17 @@ from typing import Any
 import torch
 
 from freetoken.kernel import backend
+from freetoken.utils import init_logger
 
 from ..registry import LayerKind, register_method
 from ..scheme import NVFP4_GROUP as GROUP, QuantKind
 from .base import LinearConfig, LinearKernel, LinearMethod
 
+logger = init_logger(__name__)
+
 FP8 = torch.float8_e4m3fn
+# fused parts whose weight globals are further apart than this ratio get a load-time warning
+_PART_GLOBAL_WARN_RATIO = 1.05
 
 
 class TritonNvfp4LinearKernel(LinearKernel):
@@ -33,12 +38,21 @@ class TritonNvfp4LinearKernel(LinearKernel):
         return nvfp4_dense_linear_t(x, layer.weight, layer.weight_scale, layer.weight_global, layer.bias)
 
 
-def _fold_globals(layer: Any) -> torch.Tensor:
-    """One tensor-wise weight global: per-part globals of a fused weight are folded into the block scales (<= 1 e4m3 ulp)."""
+@functools.cache
+def _warn_part_globals() -> None:
+    logger.warning_rank0(
+        "an NVFP4 linear fuses parts whose weight global scales differ by more than %d%%; the W4A4 kernels use the largest "
+        "for every part, which scales the other parts' outputs by their ratio; --quant-backend linear.nvfp4=triton keeps "
+        "each part's global", round((_PART_GLOBAL_WARN_RATIO - 1) * 100),
+    )
+
+
+def _tensor_global(layer: Any) -> torch.Tensor:
+    """The one weight global the W4A4 GEMMs and the small-batch kernels take: the largest per-part global, the block scales unchanged."""
     g = layer.weight_global.float()
     g_max = g.max()
-    if not torch.all(g == g_max):
-        layer.weight_scale = (layer.weight_scale.float() * (g / g_max).unsqueeze(1)).to(FP8)
+    if g_max > _PART_GLOBAL_WARN_RATIO * g.min():
+        _warn_part_globals()
     return g_max
 
 
@@ -111,7 +125,7 @@ class CublasNvfp4LinearKernel(LinearKernel):
         return _small_batch_usable()
 
     def finalize(self, layer: Any) -> None:
-        g_w = _fold_globals(layer)
+        g_w = _tensor_global(layer)
         layer.weight_scale = _swizzle_128x4(layer.weight_scale)
         layer.weight_global = g_w.reshape(())
         layer.input_scale = layer.input_scale.float().reshape(())
@@ -174,7 +188,7 @@ class B12xNvfp4LinearKernel(LinearKernel):
     def finalize(self, layer: Any) -> None:
         from flashinfer import nvfp4_block_scale_interleave
 
-        g_w = _fold_globals(layer)
+        g_w = _tensor_global(layer)
         layer.weight_scale = nvfp4_block_scale_interleave(layer.weight_scale.view(torch.uint8)).view(FP8)
         # flashinfer takes the quant-side activation global and alpha = 1 / (that * the weight's quant-side global)
         layer.input_scale_inv = (1.0 / layer.input_scale.float()).reshape(1)

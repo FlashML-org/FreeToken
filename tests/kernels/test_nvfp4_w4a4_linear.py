@@ -74,7 +74,7 @@ def test_swizzled_scales_are_the_cublas_128x4_layout(rows, K):
 def test_w4a4_linear_matches_nvfp4_activation_reference(kernel_name, M, N, K, parts_differ):
     """finalize + apply against a torch emulation: W4A4, or W4A16 where the sm_120 small-batch kernels take the batch (M <= 16 for cublas,
     M <= 8 for b12x, at 512 x 1024; 528 x 2080 fits neither and keeps the GEMM; N = 12 must be refused, b12x returns garbage there);
-    parts_differ gives the halves of a fused weight different globals."""
+    parts_differ gives the halves of a fused weight different globals, and the larger one applies to both."""
     from freetoken.layers.quantization.linear.base import LinearConfig
     from freetoken.layers.quantization.linear.nvfp4 import Nvfp4LinearMethod
     from freetoken.layers.quantization.scheme import nvfp4_scheme
@@ -94,7 +94,8 @@ def test_w4a4_linear_matches_nvfp4_activation_reference(kernel_name, M, N, K, pa
     # off amax / 2688 by an irrational factor: with amax / 2688 many values sit exactly on an e2m1 midpoint, where the kernel's
     # approximate fp32 reciprocal and torch's exact one round apart
     g_in = float(x.float().abs().max()) / 2688 * math.pi / 3
-    w_ref = _dequant(weight, scale, row_global)
+    # one tensor-wise global: the largest part's, applied to every row
+    w_ref = _dequant(weight, scale, torch.full_like(row_global, float(row_global.max())))
     small = _small_batch_route(N, K, M, 16 if kernel_name == "cublas" else 8) is not None
     ref = (x.float() if small else _qdq(x, g_in)) @ w_ref.T + bias.float()
 
@@ -102,9 +103,7 @@ def test_w4a4_linear_matches_nvfp4_activation_reference(kernel_name, M, N, K, pa
                             input_scale=torch.tensor(g_in, device="cuda"), bias=bias)
     kernel.finalize(layer)
     out = kernel.apply(layer, x)
-    # the fold rounds the rescaled block scales back to e4m3
-    tol = 3e-2 if parts_differ else 1e-2
-    torch.testing.assert_close(out.float(), ref, rtol=tol, atol=tol * float(ref.abs().max()))
+    torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
 
 
 @pytest.mark.parametrize("N,K,T", [
