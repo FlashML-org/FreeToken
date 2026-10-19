@@ -102,6 +102,11 @@ def _elsize(dt: torch.dtype) -> int:
     return torch.empty((), dtype=dt).element_size()
 
 
+def _is_nvfp4_global(name: str) -> bool:
+    m = _LAYER_ENTRY_RE.match(name)
+    return (m["base"] if m else name).endswith(("gate_up_global", "down_global", ".weight_global"))
+
+
 def is_ftw_checkpoint(path: str) -> bool:
     """True if ``path`` is a directory holding a FreeToken Weight (FTW) index."""
     return os.path.isfile(os.path.join(path, INDEX_NAME))
@@ -221,6 +226,12 @@ class FTWReader:
         self.dir = path
         self.shards = sorted(self.index["shards"], key=lambda s: s["global_off"])
         self.tensors = {t["name"]: t for t in self.index["tensors"]}
+        fp16_globals = [n for n, t in self.tensors.items() if t["dtype"] == "float16" and _is_nvfp4_global(n)]
+        if fp16_globals:
+            raise ValueError(
+                f"{path!r} stores NVFP4 global scales as fp16 (e.g. {fp16_globals[0]!r}) but FreeToken reads them as fp32; "
+                "reconvert it from the source checkpoint with `ft checkpoint`"
+            )
         self._fds: dict[str, int] = {}
         self._maps: dict[str, tuple[mmap.mmap, memoryview]] = {}
         # O_DIRECT (DMA straight from disk, bypassing the page cache) is the fast path but a

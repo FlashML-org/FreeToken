@@ -1,14 +1,14 @@
 """Inline-dequant NVFP4 fused-MoE Triton kernels.
 
 These kernels read the NVFP4 expert cache (packed FP4 codes + fp8 block scales +
-fp16 per-row global scale) *directly* and dequantize inside the GEMM K-loop, so the
+fp32 per-row global scale) *directly* and dequantize inside the GEMM K-loop, so the
 grouped MoE GEMM never materializes a BF16 copy of the experts (no separate dequant
 pass, no HBM round-trip of the 4x larger BF16 weights).
 
 Layout, for an expert weight ``W[N, K]``:
   - ``packed[slot, n, k//2]`` uint8: two FP4 codes per byte, low nibble = even k.
   - ``scale[slot, n, k//16]`` fp8-e4m3: per 16-wide block scale.
-  - ``global[slot, n]`` fp16: per-output-row scale (``weight_scale_2``).
+  - ``global[slot, n]`` fp32: per-output-row scale (``weight_scale_2``).
   - ``W[n, k] = E2M1[code] * scale[n, k//16] * global[n]``.
 
 The global scale is constant along K, so it is applied once after the K-loop.
@@ -52,7 +52,7 @@ def _decode_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 2] uint8
     scale_ptr,         # [S, N, K // 16] fp8-e4m3
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
@@ -163,7 +163,7 @@ def _decode_nvfp4_marlin_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 8] int32 (8 fp4 codes per word, nibble j -> k=8*w+j)
     scale_ptr,         # [S, N, K // 16] fp8-e4m3
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
@@ -357,7 +357,7 @@ def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
     packed_ptr,        # [S, N, K // 2] uint8
     scale_ptr,         # [S, N, K // 16] fp8-e4m3 (uint8 view before sm_89)
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [num_valid_tokens, N] output (flat over M*top_k)
     topk_weights_ptr,
     sorted_token_ids_ptr,

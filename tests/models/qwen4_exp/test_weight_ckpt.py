@@ -263,7 +263,7 @@ def test_ple_table_loads_pinned_and_matches_the_checkpoint(reader):
 
     # The two pinned host allocations the engine must budget for.
     total = PLE_BYTES + NUM_LAYERS * EXPERT_LAYER_BYTES
-    assert abs(total / 2**30 - 111.14) < 0.05
+    assert abs(total / 2**30 - 111.32) < 0.05
 
 
 @pytest.fixture(scope="module")
@@ -312,14 +312,14 @@ def test_sampled_experts_match_the_checkpoint(layer0_expert_banks, reader):
             scale = reader.get(f"{base}.{proj}.weight_scale")
             assert torch.equal(banks[bank][0][expert][rows].reshape(-1).view(torch.uint8),
                                scale.reshape(-1).view(torch.uint8))
-        gate_g = reader.get(f"{base}.gate_proj.weight_scale_2").to(torch.float16)
+        gate_g = reader.get(f"{base}.gate_proj.weight_scale_2").to(torch.float32)
         assert torch.equal(banks["gate_up_global"][0][expert, :I], gate_g.reshape(1).expand(I))
 
 
 def test_expert_bank_bytes_match_the_aot_row_table(layer0_expert_banks):
     measured = sum(t[0].numel() * t[0].element_size() for t in layer0_expert_banks.values())
     assert measured == EXPERT_LAYER_BYTES
-    assert abs(NUM_LAYERS * EXPERT_LAYER_BYTES / 2**30 - 63.46) < 0.05
+    assert abs(NUM_LAYERS * EXPERT_LAYER_BYTES / 2**30 - 63.63) < 0.05
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="dummy banks are pinned")

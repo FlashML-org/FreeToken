@@ -1,4 +1,4 @@
-"""e2m1 weight packed two per byte, e4m3 scales per 16 input elements, one fp16 global per output row."""
+"""e2m1 weight packed two per byte, e4m3 scales per 16 input elements, one fp32 global per output row."""
 
 from __future__ import annotations
 
@@ -256,7 +256,7 @@ class MarlinNvfp4LinearKernel(LinearKernel):
         dev = layer.weight.device
         layer.weight = torch.empty(0, dtype=torch.uint8, device=dev)
         layer.weight_scale = torch.empty(0, dtype=FP8, device=dev)
-        layer.weight_global = torch.empty(0, dtype=torch.float16, device=dev)
+        layer.weight_global = torch.empty(0, dtype=torch.float32, device=dev)
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import apply_fp4_marlin_linear
@@ -301,6 +301,6 @@ class Nvfp4LinearMethod(LinearMethod):
             raise ValueError(f"nvfp4 needs in_features divisible by {GROUP}, got {g.in_features}")
         layer.weight = torch.empty(g.out_features, g.in_features // 2, dtype=torch.uint8)
         layer.weight_scale = torch.empty(g.out_features, g.in_features // GROUP, dtype=FP8)
-        layer.weight_global = torch.empty(g.out_features, dtype=torch.float16)
+        layer.weight_global = torch.empty(g.out_features, dtype=torch.float32)
         # no W4A16 kernel reads it; declared so a W4A4 checkpoint loads complete and a W4A4 kernel finds it in place
         layer.input_scale = torch.empty((), dtype=torch.float32) if self.scheme.has("input_scale") else None

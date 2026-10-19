@@ -227,7 +227,7 @@ class _DenseReader:
             g = part["weight_global"].reshape(-1).to(torch.float32)
             if g.numel() != 1:
                 raise ValueError(f"{target}: weight_global has {g.numel()} elements, expected one per-tensor scale")
-            out["weight_global"] = g.to(torch.float16).expand(rows).contiguous()
+            out["weight_global"] = g.expand(rows).contiguous()
         if "input_scale" in part:
             out["input_scale"] = part["input_scale"].reshape(()).to(torch.float32)
         return out

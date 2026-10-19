@@ -131,7 +131,7 @@ def _iter_weights_compressed_tensors(
 
     Every text Linear (q/k/v/o, the attention gate, the MLP) is kept native NVFP4
     (W4A16): ``.weight`` (uint8 packed) + ``.weight_scale`` (fp8 block) + ``.weight_global``
-    (fp16 per-row, the reciprocal of the stored quant-side global). q/k/v fuse into
+    (fp32 per-row, the reciprocal of the stored quant-side global). q/k/v fuse into
     ``qkv_proj`` and gate/up into ``gate_up_proj`` on the output dim, each part keeping
     its own scales, so the fused FP4 weights are exact. Embeddings, norms, lm_head and the
     vision tower are bf16 (the checkpoint's ignore list). Scale lookups go through the

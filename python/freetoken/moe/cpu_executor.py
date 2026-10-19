@@ -448,12 +448,12 @@ class CpuMoeExecutor:
         if fmt == "fp8_block":
             return self._resolve_fp8_block_banks(banks, rep)
 
-        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp16 row globals.
+        # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp32 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]
         dnp, dns, dng = banks["down"], banks["down_scale"], banks["down_global"]
         assert gup[rep].dtype == torch.uint8 and dnp[rep].dtype == torch.uint8, (gup[rep].dtype, dnp[rep].dtype)
         assert gus[rep].element_size() == 1 and dns[rep].element_size() == 1, "block scales must be 1 byte"
-        assert gug[rep].dtype == torch.float16 and dng[rep].dtype == torch.float16, (gug[rep].dtype, dng[rep].dtype)
+        assert gug[rep].dtype == torch.float32 and dng[rep].dtype == torch.float32, (gug[rep].dtype, dng[rep].dtype)
         I = int(gup[rep].shape[1] // 2)
         H = int(gup[rep].shape[2] * 2)
         assert gup[rep].shape[1] == 2 * I

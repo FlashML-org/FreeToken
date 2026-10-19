@@ -86,6 +86,8 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
 - Muse-Glimmer keeps the attention gate as its own linear next to `qkv_proj`; an FTW converted
   when the gate was fused into `qkvg_proj` no longer loads, reconvert it with `ft checkpoint`.
+- NVFP4 global scales are kept in fp32. An NVFP4 FTW that stores them as fp16 (converted by an
+  older build) is refused at load; reconvert it with `ft checkpoint`.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`
   refuses it unless started with `--text-model-only` (or `--mm-disable vision`); reconvert it
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).

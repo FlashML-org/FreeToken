@@ -66,15 +66,15 @@ _NVFP4_DENSE_MLP_RE = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)\.weight$
 
 
 def _nvfp4_dense_parts(reader: ShardReader, raw_base: str):
-    """Load an NVFP4 dense weight as the NVFP4 linear method's buffers: weight uint8 [O, IN//2], weight_scale fp8-e4m3 block [O, IN//16], weight_global fp16 [O] (the per-tensor weight_scale_2 per output row), input_scale fp32 scalar or None when the export has none."""
+    """Load an NVFP4 dense weight as the NVFP4 linear method's buffers: weight uint8 [O, IN//2], weight_scale fp8-e4m3 block [O, IN//16], weight_global fp32 [O] (the per-tensor weight_scale_2 per output row), input_scale fp32 scalar or None when the export has none."""
     w = reader.get_tensor(raw_base + ".weight")
     s = reader.get_tensor(raw_base + ".weight_scale")
-    g = reader.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float16)
+    g = reader.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float32)
     g = g.expand(w.shape[0]).contiguous()
     assert (
         w.dtype is torch.uint8
         and s.dtype is torch.float8_e4m3fn
-        and g.dtype is torch.float16
+        and g.dtype is torch.float32
     ), f"unexpected NVFP4 dense dtypes at {raw_base}: {w.dtype}/{s.dtype}/{g.dtype}"
     a = reader.get_tensor(raw_base + ".input_scale").reshape(()).to(torch.float32) if reader.has(raw_base + ".input_scale") else None
     return w, s, g, a

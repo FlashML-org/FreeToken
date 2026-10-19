@@ -86,7 +86,7 @@ def test_w4a4_linear_matches_nvfp4_activation_reference(kernel_name, M, N, K, pa
     g = torch.Generator(device="cuda").manual_seed(0)
     weight = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device="cuda", generator=g)
     scale = (torch.rand(N, K // 16, device="cuda", generator=g) + 0.25).to(torch.float8_e4m3fn)
-    row_global = torch.full((N,), 1e-3, dtype=torch.float16, device="cuda")
+    row_global = torch.full((N,), 1e-3, dtype=torch.float32, device="cuda")
     if parts_differ:
         row_global[N // 2:] = 4e-3
     bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
@@ -149,7 +149,7 @@ def test_w4a4_linear_takes_row_strided_and_empty_inputs(kernel_name, M):
     g = torch.Generator(device="cuda").manual_seed(0)
     layer = SimpleNamespace(weight=torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device="cuda", generator=g),
                             weight_scale=(torch.rand(N, K // 16, device="cuda", generator=g) + 0.25).to(torch.float8_e4m3fn),
-                            weight_global=torch.full((N,), 1e-3, dtype=torch.float16, device="cuda"),
+                            weight_global=torch.full((N,), 1e-3, dtype=torch.float32, device="cuda"),
                             input_scale=torch.tensor(0.01, device="cuda"), bias=None)
     kernel.finalize(layer)
     buf = torch.randn(M, K + 64, device="cuda", dtype=torch.bfloat16, generator=g)

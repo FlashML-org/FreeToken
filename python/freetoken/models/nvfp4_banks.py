@@ -36,7 +36,7 @@ def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
 def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
     if spec.global_reciprocal:
         tensor = 1.0 / tensor.float()
-    return tensor.to(torch.float16)
+    return tensor.to(torch.float32)
 
 
 def _activation_scale():
@@ -99,7 +99,7 @@ def iter_nvfp4_expert_pieces(
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
-    fp16) companions, straight from the safetensors shards. When every expert also stores the
+    fp32) companions, straight from the safetensors shards. When every expert also stores the
     dialect's static activation scale, the pieces carry it as fp32 ``_input`` (dequant side).
 
     Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
