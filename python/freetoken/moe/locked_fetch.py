@@ -50,6 +50,14 @@ def _smt_siblings(cpus: list[int]) -> list[int]:
     return out
 
 
+def _copy_threads() -> int:
+    """FREETOKEN_LOCKED_FETCH_THREADS, else max(2, min(4, logical CPUs / 4)): a few threads already saturate memcpy."""
+    if env := os.environ.get("FREETOKEN_LOCKED_FETCH_THREADS"):
+        return max(1, int(env))
+    logical = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return max(2, min(4, logical // 4))
+
+
 def _copy_cpus(executor, count: int) -> list[int]:
     """CPUs for the copy threads: SMT siblings of the executor's workers, else physical cores the executor leaves free."""
     from freetoken.moe.cpu_executor import physical_core_cpus
@@ -93,11 +101,11 @@ class LockedLayerFetch:
         self.count = alloc_pinned_tensor(1, dtype=torch.int64)
         self.rows = alloc_pinned_tensor(max_fetch, dtype=torch.int32)
         self.resize(cache.evict_slots.numel())
-        cpus = _copy_cpus(executor, int(os.environ.get("FREETOKEN_LOCKED_FETCH_THREADS", "8")))
+        cpus = _copy_cpus(executor, _copy_threads())
         self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], self.count.data_ptr(), self.rows.data_ptr(), max_fetch, cpus)
         logger.info_rank0(
             f"locked layers {layers}: GPU slots + fetch {fraction:g} of each step's misses (at most {max_fetch}) through "
-            f"{sum(t.numel() for t in self.staging) / 2**20:.1f} MiB of pinned staging, {max(1, len(cpus))} copy threads on cpus {cpus or 'any'}"
+            f"{sum(t.numel() for t in self.staging) / 2**20:.1f} MiB of pinned staging, {max(1, len(cpus))} copy thread(s) on cpus {cpus or 'any'}"
         )
 
     def resize(self, plan_slots: int) -> None:
