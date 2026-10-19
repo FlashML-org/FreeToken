@@ -35,13 +35,6 @@ _EXPERT_KEY_RE = (
 # role -> the expert bank reader's canonical (ModelOpt) tensor kind
 _BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
 
-# Gemma-style (1+weight) RMSNorm weights; the GDN gated norm (linear_attn.norm) is a plain weight*x norm
-_GEMMA_NORM_SUFFIXES = (
-    ".input_layernorm.weight",
-    ".post_attention_layernorm.weight",
-    ".self_attn.q_norm.weight",
-    ".self_attn.k_norm.weight",
-)
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
 _LINEAR_LEAVES = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
@@ -61,10 +54,6 @@ def _rename(raw_name: str) -> str | None:
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
     return rename_vl_prefix(raw_name)
-
-
-def _is_gemma_norm(name: str) -> bool:
-    return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
 
 
 def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
@@ -274,8 +263,6 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                 emitted = reader.add(name, tensor)
                 if emitted is not None:
                     yield from emitted
-                elif _is_gemma_norm(name):
-                    yield name, tensor + 1.0  # (1 + weight) baked into the stored norm weight
                 else:
                     yield name, tensor
     if reader is not None and reader.pending:

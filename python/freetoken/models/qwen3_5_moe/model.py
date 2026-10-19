@@ -6,7 +6,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
-    GemmaRMSNorm,
+    GemmaPlusOneRMSNormFused,
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -58,20 +58,15 @@ class Qwen3_5DecoderLayer(BaseOP):
             if config.moe_enabled
             else Qwen3_5DenseMLP(config, prefix=f"{prefix}.mlp")
         )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps)
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
-        # Residual-stream form: fuse each residual-add into the next RMSNorm
-        # (GemmaRMSNorm.forward_add_residual) so add + norm are one kernel per sublayer.
-        if residual is None:
-            residual = hidden
-            hidden = self.input_layernorm.forward(hidden)
-        else:
-            hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
+        # Residual-stream form: fuse each residual-add into the next RMSNorm so add + norm are one kernel per sublayer.
+        hidden, residual = self.input_layernorm.forward(hidden, residual)
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
-        hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+        hidden, residual = self.post_attention_layernorm.forward(hidden, residual)
         hidden = self.mlp.forward(hidden)
         return hidden, residual
 
@@ -90,14 +85,14 @@ class Qwen3_5Model(BaseOP):
                 for layer_id in range(config.num_layers)
             ]
         )
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
-        x, _ = self.norm.forward_add_residual(x, residual)
+        x, _ = self.norm.forward(x, residual)
         return x
 
 

@@ -358,7 +358,7 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a.dtype is b.dtype and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
-def test_bf16_fusions_slice_back_and_norms_get_plus_one(checkpoint):
+def test_bf16_fusions_slice_back_and_norms_load_as_stored(checkpoint):
     name, folder, raw = checkpoint
     if name != "bf16":
         pytest.skip("bf16 layout only")
@@ -371,8 +371,8 @@ def test_bf16_fusions_slice_back_and_norms_get_plus_one(checkpoint):
     merged = loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"]
     assert _same(merged[:I], raw[f"{LM}.layers.1.mlp.shared_expert.gate_proj.weight"])
     assert _same(merged[I:], raw[f"{LM}.layers.1.mlp.shared_expert.up_proj.weight"])
-    assert torch.equal(loaded["model.norm.weight"], raw[f"{LM}.norm.weight"] + 1.0)
-    assert torch.equal(loaded["model.layers.1.self_attn.q_norm.weight"], raw[f"{attn}.q_norm.weight"] + 1.0)
+    assert torch.equal(loaded["model.norm.weight"], raw[f"{LM}.norm.weight"])
+    assert torch.equal(loaded["model.layers.1.self_attn.q_norm.weight"], raw[f"{attn}.q_norm.weight"])
     assert torch.equal(loaded["model.layers.0.linear_attn.norm.weight"], raw[f"{gdn}.norm.weight"])
     assert loaded["model.layers.0.linear_attn.A_log"].dtype is torch.float32
 

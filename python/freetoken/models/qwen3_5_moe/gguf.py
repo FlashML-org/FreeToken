@@ -1,6 +1,6 @@
 """Qwen3.5 / 3.6 / 3.8 dense and MoE from a llama.cpp ``qwen35`` / ``qwen35moe`` GGUF: config from the GGUF metadata, tensor names, and the converter's transforms undone.
 
-The llama.cpp converter (conversion/qwen.py) stores ``A_log`` as ``-exp(A_log)``, the squeezed conv kernels, and the GDN value heads in tiled order (k-head minor). Its zero-centred norms are stored as ``w + 1``, which is what this family loads. Row reorders are undone on the packed bytes; ``ssm_out`` keeps its tiled columns and the GDN layer permutes its input instead.
+The llama.cpp converter (conversion/qwen.py) stores ``A_log`` as ``-exp(A_log)``, the squeezed conv kernels, and the GDN value heads in tiled order (k-head minor). Its zero-centred norms are stored as ``w + 1``; the loader subtracts the 1 in fp32 and the norms add it back in fp32 at runtime. Row reorders are undone on the packed bytes; ``ssm_out`` keeps its tiled columns and the GDN layer permutes its input instead.
 """
 
 from __future__ import annotations
@@ -162,15 +162,18 @@ def iter_gguf_weights(
     def t(name: str) -> GgufTensorInfo:
         return index[name if name in index else f"{name}.weight"]
 
+    def norm(name: str) -> torch.Tensor:
+        return float_tensor(t(name)).float() - 1.0
+
     yield from fused("model.embed_tokens", [t("token_embd")], [matrix(t("token_embd"))], hidden)
     if not config.tie_word_embeddings:
         yield from fused("lm_head", [t("output")], [matrix(t("output"))], hidden)
-    yield "model.norm.weight", float_tensor(t("output_norm"))
+    yield "model.norm.weight", norm("output_norm")
 
     for layer in range(config.num_layers):
         blk, pre = f"blk.{layer}", f"model.layers.{layer}"
-        yield f"{pre}.input_layernorm.weight", float_tensor(t(f"{blk}.attn_norm"))
-        yield f"{pre}.post_attention_layernorm.weight", float_tensor(t(f"{blk}.post_attention_norm"))
+        yield f"{pre}.input_layernorm.weight", norm(f"{blk}.attn_norm")
+        yield f"{pre}.post_attention_layernorm.weight", norm(f"{blk}.post_attention_norm")
         if config.is_linear_layer(layer):
             la = f"{pre}.linear_attn"
             nk, dk = g.num_key_heads, g.key_head_dim
@@ -199,8 +202,8 @@ def iter_gguf_weights(
             yield from fused(f"{sa}.qkv_proj", parts, [matrix(p) for p in parts], hidden)
             out = t(f"{blk}.attn_output")
             yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
-            yield f"{sa}.q_norm.weight", float_tensor(t(f"{blk}.attn_q_norm"))
-            yield f"{sa}.k_norm.weight", float_tensor(t(f"{blk}.attn_k_norm"))
+            yield f"{sa}.q_norm.weight", norm(f"{blk}.attn_q_norm")
+            yield f"{sa}.k_norm.weight", norm(f"{blk}.attn_k_norm")
 
         mlp = f"{pre}.mlp"
         if config.moe_enabled:
