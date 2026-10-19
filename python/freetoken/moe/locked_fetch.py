@@ -92,14 +92,18 @@ class LockedLayerFetch:
         self.staging_ptrs = torch.tensor([device_ptr(t) for t in self.staging], dtype=torch.int64, device=cache.device)
         self.count = alloc_pinned_tensor(1, dtype=torch.int64)
         self.rows = alloc_pinned_tensor(max_fetch, dtype=torch.int32)
-        # the gather kernel takes src indices shaped like evict_slots; it reads only the first num_indices <= max_fetch
-        self.row_ids = torch.arange(cache.evict_slots.numel(), dtype=torch.int32, device=cache.device)
+        self.resize(cache.evict_slots.numel())
         cpus = _copy_cpus(executor, int(os.environ.get("FREETOKEN_LOCKED_FETCH_THREADS", "8")))
         self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], self.count.data_ptr(), self.rows.data_ptr(), max_fetch, cpus)
         logger.info_rank0(
             f"locked layers {layers}: GPU slots + fetch {fraction:g} of each step's misses (at most {max_fetch}) through "
             f"{sum(t.numel() for t in self.staging) / 2**20:.1f} MiB of pinned staging, {max(1, len(cpus))} copy threads on cpus {cpus or 'any'}"
         )
+
+    def resize(self, plan_slots: int) -> None:
+        """Follow the cache's evict_slots length (startup and ``OffloadMoeCache.rebuild``)."""
+        # the gather kernel takes src indices shaped like evict_slots; it reads only the first num_indices <= max_fetch
+        self.row_ids = torch.arange(plan_slots, dtype=torch.int32, device=self.staging_ptrs.device)
 
     def copy(self, cache, layer_id: int) -> None:
         """Stage and gather the rows the last hybrid ensure scheduled for ``layer_id``; graph capturable."""

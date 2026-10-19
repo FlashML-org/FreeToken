@@ -725,6 +725,8 @@ class OffloadMoeCache:
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
+        if self.locked_fetch is not None:
+            self.locked_fetch.resize(plan_slots)
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()

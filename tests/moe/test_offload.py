@@ -920,7 +920,7 @@ def test_slot_pools_keep_each_layer_in_its_own_slots(target):
     assert [v[0].shape[0] for v in map(cache.pool_bank_views, range(L))] == [8, 8, 24]
 
 
-def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu", decode_target="gpu"):
+def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
     """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
     from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -929,7 +929,7 @@ def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="
     dev = torch.device(device)
     cache = OffloadMoeCache(
         num_layers=num_layers, num_experts=4, cache_size=8,
-        device=dev, prefill_overlap=prefill_overlap, decode_target=decode_target,
+        device=dev, prefill_overlap=prefill_overlap,
     )
     cache.cpu_layer_ids = frozenset(locked)
     src_dev = dev if dev.type == "cuda" else torch.device("cpu")
@@ -1039,7 +1039,8 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
 
     monkeypatch.setenv("FREETOKEN_LOCKED_FETCH_THREADS", "2")
     torch.manual_seed(0)
-    cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda", decode_target="hybrid")
+    cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
+    cache.decode_target = "hybrid"
     cache.locked_hybrid = frozenset({1})
     cache.locked_fetch = LockedLayerFetch(cache, [1], fraction=1.0, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1))
 
@@ -1063,21 +1064,31 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
     with torch.cuda.graph(graph):
         step()
 
-    resident = set()
-    for _ in range(12):
-        experts = torch.randperm(4)[:top_k].to(torch.int32)
-        ids.copy_(experts)
-        graph.replay()
-        torch.cuda.synchronize()
-        slots, cpu_ids = out["slots"].tolist(), out["cpu"].tolist()
-        fetched = [e for e, s in zip(experts.tolist(), slots) if s >= 0 and e not in resident]
-        assert len(fetched) <= 2
-        for e, s, c in zip(experts.tolist(), slots, cpu_ids):
-            assert (s >= 0) != (c >= 0)
-            if s >= 0:
-                for (src, _), view in zip(cache.banks, cache.pool_bank_views(1)):
-                    assert torch.equal(view[s].cpu(), src[1][e])
-        resident = {e for e, s in enumerate(cache.slot_for_id[1].tolist()) if s >= 0}
+    def replay(graph, steps):
+        resident = set()
+        for _ in range(steps):
+            experts = torch.randperm(4)[:top_k].to(torch.int32)
+            ids.copy_(experts)
+            graph.replay()
+            torch.cuda.synchronize()
+            slots, cpu_ids = out["slots"].tolist(), out["cpu"].tolist()
+            fetched = [e for e, s in zip(experts.tolist(), slots) if s >= 0 and e not in resident]
+            assert len(fetched) <= 2
+            for e, s, c in zip(experts.tolist(), slots, cpu_ids):
+                assert (s >= 0) != (c >= 0)
+                if s >= 0:
+                    for (src, _), view in zip(cache.banks, cache.pool_bank_views(1)):
+                        assert torch.equal(view[s].cpu(), src[1][e])
+            resident = {e for e, s in enumerate(cache.slot_for_id[1].tolist()) if s >= 0}
+
+    replay(graph, 12)
+    # a runtime rebuild reallocates evict_slots and the slot caches; the fetch follows and a new capture still copies right
+    del graph
+    cache.rebuild(12)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    replay(graph, 6)
 
 
 def test_pin_probe_pins_middle_layers_until_refused(monkeypatch):
