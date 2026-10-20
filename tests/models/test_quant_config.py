@@ -569,9 +569,11 @@ def _expected_kinds(suffixes: set[str], tensors: dict[str, dict], module: str) -
         if tensors:
             if dtype("weight") == "U8":
                 return {QuantKind.MXFP4}
+            if dtype("weight_scale") == "U8":
+                return {QuantKind.MXFP8}
             sh = shape("weight_scale") or []
             return {QuantKind.FP8_BLOCK} if len(sh) == 2 and sh[0] > 1 and sh[1] > 1 else {QuantKind.FP8_TENSOR}
-        return {QuantKind.FP8_TENSOR, QuantKind.FP8_BLOCK, QuantKind.MXFP4}
+        return {QuantKind.FP8_TENSOR, QuantKind.FP8_BLOCK, QuantKind.MXFP4, QuantKind.MXFP8}
     return {QuantKind.NONE}
 
 

@@ -149,7 +149,7 @@ class _DenseReader:
         if module.rpartition(".")[2] not in _LINEAR_LEAVES:
             return None
         stored = self.stored(module)
-        roles = {"weight": "weight"} if stored is None else {e.name: r for r, e in self.quant.storage(stored).items()}
+        roles = {"weight": "weight"} if stored is None else {n: r for r, e in self.quant.storage(stored).items() for n in e.names}
         role = roles.get(suffix)
         if role is None:
             if suffix in _DROPPED_SUFFIXES:

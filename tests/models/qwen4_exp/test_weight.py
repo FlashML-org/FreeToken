@@ -65,11 +65,12 @@ def _fp8_scale(weight: torch.Tensor) -> torch.Tensor:
     return torch.rand(weight.shape[0] // BLOCK, weight.shape[1] // BLOCK) + 0.5
 
 
-def _raw_checkpoint(dense_fp8: bool = False, channel_fp8: bool = False) -> dict[str, torch.Tensor]:
+def _raw_checkpoint(dense_fp8: bool = False, channel_fp8: bool = False, mxfp8_scale: str | None = None) -> dict[str, torch.Tensor]:
     """Layer 0 = GDN + PLE, layer 1 = QSA; plus the mtp / visual / routed-expert noise.
 
     ``dense_fp8`` stores the attention and GDN qkv|z / out projections as 128x128 block-fp8 (e4m3 ``.weight`` + fp32 ``.weight_scale_inv``) like the community NVFP4-FP8 requants.
     ``channel_fp8`` stores those and the shared experts as per-channel fp8 (e4m3 ``.weight`` + bf16 ``[rows, 1]`` ``.weight_scale``) like the llm-compressor requants.
+    ``mxfp8_scale`` stores the attention and GDN qkv|z / out projections as MXFP8 (e4m3 ``.weight`` + uint8 e8m0 codes per 32 inputs) under that scale suffix.
     """
     lm = "model.language_model"
     raw: dict[str, torch.Tensor] = {
@@ -153,10 +154,25 @@ def _raw_checkpoint(dense_fp8: bool = False, channel_fp8: bool = False) -> dict[
             weight = raw[f"{module}.weight"]
             raw[f"{module}.weight"] = weight.to(torch.float8_e4m3fn)
             raw[f"{module}.weight_scale"] = (torch.rand(weight.shape[0], 1) + 0.5).to(torch.bfloat16)
+    if mxfp8_scale is not None:
+        for module in (f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z", f"{gdn}.out_proj", *(f"{attn}.{p}_proj" for p in "qkvo")):
+            weight = raw[f"{module}.weight"]
+            raw[f"{module}.weight"] = weight.to(torch.float8_e4m3fn)
+            raw[f"{module}.{mxfp8_scale}"] = torch.randint(120, 135, (weight.shape[0], weight.shape[1] // 32), dtype=torch.uint8)
     return raw
 
 
 FP8_DENSE_QUANT = mixed_precision_quant(gdn_layers=(0,), attn_layers=(1,), moe_layers=(0, 1))
+
+
+# ModelOpt MIXED_PRECISION with MXFP8 attention / GDN projections, as in nvidia/Qwen3.8-Flash-Next-FP4-Local
+MXFP8_DENSE_QUANT = {
+    **FP8_DENSE_QUANT,
+    "quantized_layers": {
+        k: ({"quant_algo": "MXFP8", "group_size": 32} if v["quant_algo"] == "FP8_PB_WO" else v)
+        for k, v in FP8_DENSE_QUANT["quantized_layers"].items()
+    },
+}
 
 
 def _channel_fp8_modules(gdn_layers, attn_layers, mlp_layers) -> list[str]:
@@ -539,6 +555,18 @@ def test_channel_fp8_scales_fuse_as_fp32_rows(checkpoint_fp8_channel):
     ):
         assert torch.equal(loaded[f"{fused}.weight_scale"], torch.cat([raw[f"{p}.weight_scale"].reshape(-1).float() for p in parts]))
         assert torch.equal(loaded[f"{fused}.weight"].view(torch.uint8), torch.cat([raw[f"{p}.weight"].view(torch.uint8) for p in parts]))
+
+
+@pytest.mark.parametrize("scale_name", ["weight_scale_inv", "weight_scale"])
+def test_mxfp8_scales_load_under_either_modelopt_name(tmp_path, scale_name):
+    folder, raw = _write_checkpoint(tmp_path, _raw_checkpoint(mxfp8_scale=scale_name), MXFP8_DENSE_QUANT)
+    loaded, state = _load(folder, vision=False), meta_state_dict(folder)
+    assert set(loaded) == set(state)
+    gdn = f"{LM}.layers.0.linear_attn"
+    assert torch.equal(
+        loaded["model.layers.0.linear_attn.in_proj_qkvz.weight_scale_inv"],
+        torch.cat([raw[f"{gdn}.{p}.{scale_name}"] for p in ("in_proj_qkv", "in_proj_z")]),
+    )
 
 
 def test_expert_spec_reads_the_llm_compressor_names(checkpoint_fp8_channel):

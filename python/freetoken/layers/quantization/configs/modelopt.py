@@ -27,7 +27,8 @@ class ModelOptConfig(QuantConfig):
     STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
         QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale", "input_scale": "input_scale"},
         QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
-        QuantKind.MXFP8: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
+        # same e8m0 codes under either name: MiniMax-M3 exports weight_scale_inv, Qwen3.8-Flash-Next weight_scale
+        QuantKind.MXFP8: {"weight": "weight", "weight_scale_inv": Stored("weight_scale_inv", aliases=("weight_scale",))},
         QuantKind.NVFP4: {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2", "input_scale": "input_scale"},
     }
 
