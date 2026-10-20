@@ -15,6 +15,17 @@ from flashlib.kernels.slot_cache import lru_ensure
 _HYBRID_FETCH_BY_RECENCY = (
     os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
 )
+# How fetch_fraction * misses becomes a fetch count: "min-wait" (default) picks the integer
+# that makes the PCIe fetch and the CPU compute finish closest together, "stochastic" rounds
+# up with probability equal to the fractional part, "prefer-fetch" always rounds up.
+_HYBRID_FETCH_ROUNDING = {"min-wait": 0, "stochastic": 1, "prefer-fetch": 2}
+_hybrid_fetch_round = (os.getenv("FREETOKEN_HYBRID_FETCH_ROUND") or "min-wait").strip().lower()
+if _hybrid_fetch_round not in _HYBRID_FETCH_ROUNDING:
+    raise ValueError(f"FREETOKEN_HYBRID_FETCH_ROUND={_hybrid_fetch_round!r}: expected one of {sorted(_HYBRID_FETCH_ROUNDING)}")
+_HYBRID_FETCH_ROUND = _HYBRID_FETCH_ROUNDING[_hybrid_fetch_round]
+_HYBRID_FETCH_SEED = 0
+# Phase 2 of the hybrid ensure kernel scans a pool wider than this in tiles of this width.
+_HYBRID_EVICT_CHUNK = 8192
 
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -66,9 +77,9 @@ def ensure_experts_hybrid(
     experts are given a slot and scheduled for copy; the overflow misses stay
     non-resident and their ``expert_ids`` positions are rewritten to ``-1`` (compute on
     the CPU). ``fetch_fraction`` > 0 replaces the fixed cap with the bandwidth-matched
-    split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded to
-    the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
-    together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
+    split (fraction = pcie_bw / cpu_bw): fetch ~fraction of the step's misses, rounded as
+    ``FREETOKEN_HYBRID_FETCH_ROUND`` says (default: the integer that makes the PCIe fetch and the CPU overflow compute finish closest together).
+    ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
     pre-cap miss count (stats).
 
     The same launch splits the routes: ``expert_ids`` becomes the GPU slots in place, and
@@ -140,8 +151,9 @@ def _ensure_experts_hybrid_gpu(
     id_of_slot, usage = cache.pool_state(layer_id)
     num_slots = id_of_slot.numel()
     block_e = triton.next_power_of_2(cache.num_experts)
-    block_c = triton.next_power_of_2(num_slots)
-    num_warps = 8 if block_c >= 2048 else 4
+    chunk = min(_HYBRID_EVICT_CHUNK, triton.next_power_of_2(num_slots))
+    # with 4 warps a 4096+ chunk spills on sm80-sm89
+    num_warps = 8 if chunk >= 4096 else 4
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -165,9 +177,12 @@ def _ensure_experts_hybrid_gpu(
         int(fetch_cap),
         cache.num_experts,
         num_slots,
+        _HYBRID_FETCH_SEED,
         BLOCK_E=block_e,
-        BLOCK_C=block_c,
+        CHUNK=chunk,
+        SMALL=num_slots <= chunk,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        ROUND=_HYBRID_FETCH_ROUND,
         CLAMP=clamp,
         STATS=cache.collect_stats,
         num_warps=num_warps,
@@ -298,9 +313,12 @@ def _ensure_experts_hybrid_kernel(
     fetch_cap,
     num_experts: tl.constexpr,
     cache_size,
+    seed,
     BLOCK_E: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+    CHUNK: tl.constexpr,
+    SMALL: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    ROUND: tl.constexpr,
     CLAMP: tl.constexpr,
     STATS: tl.constexpr,
 ):
@@ -319,7 +337,12 @@ def _ensure_experts_hybrid_kernel(
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
     breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
     caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
-    (``missing_rank``), the original routing-blind heuristic."""
+    (``missing_rank``), the original routing-blind heuristic.
+
+    Victims are the least-used slots, ties to the lowest slot. Every usage is at most the
+    step before this launch, so the hit slots stamped with ``step`` in Phase 1 are never
+    picked. A pool of at most CHUNK slots stays in registers (SMALL); a larger one is scanned
+    from memory in CHUNK tiles per victim."""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
@@ -341,11 +364,19 @@ def _ensure_experts_hybrid_kernel(
         # F * (1 - frac), CPU time with (M - F) * frac; they balance at F = frac * M. Pick
         # the integer neighbor that minimizes the slower (max) side of the overlap.
         lo = (num_missing * fetch_frac_q16) >> 16
-        cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16), (num_missing - lo) * fetch_frac_q16)
-        cost_hi = tl.maximum(
-            (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
-        )
-        max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
+        if ROUND == 1:
+            # step is unique per launch, so each (layer, step) draws its own number
+            rem = (num_missing * fetch_frac_q16) & 0xFFFF
+            u = tl.rand(seed, (step & 0x7FFFFFFF).to(tl.int32))
+            max_fetch = lo + ((u * 65536.0) < rem.to(tl.float32)).to(tl.int32)
+        elif ROUND == 2:
+            max_fetch = (num_missing * fetch_frac_q16 + 0xFFFF) >> 16
+        else:
+            cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16), (num_missing - lo) * fetch_frac_q16)
+            cost_hi = tl.maximum(
+                (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
+            )
+            max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
     is_hit = is_active & (slot >= 0)
     # a pool smaller than num_experts may hold fewer free slots than misses
     num_fetch = tl.minimum(tl.minimum(num_missing, tl.minimum(max_fetch, fetch_cap)), cache_size - tl.sum(is_hit.to(tl.int32)))
@@ -366,18 +397,27 @@ def _ensure_experts_hybrid_kernel(
 
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     if num_fetch > 0:
-        off_c = tl.arange(0, BLOCK_C)
-        c_mask = off_c < cache_size
-        oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
-        u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
-        owner_active = c_mask & False
-        for i in tl.range(num_active):
-            ei = tl.load(expert_ids_ptr + i)
-            owner_active = owner_active | (oid == base + ei)
-        u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
+        off_k = tl.arange(0, CHUNK)
+        tl.debug_barrier()  # the scan below must see the hit stamps
+        if SMALL:
+            u_reg = tl.load(usage_ptr + off_k, mask=off_k < cache_size, other=9223372036854775807).to(tl.int64)
         for i in tl.range(num_fetch):
-            victim = tl.argmin(u, axis=0).to(tl.int32)
-            old_id = tl.sum(tl.where(off_c == victim, oid, 0))
+            if SMALL:
+                victim = tl.argmin(u_reg, axis=0).to(tl.int32)
+                u_reg = tl.where(off_k == victim, step, u_reg)
+            else:
+                best_u = tl.full((), 9223372036854775807, tl.int64)
+                best_s = tl.full((), 0, tl.int32)
+                for c0 in tl.range(0, cache_size, CHUNK):
+                    offs = c0 + off_k
+                    uu = tl.load(usage_ptr + offs, mask=offs < cache_size, other=9223372036854775807).to(tl.int64)
+                    cmin = tl.min(uu, axis=0)
+                    carg = (tl.argmin(uu, axis=0) + c0).to(tl.int32)
+                    take = cmin < best_u
+                    best_s = tl.where(take, carg, best_s)
+                    best_u = tl.where(take, cmin, best_u)
+                victim = best_s
+            old_id = tl.load(id_of_slot_ptr + victim)
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)
             if BY_RECENCY:
@@ -390,12 +430,15 @@ def _ensure_experts_hybrid_kernel(
             tl.store(usage_ptr + victim, step)
             tl.store(evict_slots_ptr + i, victim)
             tl.store(src_indices_ptr + i, e)  # layer-local row
-            u = tl.where(off_c == victim, 9223372036854775807, u)
+            tl.debug_barrier()  # the next scan must see this victim's stamp
+    tl.debug_barrier()  # Phase 3 reads slot_for_id entries written above
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
     for i in tl.range(num_active):
         e = tl.load(expert_ids_ptr + i)
         s = tl.load(slot_for_id_ptr + base + e)
+        # every warp loads e, one thread stores below; a warp that loads after that store indexes with a slot id
+        tl.debug_barrier()
         on_gpu = s >= 0
         tl.store(cpu_ids_ptr + i, tl.where(on_gpu, -1, e))
         tl.store(gpu_w_ptr + i, tl.where(on_gpu, tl.load(weights_ptr + i), 0.0))
