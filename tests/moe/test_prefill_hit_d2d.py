@@ -26,7 +26,8 @@ def _cuda_at_least(major: int, minor: int) -> bool:
     return tuple(int(x) for x in cuda.split(".")[:2]) >= (major, minor)
 
 BATCH_API = pytest.mark.skipif(
-    not _cuda_at_least(13, 0), reason="the cudaMemcpyBatchAsync binding needs CUDA >= 13.0"
+    torch.version.hip is None and not _cuda_at_least(13, 0),
+    reason="the cudaMemcpyBatchAsync binding needs CUDA >= 13.0",
 )
 
 NUM_LAYERS, E, CACHE_SIZE = 3, 8, 24  # hit region = slots [16, 24)
