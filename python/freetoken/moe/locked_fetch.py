@@ -8,6 +8,7 @@ copies staging row i into ``evict_slots[i]``. The misses it does not fetch go to
 
 from __future__ import annotations
 
+import collections
 import os
 
 import torch
@@ -15,6 +16,59 @@ import torch
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def locked_fetch_wanted(config) -> bool:
+    """Whether locked layers fetch through pinned staging: hybrid, --moe-locked-fetch not 0, CUDA (the copy kernels are untested on ROCm)."""
+    return config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0 and torch.version.hip is None
+
+
+def check_locked_fetch_config(config) -> None:
+    """Reject --moe-locked-max-fetch past the experts of a layer before the banks are read (only with --moe-cpu-layers)."""
+    num_experts = config.model_config.num_experts
+    if config.moe_cpu_layers and locked_fetch_wanted(config) and not 1 <= config.moe_locked_max_fetch <= num_experts:
+        raise ValueError(f"--moe-locked-max-fetch {config.moe_locked_max_fetch} must be in [1, {num_experts}] (the experts of a layer)")
+
+
+def staging_reserve(config, bank_bytes) -> int:
+    """Pin budget the staging takes when --moe-cpu-layers is settled before the load: ``max_fetch`` rows of twice the mean expert.
+
+    ``bank_bytes()`` estimates the banks; it runs only when the staging is wanted."""
+    if not (config.moe_cpu_layers and locked_fetch_wanted(config)) or not (total := bank_bytes()):
+        return 0
+    mc = config.model_config
+    return 2 * (total // (mc.num_moe_layers * mc.num_experts)) * config.moe_locked_max_fetch
+
+
+def settle_banks(config, banks, *, probe: bool, has_locked: bool):
+    """Pin the staging when locked layers may fetch, then with ``probe`` settle the DEFERRED banks (expert_banks.probe_banks).
+
+    Pinning the staging first keeps the banks from taking its share of the pin budget. Returns the banks, the locked layers
+    the probe found (None without ``probe``) and the staging (None when unused or not pinnable)."""
+    from freetoken.moe.expert_banks import probe_banks
+
+    staging = None
+    if locked_fetch_wanted(config) and (probe or has_locked):
+        staging = try_alloc_staging(banks.sources, config.moe_locked_max_fetch)
+    locked = None
+    if probe:
+        banks, locked = probe_banks(banks, config.model_config.num_moe_layers)
+        if staging is not None and not locked:
+            refund_staging(staging)  # every bank got pinned
+            staging = None
+    return banks, locked, staging
+
+
+def locked_pool_tags(layer_tags: list | None, locked, num_layers: int) -> list:
+    """Bank layer tags with the locked layers marked, so they group into slot pools of their own."""
+    return [(t, "locked") if i in locked else t for i, t in enumerate(layer_tags or [None] * num_layers)]
+
+
+def attach_locked_fetch(cache, config, staging: dict[str, torch.Tensor], layer_rows) -> None:
+    """Set ``cache.locked_fetch`` for ``cache.locked_hybrid``; needs the cache's CPU executor. ``layer_rows`` as in fetch_plan."""
+    locked = sorted(cache.locked_hybrid)
+    plan = fetch_plan(config.moe_locked_fetch, locked, layer_rows)
+    cache.locked_fetch = LockedLayerFetch(cache, locked, plan, config.moe_locked_max_fetch, cache.cpu_executor, staging=staging)
 
 
 def staging_bytes(sources: dict[str, list[torch.Tensor]], max_fetch: int) -> dict[str, int]:
@@ -31,10 +85,58 @@ def staging_bytes(sources: dict[str, list[torch.Tensor]], max_fetch: int) -> dic
 def alloc_staging(sizes: dict[str, int]) -> dict[str, torch.Tensor]:
     """Pinned staging per bank role."""
     from freetoken.kernel.pinned import alloc_pinned_tensor
-    from freetoken.moe.host_banks import charge_pin
+    from freetoken.moe.host_banks import charge_pin, refund_pin
 
     charge_pin(sum(sizes.values()))
-    return {role: alloc_pinned_tensor(n, dtype=torch.uint8) for role, n in sizes.items()}
+    try:
+        return {role: alloc_pinned_tensor(n, dtype=torch.uint8) for role, n in sizes.items()}
+    except BaseException:
+        refund_pin(sum(sizes.values()))
+        raise
+
+
+def try_alloc_staging(sources: dict[str, list[torch.Tensor]], max_fetch: int) -> dict[str, torch.Tensor] | None:
+    """The staging for ``sources``; None (locked layers stay CPU-only) when it cannot be pinned."""
+    from freetoken.moe.host_banks import PinFailed
+
+    sizes = staging_bytes(sources, max_fetch)
+    try:
+        return alloc_staging(sizes)
+    except (PinFailed, RuntimeError) as exc:
+        logger.warning_rank0(f"could not pin the {sum(sizes.values()) / 2**20:.1f} MiB locked-layer staging ({exc}); locked layers decode on the CPU only")
+        return None
+
+
+def refund_staging(staging: dict[str, torch.Tensor]) -> None:
+    """Give the staging's bytes back to the simulated pin cap; the memory itself goes with its last reference."""
+    from freetoken.moe.host_banks import refund_pin
+
+    refund_pin(sum(t.numel() for t in staging.values()))
+
+
+def fetch_plan(share: float, layers: list[int], layer_rows) -> dict[int, tuple[int, float]]:
+    """(max_fetch, fraction) per locked layer for the hybrid ensure.
+
+    ``share`` > 0 fetches that share of every step's misses; otherwise each layer takes p / (2p + c) from its `ft bench bw`
+    row, or a fixed cap of 1 without one. ``layer_rows()`` returns (row key, label) per MoE layer and the profile's rows, or None.
+    """
+    if share > 0:
+        logger.info_rank0(f"--moe-locked-fetch {share:g}: locked layers fetch this share of each step's misses")
+        return {layer: (0, share) for layer in layers}
+    from freetoken.moe.bench_profile import locked_fetch_fraction
+
+    rows = layer_rows()
+    keys, labels, rows = rows if rows is not None else ([None] * (max(layers) + 1), [""] * (max(layers) + 1), {})
+    fractions = {layer: locked_fetch_fraction(rows.get(keys[layer])) for layer in layers}
+    groups = collections.Counter((labels[layer], f) for layer, f in fractions.items())
+    if fetched := [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]:
+        logger.info_rank0(f"--moe-locked-fetch auto: locked layers fetch this share of each step's misses (benched p / (2p + c)): {'; '.join(fetched)}")
+    if capped := [layer for layer, f in fractions.items() if f is None]:
+        logger.warning_rank0(
+            f"--moe-locked-fetch auto: no `ft bench bw` row for locked layers {capped}; they fetch at most 1 expert per step. "
+            "`ft bench bw --model <checkpoint>` benches each layer kind"
+        )
+    return {layer: (0, f) if f is not None else (1, 0.0) for layer, f in fractions.items()}
 
 
 def _smt_siblings(cpus: list[int]) -> list[int]:
@@ -64,7 +166,8 @@ def _copy_cpus(executor, count: int) -> list[int]:
     from freetoken.moe.cpu_executor import physical_core_cpus
 
     busy = set(executor.core_ids) | {getattr(executor, "_coord_core", -1)}
-    cpus = _smt_siblings(executor.core_ids) or [c for c in physical_core_cpus() if c not in busy]
+    cpus = [c for c in dict.fromkeys(_smt_siblings(executor.core_ids)) if c not in busy]
+    cpus = cpus or [c for c in physical_core_cpus() if c not in busy]
     return cpus[:count]
 
 
@@ -78,8 +181,6 @@ class LockedLayerFetch:
 
         if not cache._copy_fused_ok:
             raise ValueError("locked layers fetch through the fused multi-bank copy, which this cache could not plan (bank alignment or FREETOKEN_FUSED_COPY=0)")
-        if not 1 <= max_fetch <= cache.num_experts:
-            raise ValueError(f"--moe-locked-max-fetch {max_fetch} must be in [1, {cache.num_experts}] (the experts of a layer)")
         # (max_fetch, fraction) of each locked layer for the hybrid ensure; max_fetch caps any of them
         self.plan = plan
         self.max_fetch = max_fetch
@@ -117,6 +218,8 @@ class LockedLayerFetch:
         """Stage and gather the rows the last hybrid ensure scheduled for ``layer_id``; graph capturable."""
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
+        # the gather reads num_indices rows of the staging, which has max_fetch
+        assert cache._pending_fetch_cap == self.max_fetch, (cache._pending_fetch_cap, self.max_fetch)
         self._ext.publish(torch.cuda.current_stream().cuda_stream, layer_id, cache.num_indices.data_ptr(), cache.src_indices.data_ptr())
         fast_index_copy_multi_jit(
             cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer_id]],

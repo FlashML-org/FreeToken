@@ -113,6 +113,9 @@ class EngineConfig:
     def __post_init__(self):
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
+        if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:
+            # the ensure kernel takes the share in Q16: this one rounds to 0 and the layers would never fetch
+            raise ValueError(f"moe_locked_fetch {self.moe_locked_fetch} rounds to 0 in Q16; pass 0 to keep locked layers CPU-only")
         if self.moe_locked_max_fetch < 1:
             raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
         if self.moe_backend is None:

@@ -60,6 +60,10 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
   void *data_ptr = nullptr;
   const cudaError_t alloc_err = cudaHostAlloc(
       &data_ptr, alloc_nbytes, cudaHostAllocPortable | cudaHostAllocMapped);
+  if (alloc_err != cudaSuccess) {
+    // callers may catch the refusal and go on: leave no error for the next launch
+    (void)cudaGetLastError();
+  }
   TORCH_CHECK(alloc_err == cudaSuccess,
               "cudaHostAlloc failed: ", cudaGetErrorString(alloc_err));
 

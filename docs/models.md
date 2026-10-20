@@ -69,11 +69,13 @@ model may not all pin. With `--moe-cpu-layers auto`, FreeToken loads the banks
 first, then pins them layer by layer from the middle out until CUDA refuses one;
 the remaining head and tail layers are OS-locked instead (resident, but with no
 device address). After a refusal under WDDM (WSL and native Windows) it
-unpins about 3 GiB more (`FREETOKEN_PIN_PROBE_MARGIN_GB`) so later CUDA
-allocations still fit.
-`FREETOKEN_PIN_BUDGET_GB` replaces the probe with a fixed budget: the locked
-layers are then picked from a size estimate before the load, and a refused pin
-stops the boot.
+unpins about 3 GiB more (`FREETOKEN_PIN_PROBE_MARGIN_GB`).
+The probe runs only where pinning is known to be capped (WDDM, or
+`FREETOKEN_SIMULATE_PIN_CAP_GB` for testing). FTW checkpoints, dummy weights
+and models the CPU executor cannot serve take the size estimate instead, as
+does `FREETOKEN_PIN_BUDGET_GB`, which fixes the budget: the locked layers are
+then picked from a size estimate before the load, and a refused pin stops the
+boot.
 
 Under `hybrid`, a locked layer keeps GPU slots of its own pools. Each decode
 step it fetches a share of its misses (`--moe-locked-fetch`, by default from the `ft bench bw` profile): CPU threads

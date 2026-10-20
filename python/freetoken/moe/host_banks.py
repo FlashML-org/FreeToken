@@ -23,6 +23,7 @@ import math
 import mmap
 import os
 import queue
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -316,10 +317,26 @@ def pin_banks(banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]])
             bank.pin()
 
 
-def probe_pin(plan: _ResidencyPlan, num_layers: int, margin_bytes: int = 0) -> list[str]:
+def _wddm() -> bool:
+    return sys.platform == "win32" or (hasattr(os, "uname") and "microsoft" in os.uname().release.lower())
+
+
+def pin_capped() -> bool:
+    """Whether CUDA pinning is known to be capped: WDDM (WSL and native Windows), or FREETOKEN_SIMULATE_PIN_CAP_GB."""
+    return _wddm() or _sim_pin_cap() is not None
+
+
+def _probe_margin() -> int:
+    """FREETOKEN_PIN_PROBE_MARGIN_GB, else 3 GiB under WDDM (WSL and native Windows)."""
+    return int(float(os.environ.get("FREETOKEN_PIN_PROBE_MARGIN_GB", "3" if _wddm() else "0")) * 2**30)
+
+
+def probe_pin(plan: _ResidencyPlan, num_layers: int, margin_bytes: int | None = None) -> list[str]:
     """Settle the DEFERRED layers: pin middle layers first until a pin fails, OS-lock the rest; returns each layer's residency.
 
-    After a refusal, the last pinned layers give back at least ``margin_bytes`` (a pin quota filled to the brim fails later device allocations on WDDM)."""
+    After a refusal, the last pinned layers give back at least ``margin_bytes`` (default ``_probe_margin()``)."""
+    if margin_bytes is None:
+        margin_bytes = _probe_margin()
     # per-layer decode miss rates are U-shaped, so the head and tail layers are the ones left unpinned
     order = sorted(plan.deferred, key=lambda l: (abs(l - (num_layers - 1) / 2), l))
     pinned: list[int] = []

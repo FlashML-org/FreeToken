@@ -317,6 +317,7 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        self._pending_fetch_cap: int | None = None  # the last hybrid ensure's cap on its fetch count
         # The two prefill staging buffers are the first 2 * _stage_bytes[k] bytes of every bank, on top of the first pools.
         # _stage_views[g][b] are buffer b's per-bank [num_experts, ...] views for layout g; _inval[b] are the global slots it overwrites.
         self._stage_bytes: list[int] = []
@@ -1103,6 +1104,7 @@ class OffloadMoeCache:
         if layer_id in self.locked_hybrid:
             # a locked layer fetches through the staging, so at most its rows per step
             (max_fetch, fraction), cap = self.locked_fetch.plan[layer_id], self.locked_fetch.max_fetch
+        self._pending_fetch_cap = cap
         return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
 
     def materialize_layer(self, layer_id: int) -> None:

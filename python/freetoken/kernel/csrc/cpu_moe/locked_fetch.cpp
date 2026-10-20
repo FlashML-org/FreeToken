@@ -85,7 +85,6 @@ class LockedFetch {
     if (memops_) sync_->gpu_wait(stream);
   }
   uintptr_t done_word() const { return sync_->done_word(); }
-  int64_t rows_copied() const { return rows_copied_.load(); }
 
  private:
   void run_jobs() {
@@ -100,24 +99,28 @@ class LockedFetch {
     if (cpu >= 0) pin_this_thread(cpu);
     uint64_t seen = 0;
     auto last_active = fetch_clock::now();
+    int64_t sleep_us = 20;
     while (!stop_.load(std::memory_order_relaxed)) {
       const uint64_t gen = gen_.load(std::memory_order_acquire);
       if (gen == seen) {
-        if (fetch_clock::now() - last_active > kHotWindow)
-          std::this_thread::sleep_for(std::chrono::microseconds(50));
-        else
+        if (fetch_clock::now() - last_active < kHotWindow) {
           cpu_relax();
+        } else {
+          std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+          sleep_us = std::min<int64_t>(sleep_us * 2, 2000);
+        }
         continue;
       }
       seen = gen;
       run_jobs();
       finished_.fetch_add(1, std::memory_order_acq_rel);
       last_active = fetch_clock::now();
+      sleep_us = 20;
     }
   }
 
-  // Splits this step's rows into chunk jobs, runs them with the workers, and returns the row count.
-  int64_t copy_layer(int layer) {
+  // Splits this step's rows into chunk jobs and runs them with the workers.
+  void copy_layer(int layer) {
     int64_t n = *count_;
     n = std::max<int64_t>(0, std::min<int64_t>(n, max_rows_));
     jobs_.clear();
@@ -133,7 +136,7 @@ class LockedFetch {
         for (int64_t off = 0; off < rb; off += kChunkBytes) jobs_.push_back({dst + off, s + off, std::min(kChunkBytes, rb - off)});
       }
     }
-    if (jobs_.empty()) return n;
+    if (jobs_.empty()) return;
     next_.store(0, std::memory_order_relaxed);
     finished_.store(0, std::memory_order_relaxed);
     gen_.fetch_add(1, std::memory_order_acq_rel);
@@ -141,7 +144,6 @@ class LockedFetch {
     // on stop a worker may leave before it joins this generation; the coordinator's run_jobs already took every job
     while (finished_.load(std::memory_order_acquire) < static_cast<int64_t>(workers_.size()) && !stop_.load(std::memory_order_relaxed))
       cpu_relax();
-    return n;
   }
 
   void coordinator_loop(int cpu) {
@@ -159,10 +161,9 @@ class LockedFetch {
         }
         continue;
       }
-      const int64_t n = copy_layer(static_cast<int>(task - 1));
+      copy_layer(static_cast<int>(task - 1));
       // release: the staging stores are visible before the GPU sees done
       sync_->cpu_done();
-      rows_copied_.fetch_add(n, std::memory_order_relaxed);
       last_active = fetch_clock::now();
       sleep_us = 20;
     }
@@ -185,7 +186,6 @@ class LockedFetch {
   std::atomic<int64_t> finished_{0};
   std::atomic<uint64_t> gen_{0};
   std::atomic<bool> stop_{false};
-  std::atomic<int64_t> rows_copied_{0};
   std::vector<std::thread> workers_;
   std::thread coord_;
 };
@@ -199,8 +199,7 @@ void bind_locked_fetch(pybind11::module_& m) {
                     bool>(),
            py::arg("src"), py::arg("row_bytes"), py::arg("staging"), py::arg("max_rows"), py::arg("cpus"), py::arg("memops"))
       .def("publish", &LockedFetch::publish, py::arg("stream"), py::arg("layer"), py::arg("num_indices"), py::arg("src_indices"))
-      .def("done_word", &LockedFetch::done_word)
-      .def("rows_copied", &LockedFetch::rows_copied);
+      .def("done_word", &LockedFetch::done_word);
 }
 
 }  // namespace freetoken::cpu_moe
