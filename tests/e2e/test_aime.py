@@ -34,6 +34,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,16 @@ def visible_gpu_index() -> int:
 
 
 def free_gpu_memory_gib() -> float:
+    if torch.version.hip is not None:
+        # Query logical device zero without initializing the engine's parent process.
+        result = subprocess.run(
+            [sys.executable, "-c", "import torch; print(torch.cuda.mem_get_info(0)[0])"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return int(result.stdout.strip()) / (1 << 30)
+
     result = subprocess.run(
         [
             "nvidia-smi",
