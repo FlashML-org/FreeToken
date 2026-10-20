@@ -63,6 +63,8 @@ _QWEN3_5_UNQUANTIZED = ("*.mlp.gate", "*.mlp.shared_expert_gate")
 _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
     ("input_mix_weight_down_block_inject", ("input_mix_weight_down", "block_inject_weight")),
 )
+# the llama.cpp converter splits the indexer projection into q and k
+_QWEN4_EXP_GGUF_PACKED = _QWEN4_EXP_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),)
 # GLM-5.3-Flash's KDA fuses its six input projections.
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
     ("in_proj", ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")),
@@ -288,7 +290,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
-        packed_modules_mapping=_QWEN4_EXP_PACKED,
+        packed_modules_mapping=_QWEN4_EXP_GGUF_PACKED,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
