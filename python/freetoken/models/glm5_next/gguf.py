@@ -4,8 +4,7 @@ The GGUF geometry is identical to the HF checkpoint (34 KDA linear-attention lay
 11 NoPE-MLA/DSA layers with a kpool-compressed indexer on a 3+1 hybrid block layout,
 mHC x4 residual streams, 288-expert sigmoid/noaux_tc MoE with a shared expert and
 clamped SwiGLU), so ``parse_gguf_config`` derives a text-config-shaped namespace from
-the GGUF KV metadata (plus a tensor-name census for the facts the KV predates) and
-reuses ``glm5_next.config.parse_config`` wholesale.
+the GGUF KV metadata and reuses ``glm5_next.config.parse_config`` wholesale.
 
 The llama.cpp converter (unsloth's glm5-next writer; tensor names identical across
 the ``glm5-next`` and the older ``glm5next`` arch spellings) stores KDA's ``A_log``
@@ -104,58 +103,28 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
 
 
 def _layer_types(shim: "GgufConfigShim", num_layers: int) -> tuple[str, ...]:
-    """Per-decoder-layer kinds: DSA where the MLA projections sit, KDA elsewhere.
+    """Per-decoder-layer kinds: DSA where the MLA projections sit, KDA elsewhere, from the
+    per-block ``attention.head_count_kv`` list (0 on the KDA blocks, 1 on the MLA ones).
 
-    The new writer carries ``attention.head_count_kv`` as a per-block list (0 on the
-    KDA blocks, 1 on the MLA ones); the older spelling predates it, so fall back to a
-    tensor-name census (``attn_q_a`` is DSA-only). A metadata-only GGUF (an FTW's
-    ``source_metadata.gguf``) has neither the list nor the tensor table, and only the
-    new writer's files can convert."""
+    Every public glm5-next GGUF carries the list (the generic scalar spelling cannot express
+    the hybrid; llama.cpp broadcasts it and then fails tensor creation), so anything else is
+    refused rather than guessed at."""
     from .args import DSA_LAYER, KDA_LAYER
 
-    md = shim.metadata
-    per_block = md.get(f"{shim.model_type}.attention.head_count_kv")
-    # the new writer carries the per-block KDA/MLA layout as a list; the generic GGUF spelling is a
-    # scalar (all blocks), which is wrong for the hybrid -- llama.cpp broadcasts it and then fails
-    # tensor creation -- so only a list is trusted and everything else falls to the census
-    if isinstance(per_block, list) and len(per_block) >= num_layers:
-        return tuple(DSA_LAYER if int(kv) else KDA_LAYER for kv in per_block[:num_layers])
-    names = gguf_tensor_names(shim.model_path)
-    if not names:
+    per_block = shim.metadata.get(f"{shim.model_type}.attention.head_count_kv")
+    if not isinstance(per_block, list) or len(per_block) < num_layers:
         raise ValueError(
-            f"{shim.model_path}: metadata-only GGUF without attention.head_count_kv; "
-            "the layer layout cannot be recovered (reconvert from a current writer)"
+            f"{shim.model_path}: glm5-next GGUF lacks the per-block attention.head_count_kv list "
+            "the KDA/MLA hybrid layout needs (reconvert with a current llama.cpp)"
         )
-    return tuple(
-        DSA_LAYER if f"blk.{i}.attn_q_a.weight" in names else KDA_LAYER for i in range(num_layers)
-    )
-
-
-def _head_dims(shim: "GgufConfigShim") -> tuple[int, int]:
-    """(qk_nope, v) head widths: the new writer's ``*_length_mla`` KVs, else the q_b/v_b rows."""
-    md = shim.metadata
-    prefix = shim.model_type
-    nope, v = md.get(f"{prefix}.attention.key_length_mla"), md.get(f"{prefix}.attention.value_length_mla")
-    if nope is None or v is None:
-        index = gguf_tensor_index(shim.model_path)
-        q_b = next((i for i in index.values() if i.name.endswith("attn_q_b.weight")), None)
-        v_b = next((i for i in index.values() if i.name.endswith("attn_v_b.weight")), None)
-        if q_b is None or v_b is None:
-            raise ValueError(f"{shim.model_path}: GGUF lacks attn_q_b/attn_v_b to size the MLA heads")
-        heads = int(md[f"{prefix}.attention.head_count"])
-        nope, v = q_b.ne[1] // heads, v_b.ne[1]
-    return int(nope), int(v)
-
-
-def _check_supported(shim: "GgufConfigShim") -> None:
-    check_scales(shim.model_path)
+    return tuple(DSA_LAYER if int(kv) else KDA_LAYER for kv in per_block[:num_layers])
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     md = shim.metadata
     prefix = shim.model_type
 
-    _check_supported(shim)
+    check_scales(shim.model_path)
 
     def kv(key: str, default=None):
         return md.get(f"{prefix}.{key}", default)
@@ -173,9 +142,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     first_dense = int(need("leading_dense_block_count"))
 
     heads = int(need("attention.head_count"))
-    qk_nope, v_head = _head_dims(shim)
+    qk_nope, v_head = int(need("attention.key_length_mla")), int(need("attention.value_length_mla"))
     # NoPE: the main attention carries no rotary dims (rope survives only in the indexer)
-    assert int(kv("rope.dimension_count", 0) or 0) == 0, "glm5-next GGUF: unexpected rotary dims on the main attention"
+    if int(kv("rope.dimension_count", 0) or 0) != 0:
+        raise NotImplementedError("glm5-next GGUF: rotary dims on the main attention are not served")
 
     # KDA head count: one q/k/v head set of kda.head_dim each; the conv channels or the
     # beta rows count them, falling back to the shared head_count (the two coincide on
@@ -191,13 +161,21 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     names = gguf_tensor_names(shim.model_path)
     kpool_compress = any(n.endswith("indexer_compressor_gate.weight") for n in names) if names else kpool > 1
     indexer_types_kv = kv("attention.indexer.types")
-    if indexer_types_kv is not None and len(indexer_types_kv) >= num_layers:
-        indexer_types = tuple("full" if b else "disabled" for b in indexer_types_kv[:num_layers])
-    else:
-        # every release carries all-"full" in the HF config (the engine builds only the DSA-owned indexers)
-        indexer_types = ("full",) * num_layers
+    if indexer_types_kv is not None and not all(indexer_types_kv):
+        # llama.cpp reads False as "no full indexer on this layer", which the model cannot express
+        raise NotImplementedError(f"{shim.model_path}: glm5-next GGUF with layers that lack a full indexer is not served")
+    indexer_types = ("full",) * num_layers
 
+    # the clamp is per-layer in the GGUF (and the shared expert carries its own array); the model
+    # takes one value, so anything non-uniform is refused instead of silently taking the first
     clamp = need("swiglu_clamp_exp")
+    clamp_vals = list(clamp) if isinstance(clamp, list) else [clamp]
+    clamp_shexp = kv("swiglu_clamp_shexp")
+    shexp_vals = list(clamp_shexp) if isinstance(clamp_shexp, list) else [clamp_shexp] if clamp_shexp is not None else []
+    if len(set(map(float, clamp_vals + shexp_vals))) != 1:
+        raise NotImplementedError(f"{shim.model_path}: non-uniform swiglu_clamp_exp / swiglu_clamp_shexp is not served")
+    if int(kv("expert_gating_func", 2) or 2) != 2:
+        raise NotImplementedError(f"{shim.model_path}: expert_gating_func other than sigmoid (2) is not served")
     text = SimpleNamespace(
         **_FAMILY_DEFAULTS,
         num_hidden_layers=num_layers,
@@ -243,7 +221,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         n_group=int(kv("expert_group_count", 1) or 1),
         topk_group=int(kv("expert_group_used_count", 1) or 1),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
-        swiglu_limit=float(clamp[0] if isinstance(clamp, list) else clamp),
+        swiglu_limit=float(clamp_vals[0]),
     )
     hf_like = SimpleNamespace(
         text_config=text,
