@@ -326,6 +326,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
     AotModel(
         name="deepseek-ai/DeepSeek-V4-Flash",
         architecture="DeepseekV4ForCausalLM",
+        # llama.cpp deepseek4 GGUF (unsloth 0731 GGUF; text only)
+        arch_aliases=("DeepseekV4GGUFForCausalLM",),
         hidden_size=4096,
         kv_groups=(),  # MLA latent pool writes via torch scatter, not store_cache
         top_k=6,

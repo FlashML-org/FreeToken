@@ -25,6 +25,14 @@ _BOS_PRE = frozenset((
 # Llama 3 and GLM pre-tokenizers, whose HF tokenizer and llama.cpp take a word that is one vocabulary token as is instead of merging it
 _IGNORE_MERGES_PRE = frozenset(("llama3", "llama-v3", "llama-bpe", "glm4", "glm5"))
 
+# DeepSeek-V4's pre-tokenizer (llama.cpp spells it "joyai-llm"; transformers maps no split
+# for it): the three splits of the model's own tokenizer.json, in order
+_JOYAI_LLM_SPLITS = (
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r'''[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+''',
+)
+
 
 def _add_bos(meta: dict) -> bool:
     if "tokenizer.ggml.add_bos_token" in meta:
@@ -91,6 +99,13 @@ def load_gguf_tokenizer(model_path: str):
             pre_tokenizers.Split(Regex(GGUF_PRE_TOKENIZER_SPLITS["llama3"]), behavior="isolated"),
             pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
         ])
+    elif pre == "joyai-llm":
+        from tokenizers import Regex, pre_tokenizers
+
+        fast.pre_tokenizer = pre_tokenizers.Sequence(
+            [pre_tokenizers.Split(Regex(r), behavior="isolated") for r in _JOYAI_LLM_SPLITS]
+            + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)]
+        )
     if pre in _IGNORE_MERGES_PRE:
         fast.model.ignore_merges = True
     # special: bos/eos/unk/pad as the file names them (None when absent) and the chat template

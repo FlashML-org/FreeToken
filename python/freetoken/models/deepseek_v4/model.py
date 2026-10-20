@@ -130,7 +130,7 @@ class Transformer(BaseOP):
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
-        self.embed = VocabParallelEmbedding(args.vocab_size, args.dim)
+        self.embed = VocabParallelEmbedding(args.vocab_size, args.dim, quant_config=quant_config, prefix=f"{prefix}.embed")
         self.layers = OPList([Block(i, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = ParallelLMHead(args.vocab_size, args.dim, quant_config=quant_config, prefix=f"{prefix}.head")
