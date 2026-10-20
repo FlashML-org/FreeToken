@@ -63,6 +63,8 @@ _QWEN3_5_UNQUANTIZED = ("*.mlp.gate", "*.mlp.shared_expert_gate")
 _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
     ("input_mix_weight_down_block_inject", ("input_mix_weight_down", "block_inject_weight")),
 )
+# the llama.cpp converter splits the indexer projection into q and k
+_QWEN4_EXP_GGUF_PACKED = _QWEN4_EXP_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),)
 # GLM-5.3-Flash's KDA fuses its six input projections.
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
     ("in_proj", ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")),
@@ -80,10 +82,6 @@ _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
 _GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
-_MUSE_GLIMMER_PACKED = (
-    ("qkvg_proj", ("q_proj", "k_proj", "v_proj", "gate_proj")),
-    ("gate_up_proj", ("gate_proj", "up_proj")),
-)
 _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
     ("index_qk_proj", ("index_q_proj", "index_k_proj")),
@@ -292,7 +290,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
-        packed_modules_mapping=_QWEN4_EXP_PACKED,
+        packed_modules_mapping=_QWEN4_EXP_GGUF_PACKED,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
@@ -316,7 +314,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.muse_glimmer",
         "MuseGlimmerForConditionalGeneration",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
-        packed_modules_mapping=_MUSE_GLIMMER_PACKED,
+        packed_modules_mapping=_DENSE_PACKED,
         mm_processor=_MUSE_GLIMMER_PROCESSOR,
         encoders=_MUSE_GLIMMER_ENCODERS,
     ),
@@ -326,7 +324,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "MuseGlimmerForCausalLM",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
-        packed_modules_mapping=_MUSE_GLIMMER_PACKED,
+        packed_modules_mapping=_DENSE_PACKED,
     ),
     "MistralForCausalLM": ModelSpec(
         "freetoken.models.mistral",
@@ -421,6 +419,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm5_next",
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
+    ),
+    # llama.cpp glm5-next GGUF (unsloth GLM-5.3-Flash-GGUF; text only): the same model
+    # classes with every tensor in its packed ggml type
+    "Glm5NextGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_GLM5_NEXT_PACKED,
+        # the MLA kv_b ships as two per-head tensors (attn_k_b transposed + attn_v_b), quantized in
+        # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
+        unquantized_modules=("*.self_attn.kv_b_proj",),
     ),
 }
 

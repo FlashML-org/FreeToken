@@ -64,9 +64,9 @@ def _make_native_sources(device: torch.device, seed: int = 0) -> dict[str, list[
     def rand_scale(*shape):
         return (torch.rand(*shape, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
 
-    gate_up_global = torch.full((total, 2 * I), 1.0, dtype=torch.float16)
+    gate_up_global = torch.full((total, 2 * I), 1.0, dtype=torch.float32)
     gate_up_global[:, I:] = 0.5  # w3 global != w1 global: exercises the alpha fold
-    down_global = torch.full((total, H), 0.75, dtype=torch.float16)
+    down_global = torch.full((total, H), 0.75, dtype=torch.float32)
     flat = {
         "gate_up_packed": rand_u8(total, 2 * I, H // 2),
         "gate_up_scale": rand_scale(total, 2 * I, H // 16),
@@ -392,7 +392,7 @@ def test_triton_prefill_routes_to_gluon_on_sm120(monkeypatch, hidden_size, inter
     def bank(n, k):
         packed = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=device, generator=g)
         scale = (torch.rand(E, n, k // 16, device=device, generator=g) + 0.25).to(torch.float8_e4m3fn)
-        return packed, scale, (torch.rand(E, n, device=device, generator=g) + 0.5).to(torch.float16)
+        return packed, scale, torch.rand(E, n, device=device, generator=g) + 0.5
 
     banks = (*bank(2 * inter, hidden_size), *bank(hidden_size, inter))
     M = 1024
@@ -471,7 +471,7 @@ def test_w4a4_prefill_matches_nvfp4_activation_reference(hidden_size, inter, act
     def bank(n, k):
         packed = torch.randint(0, 256, (E, n, k // 2), dtype=torch.uint8, device=device, generator=g)
         scale = (torch.rand(E, n, k // 16, device=device, generator=g) + 0.25).to(torch.float8_e4m3fn)
-        return packed, scale, (torch.rand(E, n, device=device, generator=g) * 0.02 + 0.01).to(torch.float16)
+        return packed, scale, torch.rand(E, n, device=device, generator=g) * 0.02 + 0.01
 
     gu, gus, gug = bank(2 * inter, hidden_size)
     dn, dns, dng = bank(hidden_size, inter)
@@ -621,10 +621,10 @@ def test_dummy_nvfp4_banks_match_the_triton_layout():
     expected = {
         "gate_up": ((E, 2 * I, H // 2), torch.uint8),
         "gate_up_scale": ((E, 2 * I, H // 16), torch.float8_e4m3fn),
-        "gate_up_global": ((E, 2 * I), torch.float16),
+        "gate_up_global": ((E, 2 * I), torch.float32),
         "down": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 16), torch.float8_e4m3fn),
-        "down_global": ((E, H), torch.float16),
+        "down_global": ((E, H), torch.float32),
     }
     assert banks.sources.keys() == expected.keys()
     for name, (shape, dtype) in expected.items():

@@ -158,7 +158,7 @@ def _nvfp4_gemv_kernel(
     a_ptr,        # [K] activation (compute dtype), contiguous
     packed_ptr,   # [N, K // 8] int32 (8 fp4 codes per word, nibble j -> k = 8*w + j)
     scale_ptr,    # [N, K // 16] fp8-e4m3 per-16 block scale
-    gscale_ptr,   # [N] fp16 per-output-row global scale (weight_scale_2)
+    gscale_ptr,   # [N] fp32 per-output-row global scale (weight_scale_2)
     out_ptr,      # [N] out dtype
     N, K,
     stride_pn, stride_pkw,
@@ -226,7 +226,7 @@ def _nvfp4_gemv_splitk_kernel(
     a_ptr,        # [K] activation (compute dtype), contiguous
     packed_ptr,   # [N, K // 8] int32
     scale_ptr,    # [N, K // 16] fp8-e4m3
-    gscale_ptr,   # [N] fp16 per-output-row global scale
+    gscale_ptr,   # [N] fp32 per-output-row global scale
     part_ptr,     # [SPLIT_K, N] fp32 partial sums (pre-global-scale)
     counter_ptr,  # [cdiv(N, BLOCK_N)] int32 arrival counters, zeroed (self-resetting)
     out_ptr,      # [N] out dtype
@@ -311,7 +311,7 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
           gscale: torch.Tensor, out_dtype: torch.dtype, transposed: bool) -> torch.Tensor:
     """M==1 W4A16 GEMV. ``a`` [K] compute-dtype; ``packed_i32`` logical [N, K//8] int32
     (row-major or a K-major transposed view); ``scale`` logical [N, K//16] fp8; ``gscale``
-    [N] fp16. Picks split-K so small ``N`` (shared expert) still fills the SMs; large ``N``
+    [N] fp32. Picks split-K so small ``N`` (shared expert) still fills the SMs; large ``N``
     (lm_head) stays single-pass (split_k=1)."""
     out_tl = _TL_DTYPE[out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16]
     N = packed_i32.shape[0]
@@ -389,7 +389,7 @@ def _nvfp4_gemm_kernel(
     a_ptr,        # [M, K] activations
     packed_ptr,   # logical [N, K // 8] int32 (row- or K-major via strides)
     scale_ptr,    # logical [N, K // 16] fp8-e4m3
-    gscale_ptr,   # [N] fp16
+    gscale_ptr,   # [N] fp32
     c_ptr,        # [M, N] output (written when SPLIT_K == 1)
     part_ptr,     # [SPLIT_K, M, N] fp32 partials (written when SPLIT_K > 1)
     M, N, K, K_WORDS, tiles_per,
@@ -612,7 +612,7 @@ def _gemm_inkernel(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tenso
 def _nvfp4_dequant_rows_kernel(
     packed_ptr,   # [N, K // 8] int32
     scale_ptr,    # [N, K // 16] fp8-e4m3
-    gscale_ptr,   # [N] fp16
+    gscale_ptr,   # [N] fp32
     out_ptr,      # [N, K] compute dtype
     K_WORDS,
     stride_pn, stride_pkw,
@@ -646,7 +646,7 @@ def _nvfp4_dequant_rows_kernel(
 def _nvfp4_dequant_cols_kernel(
     packed_ptr,   # K-major: element (n, kw) at kw * stride_pkw + n (stride_pn == 1)
     scale_ptr,
-    gscale_ptr,   # [N] fp16
+    gscale_ptr,   # [N] fp32
     out_ptr,      # [n_rows, K] compute dtype, row-major
     N, K_WORDS,
     stride_pn, stride_pkw,
@@ -781,7 +781,7 @@ def nvfp4_dense_linear(
     weight_global: torch.Tensor, bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ dequant(weight)^T`` on the checkpoint-native row-major layout.
-    ``weight`` [N, K//2] uint8, ``weight_scale`` [N, K//16] fp8-e4m3, ``weight_global`` [N] fp16."""
+    ``weight`` [N, K//2] uint8, ``weight_scale`` [N, K//16] fp8-e4m3, ``weight_global`` [N] fp32."""
     return _linear_impl(
         x, weight.view(torch.int32), weight_scale, weight_global, bias, x.dtype, transposed=False
     )

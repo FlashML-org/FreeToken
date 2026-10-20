@@ -45,4 +45,4 @@ class GGUFEmbeddingMethod(EmbeddingMethod):
     def create_weights(self, layer: Any) -> None:
         (ggml_type,) = gguf_types(self.cfg.scheme)
         h = self.cfg.embedding_dim
-        layer.weight = torch.empty(self.cfg.num_embeddings + pad_rows(h), row_bytes(ggml_type, h), dtype=torch.uint8)
+        layer.weight = torch.empty(self.cfg.num_embeddings + pad_rows(ggml_type, h), row_bytes(ggml_type, h), dtype=torch.uint8)

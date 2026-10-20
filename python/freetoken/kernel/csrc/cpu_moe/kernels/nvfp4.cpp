@@ -7,7 +7,7 @@ namespace {
 
 // --------------------------- NVFP4 (W4A16) dequant ---------------------------
 // Weights: e2m1 4-bit codes (2/byte, low nibble first), per-16 block scale in
-// fp8-e4m3, per-output-row global scale in fp16. Dequant matches the GPU kernels
+// fp8-e4m3, per-output-row global scale in fp32. Dequant matches the GPU kernels
 // (freetoken/kernel/triton/nvfp4_dequant.py): w = E2M1[code] * e4m3(scale) * global.
 // Activations stay bf16 (W4A16); the GEMV dequantizes weights inside the K-loop.
 
@@ -405,7 +405,7 @@ class Nvfp4Format final : public MoeFormat {
     const int H = p.H;
     const uint8_t* packed = static_cast<const uint8_t*>(tbl_at(gate_up_, layer));
     const uint8_t* scale = static_cast<const uint8_t*>(tbl_at(gu_scale_, layer));
-    const uint16_t* global = static_cast<const uint16_t*>(tbl_at(gu_global_, layer));
+    const float* global = static_cast<const float*>(tbl_at(gu_global_, layer));
     const float* xe = xe_.data() + (size_t)tok * (H / 2);
     const float* xo = xo_.data() + (size_t)tok * (H / 2);
     const int8_t* xi8 = nvi8dot_ != nullptr ? xi8_.data() + (size_t)tok * H : nullptr;
@@ -414,9 +414,9 @@ class Nvfp4Format final : public MoeFormat {
       const size_t r = (size_t)e * (2 * p.I) + row;
       if (nvi8dot_ != nullptr)
         return nvi8dot_(packed + r * (size_t)(H / 2), scale + r * (size_t)(H / 16),
-                        fp16_to_f32(global[r]), xi8, H, e4m3_lut_, xas);
+                        global[r], xi8, H, e4m3_lut_, xas);
       return nvdot_(packed + r * (size_t)(H / 2), scale + r * (size_t)(H / 16),
-                    fp16_to_f32(global[r]), xe, xo, H, e2m1_lut_, e4m3_lut_);
+                    global[r], xe, xo, H, e2m1_lut_, e4m3_lut_);
     });
   }
 
@@ -424,15 +424,15 @@ class Nvfp4Format final : public MoeFormat {
     const int I = p.I;
     const uint8_t* packed = static_cast<const uint8_t*>(tbl_at(down_, layer));
     const uint8_t* scale = static_cast<const uint8_t*>(tbl_at(dn_scale_, layer));
-    const uint16_t* global = static_cast<const uint16_t*>(tbl_at(dn_global_, layer));
+    const float* global = static_cast<const float*>(tbl_at(dn_global_, layer));
     for (int h = h0; h < h1; ++h) {
       for (int j = 0; j < n; ++j) {
         const size_t r = (size_t)routes[j].r;
         const size_t row = (size_t)routes[j].e * p.H + h;
         out[j * kRowBlock + h - h0] = nvi8dot_ != nullptr
-            ? nvi8dot_(packed + row * (size_t)(I / 2), scale + row * (size_t)(I / 16), fp16_to_f32(global[row]),
+            ? nvi8dot_(packed + row * (size_t)(I / 2), scale + row * (size_t)(I / 16), global[row],
                        gi8_.data() + r * I, I, e4m3_lut_, gas_.data() + r * (I / 16))
-            : nvdot_(packed + row * (size_t)(I / 2), scale + row * (size_t)(I / 16), fp16_to_f32(global[row]),
+            : nvdot_(packed + row * (size_t)(I / 2), scale + row * (size_t)(I / 16), global[row],
                      ge_.data() + r * (I / 2), go_.data() + r * (I / 2), I, e2m1_lut_, e4m3_lut_);
       }
     }
@@ -441,7 +441,7 @@ class Nvfp4Format final : public MoeFormat {
  private:
   nvdot_fn nvdot_;
   nvi8dot_fn nvi8dot_;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
-  // ModelOpt rows: packed e2m1 [E,2I,H/2], e4m3 scales per 16 along K [E,2I,H/16], fp16 row globals [E,2I]; down likewise with K = I.
+  // ModelOpt rows: packed e2m1 [E,2I,H/2], e4m3 scales per 16 along K [E,2I,H/16], fp32 row globals [E,2I]; down likewise with K = I.
   const uint64_t* gate_up_ = nullptr;
   const uint64_t* gu_scale_ = nullptr;
   const uint64_t* gu_global_ = nullptr;

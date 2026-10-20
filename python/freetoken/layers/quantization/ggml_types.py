@@ -44,9 +44,10 @@ def row_bytes(ggml_type: int, k: int) -> int:
     return k // block * size
 
 
-def pad_rows(k: int) -> int:
+def pad_rows(ggml_type: int, k: int) -> int:
     """Zero rows to append after a packed [rows, K] matrix so ggml's tail reads stay inside it."""
-    return 0 if k % MATRIX_ROW_PADDING == 0 else 1
+    tail = mmq_tail_bytes(ggml_type, k)
+    return 0 if tail == 0 else max(1, -(-tail // row_bytes(ggml_type, k)))
 
 
 def mmq_tail_bytes(ggml_type: int, k: int) -> int:

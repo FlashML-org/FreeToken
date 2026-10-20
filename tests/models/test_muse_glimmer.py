@@ -252,13 +252,12 @@ def test_weight_rename_and_fusion():
     ((key, weight),) = _vision_tensors("vision_tower.layers.0.attn.proj.weight", torch.zeros(2, 2), vbuf)
     assert key == "vision_tower.layers.0.attn.proj.weight" and torch.equal(weight, torch.zeros(2, 2))
 
-    # q/k/v + the attention gate fuse into qkvg_proj in declaration order.
+    # q/k/v fuse into qkv_proj in declaration order; the attention gate stays out of every fusion.
     buf: dict = {}
     parts = {
         "q_proj": torch.full((4, 2), 0.0),
         "k_proj": torch.full((2, 2), 1.0),
         "v_proj": torch.full((2, 2), 2.0),
-        "gate_proj": torch.full((4, 2), 3.0),
     }
     fused = None
     for name, tensor in parts.items():
@@ -268,10 +267,10 @@ def test_weight_rename_and_fusion():
             fused = out[0]
     assert fused is not None and not buf
     key, tensor = fused
-    assert key == "model.layers.0.self_attn.qkvg_proj.weight"
-    assert tensor.shape == (12, 2)
+    assert key == "model.layers.0.self_attn.qkv_proj.weight"
+    assert tensor.shape == (8, 2)
     assert tensor[0, 0] == 0.0 and tensor[4, 0] == 1.0 and tensor[6, 0] == 2.0
-    assert tensor[8, 0] == 3.0
+    assert ct_bf16_fuse("model.layers.0.self_attn.gate_proj", torch.zeros(4, 2), buf, _FUSIONS) is None
 
     # The MLP's own gate_proj is a different fusion (gate|up), not the attention one.
     buf2: dict = {}
@@ -365,7 +364,7 @@ def _bf16_checkpoint_tensors(hf) -> dict:
 @pytest.mark.parametrize("include_vision", [False, True])
 def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, include_vision):
     """The BF16 loader must produce exactly the model's state-dict keys with the
-    right shapes (rename + qkvg / gate_up fusion, norms raw); the image path only
+    right shapes (rename + qkv / gate_up fusion, norms raw); the image path only
     when an encoder is built, then with q/k/v fused into attn.qkv."""
     import torch
 
@@ -399,14 +398,15 @@ def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch, inclu
         assert torch.equal(loaded["vision_tower.layers.1.attn.qkv.weight"], torch.cat([tensors[v + f"{n}_proj.weight"] for n in "qkv"]))
         assert torch.equal(loaded["vision_tower.layers.1.attn.qkv.bias"], torch.cat([tensors[v + f"{n}_proj.bias"] for n in "qkv"]))
         assert torch.equal(loaded["vision_tower.projection.weight"], tensors["model.vision_projection.weight"])
-    # fusion order [q, k, v, gate] against the raw parts
-    fused = loaded["model.layers.0.self_attn.qkvg_proj.weight"]
+    # fusion order [q, k, v] against the raw parts; the attention gate loads on its own
+    fused = loaded["model.layers.0.self_attn.qkv_proj.weight"]
     p = "model.language_model.layers.0.self_attn."
     q_dim = tensors[p + "q_proj.weight"].shape[0]
     kv_dim = tensors[p + "k_proj.weight"].shape[0]
     assert torch.equal(fused[:q_dim], tensors[p + "q_proj.weight"])
     assert torch.equal(fused[q_dim : q_dim + kv_dim], tensors[p + "k_proj.weight"])
-    assert torch.equal(fused[-q_dim:], tensors[p + "gate_proj.weight"])
+    assert torch.equal(fused[-kv_dim:], tensors[p + "v_proj.weight"])
+    assert torch.equal(loaded["model.layers.0.self_attn.gate_proj.weight"], tensors[p + "gate_proj.weight"])
 
 
 def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
@@ -481,18 +481,19 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     loaded = dict(
         iter_weights(str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True)
     )
-    qkvg = "model.layers.0.self_attn.qkvg_proj"
-    assert loaded[qkvg + ".weight"].shape == (2 * q + 2 * kv, H // 2)
-    assert loaded[qkvg + ".weight_scale"].shape == (2 * q + 2 * kv, H // 16)
-    assert loaded[qkvg + ".weight_global"].shape == (2 * q + 2 * kv,)
+    qkv = "model.layers.0.self_attn.qkv_proj"
+    assert loaded[qkv + ".weight"].shape == (q + 2 * kv, H // 2)
+    assert loaded[qkv + ".weight_scale"].shape == (q + 2 * kv, H // 16)
+    assert loaded[qkv + ".weight_global"].shape == (q + 2 * kv,)
     # global is the reciprocal of the stored quant-side scale
-    assert loaded[qkvg + ".weight_global"][0].item() == pytest.approx(0.5)
+    assert loaded[qkv + ".weight_global"][0].item() == pytest.approx(0.5)
+    assert loaded["model.layers.0.self_attn.gate_proj.weight"].shape == (q, H // 2)
     dp = "model.layers.0.mlp.down_proj"
     assert loaded[dp + ".weight"].shape == (H, I // 2)  # cross-shard scales resolved
     assert loaded[dp + ".weight_global"][0].item() == pytest.approx(0.25)
     # the quant-side activation global lands as the dequant-side input_scale the layer declares
     assert loaded[dp + ".input_scale"].item() == pytest.approx(1.0)
-    assert loaded[qkvg + ".input_scale"].shape == ()
+    assert loaded[qkv + ".input_scale"].shape == ()
     assert not any(k.endswith(".input_global_scale") for k in loaded)
     expected_vision = {"vision_tower." + k for k in MuseGlimmerVisionModel(parse_vision_config(hf)).state_dict()}
     assert {k for k in loaded if k.startswith("vision_tower.")} == expected_vision
@@ -503,7 +504,7 @@ def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
     text_only = dict(iter_weights(
         str(tmp_path), torch.device("cpu"), include_moe_experts=False, include_non_moe=True, include_vision=False,
     ))
-    assert not any(k.startswith("vision_tower.") for k in text_only) and qkvg + ".weight" in text_only
+    assert not any(k.startswith("vision_tower.") for k in text_only) and qkv + ".weight" in text_only
 
 
 def test_raw_config_shim_serves_unknown_model_type(tmp_path):
@@ -551,7 +552,8 @@ def test_model_state_dict_matches_loader_keys():
     keys = set(model.state_dict().keys())
     layer0 = {k for k in keys if k.startswith("model.layers.0.")}
     assert layer0 == {
-        "model.layers.0.self_attn.qkvg_proj.weight",
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.0.self_attn.gate_proj.weight",
         "model.layers.0.self_attn.o_proj.weight",
         "model.layers.0.mlp.gate_up_proj.weight",
         "model.layers.0.mlp.down_proj.weight",
@@ -588,7 +590,7 @@ def test_model_state_dict_matches_loader_keys():
     qmodel = MuseGlimmerForCausalLM(qcfg)
     attn = qmodel.model.layers.op_list[0].self_attn
     mlp = qmodel.model.layers.op_list[0].mlp
-    for proj in (attn.qkvg_proj, attn.o_proj, mlp.gate_up_proj, mlp.down_proj):
+    for proj in (attn.qkv_proj, attn.gate_proj, attn.o_proj, mlp.gate_up_proj, mlp.down_proj):
         assert type(proj.quant_method) is Nvfp4LinearMethod
     assert type(qmodel.lm_head.quant_method) is UnquantizedLinearMethod  # lm_head stays bf16
     del model, qmodel, torch

@@ -66,7 +66,10 @@ def _load_local_media(url: str, config: ServerArgs) -> bytes:
     if not root:
         raise ValueError("cannot load local files without --allowed-local-media-path")
     spec = urlparse(url)
-    filepath = Path(url2pathname((spec.netloc or "") + (spec.path or "")))
+    # RFC 8089: empty authority and localhost identify the local machine.
+    if spec.netloc and spec.netloc.lower().rstrip(".") != "localhost":
+        raise ValueError("file:// URLs must have no host or use localhost")
+    filepath = Path(url2pathname(spec.path or ""))
     # resolve() follows symlinks, so a link inside the root escaping it is rejected too
     resolved = filepath.resolve()
     if Path(root).resolve() not in resolved.parents:

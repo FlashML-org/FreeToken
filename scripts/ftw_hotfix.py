@@ -38,7 +38,7 @@ import tempfile
 
 import torch
 
-from freetoken.checkpoint.ftw import ALIGN, FORMAT_TAG, INDEX_NAME, _align_up, _dtype_of, _dtype_str, _SHARD_FMT
+from freetoken.checkpoint.ftw import ALIGN, FORMAT_TAG, INDEX_NAME, _align_up, _dtype_of, _dtype_str, _is_nvfp4_global, _SHARD_FMT
 from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
 from freetoken.engine.config import EngineConfig
@@ -340,6 +340,10 @@ def validate_ftw(ftw_dir: str, index: dict, expected: dict, renames: dict[str, s
         # the loader casts between float types; anything else has to match exactly
         if dt != exp[1] and not (dt in _FLOAT_DTYPES and exp[1] in _FLOAT_DTYPES):
             problems.append(f"{name}: FTW dtype {e['dtype']} is not loadable as {exp[1]}")
+    fp16_globals = [e["name"] for e in index["tensors"] if e["dtype"] == "float16" and _is_nvfp4_global(e["name"])]
+    if fp16_globals:
+        problems.append(f"{len(fp16_globals)} NVFP4 global scale entries are fp16 (e.g. {fp16_globals[0]}) but FreeToken reads them as fp32; "
+                        "this script cannot repair that, reconvert the FTW with `ft checkpoint`")
     blocks = sorted((e["global_off"], e["global_off"] + _align_up(e["nbytes"]), e["name"]) for e in index["tensors"])
     for (_, a1, an), (b0, _, bn) in zip(blocks, blocks[1:]):
         if b0 < a1:

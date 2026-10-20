@@ -85,7 +85,7 @@ def fused(prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k
         rows = parts[seg.first_part : seg.first_part + seg.num_parts]
         zeros = pad if i == len(segs) - 1 else 0
         if is_quantized(seg.ggml_type):
-            zeros += pad_rows(k)
+            zeros += pad_rows(seg.ggml_type, k)
             dtype = torch.uint8
         else:
             rows = [r.to(torch.bfloat16) for r in rows]

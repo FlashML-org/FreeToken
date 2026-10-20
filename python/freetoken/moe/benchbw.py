@@ -309,7 +309,7 @@ def _gguf_bank_shapes(fmt: str, opts: dict, H: int, I: int) -> dict[str, tuple[t
 
 def _offload_bank_specs(fmt: str, H: int, I: int, opts: dict | None = None) -> dict[str, tuple[int, torch.dtype]]:
     """Per-bank (elems_per_expert, dtype) for the flat offload host banks (the gather)."""
-    u8, bf16, f16, f8 = torch.uint8, torch.bfloat16, torch.float16, torch.float8_e4m3fn
+    u8, bf16, f32, f8 = torch.uint8, torch.bfloat16, torch.float32, torch.float8_e4m3fn
     if fmt in ("gguf", "gguf_scaled"):
         return {name: (math.prod(shape), dtype) for name, (shape, dtype) in _gguf_bank_shapes(fmt, opts, H, I).items()}
     if fmt == "bf16":
@@ -322,8 +322,8 @@ def _offload_bank_specs(fmt: str, H: int, I: int, opts: dict | None = None) -> d
     if fmt == "nvfp4":
         return {
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 16), u8),
-            "gate_up_global": (2 * I, f16), "down_packed": (H * (I // 2), u8),
-            "down_scale": (H * (I // 16), u8), "down_global": (H, f16),
+            "gate_up_global": (2 * I, f32), "down_packed": (H * (I // 2), u8),
+            "down_scale": (H * (I // 16), u8), "down_global": (H, f32),
         }
     if fmt == "mxfp4_triton":
         return {
@@ -403,13 +403,13 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = 
         b = {
             "gate_up_packed": pin(E, 2 * I, H // 2, dtype=torch.uint8),
             "gate_up_scale": pin(E, 2 * I, H // 16, dtype=torch.uint8),
-            "gate_up_global": pin(E, 2 * I, dtype=torch.float16),
+            "gate_up_global": pin(E, 2 * I, dtype=torch.float32),
             "down_packed": pin(E, H, I // 2, dtype=torch.uint8),
             "down_scale": pin(E, H, I // 16, dtype=torch.uint8),
-            "down_global": pin(E, H, dtype=torch.float16),
+            "down_global": pin(E, H, dtype=torch.float32),
         }
         b["gate_up_global"].fill_(1.0)
-        b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32; globals are fp16
+        b["down_global"].fill_(1.0)  # e4m3 scales decode to normal float32
         return b
     if fmt == "mxfp4_triton":  # transposed split-K layout
         b = {

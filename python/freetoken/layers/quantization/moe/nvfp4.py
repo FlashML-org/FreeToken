@@ -52,10 +52,10 @@ class TritonNvfp4MoEKernel(MoEKernel):
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
-            "gate_up_global": BankSpec((2 * i,), torch.float16),
+            "gate_up_global": BankSpec((2 * i,), torch.float32),
             "down": BankSpec((h, i // 2), torch.uint8),
             "down_scale": BankSpec((h, i // GROUP), FP8),
-            "down_global": BankSpec((h,), torch.float16),
+            "down_global": BankSpec((h,), torch.float32),
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
@@ -183,7 +183,7 @@ def _marlin_pack_proj(
     """Pack one expert projection (on GPU) into the Marlin layout.
 
     ``packed`` ``[N, K//2]`` uint8 e2m1 pairs, ``scale`` ``[N, K//16]`` e4m3,
-    ``row_global`` ``[N]`` fp16 per-row global (rows of a merged gate_up may carry
+    ``row_global`` ``[N]`` fp32 per-row global (rows of a merged gate_up may carry
     w1's and w3's different globals). Returns ``(qweight [K//16, 2N] int32,
     scales [K//16, N] e4m3-coded, global scalar bf16)``.
 

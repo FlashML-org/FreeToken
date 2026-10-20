@@ -40,10 +40,10 @@ def _drop_page_cache(info: GgufTensorInfo) -> None:
         pass
 
 
-def _device_bank(shape: tuple[int, ...], k: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _device_bank(shape: tuple[int, ...], ggml_type: int, k: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     """An [E, rows, row] device bank; a zero row follows the last one when ggml's MMQ tiles read past it."""
     experts, rows, row = shape
-    flat = torch.empty(experts * rows + pad_rows(k), row, dtype=dtype, device=device)
+    flat = torch.empty(experts * rows + pad_rows(ggml_type, k), row, dtype=dtype, device=device)
     flat[experts * rows :].zero_()
     return flat[: experts * rows].view(shape)
 
@@ -101,8 +101,8 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 banks = {role: bank.tensor for role, bank in host.items()}
             else:
                 banks = {
-                    "gate_up": _device_bank(gate_up_shape, gate.ne[0], rows[0].dtype, device),
-                    "down": _device_bank(tuple(d.shape), down.ne[0], d.dtype, device),
+                    "gate_up": _device_bank(gate_up_shape, gate.ggml_type, gate.ne[0], rows[0].dtype, device),
+                    "down": _device_bank(tuple(d.shape), down.ggml_type, down.ne[0], d.dtype, device),
                 }
                 if scaled:
                     banks["global"] = torch.empty(experts, 4, dtype=torch.float32, device=device)

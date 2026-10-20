@@ -96,8 +96,8 @@ def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
 
 
 def global_rows(piece: torch.Tensor, rows: int) -> torch.Tensor:
-    """Per-expert global scale as one fp16 value per output row (a scalar per expert is broadcast)."""
-    flat = piece.reshape(piece.shape[0], -1).to(torch.float16)
+    """Per-expert global scale as one fp32 value per output row (a scalar per expert is broadcast)."""
+    flat = piece.reshape(piece.shape[0], -1).to(torch.float32)
     if flat.shape[1] == rows:
         return flat
     assert flat.shape[1] == 1, (flat.shape, rows)

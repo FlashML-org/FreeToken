@@ -40,10 +40,15 @@ def quantization_config_of(hf_config: Any) -> dict[str, Any] | None:
 
 @dataclass(frozen=True)
 class Stored:
-    """One checkpoint tensor behind a role: its suffix, and whether it holds the quant-side scale whose reciprocal the layer wants."""
+    """One checkpoint tensor behind a role: its suffix, other suffixes exports of the same dialect use for it, and whether it holds the quant-side scale whose reciprocal the layer wants."""
 
     name: str
     reciprocal: bool = False
+    aliases: tuple[str, ...] = ()
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return (self.name, *self.aliases)
 
 
 class QuantConfig(ABC):

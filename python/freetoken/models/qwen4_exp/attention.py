@@ -85,7 +85,7 @@ class Qwen4ExpIndexer(BaseOP):
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
         self.index_qk_proj = LinearReplicated(
-            args.hidden_size, sum(self._split), has_bias=False,
+            args.hidden_size, sum(self._split), has_bias=False, output_sizes=self._split,
             quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
         )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)

@@ -45,7 +45,8 @@ _LAYER_LEAVES: dict[str, tuple[str, ...]] = {
     "self_attn.k_proj": ("attn_k",),
     "self_attn.v_proj": ("attn_v",),
     "self_attn.o_proj": ("attn_output",),
-    "self_attn.indexer.index_qk_proj": ("indexer.q_proj", "indexer.k_proj"),
+    "self_attn.indexer.index_q_proj": ("indexer.q_proj",),
+    "self_attn.indexer.index_k_proj": ("indexer.k_proj",),
     "mlp.gate": ("ffn_gate_inp",),
     "mlp.shared_expert_gate": ("ffn_gate_inp_shexp",),
     "mlp.shared_expert.gate_proj": ("ffn_gate_shexp",),
@@ -85,6 +86,10 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
 def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
     # NVFP4 weight scales are unvalidated on this arch, so refuse them instead of risking wrong output
     check_scales(shim.model_path, nvfp4=False)
+    # a metadata-only GGUF (an FTW dir's source_metadata.gguf) has no tensor table to check
+    index = gguf_tensor_index(shim.model_path)
+    if index and "blk.0.hc_attn_down.weight" not in index:
+        raise NotImplementedError(f"{shim.model_path}: no decoder layer tensors (blk.0.hc_attn_down), e.g. an MTP-only draft GGUF")
     md = shim.metadata
 
     def kv(key: str):

@@ -119,6 +119,16 @@ def test_local_media_requires_allowlisted_root(tmp_path):
     config = _config(allowed_local_media_path=str(tmp_path))
     assert asyncio.run(fetch_image_bytes([{"kind": "url", "data": url}], config)) == [b"fakepng"]
 
+    # RFC 8089 local authority refers to the same file as file:///... .
+    for authority in ("localhost", "LOCALHOST", "localhost."):
+        local_url = f"file://{authority}{img}"
+        assert asyncio.run(fetch_image_bytes([{"kind": "url", "data": local_url}], config)) == [b"fakepng"]
+
+    # Non-local authorities must not be interpreted as filesystem paths.
+    remote_url = f"file://remote.invalid{img}"
+    with pytest.raises(ValueError, match="no host or use localhost"):
+        asyncio.run(fetch_image_bytes([{"kind": "url", "data": remote_url}], config))
+
     # a path outside the root is rejected even with the gate on
     with pytest.raises(ValueError, match="subpath"):
         asyncio.run(fetch_image_bytes([{"kind": "url", "data": "file:///etc/hostname"}], config))

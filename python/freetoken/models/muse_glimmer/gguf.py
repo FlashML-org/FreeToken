@@ -171,8 +171,9 @@ def iter_gguf_weights(
         else:
             qkv = [t(f"{blk}.attn_{p}") for p in ("q", "k", "v")]
             q, k, v = (matrix(p) for p in qkv)
+        yield from fused(f"{sa}.qkv_proj", qkv, [_unpermute(q, heads), _unpermute(k, kv_heads), v], hidden)
         gate = t(f"{blk}.attn_gate")
-        yield from fused(f"{sa}.qkvg_proj", [*qkv, gate], [_unpermute(q, heads), _unpermute(k, kv_heads), v, matrix(gate)], hidden)
+        yield from fused(f"{sa}.gate_proj", [gate], [matrix(gate)], hidden)
         out = t(f"{blk}.attn_output")
         yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
         mlp = f"{pre}.mlp"

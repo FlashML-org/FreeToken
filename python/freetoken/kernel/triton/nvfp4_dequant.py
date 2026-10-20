@@ -26,7 +26,7 @@ def _e2m1_lut(device_index: int) -> torch.Tensor:
 def _dequant_nvfp4_kernel(
     packed_ptr,      # [S, OUT, IN // 2] uint8
     scale_ptr,       # [S, OUT, IN // 16] fp8-e4m3 per-block scale (checkpoint native)
-    global_ptr,      # [S, OUT] fp16 per-output-row global scale (weight_scale_2)
+    global_ptr,      # [S, OUT] fp32 per-output-row global scale (weight_scale_2)
     slots_ptr,       # [N] int32 -> cache slot for each output expert
     out_ptr,         # [N, OUT, IN] compute dtype
     lut_ptr,         # [16] float32 E2M1 values
