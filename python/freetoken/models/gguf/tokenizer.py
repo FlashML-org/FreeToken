@@ -23,7 +23,7 @@ _BOS_PRE = frozenset((
 ))
 
 # Llama 3 and GLM pre-tokenizers, whose HF tokenizer and llama.cpp take a word that is one vocabulary token as is instead of merging it
-_IGNORE_MERGES_PRE = frozenset(("llama3", "llama-v3", "llama-bpe", "glm4"))
+_IGNORE_MERGES_PRE = frozenset(("llama3", "llama-v3", "llama-bpe", "glm4", "glm5"))
 
 
 def _add_bos(meta: dict) -> bool:
@@ -81,11 +81,12 @@ def load_gguf_tokenizer(model_path: str):
     meta = load_gguf_metadata(model_path)
     fast = _fix_added_tokens(fast, meta)
     pre = meta.get("tokenizer.ggml.pre") if meta.get("tokenizer.ggml.model") == "gpt2" else None
-    if pre == "glm4":
+    if pre in ("glm4", "glm5"):
+        # llama.cpp spells the same GLM pre-tokenizer "glm4" and "glm5" (llama-vocab.cpp maps both
+        # to CHATGLM4 with ignore_merges); transformers maps no split for either
         from tokenizers import Regex, pre_tokenizers
         from transformers.integrations.gguf.gguf_tokenizer_mapping import GGUF_PRE_TOKENIZER_SPLITS
 
-        # transformers maps no split for glm4, which the HF tokenizer and llama.cpp split like Llama 3
         fast.pre_tokenizer = pre_tokenizers.Sequence([
             pre_tokenizers.Split(Regex(GGUF_PRE_TOKENIZER_SPLITS["llama3"]), behavior="isolated"),
             pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
