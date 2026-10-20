@@ -1031,8 +1031,10 @@ def test_locked_layer_copy_missing_rejects_ensure_experts_staging():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
+@pytest.mark.parametrize("memops", [True, False])
+def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch, memops):
     # a locked layer's hybrid decode fetches at most max_fetch misses per step into its slots through the pinned staging; the rest go to the CPU
+    # memops: the GPU waits on the doorbell with a stream memop, else the gather kernel spins on it
     from types import SimpleNamespace
 
     from freetoken.moe.locked_fetch import LockedLayerFetch
@@ -1042,7 +1044,7 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
     cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
     cache.decode_target = "hybrid"
     cache.locked_hybrid = frozenset({1})
-    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1))
+    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops))
 
     top_k = 3
     ids = torch.zeros(top_k, dtype=torch.int32, device="cuda")
@@ -1085,7 +1087,7 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch):
     replay(graph, 12)
     # --moe-collect-stats: the locked layer reports as its own group, and each line clears the counters
     line = cache.decode_stats_line()
-    assert "locked 1 layers: hit" in line and "pinned" not in line, line
+    assert "locked 1 layer: hit" in line and "pinned" not in line, line
     assert cache.decode_stats_line() is None
     # a runtime rebuild reallocates evict_slots and the slot caches; the fetch follows and a new capture still copies right
     del graph

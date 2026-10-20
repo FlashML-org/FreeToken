@@ -268,6 +268,7 @@ setup(
             sources=[
                 "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
                 "python/freetoken/kernel/csrc/cpu_moe/locked_fetch.cpp",
+                "python/freetoken/kernel/csrc/cpu_moe/locked_fetch_io.cu",
                 f"python/freetoken/kernel/csrc/cpu_moe/gpu_sync_{'hip' if IS_ROCM else 'cuda'}.cpp",
                 "python/freetoken/kernel/csrc/cpu_moe/gpu_sync_io.cu",
                 *sorted(

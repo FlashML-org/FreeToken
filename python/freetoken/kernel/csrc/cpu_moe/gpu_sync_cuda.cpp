@@ -94,8 +94,8 @@ struct GpuSync::Impl {
   volatile int64_t* done = nullptr;
 };
 
-GpuSync::GpuSync() : impl_(std::make_unique<Impl>()) {
-  if (!cumemop_resolve()) throw std::runtime_error("CPU MoE flag sync: CUDA stream memops are unavailable");
+GpuSync::GpuSync(bool require_memops) : impl_(std::make_unique<Impl>()) {
+  if (require_memops && !cumemop_resolve()) throw std::runtime_error("CPU MoE flag sync: CUDA stream memops are unavailable");
   const cudaError_t rc = cudaHostAlloc(&impl_->block, 128, cudaHostAllocPortable | cudaHostAllocMapped);
   if (rc != cudaSuccess)
     throw std::runtime_error(std::string("CPU MoE flag allocation failed: ") + cudaGetErrorString(rc));

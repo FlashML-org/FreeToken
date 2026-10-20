@@ -68,8 +68,9 @@ WSL caps CUDA pinned memory near half of RAM, so the expert banks of a large
 model may not all pin. With `--moe-cpu-layers auto`, FreeToken loads the banks
 first, then pins them layer by layer from the middle out until CUDA refuses one;
 the remaining head and tail layers are OS-locked instead (resident, but with no
-device address). After a refusal on WSL it unpins about 4 GiB more
-(`FREETOKEN_PIN_PROBE_MARGIN_GB`) so later CUDA allocations still fit.
+device address). After a refusal under WDDM (WSL and native Windows) it
+unpins about 3 GiB more (`FREETOKEN_PIN_PROBE_MARGIN_GB`) so later CUDA
+allocations still fit.
 `FREETOKEN_PIN_BUDGET_GB` replaces the probe with a fixed budget: the locked
 layers are then picked from a size estimate before the load, and a refused pin
 stops the boot.

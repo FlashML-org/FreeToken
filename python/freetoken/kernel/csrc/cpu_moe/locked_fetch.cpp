@@ -1,10 +1,11 @@
 // Locked-layer fetch for hybrid decode (python/freetoken/moe/locked_fetch.py).
 //
-// A locked layer's host banks have no device address, so the GPU cannot gather its rows. Per decode step the GPU copies
-// the fetch list (count + layer-local expert rows) to pinned meta and rings a doorbell (GpuSync); the coordinator and
-// worker threads memcpy each listed row of every bank into pinned staging, then complete the doorbell, and the GPU
-// gathers staging row i into the i-th evicted slot. The GPU side is a copy plus two stream memops, so it captures into
-// the decode graph. Row i of a bank sits at i * the layer's own row bytes, so layers of different widths share staging.
+// A locked layer's host banks have no device address, so the GPU cannot gather its rows. Per decode step a publish kernel
+// writes the fetch list (count + layer-local expert rows) into mapped meta and rings a doorbell (GpuSync's words); the
+// coordinator and worker threads memcpy each listed row of every bank into pinned staging, then complete the doorbell,
+// and a gather kernel copies staging row i into the i-th evicted slot after a stream memop wait, or its own spin wait
+// where memops do not work. Everything is kernels and memops, so it captures into the decode graph. Row i of a bank sits
+// at i * the layer's own row bytes, so layers of different widths share staging.
 
 #include <algorithm>
 #include <atomic>
@@ -12,12 +13,16 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include <torch/extension.h>
 
+#include <freetoken/hip_compat.h>
+
 #include "gpu_sync.h"
+#include "locked_fetch_io.h"
 #include "threads.h"
 
 namespace freetoken::cpu_moe {
@@ -36,16 +41,26 @@ struct CopyJob {
 
 class LockedFetch {
  public:
-  // src[l][b] / row_bytes[l][b]: host base and row bytes of layer l's bank b (0 for banks or layers it never fetches)
+  // src[l][b] / row_bytes[l][b]: host base and row bytes of layer l's bank b (0 for banks or layers it never fetches).
+  // memops: wait on the doorbell with a stream memop, else spin in the gather kernel.
   LockedFetch(std::vector<std::vector<uintptr_t>> src, std::vector<std::vector<int64_t>> row_bytes, std::vector<uintptr_t> staging,
-              uintptr_t meta_count, uintptr_t meta_rows, int max_rows, std::vector<int> cpus)
-      : src_(std::move(src)),
-        row_bytes_(std::move(row_bytes)),
-        staging_(std::move(staging)),
-        count_(reinterpret_cast<const volatile int64_t*>(meta_count)),
-        rows_(reinterpret_cast<const int32_t*>(meta_rows)),
-        max_rows_(max_rows),
-        sync_(std::make_unique<GpuSync>()) {
+              int max_rows, std::vector<int> cpus, bool memops)
+      : src_(std::move(src)), row_bytes_(std::move(row_bytes)), staging_(std::move(staging)), max_rows_(max_rows), memops_(memops) {
+    sync_ = std::make_unique<GpuSync>(memops);
+    void* meta = nullptr;
+    void* meta_dev = nullptr;
+    const size_t meta_bytes = sizeof(int64_t) * (1 + (max_rows + 1) / 2);
+    if (cudaHostAlloc(&meta, meta_bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer(&meta_dev, meta, 0) != cudaSuccess) {
+      (void)cudaGetLastError();
+      if (meta) (void)cudaFreeHost(meta);
+      throw std::runtime_error("locked fetch: mapped meta allocation failed");
+    }
+    meta_ = meta;
+    count_ = static_cast<volatile int64_t*>(meta);
+    rows_ = reinterpret_cast<const int32_t*>(static_cast<int64_t*>(meta) + 1);
+    count_dev_ = static_cast<int64_t*>(meta_dev);
+    rows_dev_ = reinterpret_cast<int32_t*>(static_cast<int64_t*>(meta_dev) + 1);
     const int coord_cpu = cpus.empty() ? -1 : cpus[0];
     for (size_t i = 1; i < cpus.size(); ++i) workers_.emplace_back([this, cpu = cpus[i]] { worker_loop(cpu); });
     coord_ = std::thread([this, coord_cpu] { coordinator_loop(coord_cpu); });
@@ -55,13 +70,26 @@ class LockedFetch {
     stop_.store(true);
     coord_.join();
     for (auto& t : workers_) t.join();
+    (void)cudaFreeHost(meta_);
   }
 
   LockedFetch(const LockedFetch&) = delete;
   LockedFetch& operator=(const LockedFetch&) = delete;
 
-  void gpu_submit(uintptr_t stream, int layer) { sync_->gpu_submit(stream, static_cast<uint64_t>(layer) + 1); }
-  void gpu_wait(uintptr_t stream) { sync_->gpu_wait(stream); }
+  // The whole fetch of one layer step on `stream`: num_indices, src_indices and evict_slots are the hybrid ensure's device outputs;
+  // dst_ptrs, staging_ptrs and row_bytes are [num_banks] device arrays.
+  void copy(uintptr_t stream, int layer, uintptr_t num_indices, uintptr_t src_indices, uintptr_t evict_slots, uintptr_t dst_ptrs,
+            uintptr_t staging_ptrs, uintptr_t row_bytes, int num_banks, int blocks_per_bank) {
+    const auto* n = reinterpret_cast<const int64_t*>(num_indices);
+    auto* ready = reinterpret_cast<volatile int64_t*>(sync_->ready_word());
+    auto* done = reinterpret_cast<volatile int64_t*>(sync_->done_word());
+    locked_publish(stream, n, reinterpret_cast<const int32_t*>(src_indices), max_rows_, count_dev_, rows_dev_, ready, done,
+                   static_cast<int64_t>(layer) + 1);
+    if (memops_) sync_->gpu_wait(stream);
+    locked_gather(stream, n, max_rows_, reinterpret_cast<const int32_t*>(evict_slots), reinterpret_cast<const int64_t*>(dst_ptrs),
+                  reinterpret_cast<const int64_t*>(staging_ptrs), reinterpret_cast<const int64_t*>(row_bytes), num_banks, blocks_per_bank,
+                  done, !memops_);
+  }
   int64_t rows_copied() const { return rows_copied_.load(); }
 
  private:
@@ -115,7 +143,9 @@ class LockedFetch {
     finished_.store(0, std::memory_order_relaxed);
     gen_.fetch_add(1, std::memory_order_acq_rel);
     run_jobs();
-    while (finished_.load(std::memory_order_acquire) < static_cast<int64_t>(workers_.size())) cpu_relax();
+    // on stop a worker may leave before it joins this generation; the coordinator's run_jobs already took every job
+    while (finished_.load(std::memory_order_acquire) < static_cast<int64_t>(workers_.size()) && !stop_.load(std::memory_order_relaxed))
+      cpu_relax();
     return n;
   }
 
@@ -147,10 +177,14 @@ class LockedFetch {
   std::vector<std::vector<uintptr_t>> src_;
   std::vector<std::vector<int64_t>> row_bytes_;
   std::vector<uintptr_t> staging_;
-  const volatile int64_t* count_;
-  const int32_t* rows_;
   int64_t max_rows_;
+  bool memops_;
   std::unique_ptr<GpuSync> sync_;
+  void* meta_ = nullptr;
+  const volatile int64_t* count_ = nullptr;
+  const int32_t* rows_ = nullptr;
+  int64_t* count_dev_ = nullptr;
+  int32_t* rows_dev_ = nullptr;
   std::vector<CopyJob> jobs_;
   std::atomic<int64_t> next_{0};
   std::atomic<int64_t> finished_{0};
@@ -166,12 +200,12 @@ class LockedFetch {
 void bind_locked_fetch(pybind11::module_& m) {
   namespace py = pybind11;
   py::class_<LockedFetch>(m, "LockedFetch")
-      .def(py::init<std::vector<std::vector<uintptr_t>>, std::vector<std::vector<int64_t>>, std::vector<uintptr_t>, uintptr_t, uintptr_t, int,
-                    std::vector<int>>(),
-           py::arg("src"), py::arg("row_bytes"), py::arg("staging"), py::arg("meta_count"), py::arg("meta_rows"), py::arg("max_rows"),
-           py::arg("cpus"))
-      .def("gpu_submit", &LockedFetch::gpu_submit, py::arg("stream"), py::arg("layer"))
-      .def("gpu_wait", &LockedFetch::gpu_wait, py::arg("stream"))
+      .def(py::init<std::vector<std::vector<uintptr_t>>, std::vector<std::vector<int64_t>>, std::vector<uintptr_t>, int, std::vector<int>,
+                    bool>(),
+           py::arg("src"), py::arg("row_bytes"), py::arg("staging"), py::arg("max_rows"), py::arg("cpus"), py::arg("memops"))
+      .def("copy", &LockedFetch::copy, py::arg("stream"), py::arg("layer"), py::arg("num_indices"), py::arg("src_indices"),
+           py::arg("evict_slots"), py::arg("dst_ptrs"), py::arg("staging_ptrs"), py::arg("row_bytes"), py::arg("num_banks"),
+           py::arg("blocks_per_bank"))
       .def("rows_copied", &LockedFetch::rows_copied);
 }
 

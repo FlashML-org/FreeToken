@@ -6,6 +6,7 @@ import errno
 import gc
 import math
 import os
+import sys
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -691,6 +692,10 @@ class Engine:
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
+        if _locked_fetch_wanted(config) and not 1 <= config.moe_locked_max_fetch <= config.model_config.num_experts:
+            raise ValueError(
+                f"--moe-locked-max-fetch {config.moe_locked_max_fetch} must be in [1, {config.model_config.num_experts}] (the experts of a layer)"
+            )
         # --moe-cpu-layers auto without a manual pin budget: load unpinned, pin the staging, then pin layers until the driver refuses (host_banks.probe_pin)
         probe = _pin_probe_enabled(config, layer_methods)
         if probe:
@@ -699,9 +704,10 @@ class Engine:
             requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
             cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
         else:
-            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method, all_methods=offload_layer_methods(self.model))
-            _check_pin_budget(config, reserved=self._host_tables_bytes, method=method, layer_methods=layer_methods)
-            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(self._host_tables_bytes) is not None)
+            reserved = self._host_tables_bytes + _locked_staging_estimate(config, method, layer_methods)
+            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method, all_methods=offload_layer_methods(self.model))
+            _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
+            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
             requested_residency = None
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency
@@ -734,17 +740,19 @@ class Engine:
         if probe:
             banks, cpu_layer_ids = self._probe_pins(config, banks, num_moe_layers)
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
+        elif split_residency and _locked_fetch_wanted(config):
+            self._locked_staging = self._alloc_locked_staging(config, banks)
         from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
-        locked_fetch = split_residency and config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0
+        locked_fetch = split_residency and self._locked_staging is not None
         layer_tags = banks.layer_tags
         if locked_fetch:
             layer_tags = [(t, "locked") if i in cpu_layer_ids else t for i, t in enumerate(layer_tags or [None] * num_moe_layers)]
         self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
         if locked_fetch:
-            # a locked refill costs a staged copy: keep the locked pools past the prefill staging so prefill never evicts them
+            # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
         if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch:
             raise ValueError(
@@ -875,16 +883,11 @@ class Engine:
         plan = banks.deferred_plan
         if plan is None:
             return banks, frozenset()  # the loader settled the banks itself (pinned)
-        if config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0:
-            from freetoken.moe.locked_fetch import alloc_staging, staging_bytes
-
-            sizes = staging_bytes(banks.sources, config.moe_locked_max_fetch)
-            try:
-                self._locked_staging = alloc_staging(sizes)
-            except Exception as exc:
-                raise RuntimeError(f"could not pin the {sum(sizes.values()) / 2**20:.1f} MiB locked-layer staging: {exc}") from exc
-        is_wsl = hasattr(os, "uname") and "microsoft" in os.uname().release.lower()
-        margin = int(float(os.environ.get("FREETOKEN_PIN_PROBE_MARGIN_GB", "4" if is_wsl else "0")) * 2**30)
+        if _locked_fetch_wanted(config):
+            self._locked_staging = self._alloc_locked_staging(config, banks)
+        # a pin quota filled to the brim fails later device allocations under WDDM (WSL and native Windows)
+        wddm = sys.platform == "win32" or (hasattr(os, "uname") and "microsoft" in os.uname().release.lower())
+        margin = int(float(os.environ.get("FREETOKEN_PIN_PROBE_MARGIN_GB", "3" if wddm else "0")) * 2**30)
         t0 = time.perf_counter()
         labels = probe_pin(plan, num_moe_layers, margin)
         locked = frozenset(i for i, r in enumerate(labels) if r != HostResidency.PINNED.value)
@@ -900,6 +903,17 @@ class Engine:
             + (f", staging {sum(t.numel() for t in self._locked_staging.values()) / 2**20:.1f} MiB pinned first" if self._locked_staging else "")
         )
         return dataclasses.replace(banks, layer_residency=labels, deferred_plan=None), locked
+
+    def _alloc_locked_staging(self, config: EngineConfig, banks) -> dict | None:
+        """The locked-layer staging, pinned before the cache is planned; None (locked layers stay CPU-only) when it cannot be pinned."""
+        from freetoken.moe.locked_fetch import alloc_staging, staging_bytes
+
+        sizes = staging_bytes(banks.sources, config.moe_locked_max_fetch)
+        try:
+            return alloc_staging(sizes)
+        except (PinFailed, RuntimeError) as exc:
+            logger.warning_rank0(f"could not pin the {sum(sizes.values()) / 2**20:.1f} MiB locked-layer staging ({exc}); locked layers decode on the CPU only")
+            return None
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
@@ -1549,6 +1563,22 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+def _locked_fetch_wanted(config: EngineConfig) -> bool:
+    """Whether locked layers fetch through pinned staging: hybrid, --moe-locked-fetch not 0, CUDA (the copy kernels are untested on ROCm)."""
+    return config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0 and torch.version.hip is None
+
+
+def _locked_staging_estimate(config: EngineConfig, method, layer_methods) -> int:
+    """Pinned bytes the locked-layer staging will take, for a pin budget set before the load: twice the mean expert per row."""
+    if not (config.moe_cpu_layers and _locked_fetch_wanted(config)):
+        return 0
+    bank_bytes = _bank_bytes(config, method, layer_methods)
+    if not bank_bytes:
+        return 0
+    mean_expert = bank_bytes // (config.model_config.num_moe_layers * config.model_config.num_experts)
+    return 2 * mean_expert * config.moe_locked_max_fetch
 
 
 def _pin_probe_enabled(config: EngineConfig, layer_methods) -> bool:

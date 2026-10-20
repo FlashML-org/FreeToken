@@ -1,10 +1,9 @@
 """Locked-layer fetch for hybrid decode.
 
 A locked layer's host banks are OS-locked but not registered with CUDA (the pin quota ran out), so the GPU cannot
-gather their rows. Each decode step the GPU copies the fetch list chosen by the hybrid ensure (count + layer-local
-rows) to pinned meta and rings a doorbell; CPU threads copy each fetched row of every bank into pinned staging
-(``_cpu_moe.LockedFetch``) and the GPU gathers staging row i into ``evict_slots[i]``. The misses it does not fetch
-go to the CPU executor as on any hybrid layer.
+gather their rows. Each decode step a publish kernel hands the fetch list chosen by the hybrid ensure to CPU threads,
+which copy each fetched row of every bank into pinned staging, and a gather kernel copies staging row i into
+``evict_slots[i]`` (``_cpu_moe.LockedFetch``). The misses it does not fetch go to the CPU executor as on any hybrid layer.
 """
 
 from __future__ import annotations
@@ -18,12 +17,14 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 
-def staging_bytes(sources: dict[str, list[torch.Tensor]], max_fetch: int, layers=None) -> dict[str, int]:
-    """Per bank role: ``max_fetch`` rows of the widest row over ``layers`` (every layer when None)."""
+def staging_bytes(sources: dict[str, list[torch.Tensor]], max_fetch: int) -> dict[str, int]:
+    """Per canonical bank role: ``max_fetch`` rows of the bank's widest row over every layer."""
+    from freetoken.moe.legacy_format import canonical_role
+
     out = {}
-    for role, per_layer in sources.items():
-        rows = [t[0].numel() * t.element_size() for l, t in enumerate(per_layer) if t.numel() and (layers is None or l in layers)]
-        out[role] = max([16] + [r * max_fetch for r in rows])
+    for name, per_layer in sources.items():
+        rows = [t[0].numel() * t.element_size() for t in per_layer if t.numel()]
+        out[canonical_role(name)] = max([16] + [r * max_fetch for r in rows])
     return out
 
 
@@ -68,15 +69,17 @@ def _copy_cpus(executor, count: int) -> list[int]:
 
 
 class LockedLayerFetch:
-    """Staging, meta and copy threads for the locked layers of one ``OffloadMoeCache``."""
+    """Staging and copy threads for the locked layers of one ``OffloadMoeCache``."""
 
     def __init__(self, cache, layers: list[int], plan: dict[int, tuple[int, float]], max_fetch: int, executor, staging: dict[str, torch.Tensor] | None = None) -> None:
         from freetoken.kernel import _cpu_moe
-        from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
+        from freetoken.kernel.pinned import device_ptr
         from freetoken.moe.legacy_format import canonical_role
 
         if not cache._copy_fused_ok:
             raise ValueError("locked layers fetch through the fused multi-bank copy, which this cache could not plan (bank alignment or FREETOKEN_FUSED_COPY=0)")
+        if not 1 <= max_fetch <= cache.num_experts:
+            raise ValueError(f"--moe-locked-max-fetch {max_fetch} must be in [1, {cache.num_experts}] (the experts of a layer)")
         # (max_fetch, fraction) of each locked layer for the hybrid ensure; max_fetch caps any of them
         self.plan = plan
         self.max_fetch = max_fetch
@@ -99,37 +102,27 @@ class LockedLayerFetch:
             assert staging[role].numel() >= need[b], (role, staging[role].numel(), need[b])
         self.staging = [staging[role] for role in roles]
         self.staging_ptrs = torch.tensor([device_ptr(t) for t in self.staging], dtype=torch.int64, device=cache.device)
-        self.count = alloc_pinned_tensor(1, dtype=torch.int64)
-        self.rows = alloc_pinned_tensor(max_fetch, dtype=torch.int32)
-        self.resize(cache.evict_slots.numel())
         cpus = _copy_cpus(executor, _copy_threads())
-        self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], self.count.data_ptr(), self.rows.data_ptr(), max_fetch, cpus)
+        # the executor's doorbell decision (FREETOKEN_CPU_MOE_FLAG_SYNC and the memop probe); without memops the gather spins on the GPU
+        memops = bool(getattr(executor, "_flag_sync", False))
+        self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], max_fetch, cpus, memops)
         logger.info_rank0(
             f"locked layers {layers}: GPU slots + fetch up to {max_fetch} misses per step through "
             f"{sum(t.numel() for t in self.staging) / 2**20:.1f} MiB of pinned staging, {max(1, len(cpus))} copy thread(s) on cpus {cpus or 'any'}"
+            + ("" if memops else ", the GPU spin-waits on them (no stream memops)")
         )
-
-    def resize(self, plan_slots: int) -> None:
-        """Follow the cache's evict_slots length (startup and ``OffloadMoeCache.rebuild``)."""
-        # the gather kernel takes src indices shaped like evict_slots; it reads only the first num_indices <= max_fetch
-        self.row_ids = torch.arange(plan_slots, dtype=torch.int32, device=self.staging_ptrs.device)
 
     def copy(self, cache, layer_id: int) -> None:
         """Stage and gather the rows the last hybrid ensure scheduled for ``layer_id``; graph capturable."""
-        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
-
-        assert self.row_ids.numel() == cache.evict_slots.numel(), "the slot plan was rebuilt after the locked fetch"
-        stream = torch.cuda.current_stream().cuda_stream
-        self.count.copy_(cache.num_indices, non_blocking=True)
-        self.rows.copy_(cache.src_indices[: self.max_fetch], non_blocking=True)
-        self._ext.gpu_submit(stream, layer_id)
-        self._ext.gpu_wait(stream)
-        fast_index_copy_multi_jit(
-            cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer_id]],
-            self.staging_ptrs,
-            cache._copy_feat_bytes[cache.layer_layout[layer_id]],
-            cache.evict_slots,
-            self.row_ids,
-            cache.num_indices,
-            blocks_per_bank=cache._copy_blocks_per_bank,
+        self._ext.copy(
+            torch.cuda.current_stream().cuda_stream,
+            layer_id,
+            cache.num_indices.data_ptr(),
+            cache.src_indices.data_ptr(),
+            cache.evict_slots.data_ptr(),
+            cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer_id]].data_ptr(),
+            self.staging_ptrs.data_ptr(),
+            cache._copy_feat_bytes[cache.layer_layout[layer_id]].data_ptr(),
+            len(self.staging),
+            cache._copy_blocks_per_bank,
         )

@@ -192,7 +192,7 @@ class HostBank:
         self._buf.madvise(mmap.MADV_DONTNEED)
 
     def lock(self) -> None:
-        """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
+        """mlock the (now-filled) buffer: resident without CUDA pin quota, but with no device address, so the GPU cannot gather its rows.
 
         Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
         if self._locked or self._pinned:  # cudaHostRegister already page-locks

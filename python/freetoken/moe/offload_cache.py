@@ -471,7 +471,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must be in ``cpu_layer_ids`` (set BEFORE this call) and the copy plan skips their rows. Prefill moves them with ``copy_missing``'s whole-layer pageable branch, so prefill overlap is incompatible with them; ``locked_hybrid`` layers also fetch decode misses through ``locked_fetch``.
 
         ``layer_tags`` names each layer's quant (see :func:`bank_layouts`); layers of different tags never share a pool.
 
@@ -725,8 +725,6 @@ class OffloadMoeCache:
         plan_slots = max(self.num_experts, cache_size)
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
-        if self.locked_fetch is not None:
-            self.locked_fetch.resize(plan_slots)
         self.step.zero_()
         self.active_mask.zero_()
         self.num_indices.zero_()
@@ -1180,12 +1178,12 @@ class OffloadMoeCache:
             steps, active, missing, fetched = (sum(rows[l][k] for l in layers) for k in range(4))
             if steps and active:
                 parts.append(
-                    f"{name} {len(layers)} layers: hit {1 - missing / active:.1%}, per layer-step "
+                    f"{name} {_layers(len(layers))}: hit {1 - missing / active:.1%}, per layer-step "
                     f"miss {missing / steps:.2f} fetch {fetched / steps:.2f} cpu {(missing - fetched) / steps:.2f}"
                 )
         cpu_only = self.cpu_layer_ids - self.locked_hybrid
         if cpu_only:
-            parts.append(f"cpu-only {len(cpu_only)} layers")
+            parts.append(f"cpu-only {_layers(len(cpu_only))}")
         return "MoE decode, " + "; ".join(parts) if parts else None
 
     def decode_miss_stats_per_layer(self) -> dict:
@@ -1302,6 +1300,10 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+
+
+def _layers(n: int) -> str:
+    return f"{n} layer" if n == 1 else f"{n} layers"
 
 
 def iter_offload_moe_layers(model) -> Iterator:
