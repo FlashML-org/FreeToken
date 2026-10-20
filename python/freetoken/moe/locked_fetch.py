@@ -44,12 +44,12 @@ def settle_banks(config, banks, *, probe: bool, has_locked: bool):
     """Pin the staging when locked layers may fetch, then with ``probe`` settle the DEFERRED banks (expert_banks.probe_banks).
 
     Pinning the staging first keeps the banks from taking its share of the pin budget. Returns the banks, the locked layers
-    the probe found (None without ``probe``) and the staging (None when unused or not pinnable)."""
+    the probe found (None without ``probe``) and the staging (None when unused); a staging that cannot be pinned raises."""
     from freetoken.moe.expert_banks import probe_banks
 
     staging = None
     if locked_fetch_wanted(config) and (probe or has_locked):
-        staging = try_alloc_staging(banks.sources, config.moe_locked_max_fetch)
+        staging = pin_staging(banks.sources, config.moe_locked_max_fetch)
     locked = None
     if probe:
         banks, locked = probe_banks(banks, config.model_config.num_moe_layers)
@@ -95,16 +95,18 @@ def alloc_staging(sizes: dict[str, int]) -> dict[str, torch.Tensor]:
         raise
 
 
-def try_alloc_staging(sources: dict[str, list[torch.Tensor]], max_fetch: int) -> dict[str, torch.Tensor] | None:
-    """The staging for ``sources``; None (locked layers stay CPU-only) when it cannot be pinned."""
+def pin_staging(sources: dict[str, list[torch.Tensor]], max_fetch: int) -> dict[str, torch.Tensor]:
+    """The staging for ``sources``; raises when it cannot be pinned."""
     from freetoken.moe.host_banks import PinFailed
 
     sizes = staging_bytes(sources, max_fetch)
     try:
         return alloc_staging(sizes)
     except (PinFailed, RuntimeError) as exc:
-        logger.warning_rank0(f"could not pin the {sum(sizes.values()) / 2**20:.1f} MiB locked-layer staging ({exc}); locked layers decode on the CPU only")
-        return None
+        raise RuntimeError(
+            f"could not pin the {sum(sizes.values()) / 2**20:.1f} MiB locked-layer staging ({exc}); free pinned host memory, "
+            "lower --moe-locked-max-fetch, or pass --moe-locked-fetch 0 to keep locked layers CPU-only"
+        ) from exc
 
 
 def refund_staging(staging: dict[str, torch.Tensor]) -> None:

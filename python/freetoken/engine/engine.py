@@ -932,7 +932,8 @@ class Engine:
         keys, labels, rows = layer_rows
         fractions = [fetch_fraction(rows.get(key)) for key in keys]
         cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
-        groups = collections.Counter(zip(labels, fractions))
+        # locked layers fetch the fetch_plan share instead; their own log line lists it
+        groups = collections.Counter((labels[l], fractions[l]) for l in range(len(keys)) if l not in cache.locked_hybrid)
         fetched = [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]
         if fetched:
             logger.info_rank0(
