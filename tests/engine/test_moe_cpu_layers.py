@@ -61,6 +61,27 @@ def test_resolve_backend_dispatch():
     assert resolve(_cfg("fused", "8"), L) == frozenset()
 
 
+@pytest.mark.parametrize("local_safe,remote_safe", [(True, True), (False, True), (True, False)])
+def test_cpu_moe_graph_fallback_agrees_across_tp_ranks(monkeypatch, local_safe, remote_safe):
+    import torch
+    from freetoken.engine.engine import _disable_unsafe_cpu_moe_graphs
+
+    config = SimpleNamespace(tp_info=SimpleNamespace(size=2), cuda_graph_bs=[1, 4], cuda_graph_max_bs=4)
+    executor = SimpleNamespace(graph_capture_safe=lambda dtype: local_safe)
+    group = object()
+    calls = []
+
+    def reduce(tensor, *, op, group):
+        calls.append((op, group))
+        tensor.fill_(bool(tensor.item()) and remote_safe)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    _disable_unsafe_cpu_moe_graphs(config, executor, torch.bfloat16, group)
+    assert calls == [(torch.distributed.ReduceOp.MIN, group)]
+    assert config.cuda_graph_bs == ([1, 4] if local_safe and remote_safe else [])
+    assert config.cuda_graph_max_bs == (4 if local_safe and remote_safe else 0)
+
+
 if __name__ == "__main__":
     import sys
 

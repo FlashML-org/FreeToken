@@ -545,6 +545,46 @@ def test_cpu_moe_hip_probe_error_recovery(hip_probe_fault_library, fault):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
+@pytest.mark.parametrize("fallback", ["kernel-probe", "graph-data", "fp16"])
+def test_cpu_moe_hip_unsafe_graph_keeps_eager_usable(monkeypatch, fallback):
+    from freetoken.kernel import _cpu_moe
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    if fallback == "kernel-probe":
+        monkeypatch.setattr(_cpu_moe, "kernel_io_probe", lambda stream: "injected kernel IO rejection")
+    elif fallback == "graph-data":
+        original = CpuMoeExecutor.decode_sync
+
+        def corrupt_capture(self, *args, **kwargs):
+            out = original(self, *args, **kwargs)
+            return out + 1 if torch.cuda.is_current_stream_capturing() else out
+
+        monkeypatch.setattr(CpuMoeExecutor, "decode_sync", corrupt_capture)
+
+    cache = _make_cache(3, 8, 256, 128, scale=0.03)
+    ex = CpuMoeExecutor(
+        cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=1, device=torch.device("cuda"),
+    )
+    dtype = torch.float16 if fallback == "fp16" else torch.bfloat16
+    assert not ex.graph_capture_safe(dtype)
+    if fallback == "graph-data":
+        assert ex._kernel_io, "must test rejection of the full data protocol, not the kernel capability probe"
+    hidden = torch.randn(1, 256, device="cuda", dtype=torch.bfloat16).to(dtype)
+    ids = torch.tensor([[0, 2, -1, 5]], device="cuda", dtype=torch.int32)
+    weights = torch.tensor([[0.2, 0.3, 0.1, 0.4]], device="cuda")
+    actual = ex.decode(1, hidden, weights, ids)
+    expected = _reference(cache, 1, hidden, ids.cpu(), weights.cpu())
+    assert actual.dtype == dtype
+    relative = (actual.float().cpu() - expected).abs().max() / (expected.abs().max() + 1e-6)
+    assert relative < 2e-2, relative
+    with pytest.raises(RuntimeError, match="--cuda-graph-max-bs 0"):
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=torch.cuda.Stream()):
+            ex.decode(1, hidden, weights, ids)
+    assert torch.isfinite(ex.decode(1, hidden, weights, ids).cpu()).all()
+
+
 def test_cpu_moe_decode_cuda_graph_replay():
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 

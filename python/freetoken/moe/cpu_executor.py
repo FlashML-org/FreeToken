@@ -9,7 +9,7 @@ the whole CUDA-graph-capturable sequence on the current stream:
       -> sync   (wait for the CPU pool to finish)
       -> H2D (pinned expert output -> GPU)
 
-With the doorbell on CUDA, a publish kernel does the D2H and the doorbell, and skips the step when no route goes to the CPU; a combine kernel does the H2D (csrc/cpu_moe/gpu_sync_io.h).
+With kernel IO, a publish kernel does the D2H and the doorbell, and skips the step when no route goes to the CPU; a combine kernel does the H2D (csrc/cpu_moe/gpu_sync_io.h).
 """
 
 from __future__ import annotations
@@ -342,14 +342,12 @@ class CpuMoeExecutor:
         self._kernel_io = False
         if self._flag_sync:
             self._ext.start_flag_coordinator(self._coord_core)
-            # ROCm keeps the copies until the kernel IO has been checked on AMD GPUs.
-            if torch.version.hip is None:
-                reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
-                if reason:
-                    logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
-                else:
-                    self._ext.enable_kernel_io()
-                    self._kernel_io = True
+            reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
+            if reason:
+                logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
+            else:
+                self._ext.enable_kernel_io()
+                self._kernel_io = True
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -366,6 +364,14 @@ class CpuMoeExecutor:
             )
             self._watchdog.start()
 
+        if torch.version.hip is not None:
+            # The flag probe alone misses stale shared IO in HIP graphs using memcpy + memops.
+            self._graph_capture_safe = self._flag_sync and self._kernel_io
+            if self._graph_capture_safe:
+                reason = self._probe_kernel_graph_io()
+                if reason:
+                    self._graph_capture_safe = False
+                    logger.warning_rank0(f"cpu-moe kernel IO graph probe failed ({reason}); using eager decode")
 
         fmt_label = "; ".join(f"{_format_label(name, opts)}: {n} layers" for (name, opts), n in layer_counts.items())
         logger.info_rank0(
@@ -377,6 +383,51 @@ class CpuMoeExecutor:
             f"spin_wait={self.spin_wait} "
             f"handshake={'kernel' if self._kernel_io else 'memop' if self._flag_sync else 'host-func'}"
         )
+
+    def graph_capture_safe(self, dtype: torch.dtype) -> bool:
+        # Non-bf16 inputs still take the memcpy path, even when kernel IO is enabled.
+        return self._graph_capture_safe and (
+            torch.version.hip is None or (self._kernel_io and dtype == torch.bfloat16)
+        )
+
+    def _probe_kernel_graph_io(self) -> str:
+        """Check distinct tasks sharing IO, including CPU-route skips, before engine capture."""
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            hidden = torch.empty(3, 1, self.H, device="cuda", dtype=torch.bfloat16)
+            ids = torch.empty(3, 1, self.top_k, device="cuda", dtype=torch.int32)
+            weights = torch.empty(3, 1, self.top_k, device="cuda", dtype=torch.float32)
+            base = torch.arange(3 * self.H, dtype=torch.float32).reshape(3, 1, self.H)
+            routes = torch.arange(3 * self.top_k).reshape(3, 1, self.top_k)
+
+            def inputs(step):
+                hidden.copy_((((base + step * 7) % 31 - 15) / 64).bfloat16())
+                cpu_ids = ((routes + step) % self.num_experts).int()
+                cpu_ids[step % 3].fill_(-1)
+                ids.copy_(cpu_ids)
+                weights.copy_(((routes + step) % 7 + 1).float() / (7 * self.top_k))
+
+            def forward():
+                return [self.decode(i % self.num_layers, hidden[i], weights[i], ids[i]) for i in range(3)]
+
+            inputs(0)
+            forward()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = forward()
+            for step in range(1, 4):
+                inputs(step)
+                graph.replay()
+                stream.synchronize()
+                # Eager must follow replay: otherwise it can prefill shared IO and hide stale graph inputs.
+                eager = forward()
+                stream.synchronize()
+                self.raise_if_unhealthy()
+                if any(not torch.equal(got, expected) for got, expected in zip(captured, eager)):
+                    return "graph output differs from eager with distinct task inputs"
+        return ""
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
         """Build a CPU int64 tensor of per-layer base addresses for one bank.
@@ -559,11 +610,10 @@ class CpuMoeExecutor:
         bs = hidden_states.shape[0]
         if bs > self.max_tokens:
             raise ValueError(f"CPU MoE decode batch {bs} exceeds the executor's max_tokens {self.max_tokens}")
-        if not self._graph_capture_safe and torch.cuda.is_current_stream_capturing():
+        if not self.graph_capture_safe(hidden_states.dtype) and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "CPU MoE decode cannot be captured into a CUDA graph here: the stream-memop "
-                "doorbell is off or failed its startup probe, and the host-function sync is not "
-                "replay-safe on this runtime; run with --cuda-graph-max-bs 0"
+                "CPU MoE decode cannot be captured into a CUDA graph here: the IO/handshake "
+                "path is not replay-safe for this runtime and dtype; run with --cuda-graph-max-bs 0"
             )
 
         if self._gpu_prequant:
