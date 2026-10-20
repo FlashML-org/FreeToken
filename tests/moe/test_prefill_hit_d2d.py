@@ -80,6 +80,32 @@ def test_batch_memcpy_roundtrip():
 @CUDA
 @JIT
 @BATCH_API
+def test_batch_memcpy_probe_waits_for_current_stream():
+    from freetoken.kernel.batch_memcpy import load_batch_memcpy
+
+    # Compile and initialize the binding before queuing work so JIT cannot drain it.
+    load_batch_memcpy()
+    # Warm probe-sized allocations and the stream pool to avoid first-use syncs.
+    for _ in range(4):
+        block = torch.zeros(16, dtype=torch.uint8, device="cuda")
+        del block
+        pinned = torch.arange(16, dtype=torch.uint8).pin_memory()
+        del pinned
+    streams = [torch.cuda.Stream() for _ in range(40)]
+    torch.cuda.synchronize()
+    del streams
+
+    try:
+        torch.cuda._sleep(1_500_000_000)
+        assert not torch.cuda.current_stream().query(), "backlog drained before the probe ran"
+        load_batch_memcpy()
+    finally:
+        torch.cuda.synchronize()
+
+
+@CUDA
+@JIT
+@BATCH_API
 def test_prefill_hit_d2d_matches_sources():
     cache, sources = _make_cache()
     # layer 1 residents: two real hits in the hit region, one expert stuck in a
