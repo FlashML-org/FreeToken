@@ -332,3 +332,17 @@ def test_to_gguf_maps_the_fused_and_packed_modules(glm_gguf):
         assert to_gguf(f"model.language_model.layers.0.self_attn.{leaf}", {}) == (f"blk.0.{gguf_name}",)
     assert to_gguf("model.language_model.layers.3.mlp.experts.0.gate_proj", {}) == ("blk.3.ffn_gate_exps",)
     assert to_gguf("model.language_model.layers.3.mlp.gate", {}) == ()
+
+
+def test_fused_covers_the_mmq_tail():
+    """A packed segment must cover the bytes MMQ reads past the last row: the KDA f_b / g_b
+    (K = linear head dim 128) are the family's first K below half a padding unit."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes, row_bytes
+    from freetoken.models.gguf.tensors import fused
+
+    k = 128
+    part = torch.zeros(96, row_bytes(8, k), dtype=torch.uint8)  # Q8_0
+    out = dict(fused("l0.self_attn.f_b_proj", [SimpleNamespace(ggml_type=8)], [part], k))
+    assert out["l0.self_attn.f_b_proj.weight"].numel() >= 96 * row_bytes(8, k) + mmq_tail_bytes(8, k)

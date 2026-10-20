@@ -54,7 +54,7 @@ class GGUFLinearMethod(LinearMethod):
         k = g.in_features
         for i, s in enumerate(segs):
             if is_quantized(s.ggml_type):
-                setattr(layer, segment_param(i), torch.empty(s.rows + pad_rows(k), row_bytes(s.ggml_type, k), dtype=torch.uint8))
+                setattr(layer, segment_param(i), torch.empty(s.rows + pad_rows(s.ggml_type, k), row_bytes(s.ggml_type, k), dtype=torch.uint8))
             else:
                 setattr(layer, segment_param(i), torch.empty(s.rows, k))
         if g.scheme.weight.scale is not None:
