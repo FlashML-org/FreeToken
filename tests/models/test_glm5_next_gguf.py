@@ -76,7 +76,8 @@ def _gguf_writer(path, kvs, tensors):
 _F32, _Q8_0, _IQ3_S, _IQ4_XS, _BF16 = 0, 8, 21, 23, 30
 
 
-def _make_gguf(path, *, n_layers=2, n_mtp=1, arch="glm5-next", head_kv_list=None, kv_b_q8_0=False):
+def _make_gguf(path, *, n_layers=2, n_mtp=1, arch="glm5-next", head_kv_list=None, kv_b_q8_0=False,
+                 head_kv_scalar=False, conv_unit_dim=False):
     """A miniature glm5-next layout: layer 0 KDA, layer 1 DSA, one trailing MTP block."""
     import numpy as np
 
@@ -104,7 +105,8 @@ def _make_gguf(path, *, n_layers=2, n_mtp=1, arch="glm5-next", head_kv_list=None
         f"{arch}.embedding_length": (_T_UINT32, hidden),
         f"{arch}.feed_forward_length": (_T_UINT32, I),
         f"{arch}.attention.head_count": (_T_UINT32, H),
-        f"{arch}.attention.head_count_kv": (_T_ARRAY, kv_heads),
+        # the generic GGUF spelling is a scalar (all blocks); the new writer's list carries the layout
+        f"{arch}.attention.head_count_kv": (_T_UINT32, 1) if head_kv_scalar else (_T_ARRAY, kv_heads),
         f"{arch}.attention.layer_norm_rms_epsilon": (_T_FLOAT32, 1e-6),
         f"{arch}.attention.q_lora_rank": (_T_UINT32, q_lora),
         f"{arch}.attention.kv_lora_rank": (_T_UINT32, D),
@@ -177,7 +179,8 @@ def _make_gguf(path, *, n_layers=2, n_mtp=1, arch="glm5-next", head_kv_list=None
             tensors.append((f"blk.{blk}.ssm_g_b.weight", (_BF16, (KDA_D, QKV), bf16(KDA_D * QKV))))
             tensors.append((f"blk.{blk}.attn_output.weight", (_Q8_0, (QKV, hidden), q8(QKV, hidden))))
             for q in ("q", "k", "v"):
-                tensors.append((f"blk.{blk}.ssm_conv1d_{q}.weight", (_F32, (4, 1, QKV), f32(4, 1, QKV).tobytes())))
+                conv_ne = (4, 1, QKV, 1) if conv_unit_dim else (4, 1, QKV)
+                tensors.append((f"blk.{blk}.ssm_conv1d_{q}.weight", (_F32, conv_ne, f32(4, 1, QKV).tobytes())))
             tensors.append((f"blk.{blk}.ssm_a", (_F32, (KDA_H,), (-np.abs(f32(KDA_H)) - 0.1).tobytes())))
             tensors.append((f"blk.{blk}.ssm_dt.bias", (_F32, (QKV,), f32(QKV).tobytes())))
             tensors.append((f"blk.{blk}.ssm_norm.weight", (_F32, (KDA_D,), f32(KDA_D).tobytes())))
@@ -346,3 +349,37 @@ def test_fused_covers_the_mmq_tail():
     part = torch.zeros(96, row_bytes(8, k), dtype=torch.uint8)  # Q8_0
     out = dict(fused("l0.self_attn.f_b_proj", [SimpleNamespace(ggml_type=8)], [part], k))
     assert out["l0.self_attn.f_b_proj.weight"].numel() >= 96 * row_bytes(8, k) + mmq_tail_bytes(8, k)
+
+
+def test_scalar_head_count_kv_falls_back_to_census(tmp_path):
+    """The generic GGUF spelling of head_count_kv is a scalar (all blocks), which is wrong for the
+    hybrid -- llama.cpp broadcasts it and then fails tensor creation; the census recovers the layout."""
+    from freetoken.models.glm5_next.args import DSA_LAYER, KDA_LAYER
+    from freetoken.models.glm5_next.gguf import _layer_types, parse_gguf_config
+
+    path = str(tmp_path / "glm5-scalar.gguf")
+    _make_gguf(path, head_kv_scalar=True)
+    shim = _shim(path)
+    assert _layer_types(shim, 2) == (KDA_LAYER, DSA_LAYER)
+    assert parse_gguf_config(shim).num_layers == 2
+
+
+def test_conv_kernels_with_a_trailing_unit_dim(tmp_path):
+    """Some writers ship the conv kernels 4-D; llama.cpp's glm5-next loader tries that shape first."""
+    _tp1()
+    from dataclasses import replace
+
+    from freetoken.models.glm5_next import Glm5NextForCausalLM
+    from freetoken.models.glm5_next.gguf import iter_gguf_weights, parse_gguf_config
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+
+    path = str(tmp_path / "glm5-conv4d.gguf")
+    _make_gguf(path, conv_unit_dim=True)
+    shim = _shim(path)
+    spec = get_model_spec(shim.architectures[0])
+    config = replace(parse_gguf_config(shim), quant=checkpoint_quant_config(path, shim, spec))
+    model = Glm5NextForCausalLM(config)
+    got = dict(iter_gguf_weights(path, torch.device("cpu"), include_moe_experts=False, include_non_moe=True))
+    want = model.state_dict()
+    assert set(want) == set(got)
+    assert tuple(want["model.layers.0.self_attn.conv1d.weight"].shape) == tuple(got["model.layers.0.self_attn.conv1d.weight"].shape)

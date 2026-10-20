@@ -115,7 +115,10 @@ def _layer_types(shim: "GgufConfigShim", num_layers: int) -> tuple[str, ...]:
 
     md = shim.metadata
     per_block = md.get(f"{shim.model_type}.attention.head_count_kv")
-    if per_block is not None and len(per_block) >= num_layers:
+    # the new writer carries the per-block KDA/MLA layout as a list; the generic GGUF spelling is a
+    # scalar (all blocks), which is wrong for the hybrid -- llama.cpp broadcasts it and then fails
+    # tensor creation -- so only a list is trusted and everything else falls to the census
+    if isinstance(per_block, list) and len(per_block) >= num_layers:
         return tuple(DSA_LAYER if int(kv) else KDA_LAYER for kv in per_block[:num_layers])
     names = gguf_tensor_names(shim.model_path)
     if not names:
@@ -259,16 +262,21 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
 def _float(info: GgufTensorInfo) -> torch.Tensor:
     """A float tensor in torch order, dequantizing packed ggml rows: dynamic quants quantize
-    tensors the module consumes as floats (the kv_b halves, the mHC mixers, the compressor gate)."""
+    tensors the module consumes as floats (the kv_b halves, the mHC mixers, the compressor gate).
+    Trailing unit dims in ``ne`` are dropped -- some writers ship the conv kernels 4-D
+    (llama.cpp's glm5-next loader tries that shape first) and a trailing 1 carries no elements."""
+    ne = info.ne
+    while len(ne) > 1 and ne[-1] == 1:
+        ne = ne[:-1]
     if not is_quantized(info.ggml_type):
         from freetoken.models.gguf.tensors import float_tensor
 
-        return float_tensor(info)
+        return float_tensor(info).reshape(tuple(reversed(ne)))
     from freetoken.third_party.gguf import quants
     from freetoken.third_party.gguf.constants import GGMLQuantizationType
 
     flat = quants.dequantize(np.array(info.data()), GGMLQuantizationType(info.ggml_type))
-    return torch.from_numpy(flat).view(*reversed(info.ne))
+    return torch.from_numpy(flat).view(*reversed(ne))
 
 
 def _kv_b(kb: GgufTensorInfo, vb: GgufTensorInfo, num_heads: int, kv_lora: int) -> torch.Tensor:
