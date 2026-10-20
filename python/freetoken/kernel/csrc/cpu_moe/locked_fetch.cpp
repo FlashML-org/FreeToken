@@ -3,9 +3,9 @@
 // A locked layer's host banks have no device address, so the GPU cannot gather its rows. Per decode step a publish kernel
 // writes the fetch list (count + layer-local expert rows) into mapped meta and rings a doorbell (GpuSync's words); the
 // coordinator and worker threads memcpy each listed row of every bank into pinned staging, then complete the doorbell,
-// and a gather kernel copies staging row i into the i-th evicted slot after a stream memop wait, or its own spin wait
-// where memops do not work. Everything is kernels and memops, so it captures into the decode graph. Row i of a bank sits
-// at i * the layer's own row bytes, so layers of different widths share staging.
+// and fast_index_copy_multi copies staging row i into the i-th evicted slot after a stream memop wait, or with its own
+// spin wait where memops do not work. Everything is kernels and memops, so it captures into the decode graph. Row i of a
+// bank sits at i * the layer's own row bytes, so layers of different widths share staging.
 
 #include <algorithm>
 #include <atomic>
@@ -42,7 +42,7 @@ struct CopyJob {
 class LockedFetch {
  public:
   // src[l][b] / row_bytes[l][b]: host base and row bytes of layer l's bank b (0 for banks or layers it never fetches).
-  // memops: wait on the doorbell with a stream memop, else spin in the gather kernel.
+  // memops: wait on the doorbell with a stream memop, else the gather spins on done_word().
   LockedFetch(std::vector<std::vector<uintptr_t>> src, std::vector<std::vector<int64_t>> row_bytes, std::vector<uintptr_t> staging,
               int max_rows, std::vector<int> cpus, bool memops)
       : src_(std::move(src)), row_bytes_(std::move(row_bytes)), staging_(std::move(staging)), max_rows_(max_rows), memops_(memops) {
@@ -76,20 +76,15 @@ class LockedFetch {
   LockedFetch(const LockedFetch&) = delete;
   LockedFetch& operator=(const LockedFetch&) = delete;
 
-  // The whole fetch of one layer step on `stream`: num_indices, src_indices and evict_slots are the hybrid ensure's device outputs;
-  // dst_ptrs, staging_ptrs and row_bytes are [num_banks] device arrays.
-  void copy(uintptr_t stream, int layer, uintptr_t num_indices, uintptr_t src_indices, uintptr_t evict_slots, uintptr_t dst_ptrs,
-            uintptr_t staging_ptrs, uintptr_t row_bytes, int num_banks, int blocks_per_bank) {
-    const auto* n = reinterpret_cast<const int64_t*>(num_indices);
-    auto* ready = reinterpret_cast<volatile int64_t*>(sync_->ready_word());
-    auto* done = reinterpret_cast<volatile int64_t*>(sync_->done_word());
-    locked_publish(stream, n, reinterpret_cast<const int32_t*>(src_indices), max_rows_, count_dev_, rows_dev_, ready, done,
-                   static_cast<int64_t>(layer) + 1);
+  // Hands one layer step's fetch list (the hybrid ensure's num_indices and src_indices) to the copy threads, then waits for
+  // them on `stream` when memops work; otherwise the gather that follows waits on done_word() itself.
+  void publish(uintptr_t stream, int layer, uintptr_t num_indices, uintptr_t src_indices) {
+    locked_publish(stream, reinterpret_cast<const int64_t*>(num_indices), reinterpret_cast<const int32_t*>(src_indices), max_rows_,
+                   count_dev_, rows_dev_, reinterpret_cast<volatile int64_t*>(sync_->ready_word()),
+                   reinterpret_cast<volatile int64_t*>(sync_->done_word()), static_cast<int64_t>(layer) + 1);
     if (memops_) sync_->gpu_wait(stream);
-    locked_gather(stream, n, max_rows_, reinterpret_cast<const int32_t*>(evict_slots), reinterpret_cast<const int64_t*>(dst_ptrs),
-                  reinterpret_cast<const int64_t*>(staging_ptrs), reinterpret_cast<const int64_t*>(row_bytes), num_banks, blocks_per_bank,
-                  done, !memops_);
   }
+  uintptr_t done_word() const { return sync_->done_word(); }
   int64_t rows_copied() const { return rows_copied_.load(); }
 
  private:
@@ -203,9 +198,8 @@ void bind_locked_fetch(pybind11::module_& m) {
       .def(py::init<std::vector<std::vector<uintptr_t>>, std::vector<std::vector<int64_t>>, std::vector<uintptr_t>, int, std::vector<int>,
                     bool>(),
            py::arg("src"), py::arg("row_bytes"), py::arg("staging"), py::arg("max_rows"), py::arg("cpus"), py::arg("memops"))
-      .def("copy", &LockedFetch::copy, py::arg("stream"), py::arg("layer"), py::arg("num_indices"), py::arg("src_indices"),
-           py::arg("evict_slots"), py::arg("dst_ptrs"), py::arg("staging_ptrs"), py::arg("row_bytes"), py::arg("num_banks"),
-           py::arg("blocks_per_bank"))
+      .def("publish", &LockedFetch::publish, py::arg("stream"), py::arg("layer"), py::arg("num_indices"), py::arg("src_indices"))
+      .def("done_word", &LockedFetch::done_word)
       .def("rows_copied", &LockedFetch::rows_copied);
 }
 

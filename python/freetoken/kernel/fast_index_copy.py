@@ -172,11 +172,12 @@ def fast_index_copy_multi_jit(
     src_ptrs: torch.Tensor,
     feat_bytes: torch.Tensor,
     dst_indices: torch.Tensor,
-    src_indices: torch.Tensor,
+    src_indices: torch.Tensor | None,
     num_indices: torch.Tensor | None = None,
     *,
     num_threads: int = 1024,
     blocks_per_bank: int = 8,
+    wait_flag: int = 0,
 ) -> None:
     """Fused multi-bank index copy: copy the same rows for every bank in ONE launch.
 
@@ -193,13 +194,16 @@ def fast_index_copy_multi_jit(
     once by the caller (the per-bank slot-cache base addr, host-source base addr, and
     per-row byte size). Every bank's per-row byte size must be a multiple of 16, and the
     base addresses 16-byte aligned (true for contiguous torch allocations of these banks).
+
+    ``src_indices`` None copies source row i to ``dst_indices[i]``. ``wait_flag``, a GPU-visible
+    int64 address, makes every block first wait until it holds >= 1 (rows a CPU thread writes).
     """
     if _skip_fast_index_copy_enabled():
         return
     module = _jit_fast_index_copy_multi_module(
         num_threads=num_threads, blocks_per_bank=blocks_per_bank
     )
-    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
+    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices, wait_flag)
 
 
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:

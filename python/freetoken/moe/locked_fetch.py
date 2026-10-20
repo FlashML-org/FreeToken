@@ -1,9 +1,9 @@
 """Locked-layer fetch for hybrid decode.
 
 A locked layer's host banks are OS-locked but not registered with CUDA (the pin quota ran out), so the GPU cannot
-gather their rows. Each decode step a publish kernel hands the fetch list chosen by the hybrid ensure to CPU threads,
-which copy each fetched row of every bank into pinned staging, and a gather kernel copies staging row i into
-``evict_slots[i]`` (``_cpu_moe.LockedFetch``). The misses it does not fetch go to the CPU executor as on any hybrid layer.
+gather their rows. Each decode step a publish kernel hands the fetch list chosen by the hybrid ensure to CPU threads
+(``_cpu_moe.LockedFetch``), which copy each fetched row of every bank into pinned staging, and fast_index_copy_multi
+copies staging row i into ``evict_slots[i]``. The misses it does not fetch go to the CPU executor as on any hybrid layer.
 """
 
 from __future__ import annotations
@@ -106,6 +106,7 @@ class LockedLayerFetch:
         # the executor's doorbell decision (FREETOKEN_CPU_MOE_FLAG_SYNC and the memop probe); without memops the gather spins on the GPU
         memops = bool(getattr(executor, "_flag_sync", False))
         self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], max_fetch, cpus, memops)
+        self._wait_flag = 0 if memops else self._ext.done_word()
         logger.info_rank0(
             f"locked layers {layers}: GPU slots + fetch up to {max_fetch} misses per step through "
             f"{sum(t.numel() for t in self.staging) / 2**20:.1f} MiB of pinned staging, {max(1, len(cpus))} copy thread(s) on cpus {cpus or 'any'}"
@@ -114,15 +115,16 @@ class LockedLayerFetch:
 
     def copy(self, cache, layer_id: int) -> None:
         """Stage and gather the rows the last hybrid ensure scheduled for ``layer_id``; graph capturable."""
-        self._ext.copy(
-            torch.cuda.current_stream().cuda_stream,
-            layer_id,
-            cache.num_indices.data_ptr(),
-            cache.src_indices.data_ptr(),
-            cache.evict_slots.data_ptr(),
-            cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer_id]].data_ptr(),
-            self.staging_ptrs.data_ptr(),
-            cache._copy_feat_bytes[cache.layer_layout[layer_id]].data_ptr(),
-            len(self.staging),
-            cache._copy_blocks_per_bank,
+        from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+        self._ext.publish(torch.cuda.current_stream().cuda_stream, layer_id, cache.num_indices.data_ptr(), cache.src_indices.data_ptr())
+        fast_index_copy_multi_jit(
+            cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer_id]],
+            self.staging_ptrs,
+            cache._copy_feat_bytes[cache.layer_layout[layer_id]],
+            cache.evict_slots,
+            None,
+            cache.num_indices,
+            blocks_per_bank=cache._copy_blocks_per_bank,
+            wait_flag=self._wait_flag,
         )
