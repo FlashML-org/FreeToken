@@ -78,6 +78,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 ## Notes
 
+- A checkpoint that fails to load: from a source checkout, run `PYTHONPATH=python python scripts/checkpoint_diagnose/diagnose.py <checkpoint dir or HF repo id>`. It reads the headers, not the weights, says whether FreeToken or the checkpoint is at fault, and for a local checkpoint gives the commands that fix a non-standard one; see [its README](../scripts/checkpoint_diagnose/README.md). GGUF files are checked with [scripts/gguf_check](../scripts/gguf_check/README.md).
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - An FTW converted by an older build with `--moe-backend fused` or `triton` keeps
