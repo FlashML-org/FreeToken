@@ -11,9 +11,9 @@ The llama.cpp converter (unsloth's glm5-next writer; tensor names identical acro
 the ``glm5-next`` and the older ``glm5next`` arch spellings) stores KDA's ``A_log``
 pre-transformed as ``-exp(A_log)`` -- inverted at load -- and splits the MLA
 ``kv_b_proj`` into per-head 3-D ``attn_k_b`` / ``attn_v_b`` tensors (k stored
-transposed, [heads, kv_lora, nope] next to [heads, v, kv_lora]); both halves ship
-BF16, so they dequantize and fuse into the dense layout the module's MLA absorption
-reads. The trailing MTP block (``blk.N.nextn.*``, ``nextn_predict_layers == 1``) is
+transposed, [heads, kv_lora, nope] next to [heads, v, kv_lora]); the halves may be
+quantized (dynamic quants store them Q8_0), so they dequantize and fuse into the
+dense layout the module's MLA absorption reads. The trailing MTP block (``blk.N.nextn.*``, ``nextn_predict_layers == 1``) is
 dropped exactly like the HF loader drops the never-read MTP layer; routed experts
 serve from the GGUF expert banks (``freetoken.models.gguf.experts``).
 """
@@ -25,10 +25,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Iterator
 
+import numpy as np
 import torch
 
+from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names
-from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, fused, matrix
 
 from .config import parse_config
 
@@ -63,7 +65,8 @@ _LAYER_LEAVES: dict[str, tuple[str, ...]] = {
     "self_attn.q_a_proj": ("attn_q_a",),
     "self_attn.q_b_proj": ("attn_q_b",),
     "self_attn.kv_a_proj_with_mqa": ("attn_kv_a_mqa",),
-    # both halves are float in every release: the module keeps its dense bf16 kv_b
+    # two tensors, dequantized and fused at load: the module keeps its dense bf16 kv_b
+    # (exempted in the registry's unquantized_modules, so quantized halves are fine too)
     "self_attn.kv_b_proj": ("attn_k_b", "attn_v_b"),
     # kpool indexer
     "self_attn.indexer.wq_b": ("indexer.attn_q_b",),
@@ -254,10 +257,24 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 # Weights
 # ----------------------------------------------------------------------------------------------
 
+def _float(info: GgufTensorInfo) -> torch.Tensor:
+    """A float tensor in torch order, dequantizing packed ggml rows: dynamic quants quantize
+    tensors the module consumes as floats (the kv_b halves, the mHC mixers, the compressor gate)."""
+    if not is_quantized(info.ggml_type):
+        from freetoken.models.gguf.tensors import float_tensor
+
+        return float_tensor(info)
+    from freetoken.third_party.gguf import quants
+    from freetoken.third_party.gguf.constants import GGMLQuantizationType
+
+    flat = quants.dequantize(np.array(info.data()), GGMLQuantizationType(info.ggml_type))
+    return torch.from_numpy(flat).view(*reversed(info.ne))
+
+
 def _kv_b(kb: GgufTensorInfo, vb: GgufTensorInfo, num_heads: int, kv_lora: int) -> torch.Tensor:
     """Per-head k [kv_lora, nope] (stored transposed) + v [v, kv_lora] -> the module's fused dense [heads * (nope + v), kv_lora]."""
-    k = float_tensor(kb).transpose(1, 2)  # [heads, nope, kv_lora]
-    fused_w = torch.cat([k, float_tensor(vb)], dim=1)
+    k = _float(kb).transpose(1, 2)  # [heads, nope, kv_lora]
+    fused_w = torch.cat([k, _float(vb)], dim=1)
     assert fused_w.shape[0] == num_heads, (fused_w.shape, num_heads)
     return fused_w.reshape(num_heads * fused_w.shape[1], kv_lora).to(torch.bfloat16).contiguous()
 
@@ -284,7 +301,7 @@ def iter_gguf_weights(
         return index[name if name in index else f"{name}.weight"]
 
     def bf16(name: str) -> torch.Tensor:
-        return float_tensor(t(name)).to(torch.bfloat16)
+        return _float(t(name)).to(torch.bfloat16)
 
     yield from fused("model.embed_tokens", [t("token_embd")], [matrix(t("token_embd"))], hidden)
     yield from fused("lm_head", [t("output")], [matrix(t("output"))], hidden)
@@ -297,7 +314,7 @@ def iter_gguf_weights(
         # mHC mixing tensors, fp32 on every layer
         for sub in ("attn", "ffn"):
             for part in ("fn", "base", "scale"):
-                yield f"{pre}.hc_{sub}_{part}", float_tensor(t(f"{blk}.hc_{sub}_{part}"))
+                yield f"{pre}.hc_{sub}_{part}", _float(t(f"{blk}.hc_{sub}_{part}"))
 
         if args.is_kda_layer(layer):
             sa = f"{pre}.self_attn"
@@ -305,14 +322,14 @@ def iter_gguf_weights(
             group = [t(f"{blk}.{n}") for n in ("attn_q", "attn_k", "attn_v", "ssm_beta", "ssm_f_a", "ssm_g_a")]
             yield from fused(f"{sa}.in_proj", group, [matrix(i) for i in group], hidden)
             # the GGUF conv kernels already carry the [channels, 1, kernel] singleton dim
-            conv = torch.cat([float_tensor(t(f"{blk}.ssm_conv1d_{q}")) for q in ("q", "k", "v")], dim=0)
+            conv = torch.cat([_float(t(f"{blk}.ssm_conv1d_{q}")) for q in ("q", "k", "v")], dim=0)
             yield f"{sa}.conv1d.weight", conv.to(torch.bfloat16)
             for proj, src, k in (("f_b_proj", "ssm_f_b", d), ("g_b_proj", "ssm_g_b", d), ("o_proj", "attn_output", p)):
                 info = t(f"{blk}.{src}")
                 yield from fused(f"{sa}.{proj}", [info], [matrix(info)], k)
             # the converter stores A_log pre-transformed as -exp(A_log); the kernels want the raw log
-            yield f"{sa}.A_log", torch.log(-float_tensor(t(f"{blk}.ssm_a")))
-            yield f"{sa}.dt_bias", float_tensor(t(f"{blk}.ssm_dt.bias"))
+            yield f"{sa}.A_log", torch.log(-_float(t(f"{blk}.ssm_a")))
+            yield f"{sa}.dt_bias", _float(t(f"{blk}.ssm_dt.bias"))
             yield f"{sa}.o_norm.weight", bf16(f"{blk}.ssm_norm")
         else:
             sa = f"{pre}.self_attn"
@@ -329,17 +346,15 @@ def iter_gguf_weights(
             )
             yield f"{sa}.q_a_layernorm.weight", bf16(f"{blk}.attn_q_a_norm")
             yield f"{sa}.kv_a_layernorm.weight", bf16(f"{blk}.attn_kv_a_norm")
-            for proj, src in (
-                ("indexer.wq_b", "indexer.attn_q_b"),
-                ("indexer.wk", "indexer.attn_k"),
-                ("indexer.weights_proj", "indexer.proj"),
-            ):
-                info = t(f"{blk}.{src}")
-                yield from fused(f"{sa}.{proj}", [info], [matrix(info)], int(info.ne[0]))
+            # wq_b serves its checkpoint quant (packed); wk / weights_proj are dense modules
+            # (glm_moe_dsa's indexer reasoning), dequantized at load when the file quantized them
+            yield from fused(f"{sa}.indexer.wq_b", [t(f"{blk}.indexer.attn_q_b")], [matrix(t(f"{blk}.indexer.attn_q_b"))], args.q_lora_rank)
+            yield f"{sa}.indexer.wk.weight", _float(t(f"{blk}.indexer.attn_k")).to(torch.bfloat16)
+            yield f"{sa}.indexer.weights_proj.weight", _float(t(f"{blk}.indexer.proj")).to(torch.bfloat16)
             yield f"{sa}.indexer.k_norm.weight", bf16(f"{blk}.indexer.k_norm")
             yield f"{sa}.indexer.k_norm.bias", bf16(f"{blk}.indexer.k_norm.bias")
             yield f"{sa}.indexer.index_kpool_compress_gate", bf16(f"{blk}.indexer_compressor_gate")
-            yield f"{sa}.indexer.index_kpool_compress_ape", float_tensor(t(f"{blk}.indexer_compressor_ape"))
+            yield f"{sa}.indexer.index_kpool_compress_ape", _float(t(f"{blk}.indexer_compressor_ape"))
 
         mlp = f"{pre}.mlp"
         if layer < config.first_k_dense_replace:
@@ -352,7 +367,7 @@ def iter_gguf_weights(
                 yield from fused(f"{mlp}.{proj}", [info], [matrix(info)], k)
         else:
             yield f"{mlp}.gate.weight", bf16(f"{blk}.ffn_gate_inp")
-            yield f"{mlp}.e_score_correction_bias", float_tensor(t(f"{blk}.exp_probs_b.bias"))
+            yield f"{mlp}.e_score_correction_bias", _float(t(f"{blk}.exp_probs_b.bias"))
             shared_i = config.moe_intermediate_size * max(1, config.n_shared_experts)
             for proj, src, k in (
                 ("gate_proj", "ffn_gate_shexp", hidden),

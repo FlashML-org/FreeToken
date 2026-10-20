@@ -427,6 +427,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         iter_weights="iter_gguf_weights",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_GLM5_NEXT_PACKED,
+        # the MLA kv_b ships as two per-head tensors (attn_k_b transposed + attn_v_b), quantized in
+        # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
+        unquantized_modules=("*.self_attn.kv_b_proj",),
     ),
 }
 

@@ -76,12 +76,13 @@ def _gguf_writer(path, kvs, tensors):
 _F32, _Q8_0, _IQ3_S, _IQ4_XS, _BF16 = 0, 8, 21, 23, 30
 
 
-def _make_gguf(path, *, n_layers=2, n_mtp=1, arch="glm5-next", head_kv_list=None):
+def _make_gguf(path, *, n_layers=2, n_mtp=1, arch="glm5-next", head_kv_list=None, kv_b_q8_0=False):
     """A miniature glm5-next layout: layer 0 KDA, layer 1 DSA, one trailing MTP block."""
     import numpy as np
 
-    # hidden/q_lora keep Q8_0 rows a multiple of 32, expert rows a multiple of 256 (IQ3_S/IQ4_XS blocks)
-    H, D, KDA_H, KDA_D = 8, 32, 4, 8
+    # hidden/q_lora keep Q8_0 rows a multiple of 32, expert rows a multiple of 256 (IQ3_S/IQ4_XS
+    # blocks); the kv_b halves block on nope/v head rows, so D doubles when they store Q8_0
+    H, D, KDA_H, KDA_D = 8, 64 if kv_b_q8_0 else 32, 4, 8
     QKV = KDA_H * KDA_D  # 32
     I, E, V = 512, 4, 64
 
@@ -150,8 +151,12 @@ def _make_gguf(path, *, n_layers=2, n_mtp=1, arch="glm5-next", head_kv_list=None
             tensors.append((f"blk.{blk}.attn_q_a.weight", (_Q8_0, (hidden, q_lora), q8(hidden, q_lora))))
             tensors.append((f"blk.{blk}.attn_q_b.weight", (_Q8_0, (q_lora, H * (D // 2)), q8(q_lora, H * (D // 2)))))
             tensors.append((f"blk.{blk}.attn_kv_a_mqa.weight", (_BF16, (hidden, D), bf16(hidden * D))))
-            tensors.append((f"blk.{blk}.attn_k_b.weight", (_BF16, (D // 2, D, H), bf16(D * (D // 2) * H))))
-            tensors.append((f"blk.{blk}.attn_v_b.weight", (_BF16, (D, D // 2, H), bf16(D * (D // 2) * H))))
+            if kv_b_q8_0:
+                tensors.append((f"blk.{blk}.attn_k_b.weight", (_Q8_0, (D // 2, D, H), q8(D // 2, D * H))))
+                tensors.append((f"blk.{blk}.attn_v_b.weight", (_Q8_0, (D, D // 2, H), q8(D, (D // 2) * H))))
+            else:
+                tensors.append((f"blk.{blk}.attn_k_b.weight", (_BF16, (D // 2, D, H), bf16(D * (D // 2) * H))))
+                tensors.append((f"blk.{blk}.attn_v_b.weight", (_BF16, (D, D // 2, H), bf16(D * (D // 2) * H))))
             tensors.append((f"blk.{blk}.attn_output.weight", (_Q8_0, (H * (D // 2), hidden), q8(H * (D // 2), hidden))))
             tensors.append((f"blk.{blk}.attn_q_a_norm.weight", (_F32, (q_lora,), f32(q_lora).tobytes())))
             tensors.append((f"blk.{blk}.attn_kv_a_norm.weight", (_F32, (D,), f32(D).tobytes())))
@@ -266,6 +271,30 @@ def test_reader_state_dict_matches_model(glm_gguf):
     model = Glm5NextForCausalLM(config)
     want = model.state_dict()
     got = dict(iter_gguf_weights(glm_gguf, torch.device("cpu"), include_moe_experts=False, include_non_moe=True))
+    assert set(want) == set(got), f"missing={sorted(set(want) - set(got))[:6]} extra={sorted(set(got) - set(want))[:6]}"
+    for k in sorted(want):
+        assert tuple(want[k].shape) == tuple(got[k].shape), k
+
+
+def test_quantized_kv_b_halves_serve_dense(tmp_path):
+    """Dynamic quants (unsloth UD) store the per-head kv_b halves Q8_0, not bf16: the
+    module stays dense -- the reader dequantizes and fuses -- instead of refusing it."""
+    _tp1()
+    from dataclasses import replace
+
+    from freetoken.models.glm5_next import Glm5NextForCausalLM
+    from freetoken.models.glm5_next.gguf import iter_gguf_weights, parse_gguf_config
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+
+    path = str(tmp_path / "glm5-kvq8.gguf")
+    _make_gguf(path, kv_b_q8_0=True)
+    shim = _shim(path)
+    spec = get_model_spec(shim.architectures[0])
+    config = replace(parse_gguf_config(shim), quant=checkpoint_quant_config(path, shim, spec))
+    model = Glm5NextForCausalLM(config)
+    assert config.quant.scheme_for("model.layers.1.self_attn.kv_b_proj") is None
+    got = dict(iter_gguf_weights(path, torch.device("cpu"), include_moe_experts=False, include_non_moe=True))
+    want = model.state_dict()
     assert set(want) == set(got), f"missing={sorted(set(want) - set(got))[:6]} extra={sorted(set(got) - set(want))[:6]}"
     for k in sorted(want):
         assert tuple(want[k].shape) == tuple(got[k].shape), k
