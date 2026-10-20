@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names
-from freetoken.models.gguf.tensors import float_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
 
 from .config import parse_config
 
@@ -141,9 +141,15 @@ def _head_dims(shim: "GgufConfigShim") -> tuple[int, int]:
     return int(nope), int(v)
 
 
+def _check_supported(shim: "GgufConfigShim") -> None:
+    check_scales(shim.model_path)
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     md = shim.metadata
     prefix = shim.model_type
+
+    _check_supported(shim)
 
     def kv(key: str, default=None):
         return md.get(f"{prefix}.{key}", default)
