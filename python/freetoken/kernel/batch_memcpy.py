@@ -28,6 +28,12 @@ def _probe(fn) -> None:
     src = torch.arange(16, dtype=torch.uint8).pin_memory()
     dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
+    # torch.zeros filled dst on the CURRENT stream; the copy below runs on this one.
+    # Without the join the fill can land after the copy and clobber it, leaving the
+    # probe to read back zeros -- a false "copied wrong bytes" on hardware that
+    # supports the API. A cold process hides this (the first torch.zeros and
+    # torch.cuda.Stream() each synchronize the device); a warmed-up server does not.
+    stream.wait_stream(torch.cuda.current_stream())
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),
