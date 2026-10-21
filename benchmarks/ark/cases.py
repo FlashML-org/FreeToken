@@ -29,21 +29,25 @@ def quant(w):
 
 
 def dense_cases():
+    from freetoken.kernel.ark.dense_fp8_decode.adapter import (
+        block_fp8_linear as candidate,
+    )
     from freetoken.kernel.triton.fp8_block_linear import block_fp8_linear as baseline
-    from freetoken.kernel.ark.dense_fp8_decode.adapter import block_fp8_linear as candidate
 
     for n, k in ((5120, 2048), (2048, 4096), (151936, 2048)):
         w, scale = quant(rand(n, k, scale=k**-0.5))
         x = rand(1, k, scale=0.5)
         args = (x, w, scale)
-        yield Case(f"N{n}_K{k}", lambda a=args: baseline(*a), lambda a=args: candidate(*a), dict(M=1, N=n, K=k))
+        yield Case(f"N{n}_K{k}", lambda a=args: baseline(*a), lambda a=args: candidate(*a), {"M": 1, "N": n, "K": k})
 
 
 def moe_cases():
+    from freetoken.kernel.ark.moe_decode_fp8.adapter import (
+        fused_experts_decode_fp8_block as candidate,
+    )
     from freetoken.layers.quantization.moe.base import MoEConfig
     from freetoken.layers.quantization.moe.fp8_block import TritonFp8BlockMoEKernel
     from freetoken.moe.fused_fp8_block import fused_experts_decode_fp8_block as baseline
-    from freetoken.kernel.ark.moe_decode_fp8.adapter import fused_experts_decode_fp8_block as candidate
 
     h, i, topk = 2048, 768, 8
     for rows in (32, 4550):
@@ -63,7 +67,7 @@ def moe_cases():
         weights = torch.softmax(torch.randn(1, topk, device="cuda"), -1)
         args = (x, banks["gate_up"], banks["gate_up_scale"], banks["down"], banks["down_scale"], weights, ids)
         yield Case(
-            f"C{rows}_H{h}_I{i}", lambda a=args: baseline(*a), lambda a=args: candidate(*a), dict(M=1, H=h, I=i, bank_rows=rows, top_k=topk)
+            f"C{rows}_H{h}_I{i}", lambda a=args: baseline(*a), lambda a=args: candidate(*a), {"M": 1, "H": h, "I": i, "bank_rows": rows, "top_k": topk}
         )
 
 

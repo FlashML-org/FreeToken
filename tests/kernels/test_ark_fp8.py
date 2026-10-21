@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from benchmarks.ark.cases import rand, quant
-from benchmarks.ark.timing import metrics, assert_close
+from benchmarks.ark.cases import quant, rand
+from benchmarks.ark.timing import assert_close, metrics
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not torch.version.hip,
@@ -21,8 +21,8 @@ pytestmark = pytest.mark.skipif(
 def native(monkeypatch):
     if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1201"):
         pytest.skip("requires gfx1201")
-    from freetoken.kernel.ark.common import policy
     from freetoken.kernel.ark import initialize
+    from freetoken.kernel.ark.common import policy
 
     monkeypatch.setenv("FREETOKEN_USE_ARK", "1")
     monkeypatch.setattr(policy, "MODE", "native")
@@ -58,17 +58,23 @@ def test_dense_bias_padding_alias(value, bias, monkeypatch):
     scale = torch.cat((scale, torch.full((3, 2), 17.0, device="cuda", dtype=scale.dtype)), -1)
     b = rand(384, dtype=torch.float32) if bias else None
     hits = []
-    monkeypatch.setattr(adapter, "record", lambda *a: hits.append(a))
+    native = torch.ops.freetoken_ark.dense_decode
+
+    def dispatch(*args):
+        hits.append(True)
+        return native(*args)
+
+    monkeypatch.setattr(torch.ops.freetoken_ark, "dense_decode", dispatch)
     actual = adapter.block_fp8_linear(x, w, scale, b)
     compare(actual, baseline(x, w, scale, b))
     assert torch.equal(x, initial) and actual.data_ptr() != x.data_ptr()
-    assert hits[-1][-1] == "ark"
+    assert hits == [True]
 
 
 @pytest.mark.parametrize("kind", ["batch", "strided", "disabled", "unknown_shape"])
 def test_dense_fallback(kind, monkeypatch):
-    from freetoken.kernel.ark.dense_fp8_decode import adapter
     from freetoken.kernel.ark.common import policy
+    from freetoken.kernel.ark.dense_fp8_decode import adapter
     from freetoken.kernel.triton.fp8_block_linear import block_fp8_linear as baseline
 
     x = rand(2 if kind == "batch" else 1, 256)
@@ -81,14 +87,17 @@ def test_dense_fallback(kind, monkeypatch):
         monkeypatch.setattr(policy, "MODE", "validated")
         monkeypatch.setattr(policy, "environment_matches", lambda: True)
         monkeypatch.setattr(policy, "_profiles", {})
-    hits = []
-    monkeypatch.setattr(adapter, "record", lambda *a: hits.append(a))
+    def reject_native(*args):
+        raise AssertionError("unsupported dense input reached ARK")
+
+    monkeypatch.setattr(torch.ops.freetoken_ark, "dense_decode", reject_native)
     compare(adapter.block_fp8_linear(x, w, scale), baseline(x, w, scale))
-    assert hits[-1][-1] == "freetoken"
 
 
 def test_moe_routes_zero_inactive_and_input_unchanged():
-    from freetoken.kernel.ark.moe_decode_fp8.adapter import fused_experts_decode_fp8_block as candidate
+    from freetoken.kernel.ark.moe_decode_fp8.adapter import (
+        fused_experts_decode_fp8_block as candidate,
+    )
     from freetoken.moe.fused_fp8_block import fused_experts_decode_fp8_block as baseline
 
     args = moe_inputs()
@@ -107,8 +116,8 @@ def test_moe_routes_zero_inactive_and_input_unchanged():
 
 @pytest.mark.parametrize("kind", ["batch", "gelu", "disabled", "graph_excluded"])
 def test_moe_fallback(kind, monkeypatch):
-    from freetoken.kernel.ark.moe_decode_fp8 import adapter
     from freetoken.kernel.ark.common import policy
+    from freetoken.kernel.ark.moe_decode_fp8 import adapter
     from freetoken.moe.fused_fp8_block import fused_experts_decode_fp8_block as baseline
 
     args = moe_inputs(2 if kind == "batch" else 1)
@@ -119,23 +128,32 @@ def test_moe_fallback(kind, monkeypatch):
         monkeypatch.setattr(policy, "MODE", "validated")
         monkeypatch.setattr(policy, "environment_matches", lambda: True)
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    hits = []
-    monkeypatch.setattr(adapter, "record", lambda *a: hits.append(a))
+    def reject_native(*args):
+        raise AssertionError("unsupported MoE input reached ARK")
+
+    monkeypatch.setattr(torch.ops.freetoken_ark, "moe_decode", reject_native)
     compare(adapter.fused_experts_decode_fp8_block(*args, **kwargs), baseline(*args, **kwargs))
-    assert hits[-1][-1] == "freetoken"
 
 
 @pytest.mark.parametrize("op", ["dense", "moe"])
 def test_nondefault_stream_graph_and_updated_inputs(op):
     if op == "dense":
-        from freetoken.kernel.ark.dense_fp8_decode.adapter import block_fp8_linear as candidate
-        from freetoken.kernel.triton.fp8_block_linear import block_fp8_linear as baseline
+        from freetoken.kernel.ark.dense_fp8_decode.adapter import (
+            block_fp8_linear as candidate,
+        )
+        from freetoken.kernel.triton.fp8_block_linear import (
+            block_fp8_linear as baseline,
+        )
 
         w, scale = quant(rand(384, 256))
         args = (rand(1, 256), w, scale)
     else:
-        from freetoken.kernel.ark.moe_decode_fp8.adapter import fused_experts_decode_fp8_block as candidate
-        from freetoken.moe.fused_fp8_block import fused_experts_decode_fp8_block as baseline
+        from freetoken.kernel.ark.moe_decode_fp8.adapter import (
+            fused_experts_decode_fp8_block as candidate,
+        )
+        from freetoken.moe.fused_fp8_block import (
+            fused_experts_decode_fp8_block as baseline,
+        )
 
         args = moe_inputs()
     stream = torch.cuda.Stream()
@@ -159,11 +177,17 @@ def test_nondefault_stream_graph_and_updated_inputs(op):
 
 @pytest.mark.parametrize("resident", [False, True])
 def test_real_method_bank_pack_apply_prefill(resident, monkeypatch):
-    from freetoken.kernel.ark.kernels import ArkFp8MoEKernel, ArkFp8LinearKernel
-    from freetoken.layers.quantization.moe.base import MoEConfig, ExpertView
-    from freetoken.layers.quantization.moe.fp8_block import Fp8BlockMoEMethod, TritonFp8BlockMoEKernel
+    from freetoken.kernel.ark.kernels import ArkFp8LinearKernel, ArkFp8MoEKernel
     from freetoken.layers.quantization.linear.base import LinearConfig
-    from freetoken.layers.quantization.linear.fp8_block import Fp8BlockLinearMethod, TritonFp8BlockLinearKernel
+    from freetoken.layers.quantization.linear.fp8_block import (
+        Fp8BlockLinearMethod,
+        TritonFp8BlockLinearKernel,
+    )
+    from freetoken.layers.quantization.moe.base import ExpertView, MoEConfig
+    from freetoken.layers.quantization.moe.fp8_block import (
+        Fp8BlockMoEMethod,
+        TritonFp8BlockMoEKernel,
+    )
     from freetoken.layers.quantization.scheme import fp8_block_scheme
 
     scheme = fp8_block_scheme("bf16")
@@ -172,13 +196,13 @@ def test_real_method_bank_pack_apply_prefill(resident, monkeypatch):
     assert candidate.layout(cfg) == baseline.layout(cfg)
     assert candidate.cpu_format == baseline.cpu_format and not candidate.supports_inactive_slots
     x, gu, gs, dn, ds, weights, ids = moe_inputs()
-    pieces = dict(gate_up=gu, gate_up_scale=gs[:, :, :2], down=dn, down_scale=ds[:, :, :1])
+    pieces = {"gate_up": gu, "gate_up_scale": gs[:, :, :2], "down": dn, "down_scale": ds[:, :, :1]}
     specs = candidate.layout(cfg)
     bank = {k: torch.zeros(4, *v.shape, device="cuda", dtype=v.dtype) for k, v in specs.items()}
     ref_bank = {k: torch.zeros_like(v) for k, v in bank.items()}
     assert candidate.pack(pieces, cfg, bank) == baseline.pack(pieces, cfg, ref_bank)
-    for k in bank:
-        assert torch.equal(bank[k], ref_bank[k])
+    for name, value in bank.items():
+        assert torch.equal(value, ref_bank[name])
     view = ExpertView(bank, n=4)
     layer = SimpleNamespace(
         activation="silu",
@@ -206,10 +230,14 @@ def test_real_method_bank_pack_apply_prefill(resident, monkeypatch):
 
 
 def test_ftw_identity_and_auto_selection(monkeypatch):
+    from freetoken.checkpoint import ftw
     from freetoken.engine.engine import _adjust_ftw_quant_backend
-    from freetoken.layers.quantization import QuantBackend, LayerKind, QuantKind
-    from freetoken.moe.legacy_format import legacy_format_for, kind_kernel_for, bank_kernel_compatible
-    import freetoken.checkpoint.ftw as ftw
+    from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind
+    from freetoken.moe.legacy_format import (
+        bank_kernel_compatible,
+        kind_kernel_for,
+        legacy_format_for,
+    )
 
     monkeypatch.setattr(ftw, "ftw_quant_format", lambda _: "fp8_block")
     kind = QuantKind.FP8_BLOCK

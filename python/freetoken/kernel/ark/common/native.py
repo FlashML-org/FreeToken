@@ -4,10 +4,10 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import threading
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 _LOADED = False
@@ -80,7 +80,7 @@ def load():
                 for source in sources:
                     obj = build / (source.parent.name + "_" + source.stem + ".o")
                     command = [compiler, *flags, "-c", str(source), "-o", str(obj)]
-                    proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    proc = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                     (build / (obj.stem + ".log")).write_text(proc.stdout)
                     if proc.returncode:
                         raise RuntimeError(f"ARK HIP build failed: {command}\n{proc.stdout}")

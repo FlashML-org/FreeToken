@@ -25,6 +25,7 @@ def candidate_kernels(method, candidates):
         return candidates
     from freetoken.layers.quantization.registry import LayerKind
     from freetoken.layers.quantization.scheme import QuantKind
+
     from .kernels import ArkFp8LinearKernel, ArkFp8MoEKernel
 
     cls = {
