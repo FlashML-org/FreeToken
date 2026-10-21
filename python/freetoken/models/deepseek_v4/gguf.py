@@ -73,7 +73,9 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
 
 
 def _compress_ratios(index: dict[str, GgufTensorInfo], head_dim: int, num_layers: int) -> tuple[int, ...]:
-    """Per-layer compressor ratios from the tensor table: the KV placeholder carries a single 0.
+    """Per-layer compressor ratios from the tensor table, which every released file's
+    ``attention.compress_ratios`` array (43 trunk entries ahead of 3 MTP zeros, which
+    llama.cpp requires) confirms element for element.
 
     An ``indexer.proj`` tensor exists exactly on the ratio-4 blocks; a compressor without an
     indexer is a 128 block, unless its ``wkv`` has the CSA overlap's double rows (ratio 4)."""
@@ -134,6 +136,22 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
     num_layers = int(need("block_count"))
     index = gguf_tensor_index(shim.model_path)
+
+    # REAP exports prune experts per layer: as a per-layer expert_count array, or with the
+    # scalar kept but the expert tensors shrunk. llama.cpp builds every layer from one
+    # n_expert and refuses both shapes; the model has no per-layer expert count to express.
+    experts_kv = need("expert_count")
+    if isinstance(experts_kv, list):
+        raise NotImplementedError(
+            f"{shim.model_path}: a per-layer expert_count array (REAP-style prune) is not served"
+        )
+    n_experts = int(experts_kv)
+    for name, info in index.items():
+        if name.endswith(".ffn_gate_exps.weight") and info.ne[-1] != n_experts:
+            raise NotImplementedError(
+                f"{shim.model_path}: {name} carries {info.ne[-1]} experts but expert_count says "
+                f"{n_experts} (REAP-style per-layer prunes are not served)"
+            )
     args = DeepseekV4Args(
         max_batch_size=1,
         vocab_size=int(shim.vocab_size),
@@ -181,22 +199,30 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
 def _float(info: GgufTensorInfo) -> torch.Tensor:
     """A float tensor in torch order, dequantizing packed ggml rows: dynamic quants quantize
-    tensors the module consumes as floats (the mHC mixers, the compressor gates, the router)."""
+    tensors the module consumes as floats (the mHC mixers, the compressor gates, the router).
+    Trailing unit dims in ``ne`` are dropped -- some writers ship tensors 4-D (llama.cpp's
+    loaders try that shape first) and a trailing 1 carries no elements."""
+    ne = info.ne
+    while len(ne) > 1 and ne[-1] == 1:
+        ne = ne[:-1]
     if not is_quantized(info.ggml_type):
         from freetoken.models.gguf.tensors import float_tensor
 
-        return float_tensor(info)
+        return float_tensor(info).view(*reversed(ne))
     from freetoken.third_party.gguf import quants
     from freetoken.third_party.gguf.constants import GGMLQuantizationType
 
     flat = quants.dequantize(np.array(info.data()), GGMLQuantizationType(info.ggml_type))
-    return torch.from_numpy(flat).view(*reversed(info.ne))
+    return torch.from_numpy(flat).view(*reversed(ne))
 
 
 def _tid2eid(info: GgufTensorInfo) -> torch.Tensor:
     """The hash-route table as the module's int64 [vocab, top_k]."""
+    ne = info.ne
+    while len(ne) > 1 and ne[-1] == 1:
+        ne = ne[:-1]
     raw = np.frombuffer(info.data(), dtype=np.int32).copy()
-    return torch.from_numpy(raw).view(*reversed(info.ne)).to(torch.int64)
+    return torch.from_numpy(raw).view(*reversed(ne)).to(torch.int64)
 
 
 def iter_gguf_weights(
