@@ -62,7 +62,7 @@ class TinyEngine:
             from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 
             self.banks = load_expert_banks(
-                checkpoint, mc, method=method, device=self.device, dtype=torch.bfloat16, parallel=False,
+                checkpoint, mc, method=method, device=self.device, parallel=False,
             )
             self.expert_cache = OffloadMoeCache(
                 num_layers=mc.num_moe_layers, num_experts=mc.num_experts,
@@ -76,7 +76,7 @@ class TinyEngine:
             from freetoken.moe.expert_banks import attach_resident_banks
 
             attach_resident_banks(list(iter_moe_layers(self.model)), load_expert_banks(
-                checkpoint, mc, method=method, device=self.device, dtype=torch.bfloat16, parallel=False, resident=True,
+                checkpoint, mc, method=method, device=self.device, parallel=False, resident=True,
             ))
         for layer in self.model.engram_layers():
             layer.attach_table(engram_table if engram_table is not None else ZeroEngramTable(layer.width, self.device))

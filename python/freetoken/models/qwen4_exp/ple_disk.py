@@ -1,4 +1,4 @@
-"""Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8 shard tensors into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
+"""Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8 or bf16 shard tensors into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
 
 Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hits, restores and COW forks need no bookkeeping); the decode input token lives device-side under overlap scheduling and is read back here.
 """
@@ -22,7 +22,7 @@ from freetoken.utils import init_logger
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
-    _PLE_ST_DTYPE,
+    _PLE_ST_DTYPES,
     _ple_table_files,
     _safetensors_header,
 )
@@ -60,6 +60,7 @@ class PleRowSource:
 def source_from_safetensors(folder: str) -> PleRowSource:
     """Map the checkpoint's ``ngram_embedding.shard_<i>`` tensors in place: one extent per shard, no copy."""
     rows = cols = 0
+    dtype: torch.dtype | None = None
     scale: torch.Tensor | None = None
     paths: list[str] = []
     path_idx: dict[str, int] = {}
@@ -111,9 +112,27 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     )
 
 
-def resolve_row_source(folder: str) -> PleRowSource:
+def source_from_gguf(model_path: str) -> PleRowSource:
+    """The GGUF ``per_layer_token_embd`` table in place: one extent of packed ggml rows."""
+    from freetoken.layers.quantization.ggml_types import row_bytes
+
+    from .gguf import ple_table_info
+
+    info = ple_table_info(model_path)
+    values, rows = info.ne
+    nbytes = row_bytes(info.ggml_type, values)
+    return PleRowSource([info.path], [0], [info.offset], rows, nbytes, nbytes, 1.0, info.ggml_type, values)
+
+
+def resolve_row_source(model_path: str) -> PleRowSource:
     """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
-    return source_from_safetensors(folder)
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if (gguf_src := gguf_config_source(model_path)) is not None:
+        return source_from_gguf(gguf_src)
+    from freetoken.utils import download_hf_weight
+
+    return source_from_safetensors(download_hf_weight(model_path))
 
 
 class DiskRowTable:
@@ -129,6 +148,7 @@ class DiskRowTable:
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         from freetoken.kernel.row_store import PleStore
+        from freetoken.layers.quantization.ggml_types import float_dtype
 
         self.num_rows = source.total_rows
         self.head_dim = source.row_bytes // (1 if source.dtype == _PLE_ST_DTYPE else 2)

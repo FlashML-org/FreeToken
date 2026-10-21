@@ -96,8 +96,8 @@ def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
 
 
 def global_rows(piece: torch.Tensor, rows: int) -> torch.Tensor:
-    """Per-expert global scale as one fp16 value per output row (a scalar per expert is broadcast)."""
-    flat = piece.reshape(piece.shape[0], -1).to(torch.float16)
+    """Per-expert global scale as one fp32 value per output row (a scalar per expert is broadcast)."""
+    flat = piece.reshape(piece.shape[0], -1).to(torch.float32)
     if flat.shape[1] == rows:
         return flat
     assert flat.shape[1] == 1, (flat.shape, rows)
@@ -151,6 +151,10 @@ class MoEKernel(ABC):
     def worth_it(self, cfg: MoEConfig) -> bool:
         return True
 
+    def cpu_options(self, cfg: MoEConfig) -> dict[str, int]:
+        """Integer options of ``cpu_format`` for these experts."""
+        return {}
+
     def slot_limit(self, cfg: MoEConfig) -> int | None:
         """Most GPU cache slots the kernel can address for ``cfg``; None for no limit."""
         return self.max_slots
@@ -195,6 +199,10 @@ class MoEMethod(QuantMethod):
     @property
     def cpu_format(self) -> str | None:
         return self.kernel.cpu_format
+
+    def cpu_spec(self) -> tuple[str | None, dict[str, int]]:
+        """The CPU executor format and options of this layer's experts."""
+        return self.cpu_format, self.kernel.cpu_options(self.cfg)
 
     def create_weights(self, layer: Any) -> None:
         # resident experts stay out of the state dict; attach_resident_banks fills these after the dense weights load

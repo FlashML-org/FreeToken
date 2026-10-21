@@ -6,12 +6,13 @@ final-logit softcap), so this produces the *same* ``ModelConfig`` as
 ``gemma4.config.parse_config`` -- only the source is GGUF KV metadata instead of a
 HF config object. transformers' own GGUF->config conversion is rejected by the
 gemma4 strict dataclass (per-layer ``num_key_value_heads`` array), so we read the
-metadata directly. ``expert_quant`` is set to ``"q4_0"`` to route the routed experts
-through the native-Q4_0 offload-cache path.
+metadata directly. Every tensor keeps its packed ggml type (``QuantKind.GGUF``); the
+routed experts load as GGUF expert banks (``freetoken.models.gguf.experts``).
 """
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -37,12 +38,9 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
     which drives the unrotated tail's frequencies to zero (ggml ops.cpp ``theta / ff``).
     Count the untouched entries to get the rotated width back.
     """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-
-    for t in iter_gguf_tensors(shim.model_path):
-        if t.name == "rope_freqs.weight":  # F32, so the packed bytes ARE the values
-            freqs = t.packed().reshape(-1).view(torch.float32)
-            return int((freqs == 1.0).sum().item()) * 2
+    info = gguf_tensor_index(shim.model_path).get("rope_freqs.weight")
+    if info is not None:
+        return int((float_tensor(info) == 1.0).sum().item()) * 2
     # A metadata-only GGUF (an FTW dir's source_metadata.gguf) has no tensor table. Every
     # released gemma4 sets partial_rotary_factor 0.25 on the full layers, and the converter
     # asserts rope_type == "proportional" (llama.cpp conversion/gemma.py).
@@ -50,6 +48,7 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
+    check_scales(shim.model_path, known=("ffn_gate_inp.scale", "ffn_down_exps.scale"))
     m = shim.metadata
 
     def g(key: str):
@@ -58,8 +57,11 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             raise KeyError(f"missing GGUF metadata key gemma4.{key}")
         return val
 
+    if int(m.get("gemma4.embedding_length_per_layer_input", 0)) or int(m.get("gemma4.attention.shared_kv_layers", 0)):
+        raise NotImplementedError("gemma4 E2B / E4B GGUF (per-layer input embeddings, shared KV layers) is not supported")
     num_layers = int(g("block_count"))
     hidden = int(g("embedding_length"))
+    num_experts = int(m.get("gemma4.expert_count", 0))
     num_qo_heads = int(g("attention.head_count"))
     kv_per_layer = g("attention.head_count_kv")  # per-layer list
     # True -> sliding-window (SWA) layer, False -> full attention.
@@ -138,9 +140,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
         rotary_config=full_rotary,
-        num_experts=int(g("expert_count")),
-        num_experts_per_tok=int(g("expert_used_count")),
-        moe_intermediate_size=int(g("expert_feed_forward_length")),
+        num_experts=num_experts,
+        num_experts_per_tok=int(g("expert_used_count")) if num_experts else 0,
+        moe_intermediate_size=int(g("expert_feed_forward_length")) if num_experts else 0,
         norm_topk_prob=True,
         model_type="gemma4",
         architectures=list(shim.architectures),
@@ -182,31 +184,60 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 # Weight loading: GGUF tensor names -> FreeToken gemma4 module params.
 # --------------------------------------------------------------------------------------
 
-# Per-layer 1:1 norm/scale tensors (gguf suffix -> freetoken module-relative name). All
-# are tiny F32 tensors dequantized to bf16.
+# Per-layer 1:1 norm/scale tensors (gguf suffix -> freetoken module-relative name), all F32.
 _LAYER_SCALAR_MAP = {
     "attn_norm.weight": "input_layernorm.weight",
     "attn_q_norm.weight": "self_attn.q_norm.weight",
     "attn_k_norm.weight": "self_attn.k_norm.weight",
     "post_attention_norm.weight": "post_attention_layernorm.weight",
     "ffn_norm.weight": "pre_feedforward_layernorm.weight",
-    "pre_ffw_norm_2.weight": "feed_forward.pre_feedforward_layernorm_2.weight",
     "post_ffw_norm.weight": "feed_forward.post_feedforward_layernorm.weight",
+    "layer_output_scale.weight": "feed_forward.layer_scalar",
+}
+# the MoE layers' second feed-forward branch and router
+_MOE_LAYER_SCALAR_MAP = {
+    "pre_ffw_norm_2.weight": "feed_forward.pre_feedforward_layernorm_2.weight",
     "post_ffw_norm_1.weight": "feed_forward.post_feedforward_layernorm_1.weight",
     "post_ffw_norm_2.weight": "feed_forward.post_feedforward_layernorm_2.weight",
-    "layer_output_scale.weight": "feed_forward.layer_scalar",
     "ffn_gate_inp.weight": "feed_forward.router.proj.weight",
     "ffn_gate_inp.scale": "feed_forward.router.scale",
     "ffn_down_exps.scale": "feed_forward.router.per_expert_scale",
 }
-# Expert weight tensors (handled by the offload bank loader, not iter_gguf_weights).
-_EXPERT_SUFFIXES = ("ffn_gate_up_exps.weight", "ffn_down_exps.weight")
+
+# checkpoint module leaf (gemma4 HF naming) -> GGUF tensor
+_LAYER_LEAVES = {
+    "self_attn.q_proj": "attn_q",
+    "self_attn.k_proj": "attn_k",
+    "self_attn.o_proj": "attn_output",
+    "mlp.gate_proj": "ffn_gate",
+    "mlp.up_proj": "ffn_up",
+    "mlp.down_proj": "ffn_down",
+    "experts.0.gate_proj": "ffn_gate_exps",
+    "experts.0.up_proj": "ffn_up_exps",
+    "experts.0.down_proj": "ffn_down_exps",
+}
+_LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 
 
-def _to_bf16(t) -> torch.Tensor:
-    """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
-    flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
-    return flat.reshape(t.shape)
+def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
+    """Checkpoint module name -> the GGUF tensors (without ``.weight``) that store it; empty for modules the GGUF has no matrix for."""
+    if name == "model.embed_tokens":
+        return ("token_embd",)
+    if name == "lm_head":
+        return ("output",) if "output.weight" in tensors else ()
+    m = _LAYER_RE.match(name)
+    if m is None:
+        return ()
+    blk, leaf = f"blk.{m.group(1)}", m.group(2)
+    if leaf in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") and f"{blk}.attn_qkv.weight" in tensors:
+        return (f"{blk}.attn_qkv",)
+    if leaf == "self_attn.v_proj":
+        # the full-attention layers store no attn_v: k is reused as v
+        return (f"{blk}.attn_v",) if f"{blk}.attn_v.weight" in tensors else (f"{blk}.attn_k",)
+    if leaf in ("experts.0.gate_proj", "experts.0.up_proj") and f"{blk}.ffn_gate_up_exps.weight" in tensors:
+        return (f"{blk}.ffn_gate_up_exps",)
+    tensor = _LAYER_LEAVES.get(leaf)
+    return (f"{blk}.{tensor}",) if tensor is not None else ()
 
 
 def _require_tp1(what: str) -> None:
@@ -278,66 +309,32 @@ def iter_gguf_weights(
     )
     assert include_non_moe
     _require_tp1("weight loading")
-
-    # Full-attention layers ship no attn_v (k reused as v); SWA layers do. Knowing which
-    # is which lets us emit the fused qkv as soon as its parts are present.
     config = parse_gguf_config(cached_load_hf_config(model_path))
-    k_eq_v_layers = {
-        lid
-        for lid in range(config.num_layers)
-        if isinstance(config.attention_group_for_layer(lid), FullAttentionGroupConfig)
-        and config.attention_group_for_layer(lid).k_eq_v
-    }
+    index = gguf_tensor_index(model_path)
+    hidden = config.hidden_size
 
-    # Per-layer fusion buffers: layer -> {slot: packed[out, row_bytes]}.
-    qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
-    gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}
+    def t(name: str):
+        return index[name if name in index else f"{name}.weight"]
 
-    def layer_of(name: str) -> int:
-        return int(name.split(".")[1])
+    embed = t("token_embd")
+    yield from fused("model.embed_tokens", [embed], [matrix(embed)], hidden)
+    if "output.weight" in index:
+        out = t("output")
+        yield from fused("lm_head", [out], [matrix(out)], hidden)
+    yield "model.norm.weight", float_tensor(t("output_norm"))
 
-    for t in iter_gguf_tensors(model_path):
-        name = t.name
-        if name == "token_embd.weight":
-            yield "model.embed_tokens.qweight", t.packed()  # Q6_K packed table
-            continue
-        if name == "output_norm.weight":
-            yield "model.norm.weight", _to_bf16(t)
-            continue
-        if name == "rope_freqs.weight":
-            continue  # rope frequencies recomputed in-engine
-        if not name.startswith("blk."):
-            continue
-        if any(name.endswith(sfx) for sfx in _EXPERT_SUFFIXES):
-            continue  # routed experts -> offload banks
-
-        layer = layer_of(name)
-        suffix = name.split(".", 2)[2]  # after "blk.N."
-        base = f"model.layers.{layer}"
-
-        if suffix in _LAYER_SCALAR_MAP:
-            rel = _LAYER_SCALAR_MAP[suffix]
-            tensor = _to_bf16(t)
-            if rel.endswith("layer_scalar"):
-                tensor = tensor.reshape(1)
-            yield f"{base}.{rel}", tensor
-            continue
-
-        # Quantized projections: keep packed; fuse q/k/v and gate/up.
-        if suffix == "attn_q.weight":
-            qkv_buf.setdefault(layer, {})["q"] = t.packed()
-        elif suffix == "attn_k.weight":
-            qkv_buf.setdefault(layer, {})["k"] = t.packed()
-        elif suffix == "attn_v.weight":
-            qkv_buf.setdefault(layer, {})["v"] = t.packed()
-        elif suffix == "ffn_gate.weight":
-            gate_up_buf.setdefault(layer, {})["gate"] = t.packed()
-        elif suffix == "ffn_up.weight":
-            gate_up_buf.setdefault(layer, {})["up"] = t.packed()
-        elif suffix == "attn_output.weight":
-            yield f"{base}.self_attn.o_proj.qweight", t.packed()
-        elif suffix == "ffn_down.weight":
-            yield f"{base}.feed_forward.shared_mlp.down_proj.qweight", t.packed()
+    scalar_map = {**_LAYER_SCALAR_MAP, **_MOE_LAYER_SCALAR_MAP} if config.moe_enabled else _LAYER_SCALAR_MAP
+    for layer in range(config.num_layers):
+        blk, base = f"blk.{layer}", f"model.layers.{layer}"
+        for suffix, rel in scalar_map.items():
+            tensor = float_tensor(index[f"{blk}.{suffix}"])
+            if suffix == "ffn_down_exps.scale" and weight_scale(index[f"{blk}.ffn_down_exps.weight"]) is not None:
+                # the converter folds per_expert_scale into the NVFP4 down weight_scale_2, which the expert kernel applies
+                tensor = torch.ones_like(tensor)
+            yield f"{base}.{rel}", tensor.reshape(1) if rel.endswith("layer_scalar") else tensor
+        if f"{blk}.attn_qkv.weight" in index:
+            # convert_hf_to_gguf.py --fuse-qkv stores q, k and v as one attn_qkv matrix
+            qkv = [t(f"{blk}.attn_qkv")]
         else:
             raise ValueError(f"unmapped gemma4 GGUF tensor: {name}")
 

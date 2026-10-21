@@ -105,7 +105,7 @@ def test_cpu_executor_matches_the_transcription(block):
     cache = SimpleNamespace(quant_format="ds_fp4", bank_sources={k: [v] for k, v in pinned.items()}, num_layers=1, num_experts=E)
     dev = torch.device("cuda", 0)
     x, slots, w = _inputs(2, dev)
-    ex = CpuMoeExecutor(cache, top_k=TOP_K, activation="silu", apply_router_weight_on_input=False, num_threads=4, max_tokens=2, device=dev, swiglu_limit=LIMIT, act_block=block)
+    ex = CpuMoeExecutor(cache, top_k=TOP_K, activation="silu", apply_router_weight_on_input=False, num_threads=4, max_tokens=2, device=dev, swiglu_limit=LIMIT, layer_formats=[("ds_fp4", {"act_block": block})] * cache.num_layers)
     got = ex.decode(0, x, w, slots.clone()).clone().float()
     torch.cuda.synchronize()
     del ex
@@ -162,7 +162,7 @@ def test_inactive_routes_contribute_zero_without_reading_their_slots(block):
         buf.copy_(t.cpu())
         pinned[name] = buf
     cache = SimpleNamespace(quant_format="ds_fp4", bank_sources={k: [v] for k, v in pinned.items()}, num_layers=1, num_experts=E)
-    ex = CpuMoeExecutor(cache, top_k=TOP_K, activation="silu", apply_router_weight_on_input=False, num_threads=4, max_tokens=2, device=torch.device("cuda", 0), swiglu_limit=LIMIT, act_block=block)
+    ex = CpuMoeExecutor(cache, top_k=TOP_K, activation="silu", apply_router_weight_on_input=False, num_threads=4, max_tokens=2, device=torch.device("cuda", 0), swiglu_limit=LIMIT, layer_formats=[("ds_fp4", {"act_block": block})] * cache.num_layers)
     cpu_ids = torch.where(on_gpu, -1, slots)
     cpu_out = ex.decode(0, x, w, cpu_ids.clone()).clone()
     torch.cuda.synchronize()

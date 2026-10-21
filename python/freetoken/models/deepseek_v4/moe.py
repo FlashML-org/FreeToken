@@ -120,8 +120,9 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         cache = self.offload_cache
         assert cache is not None
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
+        # one threshold for all layers (the smallest pool): with overlap prefill, the layers of a chunk must all stream or all take the slot path
         if (
-            hidden_states.shape[0] * self.top_k >= self.num_experts
+            hidden_states.shape[0] * self.top_k >= min(self.num_experts, *cache.pool_sizes)
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
@@ -134,7 +135,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=True,

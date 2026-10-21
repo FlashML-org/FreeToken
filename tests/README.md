@@ -14,7 +14,7 @@ in its filename (`kvcache/test_dsv4_pool.py`, `models/test_glm4_nvfp4.py`).
 | `tokenizer/` | `freetoken.tokenizer` — tokenize/detokenize request plumbing, thinking-mode resolution |
 | `engine/`    | `freetoken.engine` — cache budget planning, config resolution, backend gating |
 | `kernels/`   | `freetoken.kernel` / `freetoken.layers` — attention, rope, fused ops, JIT cache, pinned memory |
-| `moe/`       | `freetoken.moe` — offload cache, CPU/GPU expert kernels, quantized backends (fp8/nvfp4/mxfp4/q4_0) |
+| `moe/`       | `freetoken.moe` — offload cache, CPU/GPU expert kernels, quantized backends (fp8/nvfp4/mxfp4/gguf) |
 | `models/`    | `freetoken.models` — the registry, and the loading machinery every model shares (sharding, qkv/expert merge, streaming layers into banks) |
 | `e2e/`       | real-server gates: AIME 24/25/26 generation, runtime cache rebuild |
 

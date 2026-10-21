@@ -61,6 +61,8 @@ class Gemma4Model(BaseOP):
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             embed_scale=config.embedding_scale,
+            quant_config=config.quant,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = OPList(
             [
@@ -90,13 +92,6 @@ class Gemma4ForCausalLM(BaseLLMModel):
         )
         self._final_logit_softcapping = config.final_logit_softcapping
         super().__init__()
-
-        # GGUF checkpoints carry native block-quantized weights: swap the dense
-        # projections + embedding for GGUF-quant ops (experts stay on the offload cache).
-        from .gguf import convert_gemma4_to_gguf, is_gguf_model
-
-        if is_gguf_model(config):
-            convert_gemma4_to_gguf(self, config)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

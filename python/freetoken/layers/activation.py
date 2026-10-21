@@ -6,10 +6,17 @@ if TYPE_CHECKING:
     import torch
 
 
-def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
+def _use_flashinfer(x: torch.Tensor, out: torch.Tensor | None) -> bool:
+    """flashinfer's *_and_mul kernels take fp16 / bf16 in and the same dtype out; the Triton kernels take any float dtypes."""
+    import torch
+
     from freetoken.kernel.backend import is_flashinfer_installed
 
-    if is_flashinfer_installed():
+    return x.dtype in (torch.float16, torch.bfloat16) and (out is None or out.dtype == x.dtype) and is_flashinfer_installed()
+
+
+def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
+    if _use_flashinfer(x, out):
         from flashinfer import silu_and_mul
     else:
         from freetoken.kernel.triton.activation import silu_and_mul
@@ -18,9 +25,7 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    from freetoken.kernel.backend import is_flashinfer_installed
-
-    if is_flashinfer_installed():
+    if _use_flashinfer(x, out):
         from flashinfer import gelu_and_mul
     else:
         from freetoken.kernel.triton.activation import gelu_and_mul
@@ -30,9 +35,7 @@ def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
 def gelu_tanh_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     """tanh-approximate GELU gate (`gelu_pytorch_tanh`) followed by elementwise mul."""
-    from freetoken.kernel.backend import is_flashinfer_installed
-
-    if is_flashinfer_installed():
+    if _use_flashinfer(x, out):
         from flashinfer import gelu_tanh_and_mul
     else:
         from freetoken.kernel.triton.activation import gelu_tanh_and_mul

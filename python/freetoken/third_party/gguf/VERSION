@@ -1,0 +1,10 @@
+llama.cpp 8c2134a8755d8a9792af513dab20282affe903e4 (2026-10-14), the same pin as kernel/csrc/ggml
+
+Only the gguf-py modules that the GGUF reader and the ggml type tables need: gguf-py/gguf/{constants,gguf_reader,quants,lazy}.py.
+The PyPI gguf release lags the ggml types in this tree (gguf 0.19.0 cannot read Q2_0 tensors), so FreeToken reads GGUF files with this copy.
+
+Local changes, kept in freetoken.patch (already applied):
+- __init__.py: imports only the vendored modules (upstream also pulls in the writer, vocab and metadata modules and their dependencies).
+- gguf_reader.py: imports constants relatively, so the installed gguf package is never picked up.
+
+To update: copy the same files from the llama.cpp commit that kernel/csrc/ggml pins, apply freetoken.patch, and update this file.

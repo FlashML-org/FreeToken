@@ -62,7 +62,7 @@ def load_eos_token_ids(
     if (gguf_src := gguf_config_source(model_path)) is not None:
         from freetoken.models.gguf.tokenizer import gguf_eos_token_ids
 
-        return frozenset(gguf_eos_token_ids(gguf_src, tokenizer))
+        return frozenset(gguf_eos_token_ids(gguf_src))
 
     ids: set[int] = set()
     if tokenizer.eos_token_id is not None:

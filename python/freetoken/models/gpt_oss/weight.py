@@ -288,7 +288,7 @@ def _source_slices(config, tp_info) -> dict[str, tuple[str, tuple[slice, ...]]]:
     }
 
 
-def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, layers=None, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20):
     """gpt-oss experts as HF ships them, one piece per layer: stacked ``[E, ...]`` mxfp4
     ``_blocks`` / ``_scales`` / ``_bias`` tensors sliced to this rank's intermediate range."""
     if kind is not QuantKind.MXFP4:
@@ -298,10 +298,11 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     tp_info = get_tp_info()
     slices = _source_slices(config, tp_info)
     num_layers, num_experts = config.num_layers, config.num_experts
+    keep = None if layers is None else set(layers)
 
     def _is_expert(name: str) -> bool:
         info = _expert_layer_and_name(name)
-        return info is not None and 0 <= info[0] < num_layers
+        return info is not None and 0 <= info[0] < num_layers and (keep is None or info[0] in keep)
 
     def _tensors():
         if parallel:
@@ -320,6 +321,8 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
                     layer_id, source = info
                     if not 0 <= layer_id < num_layers:
                         raise ValueError(f"Unexpected GPT-OSS expert layer in checkpoint: {name}")
+                    if keep is not None and layer_id not in keep:
+                        continue
                     if source not in slices:
                         raise ValueError(f"Unexpected GPT-OSS expert source: {name}")
                     yield name, _read_safetensor_slice(f, name, slices[source][1])

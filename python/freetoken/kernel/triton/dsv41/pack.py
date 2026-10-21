@@ -87,7 +87,12 @@ def _pack_rows_kernel(
         amax = tl.maximum(tl.max(tl.abs(xe), axis=1), tl.max(tl.abs(xo), axis=1))
         if FMT == 2:
             amax = tl.maximum(amax, 6.0 * (2.0 ** -9))
-            s = _e4m3_round(amax * (1.0 / 6.0))
+            if e4m3_native_cx():
+                s = amax * (1.0 / 6.0)
+            else:
+                # Round before the emulated magic-add; fusing it changes subnormal ties.
+                s = tl.math.div_rn(amax, 6.0)
+            s = _e4m3_round(s)
             tl.store(dst + D // 2 + offs_g, _e4m3_codes(s))
         else:
             amax = tl.maximum(amax, 6.0 * (2.0 ** -126))

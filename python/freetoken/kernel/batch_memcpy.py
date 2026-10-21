@@ -28,6 +28,9 @@ def _probe(fn) -> None:
     src = torch.arange(16, dtype=torch.uint8).pin_memory()
     dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
+    # Order the copy after dst's initialization on the current stream;
+    # otherwise the fill can overwrite the copied bytes.
+    stream.wait_stream(torch.cuda.current_stream())
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),
@@ -45,9 +48,12 @@ def load_batch_memcpy():
     The 8-argument cudaMemcpyBatchAsync signature this binding uses is CUDA 13.0's
     (12.8/12.9 had an extra failIdx parameter); gate on the torch runtime version
     before paying for the JIT build, then verify with a real copy.
+    HIP uses its own signature, checked by building and probing a real copy.
     """
     cuda = torch.version.cuda
-    if cuda is None or tuple(int(x) for x in cuda.split(".")[:2]) < (13, 0):
+    if torch.version.hip is None and (
+        cuda is None or tuple(int(x) for x in cuda.split(".")[:2]) < (13, 0)
+    ):
         raise RuntimeError(f"cudaMemcpyBatchAsync binding requires CUDA >= 13.0 (torch built with {cuda})")
     fn = _jit_batch_memcpy_module().batch_memcpy
     _probe(fn)
@@ -60,10 +66,10 @@ def batch_memcpy_jit(
     sizes: torch.Tensor,
     stream: int,
 ) -> None:
-    """Enqueue one cudaMemcpyBatchAsync of ``len(sizes)`` independent copies.
+    """Enqueue one cudaMemcpyBatchAsync/hipMemcpyBatchAsync of ``len(sizes)`` independent copies.
 
     ``dst_ptrs``/``src_ptrs``/``sizes`` are same-length CPU int64 tensors of raw
-    addresses and byte counts; ``stream`` is a raw cudaStream_t handle
+    addresses and byte counts; ``stream`` is a raw cudaStream_t/hipStream_t handle
     (``torch.cuda.Stream.cuda_stream``), which must not be the legacy NULL stream.
     """
     load_batch_memcpy()(dst_ptrs, src_ptrs, sizes, stream)

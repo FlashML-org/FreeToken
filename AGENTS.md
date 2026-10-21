@@ -34,6 +34,8 @@ benchmarks/            end-to-end and micro benchmarks, see benchmarks/README.md
 docs/                  install, quickstart, CLI and model docs
 freetoken-kernel-cache/ companion wheel of prebuilt kernels, see its README
 scripts/               wheel build and release scripts
+  checkpoint_diagnose/ why an HF safetensors checkpoint does not load, and fixes for non-standard ones
+  gguf_check/          which GGUF files of a family load
 ```
 
 ## Development
@@ -54,6 +56,7 @@ Put a new test in the `tests/` directory that mirrors the module it protects, an
 
 - Search existing issues and PRs before starting. Items on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) are discussed with maintainers before implementation; features not on it start as an issue.
 - When helping the user draft an issue, follow the matching template in `.github/ISSUE_TEMPLATE/` (engine bug, model checkpoint, feature request) and fill in every required field: hardware, driver, FreeToken version, checkpoint ID, exact command, and the full log.
+- When a checkpoint fails to load, follow [scripts/checkpoint_diagnose/README.md](scripts/checkpoint_diagnose/README.md) before drafting a model checkpoint issue: it tells a FreeToken gap from a non-standard checkpoint, and repairs the latter.
 - One change per PR, linked to its issue, with the hardware, checkpoint ID and exact command it was tested with.
 
 ## Code comments

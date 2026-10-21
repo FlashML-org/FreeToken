@@ -179,7 +179,7 @@ def _bench_load(mode: str, model_path: str, *, parallel: bool, workers: int, chu
     t = time.perf_counter()
     try:
         banks = load_expert_banks(model_path, mc, device=torch.device("cuda", torch.cuda.current_device()),
-                                  dtype=torch.bfloat16, parallel=parallel,
+                                  parallel=parallel,
                                   workers=workers, chunk=chunk)
     except NotImplementedError as e:
         s.stop()

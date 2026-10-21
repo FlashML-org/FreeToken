@@ -19,4 +19,7 @@ __all__ = [
     "iter_weights_parallel",
     "iter_expert_pieces",
     "nvfp4_expert_spec",
+    "iter_gguf_weights",
+    "parse_gguf_config",
+    "to_gguf",
 ]

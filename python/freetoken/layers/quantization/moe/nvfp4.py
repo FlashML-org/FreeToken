@@ -52,10 +52,10 @@ class TritonNvfp4MoEKernel(MoEKernel):
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
-            "gate_up_global": BankSpec((2 * i,), torch.float16),
+            "gate_up_global": BankSpec((2 * i,), torch.float32),
             "down": BankSpec((h, i // 2), torch.uint8),
             "down_scale": BankSpec((h, i // GROUP), FP8),
-            "down_global": BankSpec((h,), torch.float16),
+            "down_global": BankSpec((h,), torch.float32),
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
@@ -76,6 +76,56 @@ class TritonNvfp4MoEKernel(MoEKernel):
         if is_prefill:
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+
+
+class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
+    """The Triton kernels' banks and decode, with the prefill GEMMs on NVFP4 activations (W4A4) where the GPU and the batch favour it.
+
+    Needs a checkpoint whose experts declare static activation scales; the GPU-resident alphas carry them per expert (gate_up_alpha: the larger of gate's and up's input_scale).
+    """
+
+    name = "w4a4"
+
+    def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        reason = super().unusable_reason(cfg)
+        if reason:
+            return reason
+        if cfg.scheme is None or not cfg.scheme.has("input_scale"):
+            return "the experts declare no static activation scale (W4A16 checkpoint)"
+        if cfg.apply_router_weight_on_input:
+            return "the routing weight scales the input, which is quantized once per token"
+        return None
+
+    def worth_it(self, cfg: MoEConfig) -> bool:
+        from freetoken.kernel import nvfp4_moe
+
+        return not backend.is_rocm() and torch.cuda.is_available() and nvfp4_moe.w4a4_available(torch.cuda.current_device())
+
+    def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
+        return {
+            **super().layout(cfg),
+            "gate_up_alpha": BankSpec((), torch.float32, resident=True),
+            "down_alpha": BankSpec((), torch.float32, resident=True),
+        }
+
+    def pack(self, pieces, cfg: MoEConfig, out):
+        super().pack(pieces, cfg, out)
+        if not all(f"{p}_input" in pieces for p in ("gate", "up", "down")):
+            raise ValueError("w4a4 nvfp4 MoE kernel: the checkpoint has no expert input_scale tensors")
+        gate, up, down = (pieces[f"{p}_input"].reshape(len(pieces[f"{p}_input"]), -1)[:, 0].float() for p in ("gate", "up", "down"))
+        return {"gate_up_alpha": torch.maximum(gate, up), "down_alpha": down}
+
+    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+        if not is_prefill:
+            return super().apply(layer, x, topk_weights, topk_ids, view, is_prefill=False)
+        from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4_w4a4
+
+        t = view.tensors
+        assert view.alphas is not None
+        return fused_experts_nvfp4_w4a4(
+            x, t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"],
+            view.alphas[0], view.alphas[1], topk_weights, topk_ids, view.n, layer.activation, float(layer.alpha), limit_or_inf(layer),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +183,7 @@ def _marlin_pack_proj(
     """Pack one expert projection (on GPU) into the Marlin layout.
 
     ``packed`` ``[N, K//2]`` uint8 e2m1 pairs, ``scale`` ``[N, K//16]`` e4m3,
-    ``row_global`` ``[N]`` fp16 per-row global (rows of a merged gate_up may carry
+    ``row_global`` ``[N]`` fp32 per-row global (rows of a merged gate_up may carry
     w1's and w3's different globals). Returns ``(qweight [K//16, 2N] int32,
     scales [K//16, N] e4m3-coded, global scalar bf16)``.
 
@@ -570,4 +620,4 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
 @register_method(QuantKind.NVFP4, LayerKind.MOE)
 class Nvfp4MoEMethod(MoEMethod):
-    candidates = (TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)
+    candidates = (W4a4Nvfp4MoEKernel, TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)

@@ -45,6 +45,7 @@ class MiniMaxM3Attention(BaseOP):
 
         self.qkv_proj = LinearReplicated(
             args.hidden_size, self.qo_attn_dim + 2 * self.kv_attn_dim, has_bias=False,
+            output_sizes=[self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim],
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = LinearReplicated(

@@ -286,7 +286,6 @@ def test_decode_triton_attention_matches_reference(
         device=device,
     )
     attn_lse = torch.empty(batch, num_q_heads, max_kv_splits, dtype=torch.float32, device=device)
-    num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=device)
 
     actual = decode_paged_attention(
         q,
@@ -297,8 +296,6 @@ def test_decode_triton_attention_matches_reference(
         q_positions,
         attn_logits,
         attn_lse,
-        num_kv_splits,
-        max_kv_splits,
         sm_scale,
         sliding_window=sliding_window,
     )
@@ -344,11 +341,10 @@ def test_decode_triton_attention_non_pow2_group(num_q_heads: int, num_kv_heads: 
         batch, num_q_heads, max_kv_splits, head_dim, dtype=torch.float32, device=device
     )
     attn_lse = torch.empty(batch, num_q_heads, max_kv_splits, dtype=torch.float32, device=device)
-    num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=device)
 
     actual = decode_paged_attention(
         q, k_cache, v_cache, indptr, indices, q_positions,
-        attn_logits, attn_lse, num_kv_splits, max_kv_splits, sm_scale,
+        attn_logits, attn_lse, sm_scale,
     )
     expected = _reference_paged_attention(
         q, k_cache, v_cache, indptr, indices, q_to_req, q_positions, sm_scale, None,
@@ -392,7 +388,6 @@ def test_decode_triton_attention_with_sinks_matches_reference():
         device=device,
     )
     attn_lse = torch.empty(batch, num_q_heads, max_kv_splits, dtype=torch.float32, device=device)
-    num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=device)
 
     actual = decode_paged_attention(
         q,
@@ -403,8 +398,6 @@ def test_decode_triton_attention_with_sinks_matches_reference():
         q_positions,
         attn_logits,
         attn_lse,
-        num_kv_splits,
-        max_kv_splits,
         sm_scale,
         sinks=sinks,
     )
@@ -421,6 +414,54 @@ def test_decode_triton_attention_with_sinks_matches_reference():
         sinks=sinks,
     )
 
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize(
+    ("seq_lens", "num_kv_heads", "sliding_window", "scratch_splits", "use_sinks"),
+    [
+        ([1, 129, 1000, 8193], 2, None, 64, False),
+        ([1, 129, 1000, 8193], 2, None, 8, False),
+        ([300, 2000, 70], 8, 300, 64, True),
+    ],
+)
+def test_decode_triton_attention_splits_long_requests(
+    seq_lens: list[int],
+    num_kv_heads: int,
+    sliding_window: int | None,
+    scratch_splits: int,
+    use_sinks: bool,
+):
+    """Requests of many splits next to short ones, a scratch smaller than the split cap, and windows that span several splits."""
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    batch = len(seq_lens)
+    num_q_heads = 16
+    head_dim = 256
+    total_kv = sum(seq_lens)
+    q = torch.randn(batch, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    indptr = torch.tensor([0, *seq_lens], dtype=torch.int32, device=device).cumsum(0).to(torch.int32)
+    indices = torch.randperm(total_kv, device=device).to(torch.int32)
+    q_positions = torch.tensor([n - 1 for n in seq_lens], dtype=torch.int64, device=device)
+    q_to_req = torch.arange(batch, dtype=torch.int32, device=device)
+    sinks = torch.randn(num_q_heads, dtype=torch.float32, device=device) if use_sinks else None
+    sm_scale = head_dim**-0.5
+    attn_logits = torch.empty(batch, num_q_heads, scratch_splits, head_dim, dtype=torch.float32, device=device)
+    attn_lse = torch.empty(batch, num_q_heads, scratch_splits, dtype=torch.float32, device=device)
+
+    actual = decode_paged_attention(
+        q, k_cache, v_cache, indptr, indices, q_positions,
+        attn_logits, attn_lse, sm_scale,
+        sliding_window=sliding_window, sinks=sinks,
+    )
+    expected = _reference_paged_attention(
+        q, k_cache, v_cache, indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, sinks=sinks,
+    )
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
@@ -837,10 +878,8 @@ def test_triton_backend_replay_metadata_uses_capture_buffers(monkeypatch):
     assert replay_metadata.q_positions.data_ptr() == backend.capture.positions.data_ptr()
     assert replay_metadata.attn_logits is not None
     assert replay_metadata.attn_lse is not None
-    assert replay_metadata.num_kv_splits is not None
     assert replay_metadata.attn_logits.data_ptr() == backend.capture.attn_logits.data_ptr()
     assert replay_metadata.attn_lse.data_ptr() == backend.capture.attn_lse.data_ptr()
-    assert replay_metadata.num_kv_splits.data_ptr() == backend.capture.num_kv_splits.data_ptr()
 
     torch.testing.assert_close(backend.capture.cu_seqlens_k[:3], expected_indptr)
     torch.testing.assert_close(backend.capture.page_table.view(-1)[:8], expected_indices)

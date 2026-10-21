@@ -47,12 +47,19 @@ class EngineConfig:
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
+    # --moe-cache-mem: slot-cache budget in bytes, turned into a slot count once the expert banks are loaded
+    moe_cache_mem: int | None = None
+    # --moe-cache-scope: unified (one LRU pool per expert quant) or per-layer (one pool per layer)
+    moe_cache_scope: str = "unified"
+    # --moe-cache-split: how pools share the slots; equal or profile:<path> (by expert use from a profile file)
+    moe_cache_split: str = "equal"
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
-    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
-    # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
+    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 13.0
+    # (cudaMemcpyBatchAsync) or HIP (hipMemcpyBatchAsync);
+    # no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
@@ -73,6 +80,13 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # Hybrid with locked layers (banks the pin quota could not take, OS-locked instead): a locked layer keeps GPU
+    # slots of its own pools and fetches this share of each decode step's misses through pinned staging; the rest
+    # are computed on the CPU. -1 (default) = auto: per layer from its `ft bench bw` row (bench_profile.locked_fetch_fraction),
+    # a fixed cap of 1 without one. 0 = locked layers decode on the CPU only. moe_locked_max_fetch caps the fetches per
+    # (layer, step) and sizes the staging (that many rows of the widest expert, per bank).
+    moe_locked_fetch: float = -1.0
+    moe_locked_max_fetch: int = 8
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -103,6 +117,13 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
+            raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
+        if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:
+            # the ensure kernel takes the share in Q16: this one rounds to 0 and the layers would never fetch
+            raise ValueError(f"moe_locked_fetch {self.moe_locked_fetch} rounds to 0 in Q16; pass 0 to keep locked layers CPU-only")
+        if self.moe_locked_max_fetch < 1:
+            raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

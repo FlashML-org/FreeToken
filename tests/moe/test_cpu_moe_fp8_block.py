@@ -74,11 +74,11 @@ def test_cpu_fp8_block_accepts_qwen38_padded_scale_bank():
         device=torch.device("cpu"),
     )
     hidden = torch.randn(1, H, dtype=torch.bfloat16)
-    io = ex._io_for(1)
+    io = ex._io
     io["x"].copy_(hidden)
     io["ids"].zero_()
     io["w"].fill_(1.0)
-    ex._ext.run_task(ex._task_for(0, 1))
+    ex._ext.run(0, 1)
     cpu_out = io["y"][0].float().to(torch.float64)
     banks = cache.bank_sources
     gate_up = _reference_fp8_block_gemv(banks["gate_up"][0], banks["gate_up_scale"][0], hidden[0])
@@ -140,11 +140,8 @@ def _reference_fp8_block_gemv(weights, scales, x):
 
 
 @pytest.mark.parametrize("codes", ["finite", "subnormal"])
-@pytest.mark.parametrize(
-    "isa, expected_isa",
-    [("scalar", "scalar"), ("avx2", "avx2"), ("avx512", "avx512f"), ("avx512bf16", "avx512f")],
-)
-def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa, codes):
+@pytest.mark.parametrize("isa", ["scalar", "avx2", "avx512"])
+def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, codes):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     H, I = 259, 257  # ragged K for both GEMVs; 257 down rows exercise many reductions
@@ -159,17 +156,16 @@ def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, expected_isa,
         max_tokens=1,
         device=torch.device("cpu"),
     )
-    tiers = {"scalar": 0, "avx2": 1, "avx512": 2, "avx512bf16": 3}
+    tiers = {"scalar": 0, "avx2": 1, "avx512": 2}
     if tiers[isa] > ("scalar", "avx2", "avx512f", "avx512bf16").index(ex.isa):
         pytest.skip(f"requested {isa}, host/build selected {ex.isa}")
-    assert ex._ext.fp8_block_isa_name() == expected_isa
 
     hidden = torch.randn(1, H, dtype=torch.bfloat16)
-    io = ex._io_for(1)
+    io = ex._io
     io["x"].copy_(hidden)
     io["ids"].zero_()
     io["w"].fill_(1.0)
-    ex._ext.run_task(ex._task_for(0, 1))
+    ex._ext.run(0, 1)
     cpu_out = io["y"][0].float().to(torch.float64)
 
     banks = cache.bank_sources
@@ -233,9 +229,8 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs, isa, monkeypatch):
         max_tokens=bs,
         device=dev,
     )
-    got = ex._ext.fp8_block_isa_name()
-    if got != _ISA_TIERS[isa]:
-        pytest.skip(f"asked for {isa}, kernel selected {got}: not supported here")
+    if ex.isa != _ISA_TIERS[isa]:
+        pytest.skip(f"asked for {isa}, host/build selected {ex.isa}: not supported here")
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
     ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
@@ -254,7 +249,7 @@ def test_cpu_fp8_block_matches_gpu_decode_kernel(bs, isa, monkeypatch):
     ).float()
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
-    assert rel < 2e-2, f"bs={bs} isa={got} rel err {rel.item()}"
+    assert rel < 2e-2, f"bs={bs} isa={ex.isa} rel err {rel.item()}"
 
 
 def test_fp16_bits_carry_every_e4m3_byte():

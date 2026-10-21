@@ -6,14 +6,15 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from ..embedding import EmbeddingConfig
 from ..linear import LinearConfig
 from ..moe import MoEConfig
 from ..names import Matcher, NameMap, name_set
 from ..quant_backend import get_quant_backend
-from ..registry import LayerKind, dialects, method_class, register_dialect
+from ..registry import LayerKind, dialects, method_class, methods_for, register_dialect
 from ..scheme import QuantKind, QuantScheme
 
-LAYER_CONFIGS = {LayerKind.LINEAR: LinearConfig, LayerKind.MOE: MoEConfig}
+LAYER_CONFIGS = {LayerKind.LINEAR: LinearConfig, LayerKind.MOE: MoEConfig, LayerKind.EMBEDDING: EmbeddingConfig}
 
 
 def cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -39,10 +40,15 @@ def quantization_config_of(hf_config: Any) -> dict[str, Any] | None:
 
 @dataclass(frozen=True)
 class Stored:
-    """One checkpoint tensor behind a role: its suffix, and whether it holds the quant-side scale whose reciprocal the layer wants."""
+    """One checkpoint tensor behind a role: its suffix, other suffixes exports of the same dialect use for it, and whether it holds the quant-side scale whose reciprocal the layer wants."""
 
     name: str
     reciprocal: bool = False
+    aliases: tuple[str, ...] = ()
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return (self.name, *self.aliases)
 
 
 class QuantConfig(ABC):
@@ -103,6 +109,9 @@ class QuantConfig(ABC):
         scheme = self.scheme_for(prefix)
         layer_kind = layer.quant_layer_kind
         kind = scheme.kind if scheme else QuantKind.NONE
+        if layer_kind is LayerKind.EMBEDDING and kind not in methods_for(layer_kind):
+            # a checkpoint that quantizes its linears stores the vocab table dense
+            scheme, kind = None, QuantKind.NONE
         cls = method_class(kind, layer_kind)
         cfg = self.layer_config(layer, layer_kind, scheme)
         return cls(cfg, get_quant_backend().select(layer_kind, kind))

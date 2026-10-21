@@ -4,7 +4,7 @@ import collections
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Collection
 
 import safetensors
 import torch
@@ -36,7 +36,29 @@ def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
 def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch.Tensor:
     if spec.global_reciprocal:
         tensor = 1.0 / tensor.float()
-    return tensor.to(torch.float16)
+    return tensor.to(torch.float32)
+
+
+def _activation_scale():
+    """The checkpoint tensor of the NVFP4 static activation scale under the installed dialect, or None."""
+    from freetoken.layers.quantization import QuantKind, get_quant_config
+
+    try:
+        quant = get_quant_config()
+    except RuntimeError:
+        return None
+    if quant is None or QuantKind.NVFP4 not in quant.STORAGE:
+        return None
+    return quant.stored_tensors(QuantKind.NVFP4).get("input_scale")
+
+
+def _ingest(spec: "Nvfp4ExpertSourceSpec", act, role: str, tensor: torch.Tensor) -> torch.Tensor:
+    if role.endswith("_global"):
+        return _ingest_global(spec, tensor)
+    if role.endswith("_input"):
+        tensor = tensor.float()
+        return 1.0 / tensor if act.reciprocal else tensor
+    return tensor
 
 
 def _num_moe_layers(config) -> int:
@@ -68,6 +90,7 @@ def iter_nvfp4_expert_pieces(
     config,
     spec: Nvfp4ExpertSourceSpec,
     *,
+    layers: Collection[int] | None = None,
     parallel: bool = False,
     workers: int = 8,
     chunk: int = 8 << 20,
@@ -77,10 +100,12 @@ def iter_nvfp4_expert_pieces(
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
-    fp16) companions, straight from the safetensors shards.
+    fp32) companions, straight from the safetensors shards. When every expert also stores the
+    dialect's static activation scale, the pieces carry it as fp32 ``_input`` (dequant side).
 
     Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
     way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
+    ``layers`` (bank layer ids, default all) reads only those layers' experts.
     """
     from freetoken.models.loader import drop_page_cache as _drop
     from freetoken.models.loader import safetensors_weight_map
@@ -90,6 +115,8 @@ def iter_nvfp4_expert_pieces(
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
 
+    keep = None if layers is None else set(layers)
+    act = _activation_scale()
     wanted: dict[str, tuple[int, int, str]] = {}
     for name in weight_map:
         match = spec.key_pattern.match(name)
@@ -98,7 +125,7 @@ def iter_nvfp4_expert_pieces(
         if skip_experts_from is not None and int(match.group("expert")) >= skip_experts_from:
             continue
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
-        if bank_layer is None:
+        if bank_layer is None or (keep is not None and bank_layer not in keep):
             continue
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
@@ -121,21 +148,16 @@ def iter_nvfp4_expert_pieces(
             drop(path)
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                 for name in by_shard[shard]:
-                    tensor = f.get_tensor(name)
-                    if wanted[name][2].endswith("_global"):
-                        tensor = _ingest_global(spec, tensor)
-                    yield name, tensor
+                    yield name, _ingest(spec, act, wanted[name][2], f.get_tensor(name))
             drop(path)
 
     def _parallel():
         from freetoken.models.weight import iter_expert_tensors_parallel
 
         for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
-            if wanted[name][2].endswith("_global"):
-                tensor = _ingest_global(spec, tensor)
-            yield name, tensor
+            yield name, _ingest(spec, act, wanted[name][2], tensor)
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=per_expert)
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

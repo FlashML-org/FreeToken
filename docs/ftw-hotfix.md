@@ -32,6 +32,8 @@ byte range, never the whole checkpoint; `--revision` pins the Hub revision to re
 | `KeyError: 'model.embed.weight'` | deepseek-ai/DeepSeek-V4-Flash-0731 | rename the index entries | none |
 | `RuntimeError: Unexpected keys ... .weight_scale` | nvidia/GLM-5.2-NVFP4 | dequantize the old runtime-fp8 weights back to bf16 | none |
 | `PLE shard indices are not contiguous 0..N-1: []` | Qwen3.8-Flash-Next (FTWs converted before #420) | write the PLE table as `ple-table-*.safetensors` | 47.7 GiB |
+| `ValueError: ... stores NVFP4 global scales as fp16` | NVFP4 FTWs converted by older builds | none: the fp16 rounding cannot be undone, so the script refuses; reconvert with `ft checkpoint` | - |
+| none: loads, but the output is wrong | Qwen3.5 / Qwen3.6 / Qwen3.8-27B FTWs converted by older builds (norm weights stored as bf16(1 + w)) | none: the script does not detect it; reconvert with `ft checkpoint` | - |
 | `ValueError: ... holds no vision encoder tensors` | image-input families (Qwen3-VL, Qwen3.6, Qwen3.8-Flash-Next, Gemma-4, GLM-5.3-Flash, Muse-Glimmer, MiniMax-M3) converted before the family served images | add the vision encoder: the tower's checkpoint tensors are fetched and the family's own weight reader emits them as the converter would | 1 to 4 GiB |
 
 The script decides by itself: it builds the current model from the FTW's `config.json`, compares

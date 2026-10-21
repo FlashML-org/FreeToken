@@ -63,6 +63,7 @@ class LinearReplicated(_LinearTPImpl):
         output_size: int,
         has_bias: bool,
         *,
+        output_sizes: List[int] | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -72,6 +73,7 @@ class LinearReplicated(_LinearTPImpl):
             local_isize=input_size,
             local_osize=output_size,
             has_bias=has_bias,
+            output_sizes=output_sizes,
             quant_config=quant_config,
             prefix=prefix,
         )
