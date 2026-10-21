@@ -209,6 +209,11 @@ class EngramHost:
         self.wait_sync = probe_wait_sync(sync_mode, device)
         for t in self.tables:
             t.wait_sync = self.wait_sync
+            if self.wait_sync and torch.version.hip is not None:
+                from freetoken.kernel.row_store import alloc_sync_flag
+
+                with torch.cuda.device(device):
+                    t.flag = alloc_sync_flag()
         self._token_readback = alloc_pinned_tensor(min(t.max_graph_rows for t in self.tables), dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-fill")

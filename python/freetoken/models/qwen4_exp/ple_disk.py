@@ -6,6 +6,7 @@ Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hi
 from __future__ import annotations
 
 import os
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
@@ -202,12 +203,71 @@ class DiskRowTable:
 
         self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
-        self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
-        self._flag.zero_()
+        if torch.version.hip is not None:
+            from freetoken.kernel.row_store import alloc_sync_flag
+
+            self._flag = alloc_sync_flag() if self._wait_sync else None
+        else:
+            self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
+            self._flag.zero_()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
+        self._worker = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-fill")
+            if self._wait_sync and torch.version.hip is not None else None
+        )
+        self._pending: Future | None = None
+        self._failed = False
+        self._closed = False
+
+    def _start_fill(self, reqs, bs: int):
+        histories = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
+
+        @torch.inference_mode()
+        def _complete() -> None:
+            try:
+                self._readback_event.synchronize()
+                tokens = self._token_readback[:bs].to(torch.int64).tolist()
+                runs = [torch.tensor([*history, t], dtype=torch.int64)
+                        for history, t in zip(histories, tokens)]
+                self.fill(runs, graph=True)
+            except BaseException:
+                from freetoken.kernel.row_store import signal
+
+                signal(self._flag)
+                raise
+
+        # Like Engram, release HIP's WAIT independently of a queue-blocked graph launch.
+        self._pending = self._worker.submit(_complete)
+        return self._await_pending
+
+    def _await_pending(self) -> None:
+        if self._pending is not None:
+            pending, self._pending = self._pending, None
+            try:
+                pending.result()
+            except BaseException:
+                self._failed = True
+                if self._worker is not None:
+                    # An interrupted waiter must drain the fill before recording its consumed event.
+                    self._worker.shutdown(wait=True)
+                raise
+
+    def close(self) -> None:
+        self._closed = True
+        if self._worker is not None:
+            self._worker.shutdown(wait=True)
+            try:
+                self._await_pending()
+            finally:
+                self._graph_consumed.synchronize()
+
+    def __del__(self) -> None:
+        worker = getattr(self, "_worker", None)
+        if worker is not None:
+            worker.shutdown(wait=False)
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
@@ -238,6 +298,10 @@ class DiskRowTable:
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
+        if torch.version.hip is not None:
+            self._await_pending()
+            if self._failed or self._closed:
+                raise RuntimeError("PLE disk table is closed or failed; recreate the engine before dispatch")
         eos = self.eos_token_id
         if batch.is_decode:
             reqs = list(batch.reqs)
@@ -245,6 +309,8 @@ class DiskRowTable:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
+                if self._worker is not None:
+                    return self._start_fill(reqs, bs)
 
                 def _complete() -> None:
                     try:
@@ -281,6 +347,20 @@ class DiskRowTable:
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
         """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
         deferred = self.host_fill_batch(batch, use_graph)
+        if self._worker is not None:
+            try:
+                yield
+            except BaseException:
+                self._failed = True
+                raise
+            finally:
+                try:
+                    self._await_pending()
+                finally:
+                    # The worker must finish before recording the event it waits on at the next fill.
+                    if use_graph:
+                        self._graph_consumed.record(torch.cuda.current_stream(self._device))
+            return
         yield
         # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
         if deferred is not None:

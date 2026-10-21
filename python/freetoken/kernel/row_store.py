@@ -20,22 +20,32 @@ RowStore = _row_store.RowStore
 PleStore = _row_store.PleStore
 
 
+def alloc_sync_flag() -> torch.Tensor:
+    if torch.version.hip is not None:
+        return _row_store.alloc_signal_tensor()
+    return alloc_pinned_tensor(1, dtype=torch.int64).zero_()
+
+
 def probe_wait_sync(mode: str, device: torch.device) -> bool:
     """``mode``: ``auto`` (probe), ``wait`` (require memops) or ``gate`` (never use them)."""
     if mode not in ("auto", "wait", "gate"):
         raise ValueError(f"unknown row-store sync mode {mode!r}; expected auto, wait or gate")
     if mode == "gate":
         return False
-    scratch = alloc_pinned_tensor(1, dtype=torch.int64)
-    scratch.zero_()
-    stream = torch.cuda.current_stream(device)
-    ok = (
-        _row_store.memop_write(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-        and _row_store.memop_wait_geq(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-    )
-    if ok:
-        stream.synchronize()
-        ok = int(scratch[0]) == 7
+    if torch.version.hip is not None:
+        with torch.cuda.device(device):
+            ok = _row_store.capture_memops_supported()
+    else:
+        scratch = alloc_pinned_tensor(1, dtype=torch.int64)
+        scratch.zero_()
+        stream = torch.cuda.current_stream(device)
+        ok = (
+            _row_store.memop_write(stream.cuda_stream, scratch.data_ptr(), 7) == 0
+            and _row_store.memop_wait_geq(stream.cuda_stream, scratch.data_ptr(), 7) == 0
+        )
+        if ok:
+            stream.synchronize()
+            ok = int(scratch[0]) == 7
     if mode == "wait" and not ok:
         raise RuntimeError("wait-sync requested but stream memops are unavailable")
     return ok
@@ -51,4 +61,4 @@ def signal(flag: torch.Tensor) -> None:
     _row_store.signal_flag(flag.data_ptr())
 
 
-__all__ = ["RowStore", "PleStore", "probe_wait_sync", "wait_reset", "signal"]
+__all__ = ["RowStore", "PleStore", "alloc_sync_flag", "probe_wait_sync", "wait_reset", "signal"]
