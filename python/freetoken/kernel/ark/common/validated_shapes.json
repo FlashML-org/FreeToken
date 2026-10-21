@@ -1,0 +1,56 @@
+{
+  "_environment": {
+    "torch": "2.14.0+rocm10.1.0",
+    "triton": "3.8.0",
+    "hip": "7.16.26385",
+    "gpu_name": "AMD Radeon AI PRO R9700",
+    "arch": "gfx1201",
+    "source_sha256": "44b97b10bff974118c6e6aacf0f5e18d1bd3ea89d974ea73101f621334ce3a87",
+    "device_count": 1,
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "compiler_sha256": "449f6779a4041275d18d801246d0c2c09ffb453a48093d4bebbbd82803954205",
+    "baseline_sha256": "9815bbdde6aa7c596020f7c1ec5c6e5ea3b363697877a6a052c833e34d74b3af"
+  },
+  "_rules": {
+    "eager_min_speedup": 1.05,
+    "graph_min_speedup": 1.03,
+    "each_repeat_faster": true,
+    "graph_requires_model_benefit": true
+  },
+  "_quality_exclusions": {
+    "moe_decode_fp8": "All Graph shapes remain FT; Qwen3 matched-prefix KL previously exceeded 0.05 nats."
+  },
+  "dense_fp8_decode": {
+    "eager": {
+      "1,5120,2048": {
+        "speedup": 2.981068802840718,
+        "min_paired_speedup": 2.8447989354948624
+      },
+      "1,2048,4096": {
+        "speedup": 2.664333983063257,
+        "min_paired_speedup": 2.5292833118591935
+      },
+      "1,151936,2048": {
+        "speedup": 1.1619853101598177,
+        "min_paired_speedup": 1.1590626384391836
+      }
+    },
+    "graph": {}
+  },
+  "moe_decode_fp8": {
+    "eager": {
+      "1,2048,768,32,8": {
+        "speedup": 2.3135117784788224,
+        "min_paired_speedup": 2.162734887012934
+      },
+      "1,2048,768,4550,8": {
+        "speedup": 2.3769916961675213,
+        "min_paired_speedup": 2.2825604528743484
+      }
+    },
+    "graph": {}
+  },
+  "_model_exclusions": {
+    "dense_fp8_decode.graph": "Three-round Qwen3 candidate model A/B: 512 -0.0804%, 32768 -0.3743%; keep FT until model benefit is demonstrated."
+  }
+}

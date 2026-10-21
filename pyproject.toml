@@ -111,6 +111,7 @@ version = {attr = "freetoken.version.__version__"}
 where = ["python"]
 
 [tool.setuptools.package-data]
+"freetoken.kernel.ark" = ["**/*.hip", "**/*.h", "**/*.cpp", "**/*.json", "NOTICE"]
 "*" = ["csrc/**/*", "moe/configs/**/*.json", "third_party/*/LICENSE", "third_party/*/VERSION", "third_party/*/freetoken.patch"]
 
 [tool.pytest.ini_options]
