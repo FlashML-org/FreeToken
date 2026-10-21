@@ -5,7 +5,7 @@
 #include <c10/cuda/CUDAStream.h>
 
 extern "C" {
-int radeon_dense_gemv_fp8(const void*, const void*, const void*, void*, int, int, int, int, void*);
+int radeon_dense_gemv_fp8(const void*, const void*, const void*, void*, int, int, int, void*);
 int radeon_moe_decode_gemv_fp8(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, int, int, int, int, int, int, void*);
 }
 
@@ -20,7 +20,7 @@ void check(const Tensor& t, const Tensor& x, at::ScalarType dtype) {
 void checked(int rc) { TORCH_CHECK(rc == 0, "ARK native HIP return code ", rc); }
 void* stream() { return (void*)at::cuda::getCurrentCUDAStream().stream(); }
 
-Tensor dense_decode(const Tensor& x, const Tensor& w, const Tensor& scale, int64_t nw) {
+Tensor dense_decode(const Tensor& x, const Tensor& w, const Tensor& scale) {
   c10::cuda::CUDAGuard guard(x.device());
   check(x, x, at::kBFloat16);
   check(w, x, at::kFloat8_e4m3fn);
@@ -28,13 +28,13 @@ Tensor dense_decode(const Tensor& x, const Tensor& w, const Tensor& scale, int64
   TORCH_CHECK(x.dim() == 2 && x.size(0) == 1 && w.dim() == 2 && scale.dim() == 2,
               "ARK dense decode requires M=1 and 2D weight/scales");
   int K = x.size(1), N = w.size(0);
-  TORCH_CHECK(K > 0 && N > 0 && K % 128 == 0 && w.size(1) == K && nw == 1,
+  TORCH_CHECK(K > 0 && N > 0 && K % 128 == 0 && w.size(1) == K,
               "ARK dense decode dimensions/configuration");
   TORCH_CHECK(scale.size(0) >= (N + 127) / 128 && scale.size(1) >= K / 128,
               "ARK dense scale storage too small");
   auto out = at::empty({1, N}, x.options());
   checked(radeon_dense_gemv_fp8(x.data_ptr(), w.data_ptr(), scale.data_ptr(), out.data_ptr(),
-                               N, K, scale.stride(0), nw, stream()));
+                               N, K, scale.stride(0), stream()));
   return out;
 }
 
@@ -66,7 +66,7 @@ Tensor moe_decode(const Tensor& x, const Tensor& w1, const Tensor& w2, const Ten
 }  // namespace
 
 TORCH_LIBRARY(freetoken_ark, m) {
-  m.def("dense_decode(Tensor x, Tensor w, Tensor scale, int nw) -> Tensor");
+  m.def("dense_decode(Tensor x, Tensor w, Tensor scale) -> Tensor");
   m.def("moe_decode(Tensor x, Tensor w1, Tensor w2, Tensor weights, Tensor ids, Tensor s1, Tensor s2) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(freetoken_ark, CUDA, m) {

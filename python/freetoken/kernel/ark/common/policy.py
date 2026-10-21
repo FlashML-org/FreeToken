@@ -1,12 +1,13 @@
 """Fail-closed environment and measured-shape selection, separate for eager/Graph."""
 
+import hashlib
 import json
 import os
-import hashlib
 import platform
 import subprocess
 from functools import lru_cache
 from pathlib import Path
+
 import torch
 
 MODE = os.environ.get("FREETOKEN_ARK_POLICY", "validated")
@@ -22,7 +23,7 @@ def current_environment():
 
     if not torch.version.hip or not torch.cuda.is_available():
         return {}
-    from .native import source_digest, _compiler
+    from .native import _compiler, source_digest
 
     p = torch.cuda.get_device_properties(torch.cuda.current_device())
     try:

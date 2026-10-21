@@ -2,8 +2,8 @@
 
 import statistics
 import time
-import torch
 
+import torch
 
 OPS = ["moe_decode_fp8", "dense_fp8_decode"]
 

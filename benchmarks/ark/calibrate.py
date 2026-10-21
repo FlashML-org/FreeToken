@@ -6,20 +6,17 @@ import os
 from pathlib import Path
 
 import torch
-
-from .cases import cases
-from .timing import metrics, assert_close, timing_pair, graph_pair
 from freetoken.kernel.ark import initialize
 from freetoken.kernel.ark.common import policy
+
+from .cases import cases
+from .timing import assert_close, graph_pair, metrics, timing_pair
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--write-profile", type=Path)
-    p.add_argument(
-        "--graph-candidates", action="store_true", help="emit dense Graph microbenchmark candidates for separate model evaluation"
-    )
     a = p.parse_args()
     torch.manual_seed(20261021)
     torch.set_num_threads(8)
@@ -28,12 +25,8 @@ def main():
     policy.MODE = "native"
     profile = {
         "_environment": policy.current_environment(),
-        "_rules": {"eager_min_speedup": 1.05, "graph_min_speedup": 1.03, "each_repeat_faster": True},
-        "_quality_exclusions": {"moe_decode_fp8": "All Graph shapes remain FT; Qwen3 matched-prefix KL previously exceeded 0.05 nats."},
-    }
-    profile["_rules"]["graph_requires_model_benefit"] = True
-    profile["_model_exclusions"] = {
-        "dense_fp8_decode.graph": "Current Qwen3 candidate model A/B did not establish a Graph benefit; default Graph remains FT."
+        "_rules": {"eager_min_speedup": 1.05, "each_repeat_faster": True},
+        "_scope": "Eager decode only; Graph entries stay empty pending separate model qualification.",
     }
     rows = []
     for op in ("dense_fp8_decode", "moe_decode_fp8"):
@@ -52,15 +45,12 @@ def main():
                 "graph": graph_pair(case.baseline, case.candidate, case.reset, False, 100),
             }
             shape = policy.metadata_key(op, case.metadata)
-            for mode, threshold in (("eager", 1.05), ("graph", 1.03)):
-                timing = row[mode]
-                paired = [x / y for x, y in zip(timing["samples_us"]["baseline"], timing["samples_us"]["candidate"])]
-                eligible = timing["speedup"] >= threshold and min(paired) > 1
-                if mode == "graph" and (op == "moe_decode_fp8" or not a.graph_candidates):
-                    eligible = False
-                row[mode]["enabled"] = eligible
-                if eligible:
-                    profile[op][mode][shape] = {"speedup": timing["speedup"], "min_paired_speedup": min(paired)}
+            timing = row["eager"]
+            paired = [x / y for x, y in zip(timing["samples_us"]["baseline"], timing["samples_us"]["candidate"])]
+            timing["enabled"] = timing["speedup"] >= 1.05 and min(paired) > 1
+            row["graph"]["enabled"] = False
+            if timing["enabled"]:
+                profile[op]["eager"][shape] = {"speedup": timing["speedup"], "min_paired_speedup": min(paired)}
             rows.append(row)
             a.output.parent.mkdir(parents=True, exist_ok=True)
             a.output.write_text(json.dumps({"environment": profile["_environment"], "rows": rows}, indent=2) + "\n")
