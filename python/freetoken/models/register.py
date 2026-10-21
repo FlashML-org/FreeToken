@@ -206,7 +206,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.deepseek_v4",
         "DeepseekV4ForCausalLM",
         # the checkpoint has no ``model.`` root
-        checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
+        checkpoint_roots=(("model.layers", "layers"), ("model.embed", "embed"), ("model.head", "head")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
         # the embed, the head, the KV compressors, the indexer's scorer and the vision tower +
         # aligner ship bf16; the fp8 config has no modules_to_not_convert (patterns match

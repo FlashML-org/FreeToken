@@ -27,6 +27,7 @@ import torch
 from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names
 from freetoken.models.gguf.tensors import check_scales, fused, matrix
+from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
 from .config import model_config_from_args
@@ -34,6 +35,8 @@ from .config import model_config_from_args
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
     from freetoken.models.gguf.config import GgufConfigShim
+
+logger = init_logger(__name__)
 
 # engine module leaf (after "model.layers.N.") -> GGUF tensor names (without ".weight")
 _LAYER_LEAVES: dict[str, tuple[str, ...]] = {
@@ -125,8 +128,27 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     if int(need("expert_gating_func")) != int(ExpertGatingFuncType.SQRTSOFTPLUS):
         raise NotImplementedError(f"{shim.model_path}: expert_gating_func other than sqrtsoftplus is not served")
 
-    if kv("rope.scaling.type", "yarn") != "yarn":
+    # every official DeepSeek-V4 config carries the same yarn block (V4-Flash, 0731, Pro,
+    # Pro-0813: factor 16 over 65536, betas 32 / 1). The no-yarn files on HF lost the whole
+    # block in conversion -- llama.cpp serves them unscaled, which is wrong for them -- so a
+    # wholly missing block falls back to the family values and a partly present one refuses.
+    scaling = {k: kv(f"rope.scaling.{k}") for k in
+               ("type", "factor", "original_context_length", "yarn_beta_fast", "yarn_beta_slow")}
+    if scaling["type"] not in (None, "yarn"):
         raise NotImplementedError(f"{shim.model_path}: rope scaling other than yarn is not served")
+    missing = [k for k, v in scaling.items() if v is None]
+    if missing:
+        if len(missing) != len(scaling):
+            raise ValueError(
+                f"{shim.model_path}: rope.scaling is only partly present "
+                f"(missing {', '.join(missing)}); the file is inconsistent"
+            )
+        logger.warning(
+            f"{shim.model_path}: no rope.scaling block; using the family values "
+            "(yarn, factor 16, original 65536, betas 32 / 1)"
+        )
+        scaling = {"type": "yarn", "factor": 16.0, "original_context_length": 65536,
+                   "yarn_beta_fast": 32.0, "yarn_beta_slow": 1.0}
 
     head_dim = int(need("attention.key_length"))
     if int(need("attention.value_length")) != head_dim:
@@ -175,11 +197,11 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         window_size=int(need("attention.sliding_window")),
         compress_ratios=_compress_ratios(index, head_dim, num_layers),
         compress_rope_theta=float(kv("attention.compress_rope_freq_base", 160000.0) or 160000.0),
-        original_seq_len=int(need("rope.scaling.original_context_length")),
+        original_seq_len=int(scaling["original_context_length"]),
         rope_theta=float(need("rope.freq_base")),
-        rope_factor=float(need("rope.scaling.factor")),
-        beta_fast=float(kv("rope.scaling.yarn_beta_fast", 32) or 32),
-        beta_slow=float(kv("rope.scaling.yarn_beta_slow", 1) or 1),
+        rope_factor=float(scaling["factor"]),
+        beta_fast=float(scaling["yarn_beta_fast"]),
+        beta_slow=float(scaling["yarn_beta_slow"]),
         index_n_heads=int(need("attention.indexer.head_count")),
         index_head_dim=int(need("attention.indexer.key_length")),
         index_topk=int(need("attention.indexer.top_k")),
