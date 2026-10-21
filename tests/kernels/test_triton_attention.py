@@ -923,3 +923,174 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+def test_output_gate_fallback_and_hybrid_apply_gate_once():
+    from freetoken.attention.base import AttentionSpec, BaseAttnBackend, HybridBackend
+
+    class DenseBackend(BaseAttnBackend):
+        def __init__(self, value):
+            self.value = value
+            self.calls = []
+
+        def forward(self, q, k, v, layer_id, batch, attn_spec=None):
+            self.calls.append(attn_spec)
+            return self.value
+
+        def prepare_metadata(self, batch): pass
+        def init_capture_graph(self, max_seq_len, bs_list): pass
+        def prepare_for_capture(self, batch): pass
+        def prepare_for_replay(self, batch): pass
+
+    torch.manual_seed(29)
+    out = torch.randn(2, 3, 8)
+    gate = torch.randn(2, 24)
+    prefill, decode = DenseBackend(out), DenseBackend(out + 1)
+    backend = HybridBackend(prefill, decode)
+    spec = AttentionSpec(sm_scale=0.25)
+    for is_prefill, selected in [(True, prefill), (False, decode)]:
+        batch = SimpleNamespace(is_prefill=is_prefill)
+        actual = backend.forward_gated(out, out, out, 0, batch, gate, attn_spec=spec)
+        expected = (selected.value.reshape(2, 24) * gate.sigmoid()).reshape_as(out)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert selected.calls == [spec]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize(
+    ("lens", "heads", "kv_heads", "dim", "window", "use_sinks"),
+    [([512], 16, 2, 256, None, False),
+     ([512, 495, 478, 461], 16, 2, 256, None, False),
+     ([512], 16, 4, 256, None, False),
+     ([7, 129], 24, 4, 256, None, False),
+     ([1, 1000], 8, 2, 128, 300, True),
+     ([0, 65], 4, 1, 256, None, False)],
+)
+def test_decode_output_gate_matches_unfused_and_reference(lens, heads, kv_heads, dim, window, use_sinks):
+    from freetoken.kernel.triton.attention import decode_paged_attention, _decode_gate_sigmoid_table
+
+    torch.manual_seed(37)
+    batch, total = len(lens), sum(lens)
+    q = torch.randn(batch, heads, dim, device="cuda", dtype=torch.bfloat16) * 0.2
+    k = torch.randn(total, kv_heads, dim, device="cuda", dtype=torch.bfloat16) * 0.2
+    v = torch.randn_like(k) * 0.2
+    gate = torch.randn_like(q) * 8
+    gate.flatten()[:3] = torch.tensor([0, float("inf"), -float("inf")], device="cuda")
+    ip = torch.tensor([0, *lens], device="cuda", dtype=torch.int32).cumsum(0).to(torch.int32)
+    ix = torch.randperm(total, device="cuda").to(torch.int32)
+    pos = torch.tensor([n - 1 for n in lens], device="cuda", dtype=torch.int64)
+    partial = torch.empty(batch, heads, 8, dim, device="cuda", dtype=torch.float32)
+    lse = torch.empty(batch, heads, 8, device="cuda", dtype=torch.float32)
+    sinks = torch.randn(heads, device="cuda") if use_sinks else None
+    args = (q, k, v, ip, ix, pos, partial, lse, dim ** -0.5)
+    kwargs = dict(sliding_window=window, sinks=sinks)
+    _decode_gate_sigmoid_table(q.device.index)
+    expected = decode_paged_attention(*args, **kwargs) * gate.sigmoid()
+    output = torch.empty_like(q)
+    actual = decode_paged_attention(*args, **kwargs, out=output, output_gate=gate)
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    if all(lens):
+        oracle = _reference_paged_attention(
+            q, k, v, ip, ix, torch.arange(batch, device="cuda"), pos,
+            dim ** -0.5, window, sinks=sinks,
+        ) * gate.sigmoid()
+        torch.testing.assert_close(actual.float(), oracle.float(), rtol=2e-2, atol=2e-2)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        replay_output = decode_paged_attention(*args, **kwargs, output_gate=gate)
+    # Change the inputs and effective CSR lengths after capture.
+    q.mul_(0.5)
+    gate.neg_()
+    pos.sub_(1)
+    expected = decode_paged_attention(*args, **kwargs) * gate.sigmoid()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replay_output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+def test_output_gate_backend_graph_and_eager_fallback(monkeypatch):
+    from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
+    from freetoken.kernel.triton import attention as kernel
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(41)
+    q = torch.randn(1, 16, 256, device=device, dtype=torch.bfloat16) * 0.2
+    gate = torch.randn(1, 4096, device=device, dtype=torch.bfloat16)
+    k = torch.randn(512, 2, 256, device=device, dtype=torch.bfloat16) * 0.2
+    v = torch.randn_like(k)
+    stores, calls = [], []
+    cache = SimpleNamespace(device=device, k_cache=lambda _: k, v_cache=lambda _: v,
+                            store_kv=lambda *args: stores.append(True))
+    monkeypatch.setattr("freetoken.attention.triton.get_global_ctx", lambda: SimpleNamespace(kv_cache=cache))
+    monkeypatch.delenv("FREETOKEN_TRITON_FUSE_OUTPUT_GATE", raising=False)
+    config = SimpleNamespace(num_qo_heads=16, num_kv_heads=2, head_dim=256)
+    backend = TritonAttentionBackend(config)
+    ip = torch.tensor([0, 512], device=device, dtype=torch.int32)
+    ix = torch.arange(512, device=device, dtype=torch.int32)
+    pos = torch.tensor([511], device=device, dtype=torch.int64)
+    metadata = TritonMetadata(ip, ip, ix, torch.zeros_like(pos), pos, True, torch.zeros_like(pos), 1)
+    batch = SimpleNamespace(attn_metadata=metadata, out_loc=pos, mm_block_ends=None)
+    original = kernel.decode_paged_attention
+
+    def observed(*args, **kwargs):
+        calls.append(kwargs.get("output_gate") is not None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "decode_paged_attention", observed)
+    expected = backend.forward(q, k[-1:], v[-1:], 0, batch) * gate.sigmoid().view_as(q)
+    eager = backend.forward_gated(q, k[-1:], v[-1:], 0, batch, gate)
+    torch.testing.assert_close(eager, expected, rtol=0, atol=0)
+    assert len(stores) == 2 and calls == [False, False]
+    # Compile the optional kernel before capture on platforms without automatic admission.
+    kernel._decode_gate_sigmoid_table(device.index)
+    original(q, k, v, ip, ix, pos, metadata.attn_logits, metadata.attn_lse,
+             256 ** -0.5, output_gate=gate.view_as(q))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = backend.forward_gated(q, k[-1:], v[-1:], 0, batch, gate)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected_fusion = bool(torch.version.hip) and getattr(
+        torch.cuda.get_device_properties(device), "gcnArchName", ""
+    ).startswith("gfx1201")
+    assert len(stores) == 3 and calls[-1] == expected_fusion
+    # A larger CSR capacity must retain FT even while capturing.
+    metadata.indices = torch.cat((ix, torch.zeros(3584, device=device, dtype=torch.int32)))
+    fallback_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(fallback_graph, stream=stream):
+        fallback = backend.forward_gated(q, k[-1:], v[-1:], 0, batch, gate)
+    fallback_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(fallback, expected, rtol=0, atol=0)
+    assert calls[-1] is False and len(stores) == 4
+    metadata.indices = ix
+    monkeypatch.setenv("FREETOKEN_TRITON_FUSE_OUTPUT_GATE", "0")
+    disabled = TritonAttentionBackend(config)
+    disabled_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(disabled_graph, stream=stream):
+        disabled_out = disabled.forward_gated(q, k[-1:], v[-1:], 0, batch, gate)
+    disabled_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(disabled_out, expected, rtol=0, atol=0)
+    assert calls[-1] is False and len(stores) == 5
+    q4, gate4 = q.repeat(4, 1, 1), gate.repeat(4, 1)
+    metadata.indptr = torch.arange(5, device=device, dtype=torch.int32) * 512
+    metadata.indices = ix.repeat(4)
+    metadata.q_positions = pos.repeat(4)
+    expected4 = backend.forward(q4, k[-1:], v[-1:], 0, batch) * gate4.sigmoid().view_as(q4)
+    batch4_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(batch4_graph, stream=stream):
+        batch4_out = backend.forward_gated(q4, k[-1:], v[-1:], 0, batch, gate4)
+    batch4_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(batch4_out, expected4, rtol=0, atol=0)
+    assert calls[-1] is False and len(stores) == 7
