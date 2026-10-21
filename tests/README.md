@@ -50,6 +50,7 @@ checkpoint is set:
 | `FREETOKEN_AIME_MIN_FREE_GIB` | `e2e/test_aime.py` — required free GPU memory (default `70`) |
 | `FREETOKEN_QWEN36_MODEL`   | `tokenizer/test_mm_tokenize.py` — local Qwen3.6 checkpoint (image processor + tokenizer) |
 | `FREETOKEN_QWEN3VL_MODEL`  | `tokenizer/test_mm_tokenize.py` — local Qwen3-VL checkpoint (same expansion, DeepStack family) |
+| `FREETOKEN_ORNITH_MODEL`   | `tokenizer/test_mm_tokenize.py` — local Ornith-1.5 checkpoint (same expansion, `qwen3_5_moe` vision tower) |
 | `FREETOKEN_GEMMA4_MODEL`   | `models/test_gemma4_vision.py`, `tokenizer/test_mm_tokenize.py` — local Gemma-4 `gemma4` checkpoint (tower parity, boi/eoi expansion; the tokenizer test also takes the 12B `gemma4_unified` checkpoint) |
 | `FREETOKEN_GEMMA4_UNIFIED_MODEL` | `models/test_gemma4_vision.py` — local gemma-4-12B `gemma4_unified` checkpoint (embedder parity) |
 | `FREETOKEN_GLM53_MODEL`    | `tokenizer/test_mm_tokenize.py` — local GLM-5.3-Flash checkpoint (image-token expansion) |
