@@ -1,0 +1,48 @@
+{
+  "base": "fe5a5ec9c5644e266527de5afb9f1156b9bdcabb",
+  "branch": "perf/ark-fp8-decode",
+  "gpu": {
+    "name": "AMD Radeon AI PRO R9700",
+    "pci": "0000:23:00.0",
+    "uuid": "GPU-98103ef4c22a3ccc",
+    "render": "renderD131",
+    "memory_gib": 32,
+    "link": "32 GT/s x16"
+  },
+  "cpu": {
+    "model": "AMD EPYC 9334 32-Core Processor",
+    "host_sockets": 2,
+    "allowed_cpus": "0-31,64-95",
+    "memory_nodes": "2-3",
+    "exclusive": false
+  },
+  "os": "Ubuntu 24.04.1 LTS",
+  "amdgpu": "7.1.9.31600000",
+  "model": "Qwen/Qwen3-30B-A3B-FP8",
+  "checkpoint_format": "FTW",
+  "environment": {
+    "torch": "2.14.0+rocm10.1.0",
+    "triton": "3.8.0",
+    "hip": "7.16.26385",
+    "gpu_name": "AMD Radeon AI PRO R9700",
+    "arch": "gfx1201",
+    "source_sha256": "44b97b10bff974118c6e6aacf0f5e18d1bd3ea89d974ea73101f621334ce3a87",
+    "device_count": 1,
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "compiler_sha256": "449f6779a4041275d18d801246d0c2c09ffb453a48093d4bebbbd82803954205",
+    "baseline_sha256": "9815bbdde6aa7c596020f7c1ec5c6e5ea3b363697877a6a052c833e34d74b3af"
+  },
+  "native_cache_key": "b63ee64d5f192756348a",
+  "weight_dtype": "E4M3 FP8",
+  "activation_dtype": "BF16",
+  "kv_dtype": "BF16",
+  "expert_cache_gib": 20,
+  "expert_slots": 4550,
+  "input_contexts": [
+    512,
+    32768
+  ],
+  "output_tokens": 256,
+  "concurrency": 1,
+  "prefill_chunk": 8192
+}

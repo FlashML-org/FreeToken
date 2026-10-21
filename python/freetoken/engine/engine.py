@@ -378,6 +378,13 @@ class Engine:
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
+        if os.name == "posix" and os.environ.get("FREETOKEN_USE_ARK", "0") == "1":
+            from freetoken.kernel.ark.common.policy import MODE, environment_matches
+
+            if MODE == "native" or environment_matches():
+                from freetoken.kernel.ark import initialize
+
+                initialize()
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
@@ -814,7 +821,11 @@ class Engine:
                     f"expert banks hold experts of several formats ({sorted(set(banks.layer_formats))}) but the model "
                     f"binds {method.kind} / {method.kernel.name} on every MoE layer; reconvert the checkpoint"
                 )
-            if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
+            from freetoken.moe.legacy_format import bank_kernel_compatible
+
+            if banks.kind is not None and (
+                banks.kind != method.kind or not bank_kernel_compatible(method.kind, banks.kernel, method.kernel.name)
+            ):
                 raise ValueError(
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
                     f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
@@ -1654,6 +1665,14 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     except KeyError:
         return quant_backend
     requested = quant_backend.select(LayerKind.MOE, kind)
+    if (
+        os.environ.get("FREETOKEN_USE_ARK", "0") == "1"
+        and kind is QuantKind.FP8_BLOCK and kernel == "triton"
+        and requested in ("auto", "ark_r9700")
+    ):
+        # Preserve auto selection for the layout-compatible candidate. Its own
+        # environment gate still selects FT when ARK has not been validated.
+        return quant_backend
     if requested == kernel:
         return quant_backend
     if requested != "auto":
