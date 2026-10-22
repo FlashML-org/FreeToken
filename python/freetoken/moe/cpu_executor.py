@@ -448,17 +448,7 @@ class CpuMoeExecutor:
             I = int(gate_up[0].shape[1] // 2)
             assert gate_up[0].shape[1] == 2 * I
             assert tuple(down[0].shape[1:]) == (H, I), (down[0].shape, H, I)
-            ptrs = dict(
-                gate_up_ptr=self._make_table(gate_up).data_ptr(),
-                down_ptr=self._make_table(down).data_ptr(),
-                gate_up_scale_ptr=0,
-                gate_up_global_ptr=0,
-                down_scale_ptr=0,
-                down_global_ptr=0,
-                gate_up_bias_ptr=0,
-                down_bias_ptr=0,
-            )
-            return ptrs, (H, I)
+            return self._tables(gate_up=gate_up, down=down), {}, (H, I)
 
         if fmt == "q4_0":
             return self._resolve_packed_gguf_banks(banks, block_bytes=18, fmt="q4_0")
@@ -500,7 +490,7 @@ class CpuMoeExecutor:
 
     def _resolve_packed_gguf_banks(
         self, banks: dict, *, block_bytes: int, fmt: str
-    ) -> tuple[dict, tuple[int, int]]:
+    ) -> tuple[dict, dict, tuple[int, int]]:
         """Resolve native GGUF Q4_0/Q8_0 row-major packed expert banks."""
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
@@ -512,17 +502,7 @@ class CpuMoeExecutor:
         assert H % 32 == 0 and I % 32 == 0, (H, I)
         assert int(gate_up[0].shape[2]) == (H // 32) * block_bytes, (fmt, gate_up[0].shape, H)
         assert int(down[0].shape[2]) == (I // 32) * block_bytes, (fmt, down[0].shape, I)
-        ptrs = dict(
-            gate_up_ptr=self._make_table(gate_up).data_ptr(),
-            down_ptr=self._make_table(down).data_ptr(),
-            gate_up_scale_ptr=0,
-            gate_up_global_ptr=0,
-            down_scale_ptr=0,
-            down_global_ptr=0,
-            gate_up_bias_ptr=0,
-            down_bias_ptr=0,
-        )
-        return ptrs, (H, I)
+        return self._tables(gate_up=gate_up, down=down), {}, (H, I)
 
     def _resolve_mxfp4_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """gpt-oss mxfp4 ``mxfp4_triton`` schema: transposed split-K blocks/scales

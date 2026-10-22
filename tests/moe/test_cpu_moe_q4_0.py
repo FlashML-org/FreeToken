@@ -21,6 +21,40 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+@pytest.mark.parametrize("fmt", ["bf16", "q4_0", "q8_0"])
+def test_cpu_moe_bank_resolvers_return_options_and_shape(fmt):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    executor = object.__new__(CpuMoeExecutor)
+    executor.num_layers = 1
+    executor._banks = []
+    dtype = torch.bfloat16 if fmt == "bf16" else torch.uint8
+    row_bytes = {"bf16": 32, "q4_0": 18, "q8_0": 34}.get(fmt, 0)
+    hidden_size = 32
+    intermediate_size = 32
+    banks = {
+        "gate_up": [
+            torch.empty(
+                (2, 2 * intermediate_size, hidden_size if fmt == "bf16" else row_bytes),
+                dtype=dtype,
+            )
+        ],
+        "down": [
+            torch.empty(
+                (2, hidden_size, intermediate_size if fmt == "bf16" else row_bytes),
+                dtype=dtype,
+            )
+        ],
+    }
+
+    pointers, options, shape = executor._resolve_banks(banks, fmt)
+
+    assert pointers["gate_up"] > 0
+    assert pointers["down"] > 0
+    assert options == {}
+    assert shape == (hidden_size, intermediate_size)
+
+
 def test_q4_k_gguf_moe_dispatches_to_native_kernel(monkeypatch):
     from freetoken.layers.moe import OffloadMoELayer
 
