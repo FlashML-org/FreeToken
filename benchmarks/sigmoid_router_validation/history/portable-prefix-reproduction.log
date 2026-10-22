@@ -1,0 +1,14 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+C:\Users\1\Documents\ChatGPT\UCB\validation\.venv-cuda\Lib\site-packages\huggingface_hub\file_download.py:149: UserWarning: `huggingface_hub` cache-system uses symlinks by default to efficiently store duplicated files but your machine does not support them in D:\AI\FreeToken-validation\hf-cache\hub\models--zai-org--GLM-4.5-Air. Caching files will still work but in a degraded version that might require more space on your disk. This warning can be disabled by setting the `HF_HUB_DISABLE_SYMLINKS_WARNING` environment variable. For more details, see https://huggingface.co/docs/huggingface_hub/how-to-cache#limitations.
+To support symlinks on Windows, you either need to activate Developer Mode or to run Python as an administrator. In order to activate developer mode, see this article: https://docs.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development
+  warnings.warn(message)
+C:\Users\1\Documents\ChatGPT\UCB\validation\.venv-cuda\Lib\site-packages\huggingface_hub\file_download.py:149: UserWarning: `huggingface_hub` cache-system uses symlinks by default to efficiently store duplicated files but your machine does not support them in D:\AI\FreeToken-validation\hf-cache\hub. Caching files will still work but in a degraded version that might require more space on your disk. This warning can be disabled by setting the `HF_HUB_DISABLE_SYMLINKS_WARNING` environment variable. For more details, see https://huggingface.co/docs/huggingface_hub/how-to-cache#limitations.
+To support symlinks on Windows, you either need to activate Developer Mode or to run Python as an administrator. In order to activate developer mode, see this article: https://docs.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development
+  warnings.warn(message)
+Token counts: [93, 26, 18]
+Routing: {"rows": 93, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 5.960464477539063e-08}
+Expert output: {'experts': [20, 30, 42, 61, 71, 98, 100, 114], 'bitwise_equal': True, 'max_abs_error': 0.0, 'rms_error': 0.0, 'reference_max_abs': 1.375}
+Routing: {"rows": 26, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08}
+Expert output: {'experts': [20, 30, 42, 44, 71, 98, 100, 114], 'bitwise_equal': True, 'max_abs_error': 0.0, 'rms_error': 0.0, 'reference_max_abs': 1.46875}
+Routing: {"rows": 18, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 5.960464477539063e-08}
+Expert output: {'experts': [20, 25, 30, 42, 61, 71, 100, 114], 'bitwise_equal': True, 'max_abs_error': 0.0, 'rms_error': 0.0, 'reference_max_abs': 1.5078125}

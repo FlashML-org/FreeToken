@@ -1,0 +1,42 @@
+[
+  {
+    "path": "python/freetoken/layers/linear.py",
+    "sha256": "6e706e0bb8901f9ed415d79ca703dd32428223f1eef98ee5cba10524a2a6eca0"
+  },
+  {
+    "path": "python/freetoken/models/glm4_moe/moe.py",
+    "sha256": "afe9ad9c04d05c90b367460595bcec57099f009f006f86c66150a212766af2fe"
+  },
+  {
+    "path": "python/freetoken/models/glm5_next/moe.py",
+    "sha256": "f5ff926e1ab47914f6544a540fd2e682821beaf3ab6e324cc65d3ed028ad27a3"
+  },
+  {
+    "path": "python/freetoken/models/glm_moe_dsa/moe.py",
+    "sha256": "af9ff194a096b502da05c587162e421dd8511299ec1a3d0d15a9d24facd1a172"
+  },
+  {
+    "path": "python/freetoken/models/minimax_m2/moe.py",
+    "sha256": "464932f65849bab1a3eeefdf806672eea31f2a4c4989b736969f3f76b5f3b155"
+  },
+  {
+    "path": "python/freetoken/models/minimax_m3/moe.py",
+    "sha256": "78601d8e05d1896eb999c758e51e1591159f97b7b7319f4a6f00371814406cee"
+  },
+  {
+    "path": "python/freetoken/kernel/triton/sigmoid_router.py",
+    "sha256": "94ffc653db453b14dd22a5c0eceb41cb4eefc93dcfca6e5165db216c3bcb231f"
+  },
+  {
+    "path": "tests/kernels/test_sigmoid_router.py",
+    "sha256": "bc0ab0b2f0c8bb48a8b97ee110f025e6ff1858fe08626b50efce3cc2d8cba9ec"
+  },
+  {
+    "path": "tests/models/test_sigmoid_routing.py",
+    "sha256": "c48f05d01e5b712614fd5b14ec808a26f7718eaae575fd538129c4a4c5cf7638"
+  },
+  {
+    "path": "benchmarks/bench_sigmoid_router.py",
+    "sha256": "ac11a90e1139b0fd3aa6ca786ea3b9009165fd281121800ebdf85065e4420c9c"
+  }
+]

@@ -1,0 +1,5 @@
+ssssss                                                                   [100%]
+=========================== short test summary info ===========================
+SKIPPED [1] tests\models\test_sigmoid_routing.py:11: needs CUDA
+SKIPPED [5] tests\models\test_sigmoid_routing.py:31: needs CUDA
+6 skipped in 2.71s

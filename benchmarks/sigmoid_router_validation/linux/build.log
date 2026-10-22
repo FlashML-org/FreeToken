@@ -1,0 +1,7 @@
+Using Python 3.12.3 environment at: /home/freetoken/freetoken-work/.venv
+Resolved 1 package in 5.05s
+   Building freetoken @ file:///home/freetoken/freetoken-work/FreeToken
+      Built freetoken @ file:///home/freetoken/freetoken-work/FreeToken
+Prepared 1 package in 4m 28s
+Installed 1 package in 3ms
+ + freetoken==0.1.3 (from file:///home/freetoken/freetoken-work/FreeToken)

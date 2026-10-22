@@ -1,0 +1,33 @@
+{
+  "scope": "constructed exact boundary ties; not a model quality result",
+  "experts": 18,
+  "topk": 5,
+  "old_ids": [
+    [
+      1,
+      0,
+      2,
+      4,
+      3
+    ]
+  ],
+  "new_ids": [
+    [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  ],
+  "same_set": true,
+  "new_weights": [
+    [
+      0.20000000298023224,
+      0.20000000298023224,
+      0.20000000298023224,
+      0.20000000298023224,
+      0.20000000298023224
+    ]
+  ]
+}

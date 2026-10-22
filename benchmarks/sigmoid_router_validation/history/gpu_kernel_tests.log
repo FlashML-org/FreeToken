@@ -1,0 +1,10 @@
+ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 68%]
+sssssssssssssssssssssssssssssssss                                        [100%]
+=========================== short test summary info ===========================
+SKIPPED [96] tests\kernels\test_sigmoid_router.py:34: needs CUDA
+SKIPPED [1] tests\kernels\test_sigmoid_router.py:48: needs CUDA
+SKIPPED [2] tests\kernels\test_sigmoid_router.py:59: needs CUDA
+SKIPPED [1] tests\kernels\test_sigmoid_router.py:69: needs CUDA
+SKIPPED [4] tests\kernels\test_sigmoid_router.py:79: needs CUDA
+SKIPPED [1] tests\kernels\test_sigmoid_router.py:90: needs CUDA
+105 skipped in 2.90s

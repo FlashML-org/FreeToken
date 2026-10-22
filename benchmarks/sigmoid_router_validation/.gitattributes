@@ -1,0 +1,2 @@
+# Preserve raw evidence bytes so SHA256 checks survive Git checkout.
+* -text

@@ -1,0 +1,134 @@
+{
+  "timestamp_utc": "2026-10-21T00:19:11.319482+00:00",
+  "python": "3.12.15 (main, Oct 14 2026, 01:08:45) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "results": [
+    {
+      "name": "environment",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe",
+        "-c",
+        "import torch,platform; print(platform.platform()); print(\"torch\",torch.__version__); print(\"CUDA available\",torch.cuda.is_available()); print(\"CUDA runtime\",torch.version.cuda)"
+      ],
+      "exit_code": 0,
+      "output": "Windows-11-10.0.26200-SP0\ntorch 2.14.1+cpu\nCUDA available False\nCUDA runtime None\n"
+    },
+    {
+      "name": "syntax",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe",
+        "-m",
+        "compileall",
+        "-q",
+        "python/freetoken/kernel/triton/sigmoid_router.py",
+        "python/freetoken/layers/linear.py",
+        "python/freetoken/models/glm4_moe/moe.py",
+        "python/freetoken/models/glm_moe_dsa/moe.py",
+        "python/freetoken/models/glm5_next/moe.py",
+        "python/freetoken/models/minimax_m2/moe.py",
+        "python/freetoken/models/minimax_m3/moe.py",
+        "tests/kernels/test_sigmoid_router.py",
+        "tests/models/test_sigmoid_routing.py",
+        "benchmarks/bench_sigmoid_router.py"
+      ],
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "name": "lint",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe",
+        "-m",
+        "ruff",
+        "check",
+        "--select",
+        "E9,F",
+        "python/freetoken/kernel/triton/sigmoid_router.py",
+        "python/freetoken/layers/linear.py",
+        "python/freetoken/models/glm4_moe/moe.py",
+        "python/freetoken/models/glm_moe_dsa/moe.py",
+        "python/freetoken/models/glm5_next/moe.py",
+        "python/freetoken/models/minimax_m2/moe.py",
+        "python/freetoken/models/minimax_m3/moe.py",
+        "tests/kernels/test_sigmoid_router.py",
+        "tests/models/test_sigmoid_routing.py",
+        "benchmarks/bench_sigmoid_router.py"
+      ],
+      "exit_code": 0,
+      "output": "All checks passed!\n"
+    },
+    {
+      "name": "diff_check",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "output": "warning: in the working copy of 'python/freetoken/models/glm4_moe/moe.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'python/freetoken/models/glm5_next/moe.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'python/freetoken/models/glm_moe_dsa/moe.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'python/freetoken/models/minimax_m2/moe.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'python/freetoken/models/minimax_m3/moe.py', LF will be replaced by CRLF the next time Git touches it\n"
+    },
+    {
+      "name": "cpu_reference_only",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\test_cpu_reference.py",
+        "-q",
+        "--confcutdir",
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation"
+      ],
+      "exit_code": 0,
+      "output": "........                                                                 [100%]\n8 passed in 4.27s\n"
+    },
+    {
+      "name": "gpu_kernel_tests",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "tests/kernels/test_sigmoid_router.py",
+        "-q",
+        "-ra",
+        "--confcutdir=tests/kernels"
+      ],
+      "exit_code": 0,
+      "output": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 68%]\nsssssssssssssssssssssssssssssssss                                        [100%]\n=========================== short test summary info ===========================\nSKIPPED [96] tests\\kernels\\test_sigmoid_router.py:34: needs CUDA\nSKIPPED [1] tests\\kernels\\test_sigmoid_router.py:48: needs CUDA\nSKIPPED [2] tests\\kernels\\test_sigmoid_router.py:59: needs CUDA\nSKIPPED [1] tests\\kernels\\test_sigmoid_router.py:69: needs CUDA\nSKIPPED [4] tests\\kernels\\test_sigmoid_router.py:79: needs CUDA\nSKIPPED [1] tests\\kernels\\test_sigmoid_router.py:90: needs CUDA\n105 skipped in 2.90s\n"
+    },
+    {
+      "name": "gpu_model_tests",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "tests/models/test_sigmoid_routing.py",
+        "-q",
+        "-ra",
+        "--confcutdir=tests/models"
+      ],
+      "exit_code": 0,
+      "output": "ssssss                                                                   [100%]\n=========================== short test summary info ===========================\nSKIPPED [1] tests\\models\\test_sigmoid_routing.py:11: needs CUDA\nSKIPPED [5] tests\\models\\test_sigmoid_routing.py:31: needs CUDA\n6 skipped in 2.71s\n"
+    },
+    {
+      "name": "benchmark_attempt",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe",
+        "benchmarks/bench_sigmoid_router.py"
+      ],
+      "exit_code": 1,
+      "output": "A working CUDA PyTorch GPU environment is required; no benchmark was run.\n"
+    },
+    {
+      "name": "packages",
+      "command": [
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\uv.exe",
+        "pip",
+        "freeze",
+        "--python",
+        "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\\Scripts\\python.exe"
+      ],
+      "exit_code": 0,
+      "output": "colorama==0.4.6\nfilelock==3.32.3\nfsspec==2026.7.0\niniconfig==2.3.1\njinja2==3.1.6\nmarkupsafe==3.0.3\nmpmath==1.3.0\nnetworkx==3.6.1\nnumpy==2.5.4\npackaging==26.3\npluggy==1.7.0\npygments==2.21.0\npytest==9.1.1\nruff==0.17.1\nsetuptools==78.1.0\nsympy==1.14.0\ntorch==2.14.1+cpu\ntyping-extensions==4.16.0\nUsing Python 3.12.15 environment at: C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv\n"
+    }
+  ]
+}

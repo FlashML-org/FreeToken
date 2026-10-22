@@ -1,0 +1,87 @@
+[
+  {
+    "repo": "unsloth/GLM-4.5-Air-GGUF",
+    "path": "GLM-4.5-Air-UD-IQ1_S.gguf",
+    "stub": "/home/freetoken/freetoken-work/header-stubs/unsloth/GLM-4.5-Air-GGUF/GLM-4.5-Air-UD-IQ1_S.gguf",
+    "size": 38503140416,
+    "value_tensors": [
+      "rope_freqs.weight"
+    ],
+    "header_bytes": 9359407,
+    "tensors": 803,
+    "ok": true,
+    "revision": "506d64aa8c5cfe9dbbf00bc7a15739438f83204d",
+    "lfs": {
+      "size": 38503140416,
+      "sha256": "4491e4427ecbf93588f9f23483028ff1e7a3b6f63a0602fcb353f623bf0412ab",
+      "pointer_size": 136
+    },
+    "expert_bytes": 34003222528,
+    "expert_types": {
+      "IQ4_NL": 45,
+      "IQ2_XXS": 24,
+      "IQ1_S": 52,
+      "IQ1_M": 14,
+      "Q5_0": 1,
+      "Q2_K": 2
+    },
+    "expert_layer_type_pairs": [
+      [
+        "IQ1_M",
+        "IQ4_NL"
+      ],
+      [
+        "IQ1_S",
+        "IQ4_NL"
+      ],
+      [
+        "IQ2_XXS",
+        "IQ4_NL"
+      ],
+      [
+        "Q2_K",
+        "Q5_0"
+      ]
+    ],
+    "scope": "header metadata only; sparse zero-filled stub, NOT a full checkpoint"
+  },
+  {
+    "repo": "bartowski/cerebras_GLM-4.5-Air-REAP-82B-A12B-GGUF",
+    "path": "cerebras_GLM-4.5-Air-REAP-82B-A12B-IQ1_M.gguf",
+    "stub": "/home/freetoken/freetoken-work/header-stubs/bartowski/cerebras_GLM-4.5-Air-REAP-82B-A12B-GGUF/cerebras_GLM-4.5-Air-REAP-82B-A12B-IQ1_M.gguf",
+    "size": 29397931360,
+    "value_tensors": [
+      "rope_freqs.weight"
+    ],
+    "header_bytes": 9359444,
+    "tensors": 803,
+    "ok": true,
+    "revision": "d4ba84e54f918101e1b024a9632f319a2e907445",
+    "lfs": {
+      "size": 29397931360,
+      "sha256": "05938a947b29d06c3b7eca9d0995c56a5e189a62bf561ab86a826778b2850555",
+      "pointer_size": 136
+    },
+    "expert_bytes": 25303449600,
+    "expert_types": {
+      "IQ4_NL": 48,
+      "IQ2_XXS": 18,
+      "IQ1_S": 72
+    },
+    "expert_layer_type_pairs": [
+      [
+        "IQ1_S",
+        "IQ4_NL"
+      ],
+      [
+        "IQ2_XXS",
+        "IQ4_NL"
+      ],
+      [
+        "IQ4_NL",
+        "IQ4_NL"
+      ]
+    ],
+    "scope": "header metadata only; sparse zero-filled stub, NOT a full checkpoint"
+  }
+]

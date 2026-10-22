@@ -1,0 +1,15 @@
+{
+  "platform": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "torch": "2.14.1+cu130",
+  "cuda": "13.0",
+  "triton": "3.8.0",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "capability": [
+    8,
+    9
+  ],
+  "gpu_sum": 357389824.0,
+  "expected": 357389824,
+  "pinned_memory_test": "passed"
+}

@@ -1,0 +1,25 @@
+Tie audit: 4 order differences
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 baseline 31.98327970820547
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 fusion_only 16.713931128896515
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 fp32_only 26.638051968265845
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:26 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+1 both 10.186592853852433
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+93 baseline 73.38974719144859
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+93 fusion_only 46.98744621597419
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+93 fp32_only 60.95147822276656
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:39] profiler_start
+USDT:2026-10-22 09:58:30 384:384 SyncActivityProfilerHandler.cpp:46] profiler_stop
+93 both 38.80120781030548

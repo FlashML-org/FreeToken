@@ -1,0 +1,250 @@
+{
+  "scope": "full router (input cast + gate GEMM + routing), no experts or model generation",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "torch": "2.14.1+cu130",
+  "tf32": false,
+  "repeats": 5,
+  "extra_resident_weight_bytes": 1048576,
+  "results": [
+    {
+      "tokens": 1,
+      "variant": "baseline",
+      "samples_us": [
+        29.053312767552967,
+        26.791775644871226,
+        26.67963987140986,
+        26.873397827148438,
+        26.81998401288165
+      ],
+      "median_us": 26.81998401288165,
+      "min_us": 26.67963987140986,
+      "max_us": 29.053312767552967,
+      "sample_stdev_us": 1.0141199049510832,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 13,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 2,
+          "_ZN8internal5gemvx6kernelIiiffffLb0ELb1ELb1ELb0ELi8ELb0E18cublasGemvParamsExIi30cublasGemvTensorStridedBatchedIKfES5_S3_IfEfEEENSt9enable_ifIXntT5_EvE4typeET11_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_19sigmoid_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE0_clEvENKUlvE0_clEvEUlfE_St5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_15CUDAFunctor_addIfEESt5arrayIPcLy3EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native6sbtopk10gatherTopKIfjLi1ELb0EEEvNS_4cuda6detail10TensorInfoIKT_T0_EES8_S8_bS8_S8_NS5_IS6_S8_EES8_NS5_IxS8_EES8_PS6_": 1,
+          "_ZN2at6native20bitonicSortKVInPlaceILin2ELin1ELi16ELi16EfxNS0_4GTOpIfLb1EEEjEEvNS_4cuda6detail10TensorInfoIT3_T6_EES8_S8_S8_NS6_IT4_S8_EES8_T5_": 1,
+          "_ZN2at6native34_scatter_gather_elementwise_kernelILi128ELi8EZNS0_36_cuda_scatter_gather_internal_kernelILb0ENS0_10OpaqueTypeILi4EEExEclINS0_12TensorAssignEEEvRNS_14TensorIteratorExxxRKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_21CUDAFunctorOnSelf_addIfEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_13BinaryFunctorIfffNS0_15binary_internal10DivFunctorIfEEEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_13AUnaryFunctorIfffNS0_15binary_internal10MulFunctorIfEEEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE1_clEvEUliE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1
+        }
+      }
+    },
+    {
+      "tokens": 1,
+      "variant": "fusion_only",
+      "samples_us": [
+        15.03294339443409,
+        14.054357372554003,
+        13.878364457024468,
+        13.871519804000854,
+        13.894065339766925
+      ],
+      "median_us": 13.894065339766925,
+      "min_us": 13.871519804000854,
+      "max_us": 15.03294339443409,
+      "sample_stdev_us": 0.5013745801039995,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 4,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 2,
+          "_ZN8internal5gemvx6kernelIiiffffLb0ELb1ELb1ELb0ELi8ELb0E18cublasGemvParamsExIi30cublasGemvTensorStridedBatchedIKfES5_S3_IfEfEEENSt9enable_ifIXntT5_EvE4typeET11_": 1,
+          "_sigmoid_router": 1
+        }
+      }
+    },
+    {
+      "tokens": 1,
+      "variant": "fp32_only",
+      "samples_us": [
+        21.2322703467475,
+        20.737304069377757,
+        20.66669897599654,
+        20.926339025715833,
+        20.721817136409893
+      ],
+      "median_us": 20.737304069377757,
+      "min_us": 20.66669897599654,
+      "max_us": 21.2322703467475,
+      "sample_stdev_us": 0.23154463430743327,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 12,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1,
+          "_ZN8internal5gemvx6kernelIiiffffLb0ELb1ELb1ELb0ELi8ELb0E18cublasGemvParamsExIi30cublasGemvTensorStridedBatchedIKfES5_S3_IfEfEEENSt9enable_ifIXntT5_EvE4typeET11_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_19sigmoid_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE0_clEvENKUlvE0_clEvEUlfE_St5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_15CUDAFunctor_addIfEESt5arrayIPcLy3EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native6sbtopk10gatherTopKIfjLi1ELb0EEEvNS_4cuda6detail10TensorInfoIKT_T0_EES8_S8_bS8_S8_NS5_IS6_S8_EES8_NS5_IxS8_EES8_PS6_": 1,
+          "_ZN2at6native20bitonicSortKVInPlaceILin2ELin1ELi16ELi16EfxNS0_4GTOpIfLb1EEEjEEvNS_4cuda6detail10TensorInfoIT3_T6_EES8_S8_S8_NS6_IT4_S8_EES8_T5_": 1,
+          "_ZN2at6native34_scatter_gather_elementwise_kernelILi128ELi8EZNS0_36_cuda_scatter_gather_internal_kernelILb0ENS0_10OpaqueTypeILi4EEExEclINS0_12TensorAssignEEEvRNS_14TensorIteratorExxxRKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_21CUDAFunctorOnSelf_addIfEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_13BinaryFunctorIfffNS0_15binary_internal10DivFunctorIfEEEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_13AUnaryFunctorIfffNS0_15binary_internal10MulFunctorIfEEEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE1_clEvEUliE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1
+        }
+      }
+    },
+    {
+      "tokens": 1,
+      "variant": "both",
+      "samples_us": [
+        8.053393533746284,
+        8.123181697509297,
+        8.088633655722624,
+        8.058421736815523,
+        8.177064850763966
+      ],
+      "median_us": 8.088633655722624,
+      "min_us": 8.053393533746284,
+      "max_us": 8.177064850763966,
+      "sample_stdev_us": 0.051250351301334866,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 3,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1,
+          "_ZN8internal5gemvx6kernelIiiffffLb0ELb1ELb1ELb0ELi8ELb0E18cublasGemvParamsExIi30cublasGemvTensorStridedBatchedIKfES5_S3_IfEfEEENSt9enable_ifIXntT5_EvE4typeET11_": 1,
+          "_sigmoid_router": 1
+        }
+      }
+    },
+    {
+      "tokens": 93,
+      "variant": "baseline",
+      "samples_us": [
+        55.17635929341219,
+        55.45907441307517,
+        54.865337718616836,
+        55.47520034015179,
+        57.000042484924855
+      ],
+      "median_us": 55.45907441307517,
+      "min_us": 54.865337718616836,
+      "max_us": 57.000042484924855,
+      "sample_stdev_us": 0.8238080766278872,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 14,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 2,
+          "ampere_sgemm_32x32_sliced1x4_tn": 1,
+          "_ZN8cublasLt19splitKreduce_kernelILi32ELi16EiffffLb0EfffLb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS2_SF_PKT9_S6_PSG_PvxPS2_PiSL_SL_SF_SF_SF_SF_SF_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_19sigmoid_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE0_clEvENKUlvE0_clEvEUlfE_St5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_15CUDAFunctor_addIfEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native6sbtopk10gatherTopKIfjLi2ELb0EEEvNS_4cuda6detail10TensorInfoIKT_T0_EES8_S8_bS8_S8_NS5_IS6_S8_EES8_NS5_IxS8_EES8_PS6_": 1,
+          "_ZN2at6native20bitonicSortKVInPlaceILi2ELin1ELi16ELi16EfxNS0_4GTOpIfLb1EEEjEEvNS_4cuda6detail10TensorInfoIT3_T6_EES8_S8_S8_NS6_IT4_S8_EES8_T5_": 1,
+          "_ZN2at6native34_scatter_gather_elementwise_kernelILi128ELi8EZNS0_36_cuda_scatter_gather_internal_kernelILb0ENS0_10OpaqueTypeILi4EEExEclINS0_12TensorAssignEEEvRNS_14TensorIteratorExxxRKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_21CUDAFunctorOnSelf_addIfEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_13BinaryFunctorIfffNS0_15binary_internal10DivFunctorIfEEEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_13AUnaryFunctorIfffNS0_15binary_internal10MulFunctorIfEEEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE1_clEvEUliE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1
+        }
+      }
+    },
+    {
+      "tokens": 93,
+      "variant": "fusion_only",
+      "samples_us": [
+        35.917301505219704,
+        36.72488958097352,
+        35.99652024202569,
+        36.56905174255371,
+        36.668678211129226
+      ],
+      "median_us": 36.56905174255371,
+      "min_us": 35.917301505219704,
+      "max_us": 36.72488958097352,
+      "sample_stdev_us": 0.3869948685757199,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 5,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 2,
+          "ampere_sgemm_32x32_sliced1x4_tn": 1,
+          "_ZN8cublasLt19splitKreduce_kernelILi32ELi16EiffffLb0EfffLb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS2_SF_PKT9_S6_PSG_PvxPS2_PiSL_SL_SF_SF_SF_SF_SF_": 1,
+          "_sigmoid_router": 1
+        }
+      }
+    },
+    {
+      "tokens": 93,
+      "variant": "fp32_only",
+      "samples_us": [
+        51.447102156552404,
+        49.63835592139257,
+        49.59017766846551,
+        48.39274287223816,
+        50.3230302474078
+      ],
+      "median_us": 49.63835592139257,
+      "min_us": 48.39274287223816,
+      "max_us": 51.447102156552404,
+      "sample_stdev_us": 1.1187484990306635,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 13,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1,
+          "ampere_sgemm_32x32_sliced1x4_tn": 1,
+          "_ZN8cublasLt19splitKreduce_kernelILi32ELi16EiffffLb0EfffLb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS2_SF_PKT9_S6_PSG_PvxPS2_PiSL_SL_SF_SF_SF_SF_SF_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_19sigmoid_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE0_clEvENKUlvE0_clEvEUlfE_St5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_15CUDAFunctor_addIfEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native6sbtopk10gatherTopKIfjLi2ELb0EEEvNS_4cuda6detail10TensorInfoIKT_T0_EES8_S8_bS8_S8_NS5_IS6_S8_EES8_NS5_IxS8_EES8_PS6_": 1,
+          "_ZN2at6native20bitonicSortKVInPlaceILi2ELin1ELi16ELi16EfxNS0_4GTOpIfLb1EEEjEEvNS_4cuda6detail10TensorInfoIT3_T6_EES8_S8_S8_NS6_IT4_S8_EES8_T5_": 1,
+          "_ZN2at6native34_scatter_gather_elementwise_kernelILi128ELi8EZNS0_36_cuda_scatter_gather_internal_kernelILb0ENS0_10OpaqueTypeILi4EEExEclINS0_12TensorAssignEEEvRNS_14TensorIteratorExxxRKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_21CUDAFunctorOnSelf_addIfEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastINS0_13BinaryFunctorIfffNS0_15binary_internal10DivFunctorIfEEEEEEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_": 1,
+          "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_13AUnaryFunctorIfffNS0_15binary_internal10MulFunctorIfEEEESt5arrayIPcLy2EELb0EEEviT0_T1_": 1,
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE1_clEvEUliE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1
+        }
+      }
+    },
+    {
+      "tokens": 93,
+      "variant": "both",
+      "samples_us": [
+        30.746523539225258,
+        30.431132113679926,
+        30.51313004403744,
+        30.68639274336334,
+        30.23371208932929
+      ],
+      "median_us": 30.51313004403744,
+      "min_us": 30.23371208932929,
+      "max_us": 30.746523539225258,
+      "sample_stdev_us": 0.20547579142692973,
+      "eager_profile": {
+        "status": "captured",
+        "scope": "one eager invocation, GPU events including any copies",
+        "cuda_event_count": 4,
+        "names": {
+          "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLy2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_": 1,
+          "ampere_sgemm_32x32_sliced1x4_tn": 1,
+          "_ZN8cublasLt19splitKreduce_kernelILi32ELi16EiffffLb0EfffLb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS2_SF_PKT9_S6_PSG_PvxPS2_PiSL_SL_SF_SF_SF_SF_SF_": 1,
+          "_sigmoid_router": 1
+        }
+      }
+    }
+  ]
+}

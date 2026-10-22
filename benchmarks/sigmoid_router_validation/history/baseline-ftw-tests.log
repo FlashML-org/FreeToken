@@ -1,0 +1,70 @@
+FFF.                                                                     [100%]
+================================== FAILURES ===================================
+_____________ test_keep_drops_entries_before_their_bytes_are_read _____________
+tests\checkpoint\test_ftw_weights.py:28: in test_keep_drops_entries_before_their_bytes_are_read
+    got = dict(iter_ftw_weights(str(tmp_path), keep=lambda name: not name.startswith("visual.")))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python\freetoken\checkpoint\ftw.py:443: in iter_ftw_weights
+    raise err[0]
+python\freetoken\checkpoint\ftw.py:414: in _producer
+    reader.read_into(memoryview(buf), e, workers=workers, chunk=chunk)
+tests\checkpoint\test_ftw_weights.py:25: in spy
+    return original(self, dest, entry, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python\freetoken\checkpoint\ftw.py:344: in read_into
+    touch(file)
+python\freetoken\checkpoint\ftw.py:291: in _map
+    m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                              ^^^^^^^^^^^^^^
+E   AttributeError: module 'mmap' has no attribute 'PROT_READ'
+---------------------------- Captured stderr call -----------------------------
+
+Loading weights (FTW):   0%|          | 0.00/128 [00:00<?, ?B/s]
+                                                                
+
+______________________ test_no_keep_replays_every_entry _______________________
+tests\checkpoint\test_ftw_weights.py:37: in test_no_keep_replays_every_entry
+    got = dict(iter_ftw_weights(str(tmp_path)))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python\freetoken\checkpoint\ftw.py:443: in iter_ftw_weights
+    raise err[0]
+python\freetoken\checkpoint\ftw.py:414: in _producer
+    reader.read_into(memoryview(buf), e, workers=workers, chunk=chunk)
+python\freetoken\checkpoint\ftw.py:344: in read_into
+    touch(file)
+python\freetoken\checkpoint\ftw.py:291: in _map
+    m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                              ^^^^^^^^^^^^^^
+E   AttributeError: module 'mmap' has no attribute 'PROT_READ'
+---------------------------- Captured stderr call -----------------------------
+
+Loading weights (FTW):   0%|          | 0.00/128 [00:00<?, ?B/s]
+                                                                
+
+_________________ test_load_weight_text_only_skips_the_tower __________________
+tests\checkpoint\test_ftw_weights.py:46: in test_load_weight_text_only_skips_the_tower
+    assert [n for n, _ in load_weight(str(tmp_path), cpu, include_vision=False)] == ["model.a.weight"]
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python\freetoken\models\weight.py:240: in load_weight
+    for name, tensor in weights:
+                        ^^^^^^^
+python\freetoken\checkpoint\ftw.py:443: in iter_ftw_weights
+    raise err[0]
+python\freetoken\checkpoint\ftw.py:414: in _producer
+    reader.read_into(memoryview(buf), e, workers=workers, chunk=chunk)
+python\freetoken\checkpoint\ftw.py:344: in read_into
+    touch(file)
+python\freetoken\checkpoint\ftw.py:291: in _map
+    m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                              ^^^^^^^^^^^^^^
+E   AttributeError: module 'mmap' has no attribute 'PROT_READ'
+---------------------------- Captured stderr call -----------------------------
+
+Loading weights (FTW):   0%|          | 0.00/64.0 [00:00<?, ?B/s]
+                                                                 
+
+=========================== short test summary info ===========================
+FAILED tests/checkpoint/test_ftw_weights.py::test_keep_drops_entries_before_their_bytes_are_read
+FAILED tests/checkpoint/test_ftw_weights.py::test_no_keep_replays_every_entry
+FAILED tests/checkpoint/test_ftw_weights.py::test_load_weight_text_only_skips_the_tower
+3 failed, 1 passed in 10.49s

@@ -1,0 +1,4 @@
+torch 2.14.1+cu130 triton 3.8.0
+CUDA 13.0 available True
+NVIDIA GeForce RTX 4060 Laptop GPU
+(8, 9)

@@ -1,0 +1,5 @@
+warning: in the working copy of 'python/freetoken/models/glm4_moe/moe.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'python/freetoken/models/glm5_next/moe.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'python/freetoken/models/glm_moe_dsa/moe.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'python/freetoken/models/minimax_m2/moe.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'python/freetoken/models/minimax_m3/moe.py', LF will be replaced by CRLF the next time Git touches it
