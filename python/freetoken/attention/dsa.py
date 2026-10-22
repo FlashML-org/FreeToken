@@ -193,14 +193,17 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
     # ----- attention ------------------------------------------------------------------
     def _attend(
-        self, q_cat: torch.Tensor, layer_id: int, sel: torch.Tensor, cnt: torch.Tensor
+        self, q_cat: torch.Tensor, layer_id: int, sel: torch.Tensor, cnt: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Gathered-KV MLA over latent rows: q [b, m, H, 576] -> [b, m, H, 512]."""
+        """Gathered-KV MLA over latent rows: q [b, m, H, 576] -> [b, m, H, 512].
+        ``q_cat`` keeps its strides (a transposed bmm output needs no copy) and
+        ``out`` receives the result in place."""
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
 
         return glm_dsa_sparse_attn(
             q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
-            counts=cnt, d_v=self.kv_lora_rank,
+            counts=cnt, d_v=self.kv_lora_rank, out=out,
         )
 
     def mla_forward(
@@ -253,7 +256,10 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
             sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+        if q_pe.shape[-1] == 0:  # NoPE: the cat would be a full-width copy
+            q_cat = q_nope.unsqueeze(1)
+        else:
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
         o = self._attend(q_cat, layer_id, sel, cnt)
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 
@@ -287,7 +293,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
     def _prefill(self, md, layer_id, q_nope, q_pe, batch, inputs) -> torch.Tensor:
         t = q_nope.shape[0]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1)  # [T, H, 576]
+        # NoPE (zero rope width): the cat would copy the whole [T, H, lora] q for
+        # nothing -- pass it through and let the kernel read its strides.
+        if q_pe.shape[-1] == 0:
+            q_cat = q_nope
+        else:
+            q_cat = torch.cat([q_nope, q_pe], dim=-1)  # [T, H, 576]
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         page_table = get_global_ctx().page_table
         qo = md.qo_indptr_cpu.tolist()
@@ -320,10 +331,13 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 # through per-query counts.
                 sel = page_table[r.table_idx, : r.device_len].view(1, 1, -1).to(torch.int32)
                 cnt = (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
-            o[qo[i] : qo[i + 1]] = self._attend(
+            # The kernel writes straight into the output slice (out=): no per-request
+            # attention output next to o at the peak.
+            self._attend(
                 q_cat[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.latent_dim),
                 layer_id, sel, cnt,
-            ).view(m, self.num_heads, self.kv_lora_rank)
+                out=o[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.kv_lora_rank),
+            )
         return o
 
     # ----- CUDA graph (decode) ----------------------------------------------------------
