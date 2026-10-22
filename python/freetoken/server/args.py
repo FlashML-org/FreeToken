@@ -681,6 +681,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ple-row-cache-rows",
+        default=ServerArgs.ple_row_cache_rows,
+        type=int,
+        help=(
+            "Cache this many raw PLE rows in host RAM with --ple-backend disk. "
+            "0 disables caching (default); otherwise use a multiple of 8 up to 16777216."
+        ),
+    )
+
+    parser.add_argument(
         "--swa-decoder-replay",
         default=ServerArgs.swa_decoder_replay,
         choices=["bounded", "exact"],

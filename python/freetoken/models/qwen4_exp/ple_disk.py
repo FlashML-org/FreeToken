@@ -138,6 +138,7 @@ class DiskRowTable:
         hash_constants: dict,
         *,
         max_graph_rows: int = 256,
+        row_cache_rows: int = 0,
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
@@ -175,6 +176,7 @@ class DiskRowTable:
             eos_token_id=self.eos_token_id,
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
+        self._store.set_row_cache(row_cache_rows)
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._token_bytes = self.heads * self._row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time

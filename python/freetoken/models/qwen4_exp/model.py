@@ -189,6 +189,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 resolve_row_source(engine_config.model_path),
                 constants,
                 max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
+                row_cache_rows=engine_config.ple_row_cache_rows,
                 max_extend_tokens=engine_config.max_extend_tokens,
             )
             self._ple_table = disk_table

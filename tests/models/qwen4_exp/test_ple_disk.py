@@ -82,7 +82,7 @@ def _write_checkpoint(tmp_path, table, n_shards):
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
 
-def _make_table(tmp_path, dtype=torch.float8_e4m3fn):
+def _make_table(tmp_path, dtype=torch.float8_e4m3fn, row_cache_rows=0):
     from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, source_from_safetensors
 
     args = parse_config(toy_hf_config()).qwen4_args
@@ -102,7 +102,7 @@ def _make_table(tmp_path, dtype=torch.float8_e4m3fn):
         "per_head_offsets": offsets.tolist(),
         "eos_token_id": EOS,
     }
-    disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
+    disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants, row_cache_rows=row_cache_rows)
     oracle = GpuResidentTable(table.cuda().view(torch.float8_e4m3fn), scale=0.03125) if dtype is torch.float8_e4m3fn else GpuResidentTable(table.cuda())
     return disk, oracle, args
 
@@ -262,8 +262,9 @@ def test_layouts_readers_and_errors(tmp_path):
 
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16], ids=["fp8", "bf16"])
-def test_disk_table_matches_oracle(tmp_path, dtype):
-    disk, oracle, args = _make_table(tmp_path, dtype)
+@pytest.mark.parametrize("cache_rows", [0, 64])
+def test_disk_table_matches_oracle(tmp_path, dtype, cache_rows):
+    disk, oracle, args = _make_table(tmp_path, dtype, row_cache_rows=cache_rows)
     emb = _embedding()
 
     # prefill: two segments, one fresh and one mid-sequence window
@@ -295,10 +296,11 @@ def test_disk_table_matches_oracle(tmp_path, dtype):
 
 
 @requires_cuda
-def test_eager_fill_does_not_overwrite_an_in_flight_lookup(tmp_path):
+@pytest.mark.parametrize("cache_rows", [0, 64])
+def test_eager_fill_does_not_overwrite_an_in_flight_lookup(tmp_path, cache_rows):
     """The overlap scheduler fills batch k+1 while batch k's lookup copy is still queued behind the
     layers before it (a sleep kernel here): batch k must read its own rows."""
-    disk, oracle, args = _make_table(tmp_path)
+    disk, oracle, args = _make_table(tmp_path, row_cache_rows=cache_rows)
     emb = _embedding()
     steps = [(3, 4, 7), (4, 7, 9), (7, 9, 13), (9, 13, 5)]
     ids = [emb.row_ids(_meta([[token]], [[older, newer]], decode=True)).cuda() for older, newer, token in steps]
@@ -313,8 +315,9 @@ def test_eager_fill_does_not_overwrite_an_in_flight_lookup(tmp_path):
 
 
 @requires_cuda
-def test_graph_sync_protocol(tmp_path, monkeypatch):
-    disk, oracle, args = _make_table(tmp_path)
+@pytest.mark.parametrize("cache_rows", [0, 64])
+def test_graph_sync_protocol(tmp_path, monkeypatch, cache_rows):
+    disk, oracle, args = _make_table(tmp_path, row_cache_rows=cache_rows)
     emb = _embedding()
     rows = 1
     row_ids = torch.zeros((rows, args.num_ngram_heads), dtype=torch.int64, device="cuda")
@@ -354,6 +357,6 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
 
     # gate mode: the hook fills inline and returns no deferred
     monkeypatch.setenv("FREETOKEN_PLE_SYNC", "gate")
-    gated, _, _ = _make_table(tmp_path)
+    gated, _, _ = _make_table(tmp_path, row_cache_rows=cache_rows)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
