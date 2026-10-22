@@ -87,4 +87,3 @@ $env:PYTHONIOENCODING = 'utf-8'
 ```
 
 基线 FTW 对照使用 `git archive HEAD` 导出的独立副本 `validation/baseline`，没有重置或改动当前工作树。
-
