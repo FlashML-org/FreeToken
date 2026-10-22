@@ -1,0 +1,83 @@
+[
+  {
+    "name": "hardware",
+    "command": [
+      "nvidia-smi"
+    ],
+    "exit_code": 0,
+    "output": "Tue Oct 20 21:15:33 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 616.92                 KMD Version: 616.92        CUDA UMD Version: 13.4     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                  Driver-Model | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GeForce RTX 4060 ...  WDDM  |   00000000:01:00.0  On |                  N/A |\n| N/A   44C    P8              6W /  140W |     240MiB /   8188MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+\n"
+  },
+  {
+    "name": "environment",
+    "command": [
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv-cuda\\Scripts\\python.exe",
+      "-c",
+      "import torch,triton; print(\"torch\",torch.__version__,\"triton\",triton.__version__); print(\"CUDA\",torch.version.cuda,\"available\",torch.cuda.is_available()); print(torch.cuda.get_device_name()); print(torch.cuda.get_device_capability())"
+    ],
+    "exit_code": 0,
+    "output": "torch 2.14.1+cu130 triton 3.8.0\nCUDA 13.0 available True\nNVIDIA GeForce RTX 4060 Laptop GPU\n(8, 9)\n"
+  },
+  {
+    "name": "gpu_kernel_tests",
+    "command": [
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv-cuda\\Scripts\\python.exe",
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\run_cuda_validation.py",
+      "--isolated-kernel"
+    ],
+    "exit_code": 0,
+    "output": "........................................................................ [ 68%]\n.................................                                        [100%]\n105 passed in 21.99s\n"
+  },
+  {
+    "name": "gpu_model_tests",
+    "command": [
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv-cuda\\Scripts\\python.exe",
+      "-m",
+      "pytest",
+      "tests/models/test_sigmoid_routing.py",
+      "-q",
+      "-ra",
+      "--confcutdir=tests/models",
+      "--tb=short",
+      "--maxfail=1"
+    ],
+    "exit_code": 1,
+    "output": "F\n================================== FAILURES ===================================\n___________________ test_fp32_router_load_preserves_values ____________________\ntests\\models\\test_sigmoid_routing.py:12: in test_fp32_router_load_preserves_values\n    from freetoken.layers.linear import Fp32RouterLinear\npython\\freetoken\\layers\\__init__.py:11: in <module>\n    from .embedding import ParallelLMHead, VocabParallelEmbedding\npython\\freetoken\\layers\\embedding.py:8: in <module>\n    from freetoken.utils import div_ceil, nvtx_annotate\npython\\freetoken\\utils\\__init__.py:10: in <module>\n    from .hf import (\npython\\freetoken\\utils\\hf.py:7: in <module>\n    from huggingface_hub import hf_hub_download, snapshot_download\nE   ModuleNotFoundError: No module named 'huggingface_hub'\n=========================== short test summary info ===========================\nFAILED tests/models/test_sigmoid_routing.py::test_fp32_router_load_preserves_values\n!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!\n1 failed in 3.12s\n"
+  },
+  {
+    "name": "benchmark",
+    "command": [
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv-cuda\\Scripts\\python.exe",
+      "benchmarks/bench_sigmoid_router.py"
+    ],
+    "exit_code": 0,
+    "output": "GPU=NVIDIA GeForce RTX 4060 Laptop GPU torch=2.14.1+cu130 CUDA=13.0 triton=3.8.0\nSynthetic post-logit routing, CUDA Graph median; no model checkpoint loaded.\ntokens experts topk groups keep eager_us fused_us speedup\n     1     128    4      1    1   13.820    1.913   7.225x\n     1     128    4      1    1   13.947    1.863   7.487x\n     1     192    8      8    4   34.013    3.864   8.802x\n     1     288    8      1    1   15.467    2.864   5.400x\n     8     128    4      1    1   13.702    1.878   7.298x\n     8     128    4      1    1   16.135    1.879   8.585x\n     8     192    8      8    4   34.124    3.854   8.854x\n     8     288    8      1    1   16.708    2.861   5.840x\n   256     128    4      1    1   21.938    4.563   4.808x\n   256     128    4      1    1   24.051    4.546   5.291x\n   256     192    8      8    4   67.084   11.716   5.726x\n   256     288    8      1    1   33.663    8.315   4.049x\n"
+  },
+  {
+    "name": "packages",
+    "command": [
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\uv.exe",
+      "pip",
+      "freeze",
+      "--python",
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv-cuda\\Scripts\\python.exe"
+    ],
+    "exit_code": 0,
+    "output": "colorama==0.4.6\nfilelock==3.32.3\nfsspec==2026.7.0\niniconfig==2.3.1\njinja2==3.1.6\nmarkupsafe==3.0.3\nmpmath==1.3.0\nnetworkx==3.6.1\nnumpy==2.5.4\npackaging==26.3\npluggy==1.7.0\npygments==2.21.0\npytest==9.1.1\nruff==0.17.1\nsetuptools==78.1.0\nsympy==1.14.0\ntorch==2.14.1+cu130\ntriton-windows==3.8.0.post29\ntyping-extensions==4.16.0\nUsing Python 3.12.15 environment at: C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv-cuda\n"
+  },
+  {
+    "name": "gpu_model_tests_after_dependency_install",
+    "command": [
+      "C:\\Users\\1\\Documents\\ChatGPT\\UCB\\validation\\.venv-cuda\\Scripts\\python.exe",
+      "-m",
+      "pytest",
+      "FreeToken/tests/models/test_sigmoid_routing.py",
+      "-q",
+      "-ra",
+      "--confcutdir=FreeToken/tests/models",
+      "--tb=short",
+      "--maxfail=1"
+    ],
+    "exit_code": 0,
+    "output": "......                                                                   [100%]\r\n6 passed in 12.27s\r\n"
+  }
+]

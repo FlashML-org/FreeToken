@@ -1,0 +1,393 @@
+{
+  "seed": 20261020,
+  "cases": [
+    {
+      "layer": 1,
+      "tokens": 1,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 1,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 1,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 8,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 8,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 8,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 256,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 256,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 1,
+      "tokens": 256,
+      "std": 3.0,
+      "order_mismatch": 3,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 1,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 1,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 1,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 8,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 8,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 8,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 256,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 256,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 23,
+      "tokens": 256,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 1,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 1,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 1,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 8,
+      "std": 0.1,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 8,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 8,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 256,
+      "std": 0.1,
+      "order_mismatch": 1,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 256,
+      "std": 1.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    },
+    {
+      "layer": 45,
+      "tokens": 256,
+      "std": 3.0,
+      "order_mismatch": 0,
+      "set_mismatch": 0
+    }
+  ],
+  "mismatches": [
+    {
+      "layer": 1,
+      "tokens": 256,
+      "std": 3.0,
+      "row": 73,
+      "old_ids": [
+        12,
+        107,
+        44,
+        115,
+        16,
+        80,
+        38,
+        53
+      ],
+      "new_ids": [
+        12,
+        107,
+        44,
+        16,
+        115,
+        80,
+        38,
+        53
+      ],
+      "old_selection_scores": [
+        27.381988525390625,
+        27.38157081604004,
+        27.381093978881836,
+        27.374107360839844,
+        27.374107360839844,
+        27.374067306518555,
+        27.37286376953125,
+        27.37222671508789
+      ],
+      "new_selection_scores": [
+        27.381988525390625,
+        27.38157081604004,
+        27.381093978881836,
+        27.374107360839844,
+        27.374107360839844,
+        27.374067306518555,
+        27.37286376953125,
+        27.37222671508789
+      ],
+      "changed_slots_equal_eager_scores": true,
+      "top8_top9_gap": 0.0014133453369140625,
+      "same_expert_set": true
+    },
+    {
+      "layer": 1,
+      "tokens": 256,
+      "std": 3.0,
+      "row": 166,
+      "old_ids": [
+        14,
+        18,
+        12,
+        107,
+        44,
+        68,
+        57,
+        85
+      ],
+      "new_ids": [
+        14,
+        18,
+        12,
+        107,
+        44,
+        57,
+        68,
+        85
+      ],
+      "old_selection_scores": [
+        27.384319305419922,
+        27.38410186767578,
+        27.382076263427734,
+        27.381771087646484,
+        27.38100242614746,
+        27.37610626220703,
+        27.37610626220703,
+        27.37447738647461
+      ],
+      "new_selection_scores": [
+        27.384319305419922,
+        27.38410186767578,
+        27.382076263427734,
+        27.381771087646484,
+        27.38100242614746,
+        27.37610626220703,
+        27.37610626220703,
+        27.37447738647461
+      ],
+      "changed_slots_equal_eager_scores": true,
+      "top8_top9_gap": 0.000518798828125,
+      "same_expert_set": true
+    },
+    {
+      "layer": 1,
+      "tokens": 256,
+      "std": 3.0,
+      "row": 179,
+      "old_ids": [
+        20,
+        66,
+        107,
+        12,
+        44,
+        19,
+        41,
+        7
+      ],
+      "new_ids": [
+        20,
+        66,
+        107,
+        12,
+        44,
+        19,
+        7,
+        41
+      ],
+      "old_selection_scores": [
+        27.384532928466797,
+        27.383102416992188,
+        27.38231086730957,
+        27.3820858001709,
+        27.380128860473633,
+        27.37840461730957,
+        27.37810516357422,
+        27.37810516357422
+      ],
+      "new_selection_scores": [
+        27.384532928466797,
+        27.383102416992188,
+        27.38231086730957,
+        27.3820858001709,
+        27.380128860473633,
+        27.37840461730957,
+        27.37810516357422,
+        27.37810516357422
+      ],
+      "changed_slots_equal_eager_scores": true,
+      "top8_top9_gap": 0.002201080322265625,
+      "same_expert_set": true
+    },
+    {
+      "layer": 45,
+      "tokens": 256,
+      "std": 0.1,
+      "row": 86,
+      "old_ids": [
+        73,
+        85,
+        113,
+        107,
+        79,
+        69,
+        71,
+        53
+      ],
+      "new_ids": [
+        73,
+        85,
+        113,
+        107,
+        69,
+        79,
+        71,
+        53
+      ],
+      "old_selection_scores": [
+        15.18980598449707,
+        15.180611610412598,
+        15.178577423095703,
+        15.178101539611816,
+        15.177617073059082,
+        15.177617073059082,
+        15.177289962768555,
+        15.175825119018555
+      ],
+      "new_selection_scores": [
+        15.18980598449707,
+        15.180611610412598,
+        15.178577423095703,
+        15.178101539611816,
+        15.177617073059082,
+        15.177617073059082,
+        15.177289962768555,
+        15.175825119018555
+      ],
+      "changed_slots_equal_eager_scores": true,
+      "top8_top9_gap": 0.0033435821533203125,
+      "same_expert_set": true
+    }
+  ],
+  "scope": "replay of real gate weights with synthetic hidden states"
+}

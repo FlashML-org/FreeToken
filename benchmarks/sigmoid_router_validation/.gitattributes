@@ -1,0 +1,4 @@
+# Preserve raw evidence bytes so SHA256 checks survive Git checkout.
+* -text whitespace=cr-at-eol
+# Raw console logs may include trailing spaces; do not rewrite their bytes.
+*.log -whitespace

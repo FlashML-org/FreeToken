@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from freetoken.kernel.triton.sigmoid_router import fused_topk_sigmoid
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
 
 from .mlp import MiniMaxM3MLP
@@ -72,14 +74,10 @@ class MiniMaxM3SparseMoeBlock(BaseOP):
     def _route(self, hidden_states: torch.Tensor) -> TopK:
         # HF/vLLM compute the router logits in fp32; the gate is stored fp32.
         logits = F.linear(hidden_states.float(), self.gate.weight)
-        scores = logits.sigmoid()
-        scores_for_choice = scores + self.e_score_correction_bias
-        _, topk_ids = torch.topk(scores_for_choice, self.top_k, dim=-1)
-        topk_weights = scores.gather(-1, topk_ids)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous()
+        return fused_topk_sigmoid(
+            logits, self.e_score_correction_bias, self.top_k,
+            renormalize=self.norm_topk_prob, routed_scale=self.routed_scaling_factor,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

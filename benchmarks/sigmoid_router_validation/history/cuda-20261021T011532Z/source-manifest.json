@@ -1,0 +1,15 @@
+{
+  "baseline": "cc56b6bdcf9188eb632197d6ec719c61bff11798",
+  "files": {
+    "benchmarks/bench_sigmoid_router.py": "5b6c21286b1179cd8af85a3c0a9b4f602becc4664c19658d50fdb708da40ca38",
+    "python/freetoken/kernel/triton/sigmoid_router.py": "94ffc653db453b14dd22a5c0eceb41cb4eefc93dcfca6e5165db216c3bcb231f",
+    "tests/kernels/test_sigmoid_router.py": "38713d5f30c6aa2b1cabe40f8c821d5df2147acb3e1b4a8a770677a327ddd7e7",
+    "tests/models/test_sigmoid_routing.py": "cdffc8f69766dc3de465937210ee8110cc7623f382532b89cd087ecf030a72b5",
+    "python/freetoken/layers/linear.py": "85413f0e0b9fd3c6241e96a120db7e067c599d807cbb1080c309b92d9f01601b",
+    "python/freetoken/models/glm4_moe/moe.py": "0db4f215c9ec32e5eb561f858bf9befbeb4b8202ffc1db7c9bf0016c29f2d4ac",
+    "python/freetoken/models/glm5_next/moe.py": "c559836f879235ffec78eee8a93ed192fbe03077c7369eebf37c695d2aff1bfb",
+    "python/freetoken/models/glm_moe_dsa/moe.py": "2421a1b0d67e5b058c086dd91f7abe0c216bba560d8e48d858a5912583ad3a73",
+    "python/freetoken/models/minimax_m2/moe.py": "698c4650e499f92d9e29c2f6516235eb83caac8703716df7b1ee7d2225047f9c",
+    "python/freetoken/models/minimax_m3/moe.py": "113fd648f1f2396a8cabc76f6169c1c1c48c5676a2500e9d4d46ec24d706634a"
+  }
+}

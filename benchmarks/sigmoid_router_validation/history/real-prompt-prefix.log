@@ -1,0 +1,38 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+C:\Users\1\Documents\ChatGPT\UCB\validation\.venv-cuda\Lib\site-packages\huggingface_hub\file_download.py:149: UserWarning: `huggingface_hub` cache-system uses symlinks by default to efficiently store duplicated files but your machine does not support them in D:\AI\FreeToken-validation\hf-cache\models--zai-org--GLM-4.5-Air. Caching files will still work but in a degraded version that might require more space on your disk. This warning can be disabled by setting the `HF_HUB_DISABLE_SYMLINKS_WARNING` environment variable. For more details, see https://huggingface.co/docs/huggingface_hub/how-to-cache#limitations.
+To support symlinks on Windows, you either need to activate Developer Mode or to run Python as an administrator. In order to activate developer mode, see this article: https://docs.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development
+  warnings.warn(message)
+C:\Users\1\Documents\ChatGPT\UCB\validation\.venv-cuda\Lib\site-packages\huggingface_hub\file_download.py:149: UserWarning: `huggingface_hub` cache-system uses symlinks by default to efficiently store duplicated files but your machine does not support them in D:\AI\FreeToken-validation\hf-cache. Caching files will still work but in a degraded version that might require more space on your disk. This warning can be disabled by setting the `HF_HUB_DISABLE_SYMLINKS_WARNING` environment variable. For more details, see https://huggingface.co/docs/huggingface_hub/how-to-cache#limitations.
+To support symlinks on Windows, you either need to activate Developer Mode or to run Python as an administrator. In order to activate developer mode, see this article: https://docs.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development
+  warnings.warn(message)
+Token counts: [2, 2, 2]
+Traceback (most recent call last):
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\real_prompt_prefix.py", line 134, in <module>
+    main()
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\.venv-cuda\Lib\site-packages\torch\utils\_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\real_prompt_prefix.py", line 60, in main
+    embeddings = [reader.embedding_rows(ids).cuda().unsqueeze(0) for ids in token_lists]
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\checkpoint_slices.py", line 100, in embedding_rows
+    rows = dict(pool.map(fetch, unique))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\python\cpython-3.12-windows-x86_64-none\Lib\concurrent\futures\_base.py", line 619, in result_iterator
+    yield _result_or_cancel(fs.pop())
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\python\cpython-3.12-windows-x86_64-none\Lib\concurrent\futures\_base.py", line 317, in _result_or_cancel
+    return fut.result(timeout)
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\python\cpython-3.12-windows-x86_64-none\Lib\concurrent\futures\_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\python\cpython-3.12-windows-x86_64-none\Lib\concurrent\futures\_base.py", line 401, in __get_result
+    raise self._exception
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\python\cpython-3.12-windows-x86_64-none\Lib\concurrent\futures\thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\1\Documents\ChatGPT\UCB\validation\checkpoint_slices.py", line 93, in fetch
+    pos = data_start+token*row_bytes
+          ~~~~~~~~~~^~~~~~~~~~~~~~~~
+TypeError: unsupported operand type(s) for +: 'int' and 'str'

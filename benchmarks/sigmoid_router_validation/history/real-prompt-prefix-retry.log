@@ -1,0 +1,63 @@
+Token counts: [93, 26, 18]
+Downloading model.layers.0.self_attn.q_proj.weight: 96.0 MiB
+Downloading model.layers.0.self_attn.q_proj.bias: 0.0 MiB
+Downloading model.layers.0.self_attn.k_proj.weight: 8.0 MiB
+Downloading model.layers.0.self_attn.k_proj.bias: 0.0 MiB
+Downloading model.layers.0.self_attn.v_proj.weight: 8.0 MiB
+Downloading model.layers.0.self_attn.v_proj.bias: 0.0 MiB
+Downloading model.layers.0.self_attn.o_proj.weight: 96.0 MiB
+Downloading model.layers.0.mlp.gate_proj.weight: 85.5 MiB
+Downloading model.layers.0.mlp.up_proj.weight: 85.5 MiB
+Downloading model.layers.0.mlp.down_proj.weight: 85.5 MiB
+Downloading model.layers.0.input_layernorm.weight: 0.0 MiB
+Downloading model.layers.0.post_attention_layernorm.weight: 0.0 MiB
+Downloading model.layers.1.self_attn.q_proj.weight: 96.0 MiB
+Downloading model.layers.1.self_attn.q_proj.bias: 0.0 MiB
+Downloading model.layers.1.self_attn.k_proj.weight: 8.0 MiB
+Downloading model.layers.1.self_attn.k_proj.bias: 0.0 MiB
+Downloading model.layers.1.self_attn.v_proj.weight: 8.0 MiB
+Downloading model.layers.1.self_attn.v_proj.bias: 0.0 MiB
+Downloading model.layers.1.self_attn.o_proj.weight: 96.0 MiB
+Downloading model.layers.1.input_layernorm.weight: 0.0 MiB
+Downloading model.layers.1.post_attention_layernorm.weight: 0.0 MiB
+Downloading model.layers.1.mlp.gate.weight: 1.0 MiB
+Downloading model.layers.1.mlp.gate.e_score_correction_bias: 0.0 MiB
+Downloading model.layers.1.mlp.shared_experts.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.shared_experts.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.shared_experts.down_proj.weight: 11.0 MiB
+Routing: {"rows": 93, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 5.960464477539063e-08}
+Downloading model.layers.1.mlp.experts.20.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.20.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.20.down_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.30.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.30.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.30.down_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.42.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.42.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.42.down_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.61.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.61.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.61.down_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.71.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.71.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.71.down_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.98.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.98.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.98.down_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.100.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.100.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.100.down_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.114.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.114.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.114.down_proj.weight: 11.0 MiB
+Expert output: {'experts': [20, 30, 42, 61, 71, 98, 100, 114], 'bitwise_equal': True, 'max_abs_error': 0.0, 'rms_error': 0.0, 'reference_max_abs': 1.375}
+Routing: {"rows": 26, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08}
+Downloading model.layers.1.mlp.experts.44.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.44.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.44.down_proj.weight: 11.0 MiB
+Expert output: {'experts': [20, 30, 42, 44, 71, 98, 100, 114], 'bitwise_equal': True, 'max_abs_error': 0.0, 'rms_error': 0.0, 'reference_max_abs': 1.46875}
+Routing: {"rows": 18, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 5.960464477539063e-08}
+Downloading model.layers.1.mlp.experts.25.gate_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.25.up_proj.weight: 11.0 MiB
+Downloading model.layers.1.mlp.experts.25.down_proj.weight: 11.0 MiB
+Expert output: {'experts': [20, 25, 30, 42, 61, 71, 100, 114], 'bitwise_equal': True, 'max_abs_error': 0.0, 'rms_error': 0.0, 'reference_max_abs': 1.5078125}

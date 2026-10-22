@@ -1,0 +1,24 @@
+............................................................F....F...... [ 77%]
+s....................                                                    [100%]
+=================================== FAILURES ===================================
+________________ test_adjust_config_resolves_num_tokens_generic ________________
+tests/engine/test_cache_budget.py:229: in test_adjust_config_resolves_num_tokens_generic
+    _adjust_config(cfg)
+python/freetoken/engine/engine.py:1858: in _adjust_config
+    _validate_attention_backend_choice(config, override, required_attn_types)
+python/freetoken/engine/engine.py:242: in _validate_attention_backend_choice
+    raise RuntimeError(
+E   RuntimeError: Attention backend 'fi' requires flashinfer, which is not installed. Install it with `pip install 'freetoken[fi]'` (or 'freetoken[accel]'), or use --attention-backend triton.
+_ test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend _
+tests/engine/test_cache_budget.py:410: in test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
+    _adjust_config(config)
+python/freetoken/engine/engine.py:1858: in _adjust_config
+    _validate_attention_backend_choice(config, override, required_attn_types)
+python/freetoken/engine/engine.py:242: in _validate_attention_backend_choice
+    raise RuntimeError(
+E   RuntimeError: Attention backend 'fi' requires flashinfer, which is not installed. Install it with `pip install 'freetoken[fi]'` (or 'freetoken[accel]'), or use --attention-backend triton.
+=========================== short test summary info ============================
+SKIPPED [1] tests/engine/test_cache_budget.py:522: WSL caps pinning
+FAILED tests/engine/test_cache_budget.py::test_adjust_config_resolves_num_tokens_generic
+FAILED tests/engine/test_cache_budget.py::test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
+2 failed, 90 passed, 1 skipped in 7.98s

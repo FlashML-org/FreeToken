@@ -1,0 +1,120 @@
+{
+  "seed": 20261020,
+  "torch": "2.14.1+cu130",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "purpose": "synthetic sensitivity; not model quality or real-data mismatch frequency",
+  "results": [
+    {
+      "case": "normal_random",
+      "rows": 1024,
+      "expert_set_mismatch_rows": 0,
+      "order_mismatch_rows": 0,
+      "reference_cutoff_tie_rows": 0,
+      "candidate_below_reference_cutoff_rows": 0,
+      "max_abs_weight_error_matching_sets": 5.960464477539063e-08,
+      "reference_first_ids": [
+        65,
+        19,
+        15,
+        105
+      ],
+      "candidate_first_ids": [
+        65,
+        19,
+        15,
+        105
+      ]
+    },
+    {
+      "case": "near_ties",
+      "rows": 1024,
+      "expert_set_mismatch_rows": 0,
+      "order_mismatch_rows": 580,
+      "reference_cutoff_tie_rows": 598,
+      "candidate_below_reference_cutoff_rows": 0,
+      "max_abs_weight_error_matching_sets": 2.9802322387695312e-08,
+      "reference_first_ids": [
+        47,
+        36,
+        23,
+        26
+      ],
+      "candidate_first_ids": [
+        23,
+        36,
+        47,
+        26
+      ]
+    },
+    {
+      "case": "sigmoid_saturation",
+      "rows": 1024,
+      "expert_set_mismatch_rows": 0,
+      "order_mismatch_rows": 1024,
+      "reference_cutoff_tie_rows": 1024,
+      "candidate_below_reference_cutoff_rows": 0,
+      "max_abs_weight_error_matching_sets": 0.0,
+      "reference_first_ids": [
+        1,
+        0,
+        2,
+        3
+      ],
+      "candidate_first_ids": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "case": "exact_ties",
+      "rows": 1024,
+      "expert_set_mismatch_rows": 0,
+      "order_mismatch_rows": 1024,
+      "reference_cutoff_tie_rows": 1024,
+      "candidate_below_reference_cutoff_rows": 0,
+      "max_abs_weight_error_matching_sets": 0.0,
+      "reference_first_ids": [
+        1,
+        0,
+        2,
+        3
+      ],
+      "candidate_first_ids": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "case": "grouped_exact_ties",
+      "rows": 1024,
+      "groups": 8,
+      "keep_groups": 4,
+      "expert_set_mismatch_rows": 0,
+      "reference_first_ids": [
+        7,
+        6,
+        4,
+        5,
+        1,
+        0,
+        2,
+        3
+      ],
+      "candidate_first_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "note": "All biased scores equal; both satisfy top-k, but expert identities may differ."
+    }
+  ]
+}

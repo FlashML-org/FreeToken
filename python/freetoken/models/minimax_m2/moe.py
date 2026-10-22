@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Tuple
 
 import torch
+
+from freetoken.kernel.triton.sigmoid_router import fused_topk_sigmoid
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
 
 if TYPE_CHECKING:
@@ -32,13 +34,10 @@ class MiniMaxM2SparseMoeBlock(BaseOP):
         )
 
     def _route(self, router_logits: torch.Tensor) -> TopK:
-        scores = router_logits.float().sigmoid()
-        scores_for_choice = scores + self.e_score_correction_bias.float()
-        _, topk_ids = torch.topk(scores_for_choice, self.top_k, dim=-1)
-        topk_weights = scores.gather(-1, topk_ids)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        return topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous()
+        return fused_topk_sigmoid(
+            router_logits, self.e_score_correction_bias, self.top_k,
+            renormalize=self.norm_topk_prob, eps=0.0,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

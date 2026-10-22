@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List
 
 import torch
+
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.utils import div_even
 
@@ -77,6 +78,18 @@ class LinearReplicated(_LinearTPImpl):
             quant_config=quant_config,
             prefix=prefix,
         )
+
+
+class Fp32RouterLinear(LinearReplicated):
+    """Keep the loaded router values in fp32 before decode/graph capture."""
+
+    def load_state_dict(self, state_dict, *, prefix="", _internal=False) -> None:
+        # Convert after the loader's original dtype rounding, preserving old logits.
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        self.weight = self.weight.float()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x.float(), self.weight, self.bias)
 
 
 class LinearColParallelMerged(_LinearTPImpl):

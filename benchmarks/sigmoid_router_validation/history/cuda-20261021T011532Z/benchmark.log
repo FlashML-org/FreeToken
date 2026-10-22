@@ -1,0 +1,15 @@
+GPU=NVIDIA GeForce RTX 4060 Laptop GPU torch=2.14.1+cu130 CUDA=13.0 triton=3.8.0
+Synthetic post-logit routing, CUDA Graph median; no model checkpoint loaded.
+tokens experts topk groups keep eager_us fused_us speedup
+     1     128    4      1    1   13.820    1.913   7.225x
+     1     128    4      1    1   13.947    1.863   7.487x
+     1     192    8      8    4   34.013    3.864   8.802x
+     1     288    8      1    1   15.467    2.864   5.400x
+     8     128    4      1    1   13.702    1.878   7.298x
+     8     128    4      1    1   16.135    1.879   8.585x
+     8     192    8      8    4   34.124    3.854   8.854x
+     8     288    8      1    1   16.708    2.861   5.840x
+   256     128    4      1    1   21.938    4.563   4.808x
+   256     128    4      1    1   24.051    4.546   5.291x
+   256     192    8      8    4   67.084   11.716   5.726x
+   256     288    8      1    1   33.663    8.315   4.049x

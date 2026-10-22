@@ -1,0 +1,34 @@
+Loaded model.layers.1.mlp.gate.weight: (128, 4096), torch.bfloat16
+Loaded model.layers.1.mlp.gate.e_score_correction_bias: (128,), torch.float32
+{"layer": 1, "tokens": 1, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 1, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 1, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 8, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 8, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 8, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 256, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 3.725290298461914e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 256, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 1, "tokens": 256, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 3, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+Loaded model.layers.23.mlp.gate.weight: (128, 4096), torch.bfloat16
+Loaded model.layers.23.mlp.gate.e_score_correction_bias: (128,), torch.float32
+{"layer": 23, "tokens": 1, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 1, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 1, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 8, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 8, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 8, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 256, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 256, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 23, "tokens": 256, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+Loaded model.layers.45.mlp.gate.weight: (128, 4096), torch.bfloat16
+Loaded model.layers.45.mlp.gate.e_score_correction_bias: (128,), torch.float32
+{"layer": 45, "tokens": 1, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 1, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 1, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 1.4901161193847656e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 8, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 8, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.2351741790771484e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 8, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 256, "hidden_std": 0.1, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 1, "max_abs_weight_error_matching_sets": 4.470348358154297e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 256, "hidden_std": 1.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+{"layer": 45, "tokens": 256, "hidden_std": 3.0, "expert_set_mismatch_rows": 0, "order_mismatch_rows": 0, "max_abs_weight_error_matching_sets": 2.9802322387695312e-08, "fp32_gate_logits_bitwise_equal": true}
+Saved results to D:\AI\FreeToken-validation\GLM-4.5-Air-router

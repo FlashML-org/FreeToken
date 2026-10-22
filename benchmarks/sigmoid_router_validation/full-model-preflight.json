@@ -1,0 +1,13 @@
+{
+  "status": "blocked_before_full_model_run",
+  "checked_at": "2026-10-21T22:59:39.7552400Z",
+  "os": "Microsoft Windows 11 家庭版 中文版",
+  "ram_total_bytes": 33601986560,
+  "ram_available_bytes": 15513968640,
+  "gpu": "RTX 4060 Laptop GPU",
+  "vram_mib": 8188,
+  "wsl_installed": false,
+  "nvcc_on_path": false,
+  "full_model_results": null,
+  "reason": "No installed Linux/WSL runtime; selected GLM-4.5-Air BF16 checkpoint exceeds RAM and VRAM. No full-model launch or end-to-end A/B was performed."
+}

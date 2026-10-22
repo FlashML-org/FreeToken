@@ -1,0 +1,18 @@
+F
+================================== FAILURES ===================================
+___________________ test_fp32_router_load_preserves_values ____________________
+tests\models\test_sigmoid_routing.py:12: in test_fp32_router_load_preserves_values
+    from freetoken.layers.linear import Fp32RouterLinear
+python\freetoken\layers\__init__.py:11: in <module>
+    from .embedding import ParallelLMHead, VocabParallelEmbedding
+python\freetoken\layers\embedding.py:8: in <module>
+    from freetoken.utils import div_ceil, nvtx_annotate
+python\freetoken\utils\__init__.py:10: in <module>
+    from .hf import (
+python\freetoken\utils\hf.py:7: in <module>
+    from huggingface_hub import hf_hub_download, snapshot_download
+E   ModuleNotFoundError: No module named 'huggingface_hub'
+=========================== short test summary info ===========================
+FAILED tests/models/test_sigmoid_routing.py::test_fp32_router_load_preserves_values
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed in 3.12s

@@ -1,0 +1,34 @@
+Using Python 3.12.3 environment at: /home/freetoken/freetoken-work/.venv
+Resolved 55 packages in 488ms
+Downloading flashinfer-python (17.5MiB)
+Downloading nvidia-cutlass-dsl-libs-cu13 (87.7MiB)
+Downloading nvidia-cudnn-frontend (9.7MiB)
+Downloading nvidia-cutlass-dsl-libs-base (2.9MiB)
+Downloading cuda-core (6.3MiB)
+Downloading nvidia-cutlass-dsl-libs-cu12 (87.4MiB)
+Downloading nccl4py (3.5MiB)
+Downloading nvidia-cutlass-dsl-libs-core (1.6MiB)
+ Downloaded nvidia-cutlass-dsl-libs-core
+ Downloaded nvidia-cutlass-dsl-libs-base
+ Downloaded nccl4py
+ Downloaded cuda-core
+ Downloaded nvidia-cudnn-frontend
+ Downloaded flashinfer-python
+ Downloaded nvidia-cutlass-dsl-libs-cu12
+ Downloaded nvidia-cutlass-dsl-libs-cu13
+Prepared 14 packages in 21.19s
+Installed 14 packages in 377ms
+ + cuda-core==1.2.2
+ + cuda-python==13.4.4
+ + cuda-tile==1.7.0
+ + flashinfer-python==0.6.18.post1
+ + nccl4py==0.6.0
+ + nvidia-cudnn-frontend==1.31.0
+ + nvidia-cutlass-dsl==4.8.1
+ + nvidia-cutlass-dsl-libs-base==4.8.1
+ + nvidia-cutlass-dsl-libs-core==4.8.1
+ + nvidia-cutlass-dsl-libs-cu12==4.8.1
+ + nvidia-cutlass-dsl-libs-cu13==4.8.1
+ + nvidia-ml-py==13.615.71
+ + protobuf==7.36.2
+ + tabulate==0.10.0
