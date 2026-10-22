@@ -87,7 +87,7 @@ def _find(model_path: str, override: str) -> Mmproj | None:
     width = md.get(f"{md.get('general.architecture')}.embedding_length")
     folder = os.path.dirname(os.path.abspath(model_path))
     found = []
-    for path in sorted(glob.glob(os.path.join(folder, "*mmproj*.gguf"))):
+    for path in sorted(glob.glob(os.path.join(glob.escape(folder), "*mmproj*.gguf"))):
         try:
             described = _describe(path)
         except Exception as e:  # noqa: BLE001 -- a broken download next to the model must not stop it from serving text
