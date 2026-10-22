@@ -149,7 +149,7 @@ def dequantize(w: torch.Tensor, ggml_type: int, k: int, dtype: torch.dtype = tor
 
 
 def get_rows(w: torch.Tensor, ggml_type: int, k: int, ids: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    out = torch.empty(ids.shape[0], k, dtype=dtype, device=w.device)
+    out = torch.empty(ids.shape[0], k, dtype=dtype, device=ids.device)
     _module().get_rows(w, ggml_type, k, ids, out)
     return out
 

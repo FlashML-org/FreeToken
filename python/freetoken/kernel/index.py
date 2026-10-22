@@ -46,7 +46,7 @@ def indexing(
     vocab_range: Tuple[int, int] | None = None,  # (start, length)
 ) -> torch.Tensor:
     if output is None:
-        output = weights.new_empty(indices.shape[0], weights.shape[1])
+        output = weights.new_empty(indices.shape[0], weights.shape[1], device=indices.device)
 
     element_size = weights.shape[1] * weights.element_size()
     module = _jit_index_module(element_size, num_splits=num_splits_for(element_size))

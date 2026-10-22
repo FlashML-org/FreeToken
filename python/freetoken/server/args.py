@@ -690,6 +690,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--embed-weights",
+        default=ServerArgs.embed_weights,
+        choices=["gpu", "host"],
+        help=(
+            "Where the input token embedding table lives. 'gpu' (default) keeps it in VRAM; 'host' keeps it in "
+            "pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. "
+            "Not for a table tied to the LM head."
+        ),
+    )
+
+    parser.add_argument(
         "--swa-decoder-replay",
         default=ServerArgs.swa_decoder_replay,
         choices=["bounded", "exact"],
