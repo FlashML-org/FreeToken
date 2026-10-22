@@ -110,7 +110,7 @@ def iter_weights(
                 yield f"{m}.gate.weight", reader.get(f"{m}.gate.weight")
                 yield (
                     f"{m}.e_score_correction_bias",
-                    reader.get(f"{m}.gate.e_score_correction_bias").to(torch.bfloat16),
+                    reader.get(f"{m}.gate.e_score_correction_bias").to(torch.float32),
                 )
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield f"{m}.shared_experts.{proj}.weight", reader.get(f"{m}.shared_experts.{proj}.weight")
