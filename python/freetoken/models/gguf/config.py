@@ -14,7 +14,7 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any
 
-from .mmproj import Mmproj, find_mmproj, refuse_inline_vision
+from .mmproj import Mmproj, find_mmproj, warn_inline_vision
 from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
@@ -113,7 +113,7 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
             f"(known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
         )
     names = gguf_tensor_names(model_path)
-    refuse_inline_vision(model_path, names)
+    warn_inline_vision(model_path, names)
     metadata = load_gguf_metadata(model_path)
     if names:
         # No separate output projection -> embeddings are tied.

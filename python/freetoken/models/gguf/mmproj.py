@@ -126,10 +126,15 @@ def find_mmproj(model_path: str) -> Mmproj | None:
     return _find(model_path, os.environ.get(MMPROJ_ENV, ""))
 
 
-def refuse_inline_vision(model_path: str, tensor_names: set[str]) -> None:
+@functools.cache
+def _warn_inline_vision(model_path: str) -> None:
+    logger.warning("vision: %s carries vision tensors itself (Ollama layout), which are not read; use a llama.cpp mmproj file", model_path)
+
+
+def warn_inline_vision(model_path: str, tensor_names: set[str]) -> None:
     """Old Ollama GGUFs carry the tower inside the text file under another layout; FreeToken reads only llama.cpp mmproj files."""
     if any(n.startswith(("v.", "mm.")) for n in tensor_names):
-        raise NotImplementedError(f"{model_path}: vision tensors inside the text GGUF (Ollama layout) are not supported; use a llama.cpp mmproj file")
+        _warn_inline_vision(model_path)
 
 
 def mmproj_tensor(info: GgufTensorInfo) -> torch.Tensor:
@@ -170,5 +175,5 @@ __all__ = [
     "find_mmproj",
     "log_mmproj",
     "mmproj_tensor",
-    "refuse_inline_vision",
+    "warn_inline_vision",
 ]

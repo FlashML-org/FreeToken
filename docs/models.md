@@ -38,7 +38,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 | DeepSeek-V4-Flash-Vision (`deepseek_v4`: native-resolution ViT tower, streamed under `--mm-encoder-weights host`) | one token per 3x3 grid of 14x14 patches, against a per-image cap; the block carries sentinel tokens and lead pads that align it to a 4-token compression stride, so its length depends on where it lands in the prompt | the maximum is a cap on the block (`vision_max_n_token`, checkpoint default 384) and lowers it, the minimum is read as the checkpoint's upscale floor and has no effect | not read |
 
 A GGUF model takes image input from a separate llama.cpp mmproj file, found in the model file's own folder or passed with `--mmproj` (see the
-[CLI reference](cli.md#image-input)). A GGUF file that carries the vision tensors itself (the Ollama layout) is refused. The tower runs in bf16
+[CLI reference](cli.md#image-input)). A GGUF file that carries the vision tensors itself (the Ollama layout) serves text only. The tower runs in bf16
 whatever the mmproj stores; a quantized mmproj is dequantized at load and keeps its quantization error. Image tokens and budgets are those of the
 family's row above.
 
