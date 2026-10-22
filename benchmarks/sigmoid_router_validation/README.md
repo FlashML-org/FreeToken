@@ -1,5 +1,7 @@
 # Sigmoid router experiment evidence
 
+> 最新 main 整合复验：121 项路由测试通过；分支/main 相关回归均 92 通过、1 跳过；四组消融重跑完成。见 [本轮报告](main-integration/README.md)。下文保留历史结果。
+
 > 2026-10-22 WSL 后续：Linux 环境与 FreeToken 编译成功，117 项局部测试和 46 项相关回归通过；真实权重路由复验完成。见 [Linux 验证记录](linux/README.md)。下文的 Windows 实验保留原始环境与数值；完整模型 A/B 仍未完成。
 
 

@@ -1,0 +1,5 @@
+........................................................................ [ 77%]
+s....................                                                    [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/engine/test_cache_budget.py:522: WSL caps pinning
+92 passed, 1 skipped in 7.71s

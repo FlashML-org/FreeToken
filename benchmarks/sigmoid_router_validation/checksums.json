@@ -16,8 +16,8 @@
   },
   {
     "path": "deepen_validation.py",
-    "bytes": 6875,
-    "sha256": "8e35e563086bbaadb28c7466a545f879aab20eb9c9cd90c1089fe8d06d24f3ca"
+    "bytes": 7326,
+    "sha256": "5c1c131c94da7ee0623809025e8c6f0097022893260c870151e5eaebf6ed8f54"
   },
   {
     "path": "deepening/ablation-run.log",
@@ -500,9 +500,109 @@
     "sha256": "e98c2118846981e51aeed83f0fb7ea9603816e07e7bc3c224f65b85af54233e9"
   },
   {
+    "path": "main-integration/ablation.json",
+    "bytes": 31482,
+    "sha256": "442e2dcfb01224e1a2a2324ad5c5edd9e68a7d3f1925d13c701083687e6c387a"
+  },
+  {
+    "path": "main-integration/ablation.log",
+    "bytes": 1640,
+    "sha256": "674636f63913a3391849df267b267c5fccaab0b8b08e523902983d0dbb1959ef"
+  },
+  {
+    "path": "main-integration/baseline-before-flashinfer.log",
+    "bytes": 1917,
+    "sha256": "d7ab1d2844f609f1fddbe267e07374206f37754a2f5c4050dfce2b0a334d7673"
+  },
+  {
+    "path": "main-integration/baseline-integrated.sh",
+    "bytes": 943,
+    "sha256": "7a53b23c4174adf223923e300d3b8a3fa3bbbf937437dcc849de48e4f24ec0f2"
+  },
+  {
+    "path": "main-integration/baseline-regression-tests.log",
+    "bytes": 1917,
+    "sha256": "d7ab1d2844f609f1fddbe267e07374206f37754a2f5c4050dfce2b0a334d7673"
+  },
+  {
+    "path": "main-integration/build.exit",
+    "bytes": 2,
+    "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+  },
+  {
+    "path": "main-integration/build.log",
+    "bytes": 513,
+    "sha256": "8d16abadc4675d161b403bee453acd4982980792870d8439b2721334ddebd07f"
+  },
+  {
+    "path": "main-integration/environment.txt",
+    "bytes": 2100,
+    "sha256": "fb42c98a2ee4299d48d33b310926eaf9e3de502c07223b5f373bcb402ac5bbca"
+  },
+  {
+    "path": "main-integration/flashinfer-install.log",
+    "bytes": 1181,
+    "sha256": "87d5174cbd614ec925e4fcdbd6658106b4396d86ae7813d8a937ab132cec302b"
+  },
+  {
+    "path": "main-integration/FreeToken-integrated-regression.exit",
+    "bytes": 2,
+    "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+  },
+  {
+    "path": "main-integration/FreeToken-integrated-regression.log",
+    "bytes": 339,
+    "sha256": "22a30eb852a607d1fd6f66fd99d7c9960af0da97b1a65a749e5a295d333bf8dc"
+  },
+  {
+    "path": "main-integration/FreeToken-main-baseline-regression.exit",
+    "bytes": 2,
+    "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+  },
+  {
+    "path": "main-integration/FreeToken-main-baseline-regression.log",
+    "bytes": 339,
+    "sha256": "0b94cc99111c0d2193fc263653a3c206487326133f1768587315f8b14a59470a"
+  },
+  {
+    "path": "main-integration/README.md",
+    "bytes": 5162,
+    "sha256": "455c492cb05b8e28c38e7fabfa5585941a53bf43cf5a691780c5c0f8ee41f171"
+  },
+  {
+    "path": "main-integration/regression-before-flashinfer.log",
+    "bytes": 1917,
+    "sha256": "e24d33d323c20984563c1b124f9c1b56e9c7f448d5b99fa5950a960fb82752ce"
+  },
+  {
+    "path": "main-integration/regression-integrated.sh",
+    "bytes": 754,
+    "sha256": "695fee22397d97ee828238ff4a91e902b0094d8c6dc8bc1a3308595d34e185eb"
+  },
+  {
+    "path": "main-integration/regression-tests.log",
+    "bytes": 1917,
+    "sha256": "e24d33d323c20984563c1b124f9c1b56e9c7f448d5b99fa5950a960fb82752ce"
+  },
+  {
+    "path": "main-integration/targeted-tests.log",
+    "bytes": 180,
+    "sha256": "986e8f396ea4aad0d232052bb82b0ac26d2ef0811ece75695b8cc3f318695b68"
+  },
+  {
+    "path": "main-integration/tie-audit.json",
+    "bytes": 52889,
+    "sha256": "cd82a650887f9e9b5158b3ef11f3d586757cd743ffc2f7e03f4148a6e9684a8d"
+  },
+  {
+    "path": "main-integration/validate-integrated.sh",
+    "bytes": 1355,
+    "sha256": "fda1a7e7b7bedfd4f7b584ee09ec8d0cf19a9aed67767b7bed5e50bd135b8453"
+  },
+  {
     "path": "README.md",
-    "bytes": 6393,
-    "sha256": "785da57c17895dc3d181c1ff7126ec3ee41375a73d78f8e93246e5005770d41e"
+    "bytes": 6716,
+    "sha256": "5526d269c7cbe38db4188fe1be1ccb6b27d36beaf76d3122fec115fc6a536192"
   },
   {
     "path": "real-prefix/config.json",
@@ -551,8 +651,8 @@
   },
   {
     "path": "REVIEW.md",
-    "bytes": 10962,
-    "sha256": "8c0c1fad4c05e68436f152ee095656facbbc1445723c34743d7a2bdefe5715c3"
+    "bytes": 11291,
+    "sha256": "85decb3330b3ff6253e3325014952c3837c59c24732d9963dc26c7ec85caa66d"
   },
   {
     "path": "summarize_deepening.py",
