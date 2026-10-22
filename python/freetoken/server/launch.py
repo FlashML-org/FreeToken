@@ -15,13 +15,14 @@ if TYPE_CHECKING:
     from .supervisor import BackendHandle
 
 
-def _report_startup_error(ack_queue: mp.Queue, exc: BaseException) -> None:
+def _report_startup_error(ack_queue: mp.Queue, exc: BaseException, *, cuda_oom: bool = False) -> None:
     """Tell the parent WHY this worker is dying — push an ("error", reason) ack before it exits,
     so the supervisor reports the real cause (e.g. a config ValueError) instead of the generic
     "backend worker … exited during load". Best-effort and flushed (close + join_thread), since
     the process is about to terminate; a failure to report must never mask the original error."""
     try:
-        ack_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+        kind = "cuda_oom" if cuda_oom else "error"
+        ack_queue.put((kind, f"{type(exc).__name__}: {exc}"))
         ack_queue.close()
         ack_queue.join_thread()
     except Exception:  # noqa: BLE001 -- reporting is a nicety; never shadow the real exception
@@ -114,6 +115,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
         try:
             scheduler.run_forever()
+        except torch.cuda.OutOfMemoryError as exc:
+            # A runtime OOM poisons this scheduler generation. Tell the parent with a typed
+            # signal, then exit; it must retire every peer before fresh CUDA allocation.
+            _report_startup_error(ack_queue, exc, cuda_oom=True)
+            raise
         except KeyboardInterrupt:
             logger = init_logger(__name__)
             if args.tp_info.is_primary():
@@ -150,10 +156,11 @@ def launch_server(
             f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
         )
 
-    def start_subprocess() -> "BackendHandle":
+    def start_subprocess(backend_epoch: int = 0) -> "BackendHandle":
         import multiprocessing as mp
 
         from .supervisor import BackendHandle
+        from .supervisor import _retire_oom_workers
 
         mp.set_start_method("spawn", force=True)
         detach = server_args.shell_mode  # see _detach_process_group
@@ -162,16 +169,36 @@ def launch_server(
         ack_queue: mp.Queue = mp.Queue()
         processes: list[mp.Process] = []
 
+        def _start(process: mp.Process) -> None:
+            try:
+                process.start()
+            except Exception as exc:
+                # start() can fail after assigning a PID. Retire that process too, and fail
+                # closed if any previously-created child cannot be reaped.
+                started = [*processes]
+                if process.pid is not None:
+                    started.append(process)
+                try:
+                    _retire_oom_workers(started)
+                except Exception as cleanup:
+                    raise RuntimeError(f"backend factory cleanup failed: {cleanup}") from exc
+                try:
+                    ack_queue.close()
+                    ack_queue.join_thread()
+                except Exception:
+                    pass
+                raise
+            processes.append(process)
+
         for i in range(world_size):
-            new_args = replace(server_args, tp_info=DistributedInfo(i, world_size))
+            new_args = replace(server_args, tp_info=DistributedInfo(i, world_size), backend_epoch=backend_epoch)
             p = mp.Process(
                 target=_run_scheduler,
                 args=(new_args, ack_queue),
                 daemon=False,
                 name=f"freetoken-TP{i}-scheduler",
             )
-            p.start()
-            processes.append(p)
+            _start(p)
 
         num_tokenizers = server_args.num_tokenizer
         p = mp.Process(
@@ -187,12 +214,12 @@ def launch_server(
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
                 "ack_queue": ack_queue,
+                "backend_epoch": backend_epoch,
             },
             daemon=False,
             name="freetoken-detokenizer-0",
         )
-        p.start()
-        processes.append(p)
+        _start(p)
         for i in range(num_tokenizers):
             p = mp.Process(
                 target=_run_tokenize_worker,
@@ -207,12 +234,12 @@ def launch_server(
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
                     "ack_queue": ack_queue,
+                    "backend_epoch": backend_epoch,
                 },
                 daemon=False,
                 name=f"freetoken-tokenizer-{i}",
             )
-            p.start()
-            processes.append(p)
+            _start(p)
 
         # Expected ready acks: 1 primary scheduler + num_tokenizers + 1 detokenizer.
         return BackendHandle(

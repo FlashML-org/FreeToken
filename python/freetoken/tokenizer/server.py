@@ -48,12 +48,13 @@ def _prompt_admitted_reply(msg: PromptAdmittedMsg) -> UserReply:
         finished=False,
         prompt_tokens_delta=msg.prompt_tokens,
         cached_tokens=msg.cached_tokens,
+        epoch=msg.epoch,
     )
 
 
 def _error_reply(msg: ErrorReplyMsg) -> UserReply:
     return UserReply(
-        uid=msg.uid, incremental_output="", finished=True, error=msg.error, error_code=msg.code,
+        uid=msg.uid, incremental_output="", finished=True, error=msg.error, error_code=msg.code, epoch=msg.epoch,
     )
 
 
@@ -104,6 +105,7 @@ def _tokenize_requests(
                     incremental_output="",
                     finished=True,
                     error=f"could not encode request: {exc}",
+                    epoch=msg.epoch,
                 )
             )
             continue
@@ -116,6 +118,7 @@ def _tokenize_requests(
                     incremental_output="",
                     finished=True,
                     error="prompt must contain at least one token",
+                    epoch=msg.epoch,
                 )
             )
             continue
@@ -136,6 +139,7 @@ def tokenize_worker(
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
     mm: MultimodalConfig | None = None,
+    backend_epoch: int = 0,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
@@ -162,6 +166,9 @@ def tokenize_worker(
             pending_msg = _unwrap_msg(recv_listener.get())
             while len(pending_msg) < local_bs and not recv_listener.empty():
                 pending_msg.extend(_unwrap_msg(recv_listener.get()))
+            # The frontend transport stays up across an OOM restart. Drop anything buffered
+            # for the retired generation before it reaches tokenization or scheduler state.
+            pending_msg = [m for m in pending_msg if getattr(m, "epoch", backend_epoch) == backend_epoch]
 
             logger.debug(f"Received {len(pending_msg)} messages")
 
@@ -182,6 +189,7 @@ def tokenize_worker(
                             num_mamba_slots=m.num_mamba_slots,
                             num_swa_pages=m.num_swa_pages,
                             mode=m.mode,
+                            epoch=m.epoch,
                         )
                     )
                 elif isinstance(m, CacheRebuildResultMsg):
@@ -194,6 +202,7 @@ def tokenize_worker(
                             mamba_slots=m.mamba_slots,
                             num_swa_pages=m.num_swa_pages,
                             error=m.error,
+                            epoch=m.epoch,
                         )
                     )
             n_control = sum(
@@ -225,6 +234,7 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        epoch=msg.epoch,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]
@@ -256,7 +266,7 @@ def tokenize_worker(
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
-                    data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
+                    data=[AbortBackendMsg(uid=msg.uid, epoch=msg.epoch) for msg in abort_msg]
                 )
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]

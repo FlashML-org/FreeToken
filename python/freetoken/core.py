@@ -47,6 +47,7 @@ class Req:
     mrope_delta: int = 0
     # The whole prompt's length; 0 = this request's input_ids (a ChunkedReq's end at its chunk).
     prompt_len: int = 0
+    epoch: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---

@@ -40,6 +40,7 @@ class _FakeState:
     to an injected impl (so a test can make the enqueue succeed or raise)."""
 
     def __init__(self, send_impl, *, maintenance_state="serving", fatal_error=None):
+        self.backend_epoch = 0
         self.rebuild_futures: dict = {}
         self.maintenance_state = maintenance_state
         self.fatal_error = fatal_error
@@ -274,7 +275,7 @@ def test_cache_rebuild_timeout_keeps_gate_closed():
         sent.append(msg)
 
     state = SimpleNamespace(
-        maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=send_one
+        backend_epoch=0, maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=send_one
     )
     api_server._GLOBAL_STATE = state
     try:
@@ -303,7 +304,7 @@ def test_cache_rebuild_send_failure_rolls_back_gate():
         raise RuntimeError("zmq down")
 
     state = SimpleNamespace(
-        maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=boom
+        backend_epoch=0, maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=boom
     )
     api_server._GLOBAL_STATE = state
     try:

@@ -5,7 +5,15 @@ import queue
 from queue import Empty as _Empty
 
 from freetoken.utils import progress
-from freetoken.server.supervisor import BackendHandle, LoadProgress, drain_ready, phase_slug
+from freetoken.server.supervisor import (
+    BackendHandle,
+    LoadProgress,
+    WorkerDied,
+    _retire_oom_workers,
+    drain_ready,
+    phase_slug,
+    run_backend_supervisor,
+)
 
 
 def test_drain_ready_counts_ready_acks_and_applies_progress():
@@ -116,6 +124,282 @@ def test_supervisor_reports_the_worker_error_reason_via_on_failure():
     )
     assert "ready" not in seen
     assert seen["failure"] == "ValueError: bad checkpoint config"
+
+
+class _Process:
+    def __init__(self, name: str, alive: bool = True, survives_kill: bool = False):
+        self.name = name
+        self.alive = alive
+        self.survives_kill = survives_kill
+        self.calls: list[str] = []
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.calls.append("terminate")
+        self.alive = False
+
+    def join(self, timeout: float) -> None:
+        self.calls.append(f"join:{timeout}")
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+        if not self.survives_kill:
+            self.alive = False
+
+
+def test_oom_worker_retirement_terminates_joins_and_kills_a_stubborn_worker():
+    class Stubborn(_Process):
+        def terminate(self) -> None:
+            self.calls.append("terminate")
+
+    process = Stubborn("scheduler")
+
+    _retire_oom_workers([process])
+
+    assert process.calls == ["terminate", "join:10", "kill", "join:2"]
+
+
+def test_oom_worker_retirement_denies_replacement_when_a_worker_cannot_stop():
+    class Unstoppable(_Process):
+        def terminate(self) -> None:
+            self.calls.append("terminate")
+
+        def kill(self) -> None:
+            self.calls.append("kill")
+
+    process = Unstoppable("tokenizer")
+
+    with __import__("pytest").raises(WorkerDied, match="could not be stopped: tokenizer"):
+        _retire_oom_workers([process])
+
+
+def test_post_ready_typed_cuda_oom_retires_then_replaces_once():
+    class StopAfterReplacement(Exception):
+        pass
+
+    initial_process = _Process("scheduler", alive=False)
+    initial_queue: "queue.Queue" = queue.Queue()
+    initial_queue.put("ready")
+    initial_queue.put(("cuda_oom", "CUDA out of memory in decode"))
+    initial = BackendHandle(initial_queue, [initial_process], expected_acks=1)
+
+    replacement_process = _Process("replacement")
+    replacement_queue: "queue.Queue" = queue.Queue()
+    replacement_queue.put("ready")
+    replacement = BackendHandle(replacement_queue, [replacement_process], expected_acks=1)
+    events: list[tuple] = []
+
+    def ready() -> None:
+        events.append(("ready",))
+        if len(events) == 3:
+            raise StopAfterReplacement()
+
+    with __import__("pytest").raises(StopAfterReplacement):
+        run_backend_supervisor(
+            initial,
+            LoadProgress(),
+            on_ready=ready,
+            on_failure=lambda reason: events.append(("failure", reason)),
+            on_restarting=lambda reason, attempt: events.append(("restarting", reason, attempt)),
+            restart_backend=lambda attempt: replacement,
+            max_restarts=1,
+            poll=0,
+        )
+
+    assert initial_process.calls == ["join:10"]
+    assert events == [
+        ("ready",),
+        ("restarting", "CUDA out of memory in decode", 1),
+        ("ready",),
+    ]
+
+
+def test_non_oom_and_startup_failure_never_start_a_replacement():
+    class DeadProc:
+        name = "scheduler"
+
+        def is_alive(self) -> bool:
+            return False
+
+    started: list[int] = []
+    for receipt in (("error", "RuntimeError: bad checkpoint"), ("error", "CUDA out of memory during load")):
+        q: "queue.Queue" = queue.Queue()
+        q.put(receipt)
+        failures: list[str] = []
+        run_backend_supervisor(
+            BackendHandle(q, [DeadProc()], expected_acks=1),
+            LoadProgress(),
+            on_ready=lambda: None,
+            on_failure=failures.append,
+            restart_backend=lambda attempt: started.append(attempt),
+            max_restarts=1,
+            poll=0,
+        )
+        assert failures == [receipt[1]]
+    assert started == []
+
+
+def test_typed_cuda_oom_during_startup_is_a_terminal_startup_failure_not_ready():
+    """Recovery is deliberately post-ready only: a load-time CUDA OOM has no healthy
+    request generation to preserve and must not be mistaken for a readiness ack."""
+    q: "queue.Queue" = queue.Queue()
+    q.put(("cuda_oom", "CUDA out of memory while loading weights"))
+    failures: list[str] = []
+    starts: list[int] = []
+
+    run_backend_supervisor(
+        BackendHandle(q, [], expected_acks=1),
+        LoadProgress(),
+        on_ready=lambda: (_ for _ in ()).throw(AssertionError("startup OOM became ready")),
+        on_failure=failures.append,
+        restart_backend=lambda attempt: starts.append(attempt),
+        max_restarts=1,
+        poll=0,
+    )
+
+    assert failures == ["CUDA out of memory while loading weights"]
+    assert starts == []
+
+
+def test_second_post_ready_oom_exhausts_the_bounded_recovery_budget():
+    initial_process = _Process("initial", alive=False)
+    initial_queue: "queue.Queue" = queue.Queue()
+    initial_queue.put("ready")
+    initial_queue.put(("cuda_oom", "first OOM"))
+
+    replacement_process = _Process("replacement", alive=False)
+    replacement_queue: "queue.Queue" = queue.Queue()
+    replacement_queue.put("ready")
+    replacement_queue.put(("cuda_oom", "second OOM"))
+    starts: list[int] = []
+    failures: list[str] = []
+    ready: list[bool] = []
+
+    run_backend_supervisor(
+        BackendHandle(initial_queue, [initial_process], expected_acks=1),
+        LoadProgress(),
+        on_ready=lambda: ready.append(True),
+        on_failure=failures.append,
+        restart_backend=lambda attempt: starts.append(attempt) or BackendHandle(
+            replacement_queue, [replacement_process], expected_acks=1
+        ),
+        max_restarts=1,
+        poll=0,
+    )
+
+    assert starts == [1]
+    assert ready == [True, True]
+    assert failures == ["second OOM"]
+
+
+def test_replacement_readiness_deadline_fails_and_retires_the_partial_factory_handle():
+    initial_process = _Process("initial", alive=False)
+    initial_queue: "queue.Queue" = queue.Queue()
+    initial_queue.put("ready")
+    initial_queue.put(("cuda_oom", "decode OOM"))
+    fresh_process = _Process("partial", alive=True)
+    fresh_queue: "queue.Queue" = queue.Queue()
+    failures: list[str] = []
+
+    run_backend_supervisor(
+        BackendHandle(initial_queue, [initial_process], expected_acks=1),
+        LoadProgress(),
+        on_ready=lambda: None,
+        on_failure=failures.append,
+        restart_backend=lambda _: BackendHandle(fresh_queue, [fresh_process], expected_acks=1),
+        restart_ready_timeout=0,
+        max_restarts=1,
+        poll=0,
+    )
+
+    assert failures == ["OOM recovery failed: backend readiness timed out"]
+    assert fresh_process.calls == ["terminate", "join:10"]
+
+
+def test_stop_barrier_prevents_launch_after_oom_cleanup():
+    class StopOnTerminate(_Process):
+        def __init__(self):
+            super().__init__("initial", alive=False)
+            self.stopped = False
+
+        def join(self, timeout: float) -> None:
+            super().join(timeout)
+            self.stopped = True
+
+    process = StopOnTerminate()
+    q: "queue.Queue" = queue.Queue()
+    q.put("ready")
+    q.put(("cuda_oom", "decode OOM"))
+    launches: list[int] = []
+
+    run_backend_supervisor(
+        BackendHandle(q, [process], expected_acks=1),
+        LoadProgress(),
+        on_ready=lambda: None,
+        restart_backend=lambda attempt: launches.append(attempt),
+        can_restart=lambda: not process.stopped,
+        max_restarts=1,
+        poll=0,
+    )
+
+    assert process.calls == ["join:10"]
+    assert launches == []
+
+
+def test_preparation_stop_barrier_wins_before_recovery_starts():
+    q: "queue.Queue" = queue.Queue()
+    q.put("ready")
+    q.put(("cuda_oom", "decode OOM"))
+    process = _Process("initial", alive=False)
+    launches: list[int] = []
+    restarts: list[tuple[str, int]] = []
+
+    run_backend_supervisor(
+        BackendHandle(q, [process], expected_acks=1),
+        LoadProgress(),
+        on_ready=lambda: None,
+        restart_backend=lambda attempt: launches.append(attempt),
+        on_restarting=lambda message, attempt: restarts.append((message, attempt)),
+        can_restart=lambda: False,
+        max_restarts=1,
+        poll=0,
+    )
+
+    assert launches == []
+    assert restarts == []
+
+
+def test_stop_during_replacement_readiness_cleans_the_current_handle_and_never_reopens():
+    initial_q: "queue.Queue" = queue.Queue()
+    initial_q.put("ready")
+    initial_q.put(("cuda_oom", "decode OOM"))
+    initial = _Process("initial", alive=False)
+    fresh = _Process("fresh")
+    stopped = {"value": False}
+
+    class StopWhileWaiting:
+        def get(self, timeout: float):
+            stopped["value"] = True
+            raise _Empty()
+
+    failures: list[str] = []
+    ready: list[bool] = []
+    run_backend_supervisor(
+        BackendHandle(initial_q, [initial], expected_acks=1),
+        LoadProgress(),
+        on_ready=lambda: ready.append(True),
+        on_failure=failures.append,
+        restart_backend=lambda _: BackendHandle(StopWhileWaiting(), [fresh], expected_acks=1),
+        can_restart=lambda: not stopped["value"],
+        max_restarts=1,
+        poll=0,
+    )
+
+    assert ready == [True]
+    assert failures == ["OOM recovery failed: backend startup cancelled by shutdown"]
+    assert fresh.calls == ["terminate", "join:10"]
 
 
 def test_supervisor_reports_failure_on_startup_death():

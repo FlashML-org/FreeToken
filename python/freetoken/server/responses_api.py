@@ -25,6 +25,8 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from .accounting import AdmissionClosedError
 from openai.types.responses import (
     Response,
     ResponseCompletedEvent,
@@ -118,7 +120,7 @@ def register_responses_routes(
         log_request("/v1/responses", req, request)
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
-        if mstate != "serving":
+        if mstate not in {"serving", "restarting"}:
             detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
             return _error_response(503, detail)
         if req.background:
@@ -157,6 +159,8 @@ async def handle_responses(
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
+    except AdmissionClosedError as exc:
+        return _error_response(503, str(exc), "server_restarting")
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
     except ValueError as exc:

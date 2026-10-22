@@ -56,6 +56,7 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    epoch: int = 0
 
 
 @dataclass
@@ -68,3 +69,4 @@ class CacheRebuildReply(BaseFrontendMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+    epoch: int = 0

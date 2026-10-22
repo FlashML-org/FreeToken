@@ -299,7 +299,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
     calls this — it takes the neutral spec, not a wire request type."""
     refs = collect_image_refs(spec.messages)
     images = await _resolve_images(refs, state) if refs else None
-    uid = state.new_user()
+    uid = await state.new_user()
     await state.send_one(
         TokenizeMsg(
             uid=uid,
@@ -309,6 +309,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             tools=spec.template_tools,
             images=images,
             inline_system_policy=spec.inline_system_policy,
+            epoch=getattr(state, "request_epoch", lambda _uid: 0)(uid),
         )
     )
     return uid

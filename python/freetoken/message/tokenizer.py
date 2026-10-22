@@ -48,6 +48,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    epoch: int = 0
 
 
 @dataclass
@@ -63,6 +64,7 @@ class PromptAdmittedMsg(BaseTokenizerMsg):
     uid: int
     prompt_tokens: int
     cached_tokens: int = 0
+    epoch: int = 0
 
 
 @dataclass
@@ -74,11 +76,13 @@ class TokenizeMsg(BaseTokenizerMsg):
     tools: List[Dict[str, Any]] | None = None
     images: List[bytes] | None = None
     inline_system_policy: str | None = None
+    epoch: int = 0
 
 
 @dataclass
 class AbortMsg(BaseTokenizerMsg):
     uid: int
+    epoch: int = 0
 
 
 @dataclass
@@ -90,6 +94,7 @@ class CacheRebuildMsg(BaseTokenizerMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"
+    epoch: int = 0
 
 
 @dataclass
@@ -102,6 +107,7 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+    epoch: int = 0
 
 
 @dataclass
@@ -116,3 +122,4 @@ class ErrorReplyMsg(BaseTokenizerMsg):
     # can react without parsing prose. Today only "context_length_exceeded" (prompt longer than
     # the servable context); None = no specific class, the message is all there is.
     code: str | None = None
+    epoch: int = 0

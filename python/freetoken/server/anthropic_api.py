@@ -20,6 +20,8 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .accounting import AdmissionClosedError
+
 from .anthropic_models import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -85,7 +87,7 @@ def register_anthropic_routes(
         log_request("/v1/messages", req, request)
         state = get_state()
         mstate = getattr(state, "maintenance_state", "serving")
-        if mstate != "serving":
+        if mstate not in {"serving", "restarting"}:
             detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
             return _anthropic_error_response(503, "overloaded_error", detail)
         return await handle_anthropic_messages(req, request, state, get_model_sampling())
@@ -123,6 +125,8 @@ async def handle_anthropic_messages(
             inline_system_policy=getattr(state.config, "anthropic_inline_system", "auto"),
         )
         uid = await submit_generation(spec, state)
+    except AdmissionClosedError as exc:
+        return _anthropic_error_response(503, "overloaded_error", str(exc))
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
 

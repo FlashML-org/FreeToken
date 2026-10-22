@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import List, Tuple
@@ -73,6 +74,11 @@ class ServerArgs(SchedulerConfig):
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
     gpu_assigned: "tuple[str, ...] | None" = None
+    # Opt-in recovery of a CUDA worker that OOMs after the first ready handshake.
+    oom_recovery: bool = False
+    oom_recovery_max_restarts: int = 1
+    oom_recovery_ready_timeout: float = 900.0
+    oom_recovery_wait_queue: int = 128
 
     @property
     def share_tokenizer(self) -> bool:
@@ -182,6 +188,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be a positive integer") from exc
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
+        return n
+
+    def _positive_finite_float(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a positive finite number") from exc
+        if not math.isfinite(n) or n <= 0:
+            raise argparse.ArgumentTypeError("must be a positive finite number")
         return n
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
@@ -416,6 +431,17 @@ def parse_args(
         default=ServerArgs.num_tokenizer,
         help="The number of tokenizer processes to launch. 0 means the tokenizer is shared with the detokenizer.",
     )
+    parser.add_argument("--oom-recovery", action="store_true", default=ServerArgs.oom_recovery,
+                        help="Restart backend workers once after a post-ready CUDA OOM (default: off).")
+    parser.add_argument("--oom-recovery-max-restarts", type=_positive_int,
+                        default=ServerArgs.oom_recovery_max_restarts,
+                        help="Maximum CUDA-OOM backend restarts (default: 1).")
+    parser.add_argument("--oom-recovery-ready-timeout", type=_positive_finite_float,
+                        default=ServerArgs.oom_recovery_ready_timeout,
+                        help="Seconds new requests may wait for an OOM replacement (default: 900).")
+    parser.add_argument("--oom-recovery-wait-queue", type=_positive_int,
+                        default=ServerArgs.oom_recovery_wait_queue,
+                        help="Maximum requests waiting for OOM recovery readiness (default: 128).")
 
     parser.add_argument(
         "--max-prefill-length",

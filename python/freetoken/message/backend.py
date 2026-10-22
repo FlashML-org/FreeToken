@@ -79,11 +79,13 @@ class UserMsg(BaseBackendMsg):
     # precomputed [3, len(input_ids)] mrope positions and decode delta; None for text-only requests and 1-D rope models
     mrope_positions: torch.Tensor | None = None
     mrope_delta: int = 0
+    epoch: int = 0
 
 
 @dataclass
 class AbortBackendMsg(BaseBackendMsg):
     uid: int
+    epoch: int = 0
 
 
 @dataclass
@@ -95,3 +97,4 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+    epoch: int = 0

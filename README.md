@@ -53,6 +53,7 @@ For More details:
 
 - [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
 - [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
+- [CUDA OOM recovery](docs/oom_recovery.md)
 - [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
 - [Repairing old FTW checkpoints](https://github.com/FlashML-org/FreeToken/blob/main/docs/ftw-hotfix.md)

@@ -386,6 +386,7 @@ class Scheduler(SchedulerIOMixin):
                         finish_reason=finish_reason,
                         matched_stop=matched_stop,
                         stop_strs=req.sampling_params.stop_strs or None,
+                        epoch=req.epoch,
                     )
                 )
 
@@ -493,6 +494,9 @@ class Scheduler(SchedulerIOMixin):
         return torch.cuda.memory_reserved(self.device)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
+        if getattr(msg, "epoch", self.config.backend_epoch) != self.config.backend_epoch:
+            logger.warning_rank0("Dropping stale backend message for epoch %s", getattr(msg, "epoch", None))
+            return
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
                 self._process_one_msg(msg)
@@ -514,6 +518,7 @@ class Scheduler(SchedulerIOMixin):
                         ErrorReplyMsg(
                             uid=msg.uid,
                             error="image input is not supported by this server",
+                            epoch=msg.epoch,
                         )
                     ]
                 )
@@ -540,6 +545,7 @@ class Scheduler(SchedulerIOMixin):
                             ),
                             # OpenAI's standard class for this, for clients that read a code.
                             code="context_length_exceeded",
+                            epoch=msg.epoch,
                         )
                     ]
                 )
@@ -661,6 +667,7 @@ class Scheduler(SchedulerIOMixin):
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
                     error=error,
+                    epoch=self.config.backend_epoch,
                 )
             ]
         )
@@ -889,7 +896,7 @@ class Scheduler(SchedulerIOMixin):
             return
         self.send_result(
             [
-                PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
+                PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens, epoch=self.config.backend_epoch)
                 for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
             ]
         )
@@ -900,7 +907,7 @@ class Scheduler(SchedulerIOMixin):
             return
         uids = sorted(pending)
         pending.clear()
-        self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
+        self.send_result([ErrorReplyMsg(uid=uid, error="request aborted", epoch=self.config.backend_epoch) for uid in uids])
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
