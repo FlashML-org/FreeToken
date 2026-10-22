@@ -34,6 +34,7 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    ple_row_cache_rows: int = 0
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"
@@ -112,6 +113,10 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if not 0 <= self.ple_row_cache_rows <= (1 << 24) or self.ple_row_cache_rows % 8:
+            raise ValueError("ple_row_cache_rows must be 0 or a multiple of 8 up to 16777216")
+        if self.ple_row_cache_rows and self.ple_backend != "disk":
+            raise ValueError("ple_row_cache_rows requires the disk PLE backend")
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
         if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:

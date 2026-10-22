@@ -37,6 +37,12 @@ parsers all resolve automatically from the checkpoint and the GPU.
 
 ### Server & runtime
 
+`--ple-row-cache-rows N` keeps up to N raw PLE rows in host RAM with
+`--ple-backend disk`. It defaults to 0 (disabled); N must be a multiple of 8,
+at most 16777216. Memory use is approximately `N * (row_bytes + 8) + N / 8`
+bytes, in addition to the existing staging buffers. The cache belongs to the
+loaded table and assumes checkpoint files remain unchanged while it is open.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
