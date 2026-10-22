@@ -87,6 +87,9 @@ def main():
                     changed = previous != current
                     boundary = choice[row].topk(9).values
                     mismatches.append({'layer': layer,'tokens': n,'std': std,'row': row,
+                        'logits': logits[row].tolist(), 'bias': bias.tolist(),
+                        'unbiased_scores': logits[row].sigmoid().tolist(),
+                        'old_weights': _old_w[row].tolist(), 'new_weights': _w[row].tolist(),
                         'old_ids': previous.tolist(),'new_ids': current.tolist(),
                         'old_selection_scores': choice[row,previous].tolist(),
                         'new_selection_scores': choice[row,current].tolist(),
@@ -100,7 +103,9 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     saved = torch.load(args.prefix_cache/'prompt-1-activations.pt',weights_only=True)
     weight = tensor(args.router_cache,'model.layers.1.mlp.gate.weight',torch.bfloat16,(128,4096))
+    allocated_before = torch.cuda.memory_allocated()
     resident = weight.float()
+    resident_allocation_bytes = torch.cuda.memory_allocated() - allocated_before
     bias = tensor(args.router_cache,'model.layers.1.mlp.gate.e_score_correction_bias',torch.float32,(128,))
     results = []
     for n in (1,93):
@@ -131,6 +136,7 @@ def main():
     report = {'scope': 'full router (input cast + gate GEMM + routing), no experts or model generation',
         'gpu': torch.cuda.get_device_name(),'torch': torch.__version__,'tf32': False,'repeats': 5,
         'extra_resident_weight_bytes': resident.numel()*resident.element_size()-weight.numel()*weight.element_size(),
+        'measured_fp32_allocation_bytes': resident_allocation_bytes,
         'results': results}
     (args.output/'ablation.json').write_text(json.dumps(report,indent=2))
 

@@ -3,6 +3,28 @@
 import pytest
 import torch
 
+
+@pytest.mark.parametrize("case_index", range(4))
+def test_saved_real_gate_ties_preserve_weight_id_pairing(case_index):
+    import json
+    from pathlib import Path
+    from freetoken.kernel.triton.sigmoid_router import fused_topk_sigmoid
+
+    cases = json.loads((Path(__file__).parent / "data/sigmoid_router_ties.json").read_text())
+    case = cases[case_index]
+    x = torch.tensor([case["logits"]], device="cuda", dtype=torch.float32)
+    bias = torch.tensor(case["bias"], device="cuda", dtype=torch.float32)
+    w, ids = fused_topk_sigmoid(x, bias, 8, renormalize=True)
+    wr, ir = reference(x, bias, 8, renormalize=True)
+    torch.testing.assert_close(ids.sort(-1).values, ir.sort(-1).values, rtol=0, atol=0)
+    order, ref_order = ids.argsort(-1), ir.argsort(-1)
+    torch.testing.assert_close(w.gather(-1, order), wr.gather(-1, ref_order), rtol=1e-5, atol=1e-6)
+    # Synthetic expert outputs isolate reduction-order error, not model quality.
+    outputs = torch.sin(torch.arange(x.shape[1] * 32, device="cuda", dtype=torch.float32)).reshape(-1, 32)
+    actual = (outputs[ids.long()] * w[..., None]).sum(1)
+    expected = (outputs[ir.long()] * wr[..., None]).sum(1)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
