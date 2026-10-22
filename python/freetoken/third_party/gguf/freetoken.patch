@@ -1,0 +1,23 @@
+--- a/gguf-py/gguf/__init__.py
++++ b/gguf-py/gguf/__init__.py
+@@ -1,9 +1,4 @@
+ from .constants import *
+ from .lazy import *
+ from .gguf_reader import *
+-from .gguf_writer import *
+ from .quants import *
+-from .tensor_mapping import *
+-from .vocab import *
+-from .utility import *
+-from .metadata import *
+--- a/gguf-py/gguf/gguf_reader.py
++++ b/gguf-py/gguf/gguf_reader.py
+@@ -21,7 +21,7 @@
+     # Allow running file in package as a script.
+     sys.path.insert(0, str(Path(__file__).parent.parent))
+ 
+-from gguf.constants import (
++from .constants import (
+     GGML_MAX_DIMS,
+     GGML_QUANT_SIZES,
+     GGUF_DEFAULT_ALIGNMENT,

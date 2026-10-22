@@ -78,12 +78,12 @@ def _iter_nvfp4_resident(
     """Yield native NVFP4 buffers for an always-resident Linear.
 
     ``weight`` (packed fp4) + ``weight_scale`` (fp8 block scale) verbatim; per-tensor
-    ``weight_scale_2`` broadcast to per-row fp16 ``weight_global`` as the NVFP4 linear
+    ``weight_scale_2`` broadcast to per-row fp32 ``weight_global`` as the NVFP4 linear
     method / dequant_nvfp4 expect. lossless vs checkpoint; same dequant math as routed experts.
     """
     packed = reader.get(f"{src_prefix}.weight")  # [OUT, IN//2] uint8
     scale = reader.get(f"{src_prefix}.weight_scale")  # [OUT, IN//16] fp8-e4m3
-    g = reader.get(f"{src_prefix}.weight_scale_2").reshape(()).to(torch.float16)  # scalar
+    g = reader.get(f"{src_prefix}.weight_scale_2").reshape(()).to(torch.float32)  # scalar
     yield f"{dst_prefix}.weight", packed
     yield f"{dst_prefix}.weight_scale", scale
     yield f"{dst_prefix}.weight_global", g.expand(packed.shape[0]).contiguous()

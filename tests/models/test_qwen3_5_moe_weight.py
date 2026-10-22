@@ -358,7 +358,7 @@ def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a.dtype is b.dtype and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
-def test_bf16_fusions_slice_back_and_norms_get_plus_one(checkpoint):
+def test_bf16_fusions_slice_back_and_norms_load_as_stored(checkpoint):
     name, folder, raw = checkpoint
     if name != "bf16":
         pytest.skip("bf16 layout only")
@@ -371,8 +371,8 @@ def test_bf16_fusions_slice_back_and_norms_get_plus_one(checkpoint):
     merged = loaded["model.layers.1.mlp.shared_expert.gate_up_proj.weight"]
     assert _same(merged[:I], raw[f"{LM}.layers.1.mlp.shared_expert.gate_proj.weight"])
     assert _same(merged[I:], raw[f"{LM}.layers.1.mlp.shared_expert.up_proj.weight"])
-    assert torch.equal(loaded["model.norm.weight"], raw[f"{LM}.norm.weight"] + 1.0)
-    assert torch.equal(loaded["model.layers.1.self_attn.q_norm.weight"], raw[f"{attn}.q_norm.weight"] + 1.0)
+    assert torch.equal(loaded["model.norm.weight"], raw[f"{LM}.norm.weight"])
+    assert torch.equal(loaded["model.layers.1.self_attn.q_norm.weight"], raw[f"{attn}.q_norm.weight"])
     assert torch.equal(loaded["model.layers.0.linear_attn.norm.weight"], raw[f"{gdn}.norm.weight"])
     assert loaded["model.layers.0.linear_attn.A_log"].dtype is torch.float32
 
@@ -431,7 +431,7 @@ def test_modelopt_fp8_scales_broadcast_per_part_and_input_scale_is_the_max(check
     assert _same(loaded[f"{fused}.weight"][:I], raw[f"{shared}.gate_proj.weight"])
     assert _same(loaded[f"{fused}.weight_scale"][I:], raw[f"{shared}.up_proj.weight_scale"])
     glob = loaded[f"{fused}.weight_global"]
-    assert glob.dtype is torch.float16 and torch.equal(glob[:I], raw[f"{shared}.gate_proj.weight_scale_2"].to(torch.float16).expand(I))
+    assert glob.dtype is torch.float32 and torch.equal(glob[:I], raw[f"{shared}.gate_proj.weight_scale_2"].float().expand(I))
     # W4A16: no activation quantizer, so the layer has no input_scale even when the export ships one
     assert f"{fused}.input_scale" not in loaded and "lm_head.input_scale" not in loaded
     assert loaded["lm_head.weight"].dtype is torch.uint8 and loaded["lm_head.weight_global"].shape == (V,)
@@ -444,8 +444,8 @@ def test_compressed_tensors_nvfp4_global_is_the_reciprocal(checkpoint):
     loaded = _load(folder)
     attn = f"{LM}.layers.1.self_attn"
     glob = loaded["model.layers.1.self_attn.qkv_proj.weight_global"]
-    expected = torch.cat([(1.0 / raw[f"{attn}.{p}_proj.weight_global_scale"]).to(torch.float16).expand(raw[f"{attn}.{p}_proj.weight_packed"].shape[0]) for p in "qkv"])
-    assert glob.dtype is torch.float16 and torch.equal(glob, expected)
+    expected = torch.cat([(1.0 / raw[f"{attn}.{p}_proj.weight_global_scale"].float()).expand(raw[f"{attn}.{p}_proj.weight_packed"].shape[0]) for p in "qkv"])
+    assert glob.dtype is torch.float32 and torch.equal(glob, expected)
     assert _same(loaded["model.layers.1.self_attn.o_proj.weight_scale"], raw[f"{attn}.o_proj.weight_scale"])
     # ``dynamic: local`` ships the quant-side activation global too; it lands as the dequant-side input_scale
     assert torch.equal(loaded["model.layers.1.self_attn.o_proj.input_scale"], (1.0 / raw[f"{attn}.o_proj.input_global_scale"]).reshape(()))
@@ -507,16 +507,18 @@ def test_nvfp4_expert_pieces_read_either_dialect_from_a_single_file(checkpoint):
     spec = nvfp4_expert_spec(folder, config)
     pieces = list(iter_nvfp4_expert_pieces(folder, config, spec))
     assert len(pieces) == 2 * E
+    only = list(iter_nvfp4_expert_pieces(folder, config, spec, layers=[1]))
+    assert len(only) == E and {p[0] for p in only} == {1}
     layer, e0, e1, piece = next(p for p in pieces if p[0] == 1 and p[1] == 2)
     assert (e0, e1) == (2, 3)
     base = f"{LM}.layers.1.mlp.experts.2.gate_proj"
     if name.startswith("modelopt_mixed"):
         assert _same(piece["gate"][0], raw[f"{base}.weight"])
-        assert torch.equal(piece["gate_global"].reshape(-1), raw[f"{base}.weight_scale_2"].reshape(-1).to(torch.float16))
+        assert torch.equal(piece["gate_global"].reshape(-1), raw[f"{base}.weight_scale_2"].reshape(-1).float())
     else:
         assert _same(piece["gate"][0], raw[f"{base}.weight_packed"])
         assert _same(piece["down_scale"][0], raw[f"{LM}.layers.1.mlp.experts.2.down_proj.weight_scale"])
-        assert torch.equal(piece["gate_global"].reshape(-1), (1.0 / raw[f"{base}.weight_global_scale"]).to(torch.float16))
+        assert torch.equal(piece["gate_global"].reshape(-1), 1.0 / raw[f"{base}.weight_global_scale"].float())
 
 
 @pytest.mark.parametrize("parallel", [False, True])
@@ -529,6 +531,8 @@ def test_block_fp8_expert_pieces_read_either_dialect(checkpoint, parallel):
     config = parse_config(cached_load_hf_config(folder))
     pieces = list(iter_expert_pieces(folder, config, QuantKind.FP8_BLOCK, parallel=parallel))
     assert len(pieces) == 2 * E
+    only = list(iter_expert_pieces(folder, config, QuantKind.FP8_BLOCK, layers=[1], parallel=parallel))
+    assert len(only) == E and {p[0] for p in only} == {1}
     layer, e0, e1, piece = next(p for p in pieces if p[0] == 1 and p[1] == 2)
     base = f"{LM}.layers.1.mlp.experts.2"
     scale = "weight_scale_inv" if name == "fp8_block" else "weight_scale"
@@ -559,7 +563,7 @@ def test_a_quantized_router_is_dequantized_because_the_family_serves_it_bf16(tmp
     for layer, gate in enumerate(gates):
         got = loaded[f"model.layers.{layer}.mlp.gate.weight"]
         assert got.dtype is torch.bfloat16 and got.shape == (E, H)
-        expected = _nvfp4_reference(raw[f"{gate}.weight_packed"], raw[f"{gate}.weight_scale"], (1.0 / raw[f"{gate}.weight_global_scale"]).to(torch.float16).expand(E))
+        expected = _nvfp4_reference(raw[f"{gate}.weight_packed"], raw[f"{gate}.weight_scale"], (1.0 / raw[f"{gate}.weight_global_scale"].float()).expand(E))
         assert torch.equal(got, expected)
 
 

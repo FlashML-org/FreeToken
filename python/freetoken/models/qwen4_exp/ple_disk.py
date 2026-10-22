@@ -1,4 +1,4 @@
-"""Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8 shard tensors into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
+"""Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8 or bf16 shard tensors into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
 
 Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hits, restores and COW forks need no bookkeeping); the decode input token lives device-side under overlap scheduling and is read back here.
 """
@@ -22,7 +22,7 @@ from freetoken.utils import init_logger
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
-    _PLE_ST_DTYPE,
+    _PLE_ST_DTYPES,
     _ple_table_files,
     _safetensors_header,
 )
@@ -50,6 +50,10 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    # packed ggml rows (a GGUF table) of ``row_values`` values each; None for float rows of ``row_dtype``
+    ggml_type: int | None = None
+    row_values: int | None = None
+    row_dtype: torch.dtype = torch.float8_e4m3fn
 
     @property
     def total_rows(self) -> int:
@@ -59,6 +63,7 @@ class PleRowSource:
 def source_from_safetensors(folder: str) -> PleRowSource:
     """Map the checkpoint's ``ngram_embedding.shard_<i>`` tensors in place: one extent per shard, no copy."""
     rows = cols = 0
+    dtype: torch.dtype | None = None
     scale: torch.Tensor | None = None
     paths: list[str] = []
     path_idx: dict[str, int] = {}
@@ -75,8 +80,10 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
+            shard_dtype = _PLE_ST_DTYPES.get(meta["dtype"])
+            if shard_dtype is None or dtype not in (None, shard_dtype):
+                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected one of {sorted(_PLE_ST_DTYPES)} for every shard")
+            dtype = shard_dtype
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
             rows, cols = meta["shape"]
@@ -90,14 +97,36 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     if sorted(shards) != list(range(len(shards))) or not shards:
         raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
     if scale is None:
-        raise ValueError("PLE table has no weight_scale")
+        if dtype is torch.float8_e4m3fn:
+            raise ValueError("PLE table has no weight_scale")
+        scale = torch.tensor(1.0)
     order = [shards[i] for i in range(len(shards))]
-    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
+    row_bytes = cols * dtype.itemsize
+    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, row_bytes, row_bytes, float(scale),
+                        row_values=cols, row_dtype=dtype)
 
 
-def resolve_row_source(folder: str) -> PleRowSource:
+def source_from_gguf(model_path: str) -> PleRowSource:
+    """The GGUF ``per_layer_token_embd`` table in place: one extent of packed ggml rows."""
+    from freetoken.layers.quantization.ggml_types import row_bytes
+
+    from .gguf import ple_table_info
+
+    info = ple_table_info(model_path)
+    values, rows = info.ne
+    nbytes = row_bytes(info.ggml_type, values)
+    return PleRowSource([info.path], [0], [info.offset], rows, nbytes, nbytes, 1.0, info.ggml_type, values)
+
+
+def resolve_row_source(model_path: str) -> PleRowSource:
     """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
-    return source_from_safetensors(folder)
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if (gguf_src := gguf_config_source(model_path)) is not None:
+        return source_from_gguf(gguf_src)
+    from freetoken.utils import download_hf_weight
+
+    return source_from_safetensors(download_hf_weight(model_path))
 
 
 class DiskRowTable:
@@ -113,9 +142,14 @@ class DiskRowTable:
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         from freetoken.kernel.row_store import PleStore
+        from freetoken.layers.quantization.ggml_types import float_dtype
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.row_values or source.row_bytes
+        self._ggml_type = source.ggml_type
+        self._row_bytes = source.row_bytes
+        # float rows (fp8, or F32 / F16 / BF16 in a GGUF) are only cast; quantized ggml rows go through ggml
+        self._row_dtype = source.row_dtype if source.ggml_type is None else float_dtype(source.ggml_type)
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -142,7 +176,7 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * self.head_dim
+        self._token_bytes = self.heads * self._row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -272,7 +306,13 @@ class DiskRowTable:
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
         if not capturing:
             self._eager_read[self._eager_slot].record(stream)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+        if self._row_dtype is not None:
+            # copy=True: rows already in self.dtype must not alias the staging buffer the next fill reuses
+            values = dev[:nbytes].view(self._row_dtype).to(self.dtype, copy=True)
+        else:
+            from freetoken.kernel import ggml
+
+            values = ggml.dequantize(dev[:nbytes].view(-1, self._row_bytes), self._ggml_type, self.head_dim, self.dtype)
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)

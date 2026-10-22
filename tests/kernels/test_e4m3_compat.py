@@ -217,7 +217,7 @@ def _emit_all(path: str) -> None:
     N, K = 128, 256
     pk = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=dev)
     sc = (torch.rand(N, K // 16, device=dev) * 2 + 0.1).to(FP8)
-    g = (torch.rand(N, device=dev) * 0.05 + 0.01).to(torch.float16)
+    g = torch.rand(N, device=dev) * 0.05 + 0.01
     xa = torch.randn(1, K, dtype=torch.bfloat16, device=dev)
     xb = torch.randn(8, K, dtype=torch.bfloat16, device=dev)
     xc = torch.randn(200, K, dtype=torch.bfloat16, device=dev)
@@ -231,7 +231,7 @@ def _emit_all(path: str) -> None:
     # nvfp4 bank dequant
     pkc = torch.randint(0, 256, (E, 64, 128), dtype=torch.uint8, device=dev)
     scc = (torch.rand(E, 64, 16, device=dev) + 0.1).to(FP8)
-    gc = (torch.rand(E, 64, device=dev) * 0.05 + 0.01).to(torch.float16)
+    gc = torch.rand(E, 64, device=dev) * 0.05 + 0.01
     out["nv_dequant"] = f32(dequant_nvfp4(
         pkc, scc, gc, torch.tensor([1, 3], dtype=torch.int32, device=dev)))
 
@@ -239,10 +239,10 @@ def _emit_all(path: str) -> None:
     S, H4, I4 = 4, 256, 128
     gup = torch.randint(0, 256, (S, 2 * I4, H4 // 2), dtype=torch.uint8, device=dev)
     gus4 = (torch.rand(S, 2 * I4, H4 // 16, device=dev) + 0.1).to(FP8)
-    gug = (torch.rand(S, 2 * I4, device=dev) * 0.05 + 0.01).to(torch.float16)
+    gug = torch.rand(S, 2 * I4, device=dev) * 0.05 + 0.01
     dnp = torch.randint(0, 256, (S, H4, I4 // 2), dtype=torch.uint8, device=dev)
     dns4 = (torch.rand(S, H4, I4 // 16, device=dev) + 0.1).to(FP8)
-    dng = (torch.rand(S, H4, device=dev) * 0.05 + 0.01).to(torch.float16)
+    dng = torch.rand(S, H4, device=dev) * 0.05 + 0.01
     hid4 = torch.randn(2, H4, dtype=torch.bfloat16, device=dev)
     out["nv_moe_marlin"] = f32(fused_experts_decode_nvfp4_marlin(
         hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids))

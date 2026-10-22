@@ -68,25 +68,31 @@ def _fill(store, args, window, tokens):
 
 
 def _write_checkpoint(tmp_path, table, n_shards):
+    """uint8 ``table`` bytes are stored as a scaled fp8 table, any other dtype as an unscaled table of that dtype."""
     from safetensors.torch import save_file
 
+    fp8 = table.dtype is torch.uint8
     per = table.shape[0] // n_shards
     tensors = {
-        f"{_KEY_PREFIX}.shard_{i}.weight": table[i * per : (i + 1) * per].view(torch.float8_e4m3fn)
+        f"{_KEY_PREFIX}.shard_{i}.weight": table[i * per : (i + 1) * per].view(torch.float8_e4m3fn) if fp8 else table[i * per : (i + 1) * per].clone()
         for i in range(n_shards)
     }
-    tensors[f"{_KEY_PREFIX}.weight_scale"] = torch.tensor(0.03125, dtype=torch.bfloat16)
+    if fp8:
+        tensors[f"{_KEY_PREFIX}.weight_scale"] = torch.tensor(0.03125, dtype=torch.bfloat16)
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
 
-def _make_table(tmp_path):
+def _make_table(tmp_path, dtype=torch.float8_e4m3fn):
     from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, source_from_safetensors
 
     args = parse_config(toy_hf_config()).qwen4_args
     multipliers, sizes, offsets = hash_constants(args)
     total_rows = int(offsets[-1] + sizes[-1])
     gen = torch.Generator().manual_seed(9)
-    table = torch.randint(0, 256, (total_rows, args.ngram_head_dim), dtype=torch.uint8, generator=gen)
+    if dtype is torch.float8_e4m3fn:
+        table = torch.randint(0, 256, (total_rows, args.ngram_head_dim), dtype=torch.uint8, generator=gen)
+    else:
+        table = torch.randn((total_rows, args.ngram_head_dim), generator=gen).to(dtype)
     n_shards = next(k for k in (4, 2, 1) if total_rows % k == 0)
     _write_checkpoint(tmp_path, table, n_shards)
     constants = {
@@ -97,7 +103,7 @@ def _make_table(tmp_path):
         "eos_token_id": EOS,
     }
     disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
-    oracle = GpuResidentTable(table.cuda().view(torch.float8_e4m3fn), scale=0.03125)
+    oracle = GpuResidentTable(table.cuda().view(torch.float8_e4m3fn), scale=0.03125) if dtype is torch.float8_e4m3fn else GpuResidentTable(table.cuda())
     return disk, oracle, args
 
 
@@ -255,8 +261,9 @@ def test_layouts_readers_and_errors(tmp_path):
 
 
 @requires_cuda
-def test_disk_table_matches_oracle(tmp_path):
-    disk, oracle, args = _make_table(tmp_path)
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16], ids=["fp8", "bf16"])
+def test_disk_table_matches_oracle(tmp_path, dtype):
+    disk, oracle, args = _make_table(tmp_path, dtype)
     emb = _embedding()
 
     # prefill: two segments, one fresh and one mid-sequence window

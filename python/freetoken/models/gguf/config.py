@@ -17,7 +17,22 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
 # reuses the model classes but a GGUF parse_config / iter_weights).
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
+    "deepseek4": "DeepseekV4GGUFForCausalLM",
     "gemma4": "Gemma4GGUFForCausalLM",
+    "glm4moe": "Glm4MoeGGUFForCausalLM",
+    # glm5-next: the llama.cpp spelling; glm5next: unsloth's first release
+    "glm5-next": "Glm5NextGGUFForCausalLM",
+    "glm5next": "Glm5NextGGUFForCausalLM",
+    "llama": "LlamaGGUFForCausalLM",
+    "minimax-m2": "MiniMaxM2GGUFForCausalLM",
+    "minimax-m3": "MiniMaxM3GGUFForCausalLM",
+    "muse-glimmer": "MuseGlimmerGGUFForCausalLM",
+    "qwen2": "Qwen2GGUFForCausalLM",
+    "qwen3": "Qwen3GGUFForCausalLM",
+    "qwen3moe": "Qwen3MoeGGUFForCausalLM",
+    "qwen35": "Qwen3_5GGUFForCausalLM",
+    "qwen35moe": "Qwen3_5MoeGGUFForCausalLM",
+    "qwen4exp": "Qwen4ExpGGUFForCausalLM",
 }
 
 

@@ -44,6 +44,18 @@
 #define cudaGetLastError hipGetLastError
 #endif
 
+#ifndef cudaMalloc
+#define cudaMalloc hipMalloc
+#endif
+
+#ifndef cudaFree
+#define cudaFree hipFree
+#endif
+
+#ifndef cudaMemset
+#define cudaMemset hipMemset
+#endif
+
 #ifndef cudaMallocHost
 #define cudaMallocHost hipHostMalloc
 #endif
@@ -58,6 +70,10 @@
 
 #ifndef cudaHostRegister
 #define cudaHostRegister hipHostRegister
+#endif
+
+#ifndef cudaHostUnregister
+#define cudaHostUnregister hipHostUnregister
 #endif
 
 #ifndef cudaHostRegisterPortable

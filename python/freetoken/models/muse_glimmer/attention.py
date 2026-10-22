@@ -18,16 +18,16 @@ if TYPE_CHECKING:
 class MuseGlimmerAttention(BaseOP):
     """Gated GQA for one sliding-window or full-attention (NoPE) layer.
 
-        q, k, v, gate = split(qkvg_proj(x))
+        q, k, v = split(qkv_proj(x))
         q = qk_norm(q); k = qk_norm(k)          # weightless per-head RMSNorm
         q, k = rope(q, k)                        # sliding layers only; full layers are NoPE
         attn = paged_attention(q, k, v)          # sm_scale carries qk_scale_factor/sqrt(d)
-        out = o_proj(attn * sigmoid(gate))
+        out = o_proj(attn * sigmoid(gate_proj(x)))
 
     The reference multiplies q by ``qk_scale_factor`` before rope; rope is a rotation, so
     the factor commutes and is folded into ``AttentionSpec.sm_scale`` instead (parse_config
-    sets ``attn_sm_scale = qk_scale_factor / sqrt(head_dim)``). The gate is computed from
-    the same normed layer input as q/k/v, so it rides the fused projection.
+    sets ``attn_sm_scale = qk_scale_factor / sqrt(head_dim)``). The gate stays its own
+    linear: the NVFP4 release quantizes it with a different global scale than q/k/v.
     """
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
@@ -41,10 +41,14 @@ class MuseGlimmerAttention(BaseOP):
         self.qo_attn_dim = self.num_q * head_dim
         self.kv_attn_dim = self.num_kv * head_dim
 
-        self._qkvg_split = [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim, self.qo_attn_dim]
-        self.qkvg_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkvg_split, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.qkvg_proj",
+        self._qkv_split = [self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim]
+        self.qkv_proj = LinearColParallelMerged(
+            config.hidden_size, self._qkv_split, has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+        )
+        self.gate_proj = LinearColParallelMerged(
+            config.hidden_size, [self.qo_attn_dim], has_bias=False,
+            quant_config=config.quant, prefix=f"{prefix}.gate_proj",
         )
         self.o_proj = LinearReplicated(
             self.qo_attn_dim, config.hidden_size, has_bias=False,
@@ -76,12 +80,13 @@ class MuseGlimmerAttention(BaseOP):
         ctx = get_global_ctx()
         T = x.shape[0]
 
-        qkvg = self.qkvg_proj.forward(x)
-        q, k, v, gate = torch.split(qkvg, self._qkvg_split, dim=-1)
-        del qkvg
+        gate = self.gate_proj.forward(x)
+        qkv = self.qkv_proj.forward(x)
+        q, k, v = torch.split(qkv, self._qkv_split, dim=-1)
+        del qkv
         q = self.qk_norm.forward(q.contiguous().view(T, self.num_q, self.head_dim))
         k = self.qk_norm.forward(k.contiguous().view(T, self.num_kv, self.head_dim))
-        v = v.contiguous()  # the split view has the qkvg row stride; the KV store needs contiguous
+        v = v.contiguous()  # the split view has the qkv row stride; the KV store needs contiguous
 
         q = q.reshape(T, self.qo_attn_dim)
         k = k.reshape(T, self.kv_attn_dim)

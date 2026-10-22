@@ -41,7 +41,7 @@ def _args(num_layers=1):
         index_kpool_always_select_tail=True,
         linear_num_heads=0, linear_head_dim=0, linear_conv_kernel_dim=4,
         linear_lower_bound=-5.0,
-        layer_types=("deepseek_sparse_attention",) * num_layers,
+        layer_types=("indexed_attention",) * num_layers,
         mlp_layer_types=("dense",) * num_layers,
         mhc=False, mhc_num_residual_streams=1, hc_eps=1e-6,
         mhc_sinkhorn_iterations=0, mhc_tau=0.05, mhc_post_mult_value=2.0,

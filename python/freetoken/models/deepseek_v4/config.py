@@ -18,7 +18,7 @@ from typing import Any
 
 from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, RotaryConfig
 
-from .args import load_args
+from .args import DeepseekV4Args, load_args
 
 # ``<｜deepseek_image｜>``: the only vocab-level image token. The reference expands each
 # occurrence into a block of ``vocab_size + type`` pseudo ids; here the block keeps this
@@ -46,16 +46,12 @@ class DSV4VisionConfig:
     text_dim: int
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
-    model_path = getattr(hf_config, "_name_or_path", None) or getattr(
-        hf_config, "name_or_path", None
-    )
-    if not model_path:
-        raise ValueError(
-            "DeepSeek-V4 parse_config needs the checkpoint path (hf_config._name_or_path)"
-        )
-    args = load_args(model_path, max_batch_size=1)
-
+def model_config_from_args(
+    args: DeepseekV4Args, *, max_position: int, vision_config: DSV4VisionConfig | None = None
+) -> ModelConfig:
+    """The family's :class:`ModelConfig` from built :class:`DeepseekV4Args`: the one
+    construction the HF checkpoint parser and the GGUF parser share, so the two flows
+    cannot drift. ``expert_quant`` is the caller's to override (``ds_fp4`` vs ``gguf``)."""
     rope_scaling = {
         "rope_type": "yarn",
         "factor": args.rope_factor,
@@ -63,16 +59,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         "beta_slow": args.beta_slow,
         "original_max_position_embeddings": args.original_seq_len,
     }
-
-    # Serving ceiling: the HF top-level config's max_position_embeddings (1M on V4-Flash).
-    # args.original_seq_len is yarn's PRE-scaling length (64k); the compressed tiers serve
-    # original_seq_len * rope_factor positions, so fall back to that product when a checkpoint
-    # ships only the inference/ dialect.
-    max_position = int(getattr(hf_config, "max_position_embeddings", 0) or 0)
-    if max_position <= 0:
-        max_position = int(args.original_seq_len * args.rope_factor)
-
-    vision_config = parse_vision_config(hf_config)
 
     return ModelConfig(
         num_layers=args.n_layers,
@@ -124,6 +110,27 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
+def parse_config(hf_config: Any) -> ModelConfig:
+    model_path = getattr(hf_config, "_name_or_path", None) or getattr(
+        hf_config, "name_or_path", None
+    )
+    if not model_path:
+        raise ValueError(
+            "DeepSeek-V4 parse_config needs the checkpoint path (hf_config._name_or_path)"
+        )
+    args = load_args(model_path, max_batch_size=1)
+
+    # Serving ceiling: the HF top-level config's max_position_embeddings (1M on V4-Flash).
+    # args.original_seq_len is yarn's PRE-scaling length (64k); the compressed tiers serve
+    # original_seq_len * rope_factor positions, so fall back to that product when a checkpoint
+    # ships only the inference/ dialect.
+    max_position = int(getattr(hf_config, "max_position_embeddings", 0) or 0)
+    if max_position <= 0:
+        max_position = int(args.original_seq_len * args.rope_factor)
+
+    return model_config_from_args(args, max_position=max_position, vision_config=parse_vision_config(hf_config))
+
+
 def parse_vision_config(hf_config: Any) -> DSV4VisionConfig | None:
     """The tower's dims from the checkpoint config, or None when it carries no vision stack.
 
@@ -150,4 +157,4 @@ def parse_vision_config(hf_config: Any) -> DSV4VisionConfig | None:
     )
 
 
-__all__ = ["IMAGE_TOKEN_ID", "DSV4VisionConfig", "parse_config", "parse_vision_config"]
+__all__ = ["IMAGE_TOKEN_ID", "DSV4VisionConfig", "model_config_from_args", "parse_config", "parse_vision_config"]

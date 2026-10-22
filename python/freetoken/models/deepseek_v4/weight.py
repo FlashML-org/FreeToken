@@ -237,7 +237,7 @@ _PROJ_ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
 _KIND_SUFFIX = {"weight": "", "scale": "_scale"}
 
 
-def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, layers=None, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0
     ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
     if kind is not QuantKind.MXFP4:
@@ -249,10 +249,11 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
 
     args = load_args(model_path, max_batch_size=1)
     L, E = args.n_layers, args.n_routed_experts
+    keep = None if layers is None else set(layers)
 
     def locate(raw_name: str):
         m = _EXPERT_RE.match(raw_name)
-        if m is None or int(m["layer"]) >= L:
+        if m is None or int(m["layer"]) >= L or (keep is not None and int(m["layer"]) not in keep):
             return None
         return int(m["layer"]), int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
 
@@ -263,7 +264,7 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     def _serial():
         reader = _ShardReader(model_path, _weight_map(model_path), torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading DSV4 experts (serial)", disable=not get_tp_info().is_primary()):
+            for li in tqdm(range(L) if keep is None else sorted(keep), desc="Loading DSV4 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(E):
                     base = f"layers.{li}.ffn.experts.{e}"
                     for proj in ("w1", "w3", "w2"):

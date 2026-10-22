@@ -143,6 +143,15 @@ def _radix_spec() -> KernelSpec:
     return KernelSpec(name=_make_name("radix"), build=build)
 
 
+def _ggml_spec() -> KernelSpec:
+    def build(build_directory: pathlib.Path) -> object:
+        from .ggml import load_module
+
+        return load_module(str(build_directory))
+
+    return KernelSpec(name=_make_name("ggml"), build=build)
+
+
 def default_kernel_specs() -> tuple[KernelSpec, ...]:
     specs: list[KernelSpec] = []
     specs.extend(_store_spec(element_size) for element_size in DEFAULT_STORE_ELEMENT_SIZES)
@@ -158,6 +167,7 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=64))
     specs.append(_batch_memcpy_spec())
     specs.append(_radix_spec())
+    specs.append(_ggml_spec())
 
     names = [spec.name for spec in specs]
     duplicates = {name for name in names if names.count(name) > 1}

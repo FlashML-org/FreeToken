@@ -128,8 +128,7 @@ def fused_experts_decode_fp8_blockscale(
 
 
 # ======================================================================================
-# Prefill: M-tiled inline-dequant grouped GEMM (moe_align_block_size), mirrors
-# nvfp4_fused_moe._prefill_nvfp4_moe_kernel with fp8*bf16-block-scale dequant.
+# Prefill: M-tiled inline-dequant grouped GEMM (moe_align_block_size) with fp8*bf16-block-scale dequant.
 # BLOCK_SIZE_N == BLOCK_SIZE_K == 128 so each tile maps to one weight scale block.
 # ======================================================================================
 @triton.jit

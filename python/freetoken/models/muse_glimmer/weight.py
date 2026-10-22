@@ -26,13 +26,10 @@ _VISION_RENAMES = (
 _VISION_QKV_PARTS = (".attn.q_proj", ".attn.k_proj", ".attn.v_proj")
 
 # Fused projections, concatenated on the output dim in this exact order to match the
-# model's merged-linear splits. The attention gate rides the q/k/v fusion (it is computed
-# from the same layer input); ``.self_attn.gate_proj`` and the SwiGLU ``.mlp.gate_proj``
-# are disambiguated by the full suffix.
+# model's merged-linear splits. The full suffix keeps the standalone attention gate
+# ``.self_attn.gate_proj`` out of the SwiGLU ``.mlp.gate_proj`` fusion.
 _FUSIONS: dict[str, tuple[str, ...]] = {
-    ".self_attn.qkvg_proj": (
-        ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.gate_proj",
-    ),
+    ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
     ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
 }
 
@@ -134,8 +131,8 @@ def _iter_weights_compressed_tensors(
 
     Every text Linear (q/k/v/o, the attention gate, the MLP) is kept native NVFP4
     (W4A16): ``.weight`` (uint8 packed) + ``.weight_scale`` (fp8 block) + ``.weight_global``
-    (fp16 per-row, the reciprocal of the stored quant-side global). q/k/v/gate fuse into
-    ``qkvg_proj`` and gate/up into ``gate_up_proj`` on the output dim, each part keeping
+    (fp32 per-row, the reciprocal of the stored quant-side global). q/k/v fuse into
+    ``qkv_proj`` and gate/up into ``gate_up_proj`` on the output dim, each part keeping
     its own scales, so the fused FP4 weights are exact. Embeddings, norms, lm_head and the
     vision tower are bf16 (the checkpoint's ignore list). Scale lookups go through the
     shard-map reader: they can land in a different shard than their weight_packed."""

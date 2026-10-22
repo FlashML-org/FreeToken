@@ -7,138 +7,12 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
-from typing import Any, Dict
-
 import torch
-import triton
-import triton.language as tl
 
-from freetoken.kernel import moe_sum_reduce_triton
-from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view
-from freetoken.kernel.triton.nvfp4_fused_moe import (
-    _decode_nvfp4_marlin_kernel,
-    _decode_nvfp4_moe_kernel,
-    _e2m1_lut,
-    _prefill_nvfp4_moe_kernel,
-)
+from freetoken.kernel import moe_sum_reduce_triton, nvfp4_moe
+from freetoken.kernel.triton.nvfp4_act_quant import quantize_nvfp4
 from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import moe_align_block_size
-
-# Decode is captured into a CUDA graph, so the config must be fixed (no triton.autotune,
-# which benchmarks at run time). Tuned offline against the NVFP4 decode kernels.
-# These drive the original LUT-gather decode (_decode_gemm), kept only for A/B.
-_DECODE_BLOCK_N = 64
-_DECODE_BLOCK_KB = 128
-_DECODE_WARPS = 4
-
-# Marlin-style decode: every K-loop load must keep the word tile's register layout, so BLOCK_N * BLOCK_KW <= 128 * num_warps and BLOCK_KW <= 32 at 4 warps.
-# Long K (gate_up) uses the narrow N tile for more programs at M=1; short K (down) uses the wide one.
-_DECODE_MARLIN_BLOCK_N = 16
-_DECODE_MARLIN_BLOCK_KW = 16
-_DECODE_MARLIN_UNROLL = 2
-_DECODE_MARLIN_WARPS = 4
-_DECODE_MARLIN_DEEPK_BLOCK_N = 8
-_DECODE_MARLIN_DEEPK_BLOCK_KW = 32
-_DECODE_MARLIN_DEEPK_UNROLL = 2
-_DECODE_MARLIN_DEEPK_THRESHOLD = 2048
-
-
-def _tl_dtype(dt: torch.dtype):
-    if dt == torch.bfloat16:
-        return tl.bfloat16
-    if dt == torch.float16:
-        return tl.float16
-    return tl.float32
-
-
-def _decode_gemm(
-    a: torch.Tensor,
-    packed: torch.Tensor,
-    scale: torch.Tensor,
-    glob: torch.Tensor,
-    c: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    mul_routed_weight: bool,
-    a_row_is_route: bool,
-) -> None:
-    M, top_k = topk_ids.shape
-    N = packed.shape[1]
-    K = packed.shape[2] * 2
-    scale = e4m3_kernel_view(scale)
-    total_routes = M * top_k
-    grid = (total_routes, triton.cdiv(N, _DECODE_BLOCK_N))
-    _decode_nvfp4_moe_kernel[grid](
-        a, packed, scale, glob, c, topk_weights, topk_ids,
-        _e2m1_lut(a.device.index),
-        total_routes, N, K,
-        a.stride(0), a.stride(1),
-        packed.stride(0), packed.stride(1), packed.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        glob.stride(0), glob.stride(1),
-        c.stride(0), c.stride(1), c.stride(2),
-        topk_weights.stride(0), topk_weights.stride(1),
-        topk_ids.stride(0), topk_ids.stride(1),
-        BLOCK_SIZE_N=_DECODE_BLOCK_N,
-        BLOCK_SIZE_KB=_DECODE_BLOCK_KB,
-        TOP_K=top_k,
-        A_ROW_IS_ROUTE=a_row_is_route,
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_tl_dtype(c.dtype),
-        num_warps=_DECODE_WARPS,
-    )
-
-
-def _decode_gemm_marlin(
-    a: torch.Tensor,
-    packed: torch.Tensor,
-    scale: torch.Tensor,
-    glob: torch.Tensor,
-    c: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    mul_routed_weight: bool,
-    a_row_is_route: bool,
-) -> None:
-    """Marlin-style decode GEMV: int32 wide loads + deferred reduction
-    (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
-    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4)."""
-    M, top_k = topk_ids.shape
-    N = packed.shape[1]
-    K = packed.shape[2] * 2
-    packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
-    scale = e4m3_kernel_view(scale)
-    total_routes = M * top_k
-    deep_k = K >= _DECODE_MARLIN_DEEPK_THRESHOLD
-    block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
-    block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
-    unroll = _DECODE_MARLIN_DEEPK_UNROLL if deep_k else _DECODE_MARLIN_UNROLL
-    # int64 activation loads need contiguous 16-bit rows that start 16-byte aligned
-    a_wide = (
-        a.dtype in (torch.bfloat16, torch.float16)
-        and a.stride(1) == 1 and a.stride(0) % 8 == 0 and a.data_ptr() % 16 == 0
-    )
-    grid = (total_routes, triton.cdiv(N, block_n))
-    _decode_nvfp4_marlin_kernel[grid](
-        a, packed_i32, scale, glob, c, topk_weights, topk_ids,
-        total_routes, N, K,
-        a.stride(0), a.stride(1),
-        packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        glob.stride(0), glob.stride(1),
-        c.stride(0), c.stride(1), c.stride(2),
-        topk_weights.stride(0), topk_weights.stride(1),
-        topk_ids.stride(0), topk_ids.stride(1),
-        BLOCK_SIZE_N=block_n,
-        BLOCK_SIZE_KW=block_kw,
-        UNROLL=unroll,
-        TOP_K=top_k,
-        A_ROW_IS_ROUTE=a_row_is_route,
-        A_WIDE=a_wide,
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_tl_dtype(c.dtype),
-        num_warps=_DECODE_MARLIN_WARPS,
-    )
 
 
 def _fused_experts_decode_nvfp4(
@@ -158,8 +32,8 @@ def _fused_experts_decode_nvfp4(
     act_limit: float = 7.0,
 ) -> torch.Tensor:
     """Shared decode body (gemm1 -> act -> gemm2 -> sum-reduce); ``gemm_fn`` is either
-    the marlin-style int32 GEMV (:func:`_decode_gemm_marlin`) or the original LUT-gather
-    GEMV (:func:`_decode_gemm`), both with the same calling convention."""
+    the marlin-style int32 GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm_marlin`) or the original LUT-gather
+    GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm`), both with the same calling convention."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
@@ -200,7 +74,7 @@ def fused_experts_decode_nvfp4_marlin(
 ) -> torch.Tensor:
     """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
     return _fused_experts_decode_nvfp4(
-        _decode_gemm_marlin,
+        nvfp4_moe.decode_gemm_marlin,
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
@@ -226,62 +100,11 @@ def fused_experts_decode_nvfp4_serial(
     """Original LUT-gather decode (one program per route, full K reduction). Retained for
     A/B benchmarking against the marlin decode path; not on the production decode path."""
     return _fused_experts_decode_nvfp4(
-        _decode_gemm,
+        nvfp4_moe.decode_gemm,
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
         act_alpha, act_limit,
-    )
-
-
-def _prefill_config(M: int) -> Dict[str, int]:
-    # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
-    # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
-    # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
-    if M <= 64:
-        return dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                    GROUP_SIZE_M=1, num_warps=8, num_stages=4)
-    return dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, BLOCK_SIZE_KB=32,
-                GROUP_SIZE_M=8, num_warps=8, num_stages=4)
-
-
-def _prefill_gemm(
-    a: torch.Tensor,
-    packed: torch.Tensor,
-    scale: torch.Tensor,
-    glob: torch.Tensor,
-    c: torch.Tensor,
-    topk_weights_flat: torch.Tensor,
-    sorted_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
-    num_valid_tokens: int,
-    kernel_top_k: int,
-    mul_routed_weight: bool,
-    cfg: Dict[str, Any],
-) -> None:
-    N = packed.shape[1]
-    K = packed.shape[2] * 2
-    EM = sorted_ids.shape[0]
-    scale = e4m3_kernel_view(scale)
-    grid = lambda META: (  # noqa: E731
-        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
-    _prefill_nvfp4_moe_kernel[grid](
-        a, packed, scale, glob, c, topk_weights_flat, sorted_ids, expert_ids,
-        num_tokens_post_padded,
-        _e2m1_lut(a.device.index),
-        N, K, EM, num_valid_tokens,
-        a.stride(0), a.stride(1),
-        packed.stride(0), packed.stride(1), packed.stride(2),
-        scale.stride(0), scale.stride(1), scale.stride(2),
-        glob.stride(0), glob.stride(1),
-        c.stride(1), c.stride(2),
-        topk_weights_flat.stride(0),
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=kernel_top_k,
-        compute_type=_tl_dtype(c.dtype),
-        **cfg,
     )
 
 
@@ -309,14 +132,14 @@ def fused_experts_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = _prefill_config(M)
+    cfg = nvfp4_moe.prefill_config(M, top_k, num_experts, hidden_states.device.index)
 
     sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
-    _prefill_gemm(
+    nvfp4_moe.prefill_gemm(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
         tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
         apply_router_weight_on_input, cfg,
@@ -324,7 +147,7 @@ def fused_experts_nvfp4(
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
-    _prefill_gemm(
+    nvfp4_moe.prefill_gemm(
         ic2, down_packed, down_scale, down_global, ic3,
         tw, sorted_ids, expert_ids, ntpp, num_valid, 1,
         not apply_router_weight_on_input, cfg,
@@ -334,8 +157,60 @@ def fused_experts_nvfp4(
     return out
 
 
+def fused_experts_nvfp4_w4a4(
+    hidden_states: torch.Tensor,
+    gate_up_packed: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_global: torch.Tensor,
+    down_packed: torch.Tensor,
+    down_scale: torch.Tensor,
+    down_global: torch.Tensor,
+    gate_up_input_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    activation: str = "silu",
+    act_alpha: float = 1.702,
+    act_limit: float = 7.0,
+) -> torch.Tensor:
+    """Prefill NVFP4 MoE with NVFP4 activations (W4A4) where the GPU and the batch favour it, else :func:`fused_experts_nvfp4`.
+
+    ``*_input_scale`` are the per-expert static activation scales of the ``num_experts`` banks; each GEMM input is quantized under their max, as vLLM does.
+    """
+    M, H = hidden_states.shape
+    top_k = topk_ids.shape[1]
+    inter = gate_up_packed.shape[1] // 2
+    cfg = nvfp4_moe.w4a4_prefill_config(M, top_k, num_experts, H, inter, activation, hidden_states.dtype, hidden_states.device.index)
+    if cfg is None:
+        return fused_experts_nvfp4(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global, down_packed, down_scale, down_global,
+            topk_weights, topk_ids, num_experts, activation, False, act_alpha, act_limit,
+        )
+    dev = hidden_states.device
+    g = torch.stack((gate_up_input_scale[:num_experts], down_input_scale[:num_experts])).float().amax(dim=1)
+    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    tw = topk_weights.reshape(-1).contiguous()
+    num_valid = topk_ids.numel()
+
+    xq, xs = quantize_nvfp4(hidden_states, g[0:1])
+    q = torch.empty((num_valid, inter // 2), device=dev, dtype=torch.uint8)
+    qs = torch.empty((num_valid, inter // 16), device=dev, dtype=torch.float8_e4m3fn)
+    nvfp4_moe.w4a4_gate_up_gemm(
+        xq, xs, g[0:1], gate_up_packed, gate_up_scale, gate_up_global, q, qs, g[1:2], sorted_ids, expert_ids, ntpp,
+        num_valid, top_k, activation, act_alpha, act_limit, cfg["gate_up"],
+    )
+    out = torch.zeros_like(hidden_states)
+    nvfp4_moe.w4a4_down_gemm(
+        q, qs, g[1:2], down_packed, down_scale, down_global, out, tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
+        cfg["down"],
+    )
+    return out
+
+
 __all__ = [
     "fused_experts_decode_nvfp4_marlin",
     "fused_experts_decode_nvfp4_serial",
     "fused_experts_nvfp4",
+    "fused_experts_nvfp4_w4a4",
 ]

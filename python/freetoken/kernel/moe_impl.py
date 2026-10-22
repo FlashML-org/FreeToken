@@ -34,7 +34,12 @@ def fused_moe_kernel_triton(
         even_Ks = True
     else:
         even_Ks = False
-    dtype = tl.bfloat16 if compute_type == torch.bfloat16 else tl.float16
+    if compute_type == torch.float32:
+        dtype = tl.float32
+    elif compute_type == torch.bfloat16:
+        dtype = tl.bfloat16
+    else:
+        dtype = tl.float16
     fused_moe_kernel[grid](
         A,
         B,

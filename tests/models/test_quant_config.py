@@ -26,7 +26,6 @@ from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import (
     CompressedTensorsConfig,
     Fp8BlockConfig,
-    KernelSelectionError,
     ModelOptConfig,
     Mxfp4Config,
     NoQuantConfig,
@@ -258,7 +257,8 @@ CASES = [
         "model.layers.{lin}.mlp.down_proj": FP8B, "lm_head": BF16,
     }, strategy="auto") for name in ("Qwen/Qwen3.8-27B-FP8", "Qwen/Qwen3.6-27B-FP8")],
     Case("RedHatAI/Muse-Glimmer-30B-NVFP4", CompressedTensorsConfig, {
-        "model.layers.0.self_attn.qkvg_proj": NVFP4, "model.layers.0.self_attn.o_proj": NVFP4,
+        "model.layers.0.self_attn.qkv_proj": NVFP4, "model.layers.0.self_attn.gate_proj": NVFP4,
+        "model.layers.0.self_attn.o_proj": NVFP4,
         "model.layers.0.mlp.gate_up_proj": NVFP4, "model.layers.0.mlp.down_proj": NVFP4, "lm_head": BF16,
     }, strategy="auto"),
     Case("nvidia/Gemma-4-31B-IT-NVFP4", ModelOptConfig, {
@@ -352,7 +352,7 @@ CASES = [
     # hybrid decodes on the CPU executor too, so the expert kernel must have a CPU format
     Case("Qwen3.6-35B-A3B-NVFP4", ModelOptConfig, {"model.layers.{lin}.mlp.experts": (Nvfp4MoEMethod, "triton")}, strategy="hybrid"),
     Case("Qwen3.6-35B-A3B", NoQuantConfig, {"model.layers.{lin}.mlp.experts": (UnquantizedMoEMethod, "fused")}, strategy="hybrid"),
-    Case("Qwen3.6-35B-A3B-FP8", Fp8BlockConfig, {}, strategy="hybrid", raises=KernelSelectionError),
+    Case("Qwen3.6-35B-A3B-FP8", Fp8BlockConfig, {"model.layers.{lin}.mlp.experts": (Fp8BlockMoEMethod, "triton")}, strategy="hybrid"),
 ]
 
 
@@ -569,9 +569,11 @@ def _expected_kinds(suffixes: set[str], tensors: dict[str, dict], module: str) -
         if tensors:
             if dtype("weight") == "U8":
                 return {QuantKind.MXFP4}
+            if dtype("weight_scale") == "U8":
+                return {QuantKind.MXFP8}
             sh = shape("weight_scale") or []
             return {QuantKind.FP8_BLOCK} if len(sh) == 2 and sh[0] > 1 and sh[1] > 1 else {QuantKind.FP8_TENSOR}
-        return {QuantKind.FP8_TENSOR, QuantKind.FP8_BLOCK, QuantKind.MXFP4}
+        return {QuantKind.FP8_TENSOR, QuantKind.FP8_BLOCK, QuantKind.MXFP4, QuantKind.MXFP8}
     return {QuantKind.NONE}
 
 

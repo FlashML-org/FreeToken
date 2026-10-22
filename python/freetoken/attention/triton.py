@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.kernel.triton.attention import decode_kv_split_cap
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -16,9 +17,9 @@ if TYPE_CHECKING:
 @dataclass
 class TritonCaptureData(BaseCaptureData):
     q_to_req: torch.Tensor
+    # flat decode split scratch: each graph batch size views it with its own split count
     attn_logits: torch.Tensor
     attn_lse: torch.Tensor
-    num_kv_splits: torch.Tensor
     swa_page_table: torch.Tensor | None = None
 
     @classmethod
@@ -30,7 +31,7 @@ class TritonCaptureData(BaseCaptureData):
         *,
         num_q_heads: int,
         max_head_dim: int,
-        max_kv_splits: int,
+        scratch_rows: int,
         **kwargs,
     ):
         return cls(
@@ -40,22 +41,8 @@ class TritonCaptureData(BaseCaptureData):
             cu_seqlens_q=torch.arange(0, max_bs + 1, dtype=torch.int32, device=device),
             page_table=torch.zeros((max_bs, max_seq_len), dtype=torch.int32, device=device),
             q_to_req=torch.arange(max_bs, dtype=torch.int32, device=device),
-            attn_logits=torch.empty(
-                (max_bs, num_q_heads, max_kv_splits, max_head_dim),
-                dtype=torch.float32,
-                device=device,
-            ),
-            attn_lse=torch.empty(
-                (max_bs, num_q_heads, max_kv_splits),
-                dtype=torch.float32,
-                device=device,
-            ),
-            num_kv_splits=torch.full(
-                (max_bs,),
-                max_kv_splits,
-                dtype=torch.int32,
-                device=device,
-            ),
+            attn_logits=torch.empty((scratch_rows * num_q_heads * max_head_dim,), dtype=torch.float32, device=device),
+            attn_lse=torch.empty((scratch_rows * num_q_heads,), dtype=torch.float32, device=device),
             **kwargs,
         )
 
@@ -72,7 +59,6 @@ class TritonMetadata(BaseAttnMetadata):
     max_q_len: int
     attn_logits: torch.Tensor | None = None
     attn_lse: torch.Tensor | None = None
-    num_kv_splits: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -87,7 +73,6 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.capture: TritonCaptureData | None = None
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.max_kv_splits = 8
         self.prefill_tile_min_q = 128
         self.num_q_heads = int(getattr(config, "num_qo_heads", 1))
         kv_groups = getattr(config, "kv_cache_group_specs", lambda: ())()
@@ -95,6 +80,11 @@ class TritonAttentionBackend(BaseAttnBackend):
             (group.head_dim for group in kv_groups),
             default=int(getattr(config, "head_dim", 1)),
         )
+        self.kv_heads = sorted({group.num_kv_heads for group in kv_groups}) or [int(getattr(config, "num_kv_heads", 1))]
+
+    def _split_cap(self, bs: int) -> int:
+        """The most decode KV splits any layer group takes at this batch size."""
+        return max(decode_kv_split_cap(bs, max(1, self.num_q_heads), heads, self.device.index) for heads in self.kv_heads)
 
     def _ensure_decode_scratch(
         self,
@@ -103,30 +93,25 @@ class TritonAttentionBackend(BaseAttnBackend):
         num_q_heads: int,
         head_dim: int,
     ) -> None:
+        splits = self._split_cap(bs)
         if (
             metadata.attn_logits is not None
             and metadata.attn_lse is not None
-            and metadata.num_kv_splits is not None
             and metadata.attn_logits.shape[0] >= bs
             and metadata.attn_logits.shape[1] >= num_q_heads
+            and metadata.attn_logits.shape[2] >= splits
             and metadata.attn_logits.shape[3] >= head_dim
         ):
             return
         scratch_head_dim = max(self.max_head_dim, head_dim)
         metadata.attn_logits = torch.empty(
-            (bs, num_q_heads, self.max_kv_splits, scratch_head_dim),
+            (bs, num_q_heads, splits, scratch_head_dim),
             dtype=torch.float32,
             device=self.device,
         )
         metadata.attn_lse = torch.empty(
-            (bs, num_q_heads, self.max_kv_splits),
+            (bs, num_q_heads, splits),
             dtype=torch.float32,
-            device=self.device,
-        )
-        metadata.num_kv_splits = torch.full(
-            (bs,),
-            self.max_kv_splits,
-            dtype=torch.int32,
             device=self.device,
         )
 
@@ -167,7 +152,6 @@ class TritonAttentionBackend(BaseAttnBackend):
             self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
             assert metadata.attn_logits is not None
             assert metadata.attn_lse is not None
-            assert metadata.num_kv_splits is not None
             return decode_paged_attention(
                 q=q,
                 k_cache=k_cache,
@@ -177,8 +161,6 @@ class TritonAttentionBackend(BaseAttnBackend):
                 q_positions=metadata.q_positions,
                 attn_logits=metadata.attn_logits[:bs],
                 attn_lse=metadata.attn_lse[:bs],
-                num_kv_splits=metadata.num_kv_splits[:bs],
-                max_kv_splits=self.max_kv_splits,
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
@@ -230,17 +212,16 @@ class TritonAttentionBackend(BaseAttnBackend):
         cached_lens = [req.cached_len for req in reqs]
         num_query_tokens = sum(seqlens_q)
         is_decode = max(seqlens_q) == 1
-        prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": device.type == "cuda"}
+        prefix_lens = torch.tensor(cached_lens, **CPU_KWARGS).to(device, non_blocking=True)
 
-        indptr = torch.tensor([0] + seqlens_k, dtype=torch.int32, device=device).cumsum_(0)
+        indptr = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(0).to(device, non_blocking=True)
         if is_decode:
             cu_seqlens_q_gpu = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
         elif all(l == 0 for l in cached_lens):
             cu_seqlens_q_gpu = indptr
         else:
-            cu_seqlens_q_gpu = torch.tensor(
-                [0] + seqlens_q, dtype=torch.int32, device=device
-            ).cumsum_(0)
+            cu_seqlens_q_gpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(0).to(device, non_blocking=True)
         indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
         swa_indices = None
         if getattr(self.kvcache, "swa_paged", False):
@@ -281,7 +262,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             self.device,
             num_q_heads=max(1, self.num_q_heads),
             max_head_dim=max(1, self.max_head_dim),
-            max_kv_splits=self.max_kv_splits,
+            scratch_rows=max(bs * self._split_cap(bs) for bs in bs_list),
         )
         if self._swa_capture_enabled():
             self.capture.swa_page_table = torch.zeros(
@@ -325,14 +306,20 @@ class TritonAttentionBackend(BaseAttnBackend):
         metadata.indices = indices
         metadata.q_to_req = self.capture.q_to_req[: metadata.q_to_req.numel()]
         metadata.q_positions = self.capture.positions[:q_tokens]
-        metadata.attn_logits = self.capture.attn_logits[:bs]
-        metadata.attn_lse = self.capture.attn_lse[:bs]
-        metadata.num_kv_splits = self.capture.num_kv_splits[:bs]
+        metadata.attn_logits, metadata.attn_lse = self._capture_scratch(bs)
+
+    def _capture_scratch(self, bs: int) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.capture is not None
+        splits, heads, dim = self._split_cap(bs), max(1, self.num_q_heads), max(1, self.max_head_dim)
+        logits = self.capture.attn_logits[: bs * heads * splits * dim].view(bs, heads, splits, dim)
+        lse = self.capture.attn_lse[: bs * heads * splits].view(bs, heads, splits)
+        return logits, lse
 
     def prepare_for_capture(self, batch: Batch) -> None:
         bs = batch.size
         assert bs in self.capture_bs and self.capture is not None
         capture = self.capture
+        attn_logits, attn_lse = self._capture_scratch(bs)
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=capture.cu_seqlens_q[: bs + 1],
             indptr=capture.cu_seqlens_k[: bs + 1],
@@ -342,9 +329,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             is_decode=True,
             prefix_lens=capture.positions[:bs],
             max_q_len=1,
-            attn_logits=capture.attn_logits[:bs],
-            attn_lse=capture.attn_lse[:bs],
-            num_kv_splits=capture.num_kv_splits[:bs],
+            attn_logits=attn_logits,
+            attn_lse=attn_lse,
             swa_indices=self._capture_swa_indices(),
         )
 
