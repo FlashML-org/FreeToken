@@ -128,6 +128,7 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
 
 
 def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cache(monkeypatch):
+    from freetoken.layers.quantization import RoutedExperts
     from freetoken.moe import offload_kernels
 
     layer, cache = _make_layer_and_cache(num_experts=160, cache_size=192)
@@ -163,6 +164,13 @@ def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cach
         return hidden_states
 
     monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
+    apply = layer.quant_method.apply
+
+    def apply_and_keep_the_view(*args, **kwargs):
+        calls["view"] = args[3]
+        return apply(*args, **kwargs)
+
+    monkeypatch.setattr(layer.quant_method, "apply", apply_and_keep_the_view)
 
     hidden_states = torch.randn(96, 8)
     out = layer.prefill_forward(hidden_states, torch.randn(96, 160))
@@ -179,6 +187,8 @@ def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cach
     # the grouped GEMM reads the whole slot cache at the slots the admission wrote
     assert calls["w1"].shape[0] == cache.cache_size
     assert torch.equal(calls["topk_ids"], cache.cache_size - 1 - routes[:96])
+    # and sizes itself by the layer's experts, which bf16 keeps no scales for
+    assert calls["view"].routed == RoutedExperts(160, None)
 
     events.clear()
     layer.prefill_forward(torch.randn(97, 8), torch.randn(97, 160))
