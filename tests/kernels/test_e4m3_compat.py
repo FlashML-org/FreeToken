@@ -106,16 +106,19 @@ class TestPrimitives:
         ok = ~ref.isnan()
         assert torch.equal(out[ok], ref[ok])
 
-    def test_round_to_grid_bitexact(self):
+    @pytest.mark.parametrize("native_cast", [False, True], ids=["round_e4m3", "f32_to_e4m3"])
+    def test_round_to_grid_bitexact(self, native_cast):
         import triton
         import triton.language as tl
-        from freetoken.kernel.triton.e4m3_compat import round_e4m3
+        from freetoken.kernel.triton.e4m3_compat import f32_to_e4m3, round_e4m3
 
         @triton.jit
-        def k(x_ptr, y_ptr, N, BLOCK: tl.constexpr):
+        def k(x_ptr, y_ptr, N, BLOCK: tl.constexpr, NATIVE_CAST: tl.constexpr):
             offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
             m = offs < N
-            tl.store(y_ptr + offs, round_e4m3(tl.load(x_ptr + offs, mask=m, other=0.0)), mask=m)
+            x = tl.load(x_ptr + offs, mask=m, other=0.0)
+            y = f32_to_e4m3(x).to(tl.float32) if NATIVE_CAST else round_e4m3(x)
+            tl.store(y_ptr + offs, y, mask=m)
 
         torch.manual_seed(0)
         grid = torch.arange(256, dtype=torch.uint8, device="cuda").view(FP8).to(torch.float32)
@@ -131,7 +134,7 @@ class TestPrimitives:
         ]
         x = torch.cat(parts).clamp(-448, 448).contiguous()
         y = torch.empty_like(x)
-        k[(triton.cdiv(x.numel(), 1024),)](x, y, x.numel(), BLOCK=1024)
+        k[(triton.cdiv(x.numel(), 1024),)](x, y, x.numel(), BLOCK=1024, NATIVE_CAST=native_cast)
         ref = x.to(FP8).to(torch.float32)
         assert int(((y != ref) & ~(y.isnan() & ref.isnan())).sum()) == 0
 

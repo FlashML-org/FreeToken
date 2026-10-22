@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.dsv4.fp8_linear import _log2_ceil, _round_fp4
-from freetoken.kernel.triton.e4m3_compat import e4m3_f32_to_u8, e4m3_native_cx, round_e4m3
+from freetoken.kernel.triton.e4m3_compat import e4m3_f32_to_u8, e4m3_native_cx, f32_to_e4m3, round_e4m3
 from freetoken.kvcache.dsv4.v41_row_format import BF16, RowFormat
 
 from .row_format import fp4_f32_to_nibble, load_rows
@@ -32,7 +32,7 @@ from .row_format import fp4_f32_to_nibble, load_rows
 def _e4m3_codes(q):
     """fp32 (|q| <= 448) -> e4m3 bit pattern, RNE."""
     if e4m3_native_cx():
-        return q.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        return f32_to_e4m3(q).to(tl.uint8, bitcast=True)
     else:
         return e4m3_f32_to_u8(round_e4m3(q))
 
@@ -41,7 +41,7 @@ def _e4m3_codes(q):
 def _e4m3_round(q):
     """fp32 -> nearest e4m3 value, as fp32."""
     if e4m3_native_cx():
-        return q.to(tl.float8e4nv).to(tl.float32)
+        return f32_to_e4m3(q).to(tl.float32)
     else:
         return round_e4m3(q)
 

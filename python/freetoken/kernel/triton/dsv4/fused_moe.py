@@ -25,7 +25,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel.triton.dsv4.fp8_linear import _log2_ceil
-from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, round_e4m3
+from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, f32_to_e4m3, round_e4m3
 
 _E2M1_VALUES = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -158,7 +158,7 @@ def _swiglu_kernel(
         sc = tl.exp2(_log2_ceil(amax * (1.0 / 448.0)).to(tl.float32))
         q = tl.clamp(xs / sc[:, None], -448.0, 448.0)
         if e4m3_native_cx():
-            q = q.to(tl.float8e4nv).to(tl.float32)
+            q = f32_to_e4m3(q).to(tl.float32)
         else:
             q = round_e4m3(q)
         act = tl.reshape(q * sc[:, None], (BLOCK,))
