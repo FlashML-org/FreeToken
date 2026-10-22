@@ -275,8 +275,10 @@ def test_nvfp4_experts_restricted_to_triton_for_swigluoai(monkeypatch):
     from freetoken.kernel import backend
     from freetoken.layers.quantization import KernelSelectionError, ModelOptConfig, select_kernel
     from freetoken.layers.quantization.moe import Nvfp4MoEMethod
+    from freetoken.layers.quantization.moe.nvfp4 import W4a4Nvfp4MoEKernel
 
     monkeypatch.setattr(backend, "device_capability", lambda: (12, 0))
+    monkeypatch.setattr(W4a4Nvfp4MoEKernel, "worth_it", lambda self, cfg: False)
     monkeypatch.setattr(backend, "is_vllm_installed", lambda: True)
     monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: True)
     cfg = MoEConfig(num_experts=256, hidden=6144, intermediate=3072, top_k=4, scheme=ModelOptConfig.SCHEMES["NVFP4"], strategy="offload", activation="swigluoai", alpha=1.702, limit=7.0)
