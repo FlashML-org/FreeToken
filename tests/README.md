@@ -4,8 +4,8 @@ Directories mirror the `python/freetoken/` subsystem a test primarily exercises 
 put a new test next to the module it protects. A test specific to one model
 lives in `models/<model>/`, mirroring `python/freetoken/models/<model>/`
 (`models/deepseek_v41/`, `models/qwen4_exp/`). Older model-specific tests still
-sit in subsystem directories with the model in the filename
-(`kvcache/test_dsv4_pool.py`, `dsv4/`) and will move there.
+sit flat in `models/` (`models/test_glm5_next_model.py`), in subsystem
+directories (`kvcache/test_dsv4_pool.py`) or in `dsv4/`, and will move there.
 
 | directory    | subsystem under test |
 |--------------|----------------------|
@@ -17,12 +17,13 @@ sit in subsystem directories with the model in the filename
 | `engine/`    | `freetoken.engine` — cache budget planning, config resolution, backend gating |
 | `kernels/`   | `freetoken.kernel` / `freetoken.layers` — attention, rope, fused ops, JIT cache, pinned memory |
 | `attention/` | `freetoken.attention` — attention backends against eager references |
-| `layers/`    | `freetoken.layers` — layer modules (mHC) |
+| `layers/`    | `freetoken.layers` — whole layer modules (mHC); a layer's kernels and fused ops go in `kernels/` |
 | `moe/`       | `freetoken.moe` — offload cache, CPU/GPU expert kernels, quantized backends (fp8/nvfp4/mxfp4/gguf) |
 | `models/`    | `freetoken.models` — the registry, and the loading machinery every model shares (sharding, qkv/expert merge, streaming layers into banks); one directory per model for tests specific to it |
 | `mm/`        | `freetoken.mm` — multimodal processor, placeholder expansion, encoder cache |
 | `checkpoint/` | `freetoken.checkpoint` — FTW read/write and replay |
 | `utils/`     | `freetoken.utils` — HF config loading, ROCm arch detection |
+| `dsv4/`      | DeepSeek-V4 tests that predate `models/<model>/` |
 | `e2e/`       | real-server gates: AIME 24/25/26 generation, runtime cache rebuild |
 
 The CLI surface itself is not unit-tested. `ft` dispatch, `ft ctl`, `ft launch` and
@@ -114,10 +115,9 @@ surfaces — the terminal UI, the access-log filter, the request ring, the statu
 and health endpoints, the CLI — announce their own breakage the moment anyone
 uses them, and they change shape often enough that a unit test mostly restates
 today's implementation. Those belong to `e2e/` and to actually running the
-thing. What earns a unit test is logic that fails *silently*: a wrong number
-that still looks like a number, a model family that quietly stops having its
-tool calls parsed, a cache that returns the wrong slot. Prefer covering that
-where it lives rather than through the surface that happens to expose it.
+thing. What earns a unit test is logic that fails *silently*, like the bugs
+listed above. Prefer covering that where it lives rather than through the
+surface that happens to expose it.
 
 Writing a test in the same commit as the feature is right; what matters is where
 its expectations come from. A test that checks the result against something
@@ -138,7 +138,8 @@ automatically.
 
 - **Extend before you create.** Add a case to an existing `parametrize` or
   table first, then a function in the existing file for that module. In an
-  existing file, reuse its fixtures; build new setup with real objects (below).
+  existing file, reuse its fixtures unless they stand in for FreeToken objects;
+  build new setup with real objects (below).
   A new file, directory, fixture or helper needs a reason.
 - **One strong case beats several weak ones.** Each extra case must guard a
   different failure. If the test diff dwarfs the change, cut setup and
