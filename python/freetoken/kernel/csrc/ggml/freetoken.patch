@@ -34,6 +34,37 @@
      ggml_glu_op glu_op;
      float glu_limit = 0.0f;
      const void * shared_up = nullptr;
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -450,3 +450,15 @@
+         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
+     }
+ }
++
++// FreeToken: for k_get_rows with qk = QK_NVFP4_SUB, so ib indexes a 16-element sub-block and the nibble pair lands at iqs and iqs + 8
++static __device__ __forceinline__ void dequantize_nvfp4(const void * vx, const int64_t ib, const int iqs, float2 & v){
++    const block_nvfp4 * x = (const block_nvfp4 *) vx + ib/(QK_NVFP4/QK_NVFP4_SUB);
++    const int sub = ib % (QK_NVFP4/QK_NVFP4_SUB);
++
++    const float d = ggml_cuda_ue4m3_to_fp32(x->d[sub]);
++    const int vui = x->qs[sub*(QK_NVFP4_SUB/2) + iqs];
++
++    v.x = d * kvalues_mxfp4[vui & 0xF];
++    v.y = d * kvalues_mxfp4[vui >> 4];
++}
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -404,6 +404,10 @@
+             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
++        case GGML_TYPE_NVFP4:
++            get_rows_cuda_q<QK_NVFP4_SUB, QR_NVFP4, dequantize_nvfp4>(src0_d, src1_d, dst_d,
++                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            break;
+         default:
+             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
+     }
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
 @@ -177,3 +177,45 @@

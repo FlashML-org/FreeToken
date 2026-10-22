@@ -450,3 +450,15 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
 }
+
+// FreeToken: for k_get_rows with qk = QK_NVFP4_SUB, so ib indexes a 16-element sub-block and the nibble pair lands at iqs and iqs + 8
+static __device__ __forceinline__ void dequantize_nvfp4(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_nvfp4 * x = (const block_nvfp4 *) vx + ib/(QK_NVFP4/QK_NVFP4_SUB);
+    const int sub = ib % (QK_NVFP4/QK_NVFP4_SUB);
+
+    const float d = ggml_cuda_ue4m3_to_fp32(x->d[sub]);
+    const int vui = x->qs[sub*(QK_NVFP4_SUB/2) + iqs];
+
+    v.x = d * kvalues_mxfp4[vui & 0xF];
+    v.y = d * kvalues_mxfp4[vui >> 4];
+}

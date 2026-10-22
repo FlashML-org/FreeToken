@@ -1,11 +1,18 @@
 """Packed GGUF ops against gguf-py's CPU dequantization and PyTorch math."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 
 from freetoken.kernel import ggml
+from freetoken.layers.quantization import KernelSelectionError, select_kernel
+from freetoken.layers.quantization.embedding.base import EmbeddingConfig
+from freetoken.layers.quantization.embedding.gguf import GGUFEmbeddingMethod, GgmlEmbeddingKernel
+from freetoken.layers.quantization.ggml_types import pad_rows
+from freetoken.layers.quantization.scheme import gguf_scheme
 from freetoken.third_party.gguf import GGMLQuantizationType as QType
 from freetoken.third_party.gguf import quants
 
@@ -21,6 +28,20 @@ def _q4_weights(shape, seed=690):
     storage = torch.zeros(*packed.shape[:-2], packed.shape[-2] + 1, packed.shape[-1], dtype=torch.uint8, device="cuda")
     storage[..., :-1, :].copy_(torch.from_numpy(packed))
     return storage[..., :-1, :], reference
+
+
+def _nvfp4_weights(shape, max_scale_code=0x7E, seed=765):
+    """Random NVFP4 blocks over every fp4 code; UE4M3 scale codes up to ``max_scale_code`` (0x7F is NaN), padded for MMQ."""
+    rng = np.random.default_rng(seed)
+    rows, k = shape
+    blocks = k // 64
+    d = rng.integers(0, max_scale_code + 1, (rows, blocks, 4), dtype=np.uint8)
+    qs = rng.integers(0, 256, (rows, blocks, 32), dtype=np.uint8)
+    packed = np.concatenate([d, qs], axis=-1).reshape(rows, blocks * 36)
+    reference = torch.from_numpy(quants.dequantize(packed, QType.NVFP4))
+    storage = torch.zeros(rows + pad_rows(int(QType.NVFP4), k), packed.shape[-1], dtype=torch.uint8, device="cuda")
+    storage[:rows].copy_(torch.from_numpy(packed))
+    return storage, reference
 
 
 def _activation(shape, dtype, seed=19):
@@ -82,3 +103,34 @@ def test_q4_nondefault_stream():
         copied = actual.clone()
     stream.synchronize()
     torch.testing.assert_close(copied.cpu(), F.linear(x.cpu(), ref), atol=2e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nvfp4_dequantize_and_rows(dtype):
+    # 320 values: five NVFP4 blocks, not a multiple of the 256-value super-block the k-quant get_rows path needs
+    w, ref = _nvfp4_weights((64, 320))
+    actual = ggml.dequantize(w[:64], int(QType.NVFP4), 320, dtype)
+    torch.testing.assert_close(actual.cpu(), ref.to(dtype), atol=0, rtol=0)
+    ids = torch.tensor([63, 0, 17, 17], dtype=torch.int32, device="cuda")
+    rows = ggml.get_rows(w, int(QType.NVFP4), 320, ids, dtype)
+    torch.testing.assert_close(rows.cpu(), ref[ids.cpu().long()].to(dtype), atol=0, rtol=0)
+
+
+def test_nvfp4_table_embed_and_tied_logits():
+    w, ref = _nvfp4_weights((64, 320), max_scale_code=0x3F)
+    cfg = EmbeddingConfig(64, 320, 1, torch.float32, gguf_scheme([QType.NVFP4]))
+    layer = SimpleNamespace(quant_method=SimpleNamespace(cfg=cfg), weight=w)
+    kernel = GgmlEmbeddingKernel()
+    ids = torch.tensor([[63, 0], [17, 17]], dtype=torch.int32, device="cuda")
+    torch.testing.assert_close(kernel.embed(layer, ids).cpu(), ref[ids.cpu().long()], atol=0, rtol=0)
+    x = _activation((3, 320), torch.float32)
+    torch.testing.assert_close(kernel.logits(layer, x, None).cpu(), F.linear(x.cpu(), ref), atol=1e-3, rtol=1e-3)
+
+
+def test_nvfp4_table_kernel_selection():
+    cfg = EmbeddingConfig(64, 320, 1, torch.bfloat16, gguf_scheme([QType.NVFP4]))
+    assert select_kernel(GGUFEmbeddingMethod.candidates, "auto", cfg).name == "ggml"
+    # llama.cpp reads no token_embd scale and refuses a tied NVFP4 head that has one
+    scaled = EmbeddingConfig(64, 320, 1, torch.bfloat16, gguf_scheme([QType.NVFP4], scaled=True))
+    with pytest.raises(KernelSelectionError):
+        select_kernel(GGUFEmbeddingMethod.candidates, "auto", scaled)
