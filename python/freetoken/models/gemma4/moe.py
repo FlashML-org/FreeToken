@@ -91,7 +91,9 @@ class Gemma4MLP(BaseOP):
         self.post_feedforward_layernorm_2 = GemmaRMSNorm(hidden_size, eps=eps)
         self.layer_scalar = torch.empty(1)
 
-    def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pre_ff: torch.Tensor, x: torch.Tensor, *, apply_layer_scalar: bool = True
+    ) -> torch.Tensor:
         residual = x
         shared = self.shared_mlp.forward(pre_ff)
 
@@ -101,6 +103,11 @@ class Gemma4MLP(BaseOP):
         # keep the router's output intact.
         routed = self.experts.routed_forward(routed_in, topk_weights, topk_ids.clone())
 
+        layer_scalar = (
+            self.layer_scalar
+            if apply_layer_scalar
+            else torch.ones_like(self.layer_scalar)
+        )
         return gemma_dual_rmsnorm_residual_scalar(
             shared,
             self.post_feedforward_layernorm_1.weight,
@@ -108,7 +115,7 @@ class Gemma4MLP(BaseOP):
             self.post_feedforward_layernorm_2.weight,
             self.post_feedforward_layernorm.weight,
             residual,
-            self.layer_scalar,
+            layer_scalar,
             self.post_feedforward_layernorm_1.eps,
             self.post_feedforward_layernorm_2.eps,
             self.post_feedforward_layernorm.eps,
@@ -132,10 +139,13 @@ class Gemma4DenseMLP(BaseOP):
         )
         self.layer_scalar = torch.empty(1)
 
-    def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pre_ff: torch.Tensor, x: torch.Tensor, *, apply_layer_scalar: bool = True
+    ) -> torch.Tensor:
         h = self.shared_mlp.forward(pre_ff)
         h = self.post_feedforward_layernorm.forward(h)
-        return (x + h) * self.layer_scalar
+        output = x + h
+        return output * self.layer_scalar if apply_layer_scalar else output
 
 
 __all__ = [

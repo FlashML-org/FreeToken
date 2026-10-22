@@ -266,6 +266,16 @@ def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[s
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
 
 
+def alloc_layer_banks(
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]], num_layers: int
+) -> dict[str, list[HostBank]]:
+    """Allocate independent lazy host banks for each layer and bank role."""
+    return {
+        name: [HostBank(shape, dtype) for _ in range(num_layers)]
+        for name, (shape, dtype) in specs.items()
+    }
+
+
 class _ResidencyPlan:
     """Per-layer ``HostResidency`` labels, ambiently visible to the bank settle points.
 
@@ -592,6 +602,7 @@ __all__ = [
     "LayerCompletionTracker",
     "PinPipeline",
     "alloc_banks",
+    "alloc_layer_banks",
     "born_pinned_default",
     "pin_banks",
     "read_file_into",

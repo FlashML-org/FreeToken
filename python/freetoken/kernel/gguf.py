@@ -1,13 +1,7 @@
-"""Borrowed llama.cpp GGUF dequant/GEMM CUDA kernels, JIT-compiled on first use.
+"""Compatibility wrappers for operations on packed GGUF weights.
 
-The ``.cu``/``.cuh`` under ``csrc/gguf/`` are vendored verbatim from sgl-kernel
-(``csrc/quantization/gguf/``), which are themselves ports of llama.cpp. We compile
-them through ``torch.utils.cpp_extension.load`` (the same toolchain sglang/vllm use)
-into a torch-op module and expose the handful of ops the GGUF path needs. This is a
-separate, torch-native extension that sits alongside FreeToken's tvm-ffi kernels.
-
-All ops keep the weight in its native GGUF block layout (packed ``uint8`` rows) and
-dequantize *inside* the kernel -- no bf16 copy of the weight is ever materialized.
+Dequantization, matrix multiplication and vector-routed MoE use the shared ggml
+CUDA module, keeping weights in their native packed layout until kernel execution.
 """
 
 from __future__ import annotations
@@ -124,21 +118,34 @@ def ggml_dequantize(
     weight: torch.Tensor, quant_type: int, m: int, n: int, dtype: torch.dtype | None = None
 ) -> torch.Tensor:
     """Dequantize a packed GGUF weight ``[m, row_bytes]`` to a dense ``[m, n]`` tensor."""
-    return _module().ggml_dequantize(weight, quant_type, m, n, dtype)
+    from .ggml import dequantize
+
+    if weight.shape[0] != m:
+        raise ValueError(f"expected {m} GGUF rows, got {weight.shape[0]}")
+    output_dtype = dtype if dtype is not None else torch.bfloat16
+    return dequantize(weight, quant_type, n, output_dtype)
 
 
 def ggml_mul_mat_vec_a8(
     weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:
     """MMVQ: small-batch GEMV with on-the-fly dequant. ``row`` = output features."""
-    return _module().ggml_mul_mat_vec_a8(weight, x, quant_type, row)
+    from .ggml import mul_mat
+
+    if weight.shape[0] != row:
+        raise ValueError(f"expected {row} GGUF output rows, got {weight.shape[0]}")
+    return mul_mat(weight, quant_type, x)
 
 
 def ggml_mul_mat_a8(
     weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:
     """MMQ: large-batch quantized matmul. ``row`` = output features."""
-    return _module().ggml_mul_mat_a8(weight, x, quant_type, row)
+    from .ggml import mul_mat
+
+    if weight.shape[0] != row:
+        raise ValueError(f"expected {row} GGUF output rows, got {weight.shape[0]}")
+    return mul_mat(weight, quant_type, x)
 
 
 def ggml_moe_a8(
@@ -169,7 +176,17 @@ def ggml_moe_a8_vec(
     tokens: int,
 ) -> torch.Tensor:
     """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``."""
-    return _module().ggml_moe_a8_vec(x, weight, topk_ids, top_k, quant_type, row, tokens)
+    from .ggml import mul_mat_id
+
+    if x.shape[0] != tokens:
+        raise ValueError(f"expected {tokens} input tokens, got {x.shape[0]}")
+    if weight.shape[1] != row:
+        raise ValueError(f"expected {row} GGUF output rows per expert, got {weight.shape[1]}")
+    if top_k < 1 or topk_ids.numel() < tokens * top_k:
+        raise ValueError("topk_ids does not contain the requested token routes")
+    ids = topk_ids.reshape(-1)[: tokens * top_k].reshape(tokens, top_k).to(torch.int32)
+    output = mul_mat_id(weight, quant_type, x, ids)
+    return output.reshape(tokens * top_k, row)
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:

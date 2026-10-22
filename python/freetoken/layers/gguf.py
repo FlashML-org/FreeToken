@@ -90,6 +90,19 @@ class GGUFLinear(BaseOP):
         self.qweight = torch.empty(out_features, row_bytes(in_features, quant_type), dtype=torch.uint8)
         self.bias = torch.empty(out_features) if has_bias else None
 
+    def load_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        prefix: str = "",
+        _internal: bool = False,
+    ) -> None:
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        if self._quant_type in _MMQ:
+            from freetoken.kernel.ggml import pad_mmq_tail
+
+            self.qweight = pad_mmq_tail(self.qweight, self._quant_type, self.in_features)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = fused_mul_mat_gguf(x, self.qweight, self._quant_type)
         if self.bias is not None:

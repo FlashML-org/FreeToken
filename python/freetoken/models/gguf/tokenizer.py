@@ -7,6 +7,7 @@ So we run only its tokenizer half: ``get_gguf_tokenizer`` and ``convert_gguf_tok
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from .reader import gguf_architecture, gguf_tensor_names, load_gguf_metadata
 
@@ -16,6 +17,17 @@ _EOG_NAMES = frozenset((
     "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]", "<|end_of_text|>", "<end_of_utterance>",
     "<eos>", "<turn|>", "<|tool_response>", "<\uff5cend\u2581of\u2581sentence\uff5c>", "[e~[", "<|ifm|im_end|>",
 ))
+
+_QWEN_ADDED_TOKENS = (
+    "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|object_ref_start|>",
+    "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>",
+    "<|quad_end|>", "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>",
+    "<|image_pad|>", "<|video_pad|>", "<tool_call>", "</tool_call>",
+    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>",
+    "<|repo_name|>", "<|file_sep|>", "<tool_response>", "</tool_response>",
+    "<think>", "</think>", "<|audio_start|>", "<|audio_end|>", "<tts_pad>",
+    "<tts_text_bos>", "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>",
+)
 
 # BPE pre-tokenizers that llama.cpp adds a bos for when the file has no add_bos_token key (llama_vocab::impl::load)
 _BOS_PRE = frozenset((
@@ -74,7 +86,7 @@ def _known_specials(special: dict, fast) -> dict:
 
 def load_gguf_tokenizer(model_path: str):
     from transformers import PreTrainedTokenizerFast
-    from transformers.integrations.ggml import convert_gguf_tokenizer
+    from transformers.integrations.gguf import convert_gguf_tokenizer, get_gguf_tokenizer
     from tokenizers import Tokenizer
     from tokenizers.decoders import ByteLevel as ByteLevelDecoder
     from tokenizers.decoders import Metaspace
@@ -82,11 +94,9 @@ def load_gguf_tokenizer(model_path: str):
     from tokenizers.pre_tokenizers import ByteLevel
     from tokenizers import AddedToken
 
-    arch, tok_dict, special = get_gguf_tokenizer(model_path)
-    fast, _ = convert_gguf_tokenizer(arch, tok_dict)
+    arch, converter_tok_dict, _ = get_gguf_tokenizer(model_path)
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
-    conv_arch = _TOKENIZER_ARCH.get(arch, arch)
     tok_dict: dict[str, Any] = {
         k[len("tokenizer.ggml.") :]: v
         for k, v in meta.items()
@@ -97,20 +107,10 @@ def load_gguf_tokenizer(model_path: str):
     # This repaired GGUF contains the 248044 base BPE entries but omits Qwen's
     # tokenizer.json added_tokens. Their IDs are part of the model vocabulary and
     # the chat template depends on them as atomic tokens.
-    qwen_added = (
-        "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|object_ref_start|>",
-        "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>",
-        "<|quad_end|>", "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>",
-        "<|image_pad|>", "<|video_pad|>", "<tool_call>", "</tool_call>",
-        "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>",
-        "<|repo_name|>", "<|file_sep|>", "<tool_response>", "</tool_response>",
-        "<think>", "</think>", "<|audio_start|>", "<|audio_end|>", "<tts_pad>",
-        "<tts_text_bos>", "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>",
-    )
     base_vocab_size = len(tokens)
     added_vocab = {
         token: base_vocab_size + index
-        for index, token in enumerate(qwen_added)
+        for index, token in enumerate(_QWEN_ADDED_TOKENS)
         if token not in tokens
     }
     if added_vocab:
@@ -145,9 +145,9 @@ def load_gguf_tokenizer(model_path: str):
         # array, while others omit them and require reconstruction above. Mark both cases
         # as special: leaving an existing <|im_end|> as ordinary BPE text can decode it as
         # the visible fragment ``|im_end|>`` instead of terminating the assistant turn.
-        fast.add_special_tokens([AddedToken(token, special=True) for token in qwen_added])
+        fast.add_special_tokens([AddedToken(token, special=True) for token in _QWEN_ADDED_TOKENS])
     else:
-        fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
+        fast, _extra = convert_gguf_tokenizer(arch, converter_tok_dict)
         # Gemma's vocabulary uses SentencePiece's U+2581 word marker. Some versions of
         # the GGUF converter build the tokenizer model but leave a byte/BPE-style decoder
         # attached, exposing ``▁`` and replacement characters in generated text. Restore
@@ -182,18 +182,26 @@ def gguf_eos_token_ids(model_path: str) -> set[int]:
     """Stop ids for GGUF generation, picked the way llama.cpp picks its end-of-generation tokens."""
     meta = load_gguf_metadata(model_path)
     tokens = meta["tokenizer.ggml.tokens"]
-    ids: set[int] = set()
-    if tokenizer.eos_token_id is not None:
-        ids.add(int(tokenizer.eos_token_id))
-    eid = meta.get("tokenizer.ggml.eos_token_id")
-    if eid is not None:
-        ids.add(int(eid))
-    # Look the stop tokens up in the completed vocab, which includes reconstructed Qwen
-    # added tokens. Avoid convert_tokens_to_ids for absent names because it maps them to unk.
-    for name in ("<eos>", "<turn|>", "<|im_end|>"):
-        token_id = tokenizer.get_vocab().get(name)
-        if token_id is not None:
-            ids.add(int(token_id))
+    ids = {index for index, token in enumerate(tokens) if token in _EOG_NAMES}
+    ids.update(
+        int(meta[f"tokenizer.ggml.{key}_token_id"])
+        for key in ("eos", "eot", "eom")
+        if f"tokenizer.ggml.{key}_token_id" in meta
+    )
+    names = {tokens[index]: index for index in ids if index < len(tokens)}
+    if "<|end|>" in names and names.keys() & {"<|call|>", "<|calls|>"} and names.keys() & {"<|return|>", "<|flush|>"}:
+        ids.discard(names["<|end|>"])
+    if "</s>" in names and names.keys() & {"<|tool_response>", "<|plamo:eos|>"}:
+        ids.discard(names["</s>"])
+
+    if gguf_architecture(model_path).startswith("qwen") and meta.get("tokenizer.ggml.model") == "gpt2":
+        present = set(tokens)
+        next_id = len(tokens)
+        for token in _QWEN_ADDED_TOKENS:
+            if token not in present:
+                if token in _EOG_NAMES:
+                    ids.add(next_id)
+                next_id += 1
     return ids
 
 

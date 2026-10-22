@@ -19,12 +19,13 @@ from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
 from .host_banks import HostBank
-from .offload_cache import _BANK_BYTES_PER_EXPERT, placeholder_bank
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS, placeholder_bank
 
 logger = init_logger(__name__)
 
 # the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+_PARALLEL_CHUNK = 8 << 20
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,10 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
+    layer_tags: list | None = None
+    layer_formats: list[str] | None = None
+    row_tail_bytes: dict[str, list[int]] | None = None
+    deferred_plan: object | None = None
     disk_index: object | None = None
     disk_ram_experts: int | None = None
 
@@ -206,6 +211,22 @@ def merge_expert_banks(parts: list[ExpertBanks], layer_methods, num_experts: int
     return ExpertBanks(
         primary.quant_format, sources, streamed=all(p.streamed for p in parts),
         kind=primary.kind, kernel=primary.kernel, layer_tags=formats, layer_formats=formats,
+    )
+
+
+def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for q4_0: GGUF is a single packed file "
+            "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
+            "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
+        )
+    from freetoken.models.weight import load_q4_0_moe_expert_sources
+
+    sink = None if dummy else layer_sink
+    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    return ExpertBanks(
+        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
     )
 
 
@@ -461,10 +482,12 @@ def load_expert_banks(
     *,
     method=None,
     device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
     dummy: bool = False,
     parallel: bool | None = None,
     workers: int = 8,
     chunk: int = _PARALLEL_CHUNK,
+    decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
     disk_tier=None,
@@ -507,17 +530,20 @@ def load_expert_banks(
         raise ValueError("experts of several formats are served from the offload slot cache only (no resident experts, no --moe-cpu-layers)")
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
-    if model_path and is_ftw_checkpoint(model_path) and not dummy:
-        if resident:
-            banks = load_ftw_banks_to_device(model_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
-        else:
-            banks = load_ftw_banks(
-                model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-                layer_residency=layer_residency,
-            )
-        if banks is not None:
-            logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
-            return banks
+    if model_path and is_ftw_checkpoint(model_path):
+        if disk_tier is not None:
+            raise ValueError("--moe-disk-tier requires the original safetensors checkpoint, not an FTW checkpoint")
+        if not dummy:
+            if resident:
+                banks = load_ftw_banks_to_device(model_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
+            else:
+                banks = load_ftw_banks(
+                    model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+                    layer_residency=layer_residency,
+                )
+            if banks is not None:
+                logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+                return banks
 
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(

@@ -184,7 +184,7 @@ def iter_weights(
     config = parse_config(cached_load_hf_config(model_path))
     args: Glm5NextArgs = config.glm5_args
     folder = download_hf_weight(model_path)
-    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
     reader = _ShardReader(folder, weight_map, device)
     primary = get_tp_info().is_primary()
@@ -241,7 +241,7 @@ def iter_weights(
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     folder = download_hf_weight(model_path)
-    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
     reader = _ShardReader(folder, weight_map, device)
     try:
@@ -281,7 +281,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
 
     def _serial():
         folder = download_hf_weight(model_path)
-        with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+        with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
             weight_map = json.load(f)["weight_map"]
         reader = _ShardReader(folder, weight_map, torch.device("cpu"))
         try:

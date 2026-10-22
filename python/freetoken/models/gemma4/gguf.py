@@ -1,14 +1,4 @@
-"""Gemma 4 GGUF adapter: build the FreeToken ``ModelConfig`` from GGUF metadata.
-
-The GGUF checkpoint's geometry is identical to the HF gemma4 model (hybrid
-SWA/full attention with ``k_eq_v`` full layers, 128 routed experts + shared MLP,
-final-logit softcap), so this produces the *same* ``ModelConfig`` as
-``gemma4.config.parse_config`` -- only the source is GGUF KV metadata instead of a
-HF config object. transformers' own GGUF->config conversion is rejected by the
-gemma4 strict dataclass (per-layer ``num_key_value_heads`` array), so we read the
-metadata directly. Every tensor keeps its packed ggml type (``QuantKind.GGUF``); the
-routed experts load as GGUF expert banks (``freetoken.models.gguf.experts``).
-"""
+"""Gemma 4 GGUF adapter, including dense and MoE variants, PLE, and shared KV."""
 
 from __future__ import annotations
 
@@ -25,9 +15,135 @@ from freetoken.models.config import (
     SWAAttentionGroupConfig,
 )
 from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q8_0, GGML_Q6_K, dequantize, row_bytes
+from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
+from freetoken.models.gguf.tensors import check_scales, float_tensor, matrix
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
+
+
+def _to_bf16(tensor: GgufTensorInfo) -> torch.Tensor:
+    return dequantize(tensor.packed().reshape(-1), tensor.ggml_type, torch.bfloat16).reshape(tensor.shape)
+
+
+def _kv_head_counts(value: Any, num_layers: int) -> tuple[int, ...]:
+    if isinstance(value, (list, tuple)):
+        if len(value) != num_layers:
+            raise ValueError(
+                f"gemma4.attention.head_count_kv has {len(value)} entries, expected {num_layers}"
+            )
+        counts = tuple(int(item) for item in value)
+    else:
+        counts = (int(value),) * num_layers
+    if any(count <= 0 for count in counts):
+        raise ValueError("gemma4.attention.head_count_kv entries must be positive")
+    return counts
+
+
+def _shared_kv_sources(
+    swa_pattern: list[bool], shared_kv_layers: int
+) -> tuple[int | None, ...]:
+    num_layers = len(swa_pattern)
+    if not 0 <= shared_kv_layers <= num_layers:
+        raise ValueError(
+            f"gemma4.attention.shared_kv_layers must be between 0 and {num_layers}"
+        )
+    if shared_kv_layers == 0:
+        return ()
+    first_shared = num_layers - shared_kv_layers
+    sources: dict[bool, int] = {}
+    for layer_id in range(first_shared):
+        sources[swa_pattern[layer_id]] = layer_id
+    result: list[int | None] = [None] * first_shared
+    for layer_id in range(first_shared, num_layers):
+        source = sources.get(swa_pattern[layer_id])
+        if source is None:
+            layer_type = "sliding" if swa_pattern[layer_id] else "full"
+            raise ValueError(
+                f"Gemma4 shared {layer_type}-attention layer {layer_id} has no "
+                "preceding KV source layer of the same attention type"
+            )
+        result.append(source)
+    return tuple(result)
+
+
+def _native_qweight_rows(rows: torch.Tensor) -> torch.Tensor:
+    if rows.dtype != torch.uint8:
+        rows = rows.contiguous().view(torch.uint8).reshape(rows.shape[0], -1)
+    return rows
+
+
+def _native_qweight(info: GgufTensorInfo, device) -> torch.Tensor:
+    return _native_qweight_rows(matrix(info)).to(device)
+
+
+def _convert_gemma4_ple_to_gguf(model, config) -> None:
+    if not config.per_layer_input_dim:
+        return
+    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+    from freetoken.models.gguf.reader import GGML_NVFP4, iter_gguf_tensors
+
+    tensor_types = {t.name: t.ggml_type for t in iter_gguf_tensors(config.gguf_model_path)}
+
+    def tensor_type(name: str) -> int:
+        value = tensor_types.get(name)
+        if value is None and name == "per_layer_token_embd.weight":
+            value = config.gguf_per_layer_embedding_type
+        if value is None:
+            raise ValueError(f"GGUF PLE tensor type is missing for {name}")
+        return value
+
+    ple_names = [
+        "per_layer_token_embd.weight",
+        "per_layer_model_proj.weight",
+        *(
+            f"blk.{layer_id}.{suffix}.weight"
+            for layer_id in range(config.num_layers)
+            for suffix in ("inp_gate", "proj")
+        ),
+    ]
+    if any(tensor_type(name) == GGML_NVFP4 for name in ple_names):
+        raise NotImplementedError("Gemma4 PLE tensors in NVFP4 format are not supported")
+
+    inner = model.model
+    embedding_type = tensor_type("per_layer_token_embd.weight")
+    ple_embedding = inner.embed_tokens_per_layer
+    if not (
+        isinstance(ple_embedding, GGUFEmbedding)
+        and ple_embedding._quant_type == embedding_type
+    ):
+        inner.embed_tokens_per_layer = GGUFEmbedding(
+            num_embeddings=config.per_layer_input_vocab_size or config.vocab_size,
+            embedding_dim=config.num_layers * config.per_layer_input_dim,
+            quant_type=embedding_type,
+            embed_scale=config.per_layer_input_dim**0.5,
+        )
+
+    def swap_linear(owner, attr: str, name: str) -> None:
+        lin = getattr(owner, attr)
+        out_features, in_features = lin.weight.shape
+        setattr(
+            owner,
+            attr,
+            GGUFLinear(in_features, out_features, tensor_type(name), has_bias=False),
+        )
+
+    swap_linear(
+        inner,
+        "per_layer_model_projection",
+        "per_layer_model_proj.weight",
+    )
+    for layer_id, layer in enumerate(inner.layers.op_list):
+        swap_linear(
+            layer,
+            "per_layer_input_gate",
+            f"blk.{layer_id}.inp_gate.weight",
+        )
+        swap_linear(
+            layer,
+            "per_layer_projection",
+            f"blk.{layer_id}.proj.weight",
+        )
 
 
 def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
@@ -57,13 +173,11 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             raise KeyError(f"missing GGUF metadata key gemma4.{key}")
         return val
 
-    if int(m.get("gemma4.embedding_length_per_layer_input", 0)) or int(m.get("gemma4.attention.shared_kv_layers", 0)):
-        raise NotImplementedError("gemma4 E2B / E4B GGUF (per-layer input embeddings, shared KV layers) is not supported")
     num_layers = int(g("block_count"))
     hidden = int(g("embedding_length"))
     num_experts = int(m.get("gemma4.expert_count", 0))
     num_qo_heads = int(g("attention.head_count"))
-    kv_per_layer = g("attention.head_count_kv")  # per-layer list
+    kv_per_layer = _kv_head_counts(g("attention.head_count_kv"), num_layers)
     # True -> sliding-window (SWA) layer, False -> full attention.
     swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
@@ -73,10 +187,82 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
     swa_head_dim = int(g("attention.key_length_swa"))
     full_head_dim = int(g("attention.key_length"))
-    swa_kv = int(kv_per_layer[swa_layer_ids[0]]) if swa_layer_ids else int(kv_per_layer[0])
-    full_kv = int(kv_per_layer[full_layer_ids[0]]) if full_layer_ids else int(kv_per_layer[0])
+    swa_kv = kv_per_layer[swa_layer_ids[0]] if swa_layer_ids else kv_per_layer[0]
+    full_kv = kv_per_layer[full_layer_ids[0]] if full_layer_ids else kv_per_layer[0]
+    for layer_ids, expected, name in (
+        (swa_layer_ids, swa_kv, "sliding"),
+        (full_layer_ids, full_kv, "full"),
+    ):
+        if any(kv_per_layer[layer_id] != expected for layer_id in layer_ids):
+            raise ValueError(f"Gemma4 {name}-attention layers have inconsistent KV head counts")
 
     max_pos = int(g("context_length"))
+    shared_kv_layers = int(m.get("gemma4.attention.shared_kv_layers", 0))
+    shared_kv_source_layers = _shared_kv_sources(swa_pattern, shared_kv_layers)
+    per_layer_input_dim = int(m.get("gemma4.embedding_length_per_layer_input", 0))
+    per_layer_vocab_size = int(
+        m.get("gemma4.vocab_size_per_layer_input", shim.vocab_size)
+    )
+    tensor_index = gguf_tensor_index(shim.model_path)
+    if per_layer_input_dim and tensor_index:
+        required_ple_tensors = (
+            "per_layer_token_embd.weight",
+            "per_layer_model_proj.weight",
+            "per_layer_proj_norm.weight",
+            *(
+                f"blk.{layer_id}.{suffix}.weight"
+                for layer_id in range(num_layers)
+                for suffix in ("inp_gate", "proj", "post_norm")
+            ),
+        )
+        missing = [name for name in required_ple_tensors if name not in tensor_index]
+        if missing:
+            raise ValueError(
+                "Gemma4 PLE metadata is present but GGUF tensors are missing: "
+                + ", ".join(missing)
+            )
+        expected_shapes = {
+            "per_layer_token_embd.weight": (
+                per_layer_vocab_size,
+                num_layers * per_layer_input_dim,
+            ),
+            "per_layer_model_proj.weight": (
+                num_layers * per_layer_input_dim,
+                hidden,
+            ),
+            "per_layer_proj_norm.weight": (per_layer_input_dim,),
+        }
+        for layer_id in range(num_layers):
+            expected_shapes.update(
+                {
+                    f"blk.{layer_id}.inp_gate.weight": (
+                        per_layer_input_dim,
+                        hidden,
+                    ),
+                    f"blk.{layer_id}.proj.weight": (
+                        hidden,
+                        per_layer_input_dim,
+                    ),
+                    f"blk.{layer_id}.post_norm.weight": (hidden,),
+                }
+            )
+        mismatched = [
+            f"{name}: got {tensor_index[name].shape}, expected {shape}"
+            for name, shape in expected_shapes.items()
+            if tuple(tensor_index[name].shape) != shape
+        ]
+        if mismatched:
+            raise ValueError("Gemma4 PLE tensor shapes are invalid: " + "; ".join(mismatched))
+    full_v_presence = [
+        f"blk.{layer_id}.attn_v.weight" in tensor_index for layer_id in full_layer_ids
+    ]
+    if tensor_index and full_v_presence and len(set(full_v_presence)) != 1:
+        raise ValueError("Gemma4 full-attention layers disagree on whether V is tied to K")
+    k_eq_v = (
+        not full_v_presence[0]
+        if full_v_presence
+        else bool(m.get("gemma4.attention.k_eq_v", shared_kv_layers == 0))
+    )
     full_rotary = RotaryConfig(
         head_dim=full_head_dim,
         rotary_dim=_full_rotary_dim(shim, full_head_dim),
@@ -146,12 +332,22 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         norm_topk_prob=True,
         model_type="gemma4",
         architectures=list(shim.architectures),
-        moe_enabled=True,
-        expert_quant="nvfp4" if hf_nvfp4 else _gguf_expert_quant(shim.model_path),
+        moe_enabled=num_experts > 0,
+        expert_quant=(
+            "nvfp4" if hf_nvfp4 else _gguf_expert_quant(shim.model_path)
+        ) if num_experts else "none",
         moe_weight_format="nvfp4" if hf_nvfp4 else _gguf_expert_quant(shim.model_path),
         gguf_embedding_bf16=embedding_bf16,
         gguf_embedding_type=embedding_type,
         gguf_model_path=shim.model_path,
+        per_layer_input_dim=per_layer_input_dim,
+        per_layer_input_vocab_size=per_layer_vocab_size,
+        gguf_per_layer_embedding_type=(
+            tensor_index["per_layer_token_embd.weight"].ggml_type
+            if "per_layer_token_embd.weight" in tensor_index
+            else None
+        ),
+        shared_kv_source_layers=shared_kv_source_layers,
         gguf_router_bf16=router_bf16,
         gguf_dense_bf16=dense_bf16,
         use_qk_norm=True,
@@ -165,8 +361,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
                 num_kv_heads=full_kv,
                 head_dim=full_head_dim,
                 rotary_config=full_rotary,
-                # Full layers ship no v_proj in the GGUF (k reused as v).
-                k_eq_v=True,
+                k_eq_v=k_eq_v,
             ),
             SWAAttentionGroupConfig(
                 name="swa",
@@ -209,6 +404,9 @@ _LAYER_LEAVES = {
     "self_attn.q_proj": "attn_q",
     "self_attn.k_proj": "attn_k",
     "self_attn.o_proj": "attn_output",
+    "per_layer_input_gate": "inp_gate",
+    "per_layer_projection": "proj",
+    "post_per_layer_input_norm": "post_norm",
     "mlp.gate_proj": "ffn_gate",
     "mlp.up_proj": "ffn_up",
     "mlp.down_proj": "ffn_down",
@@ -223,6 +421,12 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     """Checkpoint module name -> the GGUF tensors (without ``.weight``) that store it; empty for modules the GGUF has no matrix for."""
     if name == "model.embed_tokens":
         return ("token_embd",)
+    if name == "model.embed_tokens_per_layer":
+        return ("per_layer_token_embd",)
+    if name == "model.per_layer_model_projection":
+        return ("per_layer_model_proj",)
+    if name == "model.per_layer_projection_norm":
+        return ("per_layer_proj_norm",)
     if name == "lm_head":
         return ("output",) if "output.weight" in tensors else ()
     m = _LAYER_RE.match(name)
@@ -303,13 +507,13 @@ def iter_gguf_weights(
         yield from _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_moe)
         return
 
-    assert not include_moe_experts, (
-        "gemma4 GGUF stores experts as Q4_0 and only supports the offload backend; "
-        "experts are loaded into the offload cache via load_q4_0_expert_sources()."
-    )
     assert include_non_moe
     _require_tp1("weight loading")
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    assert not include_moe_experts or not config.moe_enabled, (
+        "gemma4 GGUF stores experts as Q4_0 and only supports the offload backend; "
+        "experts are loaded into the offload cache via load_q4_0_expert_sources()."
+    )
     index = gguf_tensor_index(model_path)
     hidden = config.hidden_size
 
@@ -317,11 +521,30 @@ def iter_gguf_weights(
         return index[name if name in index else f"{name}.weight"]
 
     embed = t("token_embd")
-    yield from fused("model.embed_tokens", [embed], [matrix(embed)], hidden)
-    if "output.weight" in index:
+    yield "model.embed_tokens.qweight", _native_qweight(embed, device)
+    if "output.weight" in index and not config.tie_word_embeddings:
         out = t("output")
-        yield from fused("lm_head", [out], [matrix(out)], hidden)
+        yield "lm_head.qweight", _native_qweight(out, device)
     yield "model.norm.weight", float_tensor(t("output_norm"))
+    if config.per_layer_input_dim:
+        ple_embed = t("per_layer_token_embd")
+        yield "model.embed_tokens_per_layer.qweight", _native_qweight(ple_embed, device)
+        yield "model.per_layer_model_projection.qweight", _native_qweight(
+            t("per_layer_model_proj"), device
+        )
+        yield "model.per_layer_projection_norm.weight", float_tensor(
+            t("per_layer_proj_norm")
+        )
+
+    def emit_linear(prefix: str, infos: list[GgufTensorInfo]) -> tuple[str, torch.Tensor]:
+        types = {info.ggml_type for info in infos}
+        row_widths = {matrix(info).shape[1] for info in infos}
+        if len(types) != 1 or len(row_widths) != 1:
+            raise NotImplementedError(
+                f"{prefix}: GGUF fused parts have incompatible quantization layouts"
+            )
+        rows = torch.cat([_native_qweight_rows(matrix(info)) for info in infos], dim=0)
+        return f"{prefix}.qweight", rows.to(device)
 
     scalar_map = {**_LAYER_SCALAR_MAP, **_MOE_LAYER_SCALAR_MAP} if config.moe_enabled else _LAYER_SCALAR_MAP
     for layer in range(config.num_layers):
@@ -332,41 +555,107 @@ def iter_gguf_weights(
                 # the converter folds per_expert_scale into the NVFP4 down weight_scale_2, which the expert kernel applies
                 tensor = torch.ones_like(tensor)
             yield f"{base}.{rel}", tensor.reshape(1) if rel.endswith("layer_scalar") else tensor
-        if f"{blk}.attn_qkv.weight" in index:
-            # convert_hf_to_gguf.py --fuse-qkv stores q, k and v as one attn_qkv matrix
-            qkv = [t(f"{blk}.attn_qkv")]
+        attn = f"{base}.self_attn"
+        fused_qkv = f"{blk}.attn_qkv.weight"
+        if fused_qkv in index:
+            qkv_infos = [t(f"{blk}.attn_qkv")]
         else:
-            raise ValueError(f"unmapped gemma4 GGUF tensor: {name}")
-
-        # Emit fused qkv once all parts are present: k_eq_v full layers reuse k as v
-        # (no attn_v tensor), SWA layers wait for their separate attn_v.
-        slots = qkv_buf.get(layer)
-        if slots is not None and "q" in slots and "k" in slots:
-            if layer in k_eq_v_layers:
-                v = slots["k"]
-            elif "v" in slots:
-                v = slots["v"]
+            qkv_infos = [t(f"{blk}.attn_{part}") for part in ("q", "k")]
+            v_name = f"{blk}.attn_v.weight"
+            if v_name in index:
+                qkv_infos.append(index[v_name])
+            elif (
+                isinstance(config.attention_group_for_layer(layer), FullAttentionGroupConfig)
+                and config.attention_group_for_layer(layer).k_eq_v
+            ):
+                qkv_infos.append(qkv_infos[-1])
             else:
-                v = None
-            if v is not None:
-                yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
-                    [slots["q"], slots["k"], v], dim=0
-                )
-                del qkv_buf[layer]
-        gu = gate_up_buf.get(layer)
-        if gu is not None and "gate" in gu and "up" in gu:
-            yield f"{base}.feed_forward.shared_mlp.gate_up_proj.qweight", torch.cat(
-                [gu["gate"], gu["up"]], dim=0
-            )
-            del gate_up_buf[layer]
+                raise KeyError(f"missing {v_name} for Gemma4 layer {layer}")
+        yield emit_linear(f"{attn}.qkv_proj", qkv_infos)
 
-    assert not qkv_buf, f"incomplete qkv groups: {sorted(qkv_buf)}"
-    assert not gate_up_buf, f"incomplete gate_up groups: {sorted(gate_up_buf)}"
+        out = t(f"{blk}.attn_output")
+        yield emit_linear(f"{attn}.o_proj", [out])
+        shared = f"{base}.feed_forward.shared_mlp"
+        fused_gate_up = f"{blk}.ffn_gate_up.weight"
+        if fused_gate_up in index:
+            gate_up_infos = [t(f"{blk}.ffn_gate_up")]
+        else:
+            gate_up_infos = [t(f"{blk}.ffn_gate"), t(f"{blk}.ffn_up")]
+        yield emit_linear(f"{shared}.gate_up_proj", gate_up_infos)
+        yield emit_linear(f"{shared}.down_proj", [t(f"{blk}.ffn_down")])
+
+        if config.per_layer_input_dim:
+            ple_layer = f"{base}"
+            yield emit_linear(
+                f"{ple_layer}.per_layer_input_gate", [t(f"{blk}.inp_gate")]
+            )
+            yield emit_linear(
+                f"{ple_layer}.per_layer_projection", [t(f"{blk}.proj")]
+            )
+            yield (
+                f"{ple_layer}.post_per_layer_input_norm.weight",
+                float_tensor(t(f"{blk}.post_norm")),
+            )
 
 
 from freetoken.models.gguf.nvfp4 import nvfp4_parts
 
 _nvfp4_parts = nvfp4_parts
+
+
+def _rename_hf_nvfp4_tensor_name(name: str) -> str:
+    if name == "token_embd.weight":
+        return "model.embed_tokens.weight"
+    if name == "per_layer_token_embd.weight":
+        return "model.embed_tokens_per_layer.weight"
+    if name == "per_layer_model_proj.weight":
+        return "model.per_layer_model_projection.weight"
+    if name == "per_layer_proj_norm.weight":
+        return "model.per_layer_projection_norm.weight"
+    if name == "output_norm.weight":
+        return "model.norm.weight"
+    if name.startswith("blk."):
+        _, layer, suffix = name.split(".", 2)
+        layer_prefix = f"model.layers.{layer}"
+        legacy_map = {
+            "attn_q.weight": "self_attn.q_proj.weight",
+            "attn_k.weight": "self_attn.k_proj.weight",
+            "attn_v.weight": "self_attn.v_proj.weight",
+            "attn_output.weight": "self_attn.o_proj.weight",
+            "inp_gate.weight": "per_layer_input_gate.weight",
+            "proj.weight": "per_layer_projection.weight",
+            "post_norm.weight": "post_per_layer_input_norm.weight",
+            "ffn_gate.weight": "feed_forward.shared_mlp.gate_proj.weight",
+            "ffn_up.weight": "feed_forward.shared_mlp.up_proj.weight",
+            "ffn_down.weight": "feed_forward.shared_mlp.down_proj.weight",
+            "ffn_gate_inp.weight": "feed_forward.router.proj.weight",
+        }
+        if suffix in legacy_map:
+            return f"{layer_prefix}.{legacy_map[suffix]}"
+        if suffix in _LAYER_SCALAR_MAP:
+            return f"{layer_prefix}.{_LAYER_SCALAR_MAP[suffix]}"
+        if suffix in _MOE_LAYER_SCALAR_MAP:
+            return f"{layer_prefix}.{_MOE_LAYER_SCALAR_MAP[suffix]}"
+        if suffix.endswith("_exps.weight"):
+            return f"{layer_prefix}.feed_forward.experts.{suffix}"
+        return f"{layer_prefix}.{suffix}"
+    name = name.removeprefix("model.language_model.")
+    name = "model." + name
+    marker = ".layers."
+    if marker not in name:
+        return name
+    layer_prefix, layer_key = name.split(marker, 1)
+    layer_id, _, layer_key = layer_key.partition(".")
+    prefix = f"{layer_prefix}{marker}{layer_id}"
+    if layer_key.startswith("mlp."):
+        return f"{prefix}.feed_forward.shared_mlp.{layer_key[4:]}"
+    if layer_key.startswith((
+        "experts.", "router.", "layer_scalar",
+        "post_feedforward_layernorm.", "post_feedforward_layernorm_1.",
+        "post_feedforward_layernorm_2.", "pre_feedforward_layernorm_2.",
+    )):
+        return f"{prefix}.feed_forward.{layer_key}"
+    return name
 
 
 def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_moe):
@@ -378,48 +667,7 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
     metadata = load_gguf_metadata(model_path)
     swa_pattern = [bool(x) for x in metadata["gemma4.attention.sliding_window_pattern"]]
 
-    def rename(name: str) -> str:
-        if name == "token_embd.weight":
-            return "model.embed_tokens.weight"
-        if name == "output_norm.weight":
-            return "model.norm.weight"
-        if name.startswith("blk."):
-            _, layer, suffix = name.split(".", 2)
-            layer_prefix = f"model.layers.{layer}"
-            legacy_map = {
-                "attn_q.weight": "self_attn.q_proj.weight",
-                "attn_k.weight": "self_attn.k_proj.weight",
-                "attn_v.weight": "self_attn.v_proj.weight",
-                "attn_output.weight": "self_attn.o_proj.weight",
-                "ffn_gate.weight": "feed_forward.shared_mlp.gate_proj.weight",
-                "ffn_up.weight": "feed_forward.shared_mlp.up_proj.weight",
-                "ffn_down.weight": "feed_forward.shared_mlp.down_proj.weight",
-                "ffn_gate_inp.weight": "feed_forward.router.proj.weight",
-            }
-            if suffix in legacy_map:
-                return f"{layer_prefix}.{legacy_map[suffix]}"
-            if suffix in _LAYER_SCALAR_MAP:
-                return f"{layer_prefix}.{_LAYER_SCALAR_MAP[suffix]}"
-            if suffix.endswith("_exps.weight"):
-                return f"{layer_prefix}.feed_forward.experts.{suffix}"
-            return f"{layer_prefix}.{suffix}"
-        name = name.removeprefix("model.language_model.")
-        name = "model." + name
-        marker = ".layers."
-        if marker not in name:
-            return name
-        layer_prefix, layer_key = name.split(marker, 1)
-        layer_id, _, layer_key = layer_key.partition(".")
-        prefix = f"{layer_prefix}{marker}{layer_id}"
-        if layer_key.startswith("mlp."):
-            return f"{prefix}.feed_forward.shared_mlp.{layer_key[4:]}"
-        if layer_key.startswith((
-            "experts.", "router.", "layer_scalar",
-            "post_feedforward_layernorm.", "post_feedforward_layernorm_1.",
-            "post_feedforward_layernorm_2.", "pre_feedforward_layernorm_2.",
-        )):
-            return f"{prefix}.feed_forward.{layer_key}"
-        return name
+    rename = _rename_hf_nvfp4_tensor_name
 
     def emit(name: str, packed: torch.Tensor, scales: torch.Tensor):
         global_name = name.removesuffix(".weight") + ".weight_scale"
@@ -442,13 +690,31 @@ def _iter_hf_nvfp4_weights(model_path, device, include_moe_experts, include_non_
         if not (
             name.startswith("model.language_model.")
             or name.startswith("blk.")
-            or name in {"token_embd.weight", "output_norm.weight"}
+            or name in {
+                "token_embd.weight",
+                "output_norm.weight",
+                "per_layer_token_embd.weight",
+                "per_layer_model_proj.weight",
+                "per_layer_proj_norm.weight",
+            }
         ):
             continue
         if name.endswith(".weight_scale") or name.endswith(".weight_scale_2"):
             continue
         if t.ggml_type != GGML_NVFP4:
             if include_non_moe and ".experts." not in name:
+                if name == "per_layer_token_embd.weight":
+                    yield "model.embed_tokens_per_layer.qweight", (
+                        t.packed().reshape(t.shape[0], t.row_bytes).to(device)
+                    )
+                    continue
+                if name in {"per_layer_model_proj.weight"} or (
+                    name.startswith("blk.")
+                    and name.endswith((".inp_gate.weight", ".proj.weight"))
+                ):
+                    target = rename(name).removesuffix(".weight") + ".qweight"
+                    yield target, t.packed().reshape(t.shape[0], t.row_bytes).to(device)
+                    continue
                 key = rename(name)
                 tensor = _to_bf16(t).to(device)
                 scale_name = name.removesuffix(".weight") + ".weight_scale"
@@ -648,6 +914,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
                 layer.self_attn.o_proj = Nvfp4DenseLinear(
                     layer.self_attn.q_dim, config.hidden_size
                 )
+        _convert_gemma4_ple_to_gguf(model, config)
         return
 
     from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
@@ -700,6 +967,7 @@ def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
 
     if config.tie_word_embeddings:
         model.lm_head = GGUFTiedLMHead(embed, embedding_type)
+    _convert_gemma4_ple_to_gguf(model, config)
 
 
 # --------------------------------------------------------------------------------------

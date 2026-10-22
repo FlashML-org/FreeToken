@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
+    LinearReplicated,
     OPList,
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -43,20 +45,55 @@ class Gemma4DecoderLayer(BaseOP):
         self.input_layernorm = GemmaRMSNorm(H, eps=eps)
         self.post_attention_layernorm = GemmaRMSNorm(H, eps=eps)
         self.pre_feedforward_layernorm = GemmaRMSNorm(H, eps=eps)
+        self.per_layer_input_dim = config.per_layer_input_dim
+        if self.per_layer_input_dim:
+            self.per_layer_input_gate = LinearReplicated(
+                H,
+                self.per_layer_input_dim,
+                has_bias=False,
+                quant_config=config.quant,
+                prefix=f"{prefix}.per_layer_input_gate",
+            )
+            self.per_layer_projection = LinearReplicated(
+                self.per_layer_input_dim,
+                H,
+                has_bias=False,
+                quant_config=config.quant,
+                prefix=f"{prefix}.per_layer_projection",
+            )
+            self.post_per_layer_input_norm = GemmaRMSNorm(H, eps=eps)
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        per_layer_input: torch.Tensor | None = None,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
         # --- attention sandwich ---
         residual = x
         h = self.input_layernorm.forward(x)
-        h = self.self_attn.forward(h)
+        h = self.self_attn.forward(h, shared_kv_states)
         h = self.post_attention_layernorm.forward(h)
         pre_ff, x = self.pre_feedforward_layernorm.forward_add_residual(h, residual)
-        return self.feed_forward.forward(pre_ff, x)
+        if not self.per_layer_input_dim:
+            return self.feed_forward.forward(pre_ff, x)
+        if per_layer_input is None:
+            raise ValueError(f"Gemma4 layer {self._layer_id} requires its PLE input")
+
+        x = self.feed_forward.forward(pre_ff, x, apply_layer_scalar=False)
+        residual = x
+        gate = F.gelu(self.per_layer_input_gate.forward(x), approximate="tanh")
+        x = self.per_layer_projection.forward(gate * per_layer_input)
+        x = self.post_per_layer_input_norm.forward(x)
+        return (residual + x) * self.feed_forward.layer_scalar
 
 
 class Gemma4Model(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
+        self.hidden_size = config.hidden_size
+        self.shared_kv_source_layers = config.shared_kv_source_layers
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -64,6 +101,35 @@ class Gemma4Model(BaseOP):
             quant_config=config.quant,
             prefix=f"{prefix}.embed_tokens",
         )
+        if config.per_layer_input_dim:
+            ple_vocab_size = config.per_layer_input_vocab_size or config.vocab_size
+            if config.gguf_per_layer_embedding_type is None:
+                self.embed_tokens_per_layer = VocabParallelEmbedding(
+                    num_embeddings=ple_vocab_size,
+                    embedding_dim=config.num_layers * config.per_layer_input_dim,
+                    embed_scale=config.per_layer_input_dim**0.5,
+                    quant_config=config.quant,
+                    prefix=f"{prefix}.embed_tokens_per_layer",
+                )
+            else:
+                from freetoken.layers.gguf import GGUFEmbedding
+
+                self.embed_tokens_per_layer = GGUFEmbedding(
+                    num_embeddings=ple_vocab_size,
+                    embedding_dim=config.num_layers * config.per_layer_input_dim,
+                    quant_type=config.gguf_per_layer_embedding_type,
+                    embed_scale=config.per_layer_input_dim**0.5,
+                )
+            self.per_layer_model_projection = LinearReplicated(
+                config.hidden_size,
+                config.num_layers * config.per_layer_input_dim,
+                has_bias=False,
+                quant_config=config.quant,
+                prefix=f"{prefix}.per_layer_model_projection",
+            )
+            self.per_layer_projection_norm = GemmaRMSNorm(
+                config.per_layer_input_dim, eps=config.rms_norm_eps
+            )
         self.layers = OPList(
             [
                 Gemma4DecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
@@ -74,8 +140,28 @@ class Gemma4Model(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
-        for layer in self.layers.op_list:
-            x = layer.forward(x)
+        per_layer_inputs = None
+        if self.layers.op_list[0].per_layer_input_dim:
+            ple_vocab_size = self.embed_tokens_per_layer.num_embeddings
+            token_inputs = self.embed_tokens_per_layer.forward(
+                input_ids.clamp(max=ple_vocab_size - 1)
+            ).reshape(-1, len(self.layers.op_list), self.layers.op_list[0].per_layer_input_dim)
+            context_inputs = self.per_layer_model_projection.forward(x)
+            context_inputs = context_inputs * (self.hidden_size**-0.5)
+            context_inputs = context_inputs.reshape_as(token_inputs)
+            context_inputs = self.per_layer_projection_norm.forward(context_inputs)
+            per_layer_inputs = (context_inputs + token_inputs) * (2.0**-0.5)
+
+        shared_kv_states = {} if self.shared_kv_source_layers else None
+        for layer_id, layer in enumerate(self.layers.op_list):
+            per_layer_input = (
+                per_layer_inputs[:, layer_id, :] if per_layer_inputs is not None else None
+            )
+            x = layer.forward(
+                x,
+                per_layer_input=per_layer_input,
+                shared_kv_states=shared_kv_states,
+            )
         return self.norm.forward(x)
 
 
@@ -92,6 +178,10 @@ class Gemma4ForCausalLM(BaseLLMModel):
         )
         self._final_logit_softcapping = config.final_logit_softcapping
         super().__init__()
+        from .gguf import convert_gemma4_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_gemma4_to_gguf(self, config)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

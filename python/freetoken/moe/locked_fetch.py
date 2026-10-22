@@ -145,7 +145,7 @@ def _smt_siblings(cpus: list[int]) -> list[int]:
     out = []
     for cpu in cpus:
         try:
-            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list", encoding="utf-8") as f:
                 text = f.read().strip()
         except OSError:
             continue

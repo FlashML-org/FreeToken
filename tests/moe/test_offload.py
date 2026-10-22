@@ -85,6 +85,130 @@ def test_shared_offload_method_can_select_unquantized_hf_moe():
     assert shared_offload_method(layer, include_unquantized=True) is layer.quant_method
 
 
+def test_load_expert_banks_forwards_dtype_and_decode_target(monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.moe import expert_banks
+
+    received = {}
+    banks = expert_banks.ExpertBanks("q4_0", {})
+
+    def load_legacy(*args, **kwargs):
+        received["args"] = args
+        received["kwargs"] = kwargs
+        return banks
+
+    monkeypatch.setattr(expert_banks, "_legacy_expert_banks", load_legacy)
+    monkeypatch.setattr("freetoken.checkpoint.ftw.is_ftw_checkpoint", lambda _: False)
+
+    result = expert_banks.load_expert_banks(
+        "",
+        SimpleNamespace(model_type="gemma4", expert_quant="nvfp4"),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        decode_target="cpu",
+        parallel=False,
+    )
+
+    assert result is banks
+    assert received["args"][2:4] == (torch.device("cpu"), torch.float32)
+    assert received["args"][8] == "cpu"
+
+
+def test_expert_banks_exposes_optional_loader_metadata():
+    from freetoken.moe.expert_banks import ExpertBanks
+
+    layer_tags = ["bf16", "nvfp4"]
+    row_tail_bytes = {"weights": [0, 16]}
+    deferred_plan = object()
+    banks = ExpertBanks(
+        "bf16",
+        {},
+        layer_tags=layer_tags,
+        layer_formats=layer_tags,
+        row_tail_bytes=row_tail_bytes,
+        deferred_plan=deferred_plan,
+    )
+
+    assert banks.layer_tags is layer_tags
+    assert banks.layer_formats is layer_tags
+    assert banks.row_tail_bytes is row_tail_bytes
+    assert banks.deferred_plan is deferred_plan
+
+
+def test_load_expert_banks_keeps_ftw_fast_path(monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.checkpoint import ftw
+    from freetoken.moe import expert_banks
+
+    banks = expert_banks.ExpertBanks("nvfp4", {})
+    received = {}
+
+    def load_ftw(path, **kwargs):
+        received["path"] = path
+        received["kwargs"] = kwargs
+        return banks
+
+    monkeypatch.setattr(ftw, "is_ftw_checkpoint", lambda _: True)
+    monkeypatch.setattr(ftw, "load_ftw_banks", load_ftw)
+
+    result = expert_banks.load_expert_banks(
+        "checkpoint",
+        SimpleNamespace(num_moe_layers=2),
+        device=torch.device("cpu"),
+        layer_residency=["pinned", "locked"],
+    )
+
+    assert result is banks
+    assert received["path"] == "checkpoint"
+    assert received["kwargs"]["num_layers"] == 2
+    assert received["kwargs"]["layer_residency"] == ["pinned", "locked"]
+    with pytest.raises(ValueError, match="original safetensors checkpoint"):
+        expert_banks.load_expert_banks(
+            "checkpoint",
+            SimpleNamespace(num_moe_layers=2),
+            device=torch.device("cpu"),
+            disk_tier=object(),
+        )
+
+
+def test_alloc_layer_banks_creates_independent_banks():
+    from freetoken.moe.host_banks import alloc_layer_banks
+
+    banks = alloc_layer_banks(
+        {"weights": ((2, 3), torch.float32), "scales": ((2,), torch.float16)},
+        num_layers=2,
+    )
+
+    assert set(banks) == {"weights", "scales"}
+    assert all(len(layers) == 2 for layers in banks.values())
+    assert [tuple(bank.tensor.shape) for bank in banks["weights"]] == [(2, 3), (2, 3)]
+    assert banks["weights"][0].tensor.data_ptr() != banks["weights"][1].tensor.data_ptr()
+
+
+def test_nvfp4_provider_returns_only_schema_banks(monkeypatch):
+    from types import SimpleNamespace
+
+    from freetoken.models.gemma4 import gguf
+    from freetoken.moe import expert_banks
+    from freetoken.moe.offload_cache import _BANK_SCHEMAS
+
+    sources = {name: [] for name in _BANK_SCHEMAS["nvfp4"]}
+    monkeypatch.setattr(gguf, "load_nvfp4_expert_sources", lambda *args, **kwargs: sources)
+
+    banks = expert_banks._nvfp4_banks(
+        "model.gguf",
+        SimpleNamespace(model_type="gemma4"),
+        torch.device("cpu"),
+        torch.bfloat16,
+        dummy=False,
+    )
+
+    assert banks.quant_format == "nvfp4"
+    assert banks.sources == sources
+
+
 def test_qwen4_exp_native_experts_do_not_use_unquantized_method():
     from types import SimpleNamespace
 
@@ -874,6 +998,51 @@ def test_offload_cache_rebuild_keeps_overlap_at_boundary():
     cache.rebuild(8)  # exactly 2*num_experts -> overlap stays on
     assert cache.prefill_overlap is True
     assert cache.cache_size == 8
+
+
+def test_offload_cache_accepts_layer_layouts_and_slot_pools():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+        layer_layouts=[{}, {}],
+        pool_of_layer=[0, 1],
+        pool_sizes=[4, 4],
+    )
+
+    assert cache.layer_layouts == [{}, {}]
+    assert cache.pool_of_layer == [0, 1]
+    assert cache.pool_sizes == [4, 4]
+
+
+def test_set_bank_sources_validates_bank_rows_without_undefined_state():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+    )
+    cache.set_bank_sources({
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    })
+
+    mismatched = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="bank 'gate_up' rows"):
+        mismatched.set_bank_sources({
+            "gate_up": [torch.randn(4, 32, 8), torch.randn(4, 32, 9)],
+            "down": [torch.randn(4, 8, 16) for _ in range(2)],
+        })
 
 
 def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():

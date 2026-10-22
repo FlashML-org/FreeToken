@@ -19,6 +19,11 @@ class Gemma4Attention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         self.layer_id = layer_id
+        sources = config.shared_kv_source_layers
+        self.kv_source_layer_id = (
+            sources[layer_id] if len(sources) == config.num_layers else None
+        )
+        self.kv_source_layers = frozenset(source for source in sources if source is not None)
         group = config.attention_group_for_layer(layer_id)
         self.is_swa = isinstance(group, SWAAttentionGroupConfig)
         if not isinstance(group, (FullAttentionGroupConfig, SWAAttentionGroupConfig)):
@@ -65,6 +70,7 @@ class Gemma4Attention(BaseOP):
             sliding_window=group.sliding_window if self.is_swa else None,
             sm_scale=config.attn_sm_scale,
             bidirectional_mm_blocks=self.is_swa and group.bidirectional_mm_blocks,
+            kv_cache_layer_id=self.kv_source_layer_id,
         )
         self.rotary = get_rope(
             head_dim=self.head_dim,
@@ -82,18 +88,25 @@ class Gemma4Attention(BaseOP):
         self,
         positions: torch.Tensor,
         q: torch.Tensor,
-        k: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         positions = positions.reshape(-1)
         if positions.device != q.device or positions.dtype != torch.long:
             positions = positions.to(device=q.device, dtype=torch.long)
         q_view = q.contiguous().view(q.shape[0], -1)
+        if k is None:
+            self.rotary.forward(positions, q_view, q_view.clone())
+            return q_view.view_as(q), None
         k_view = k.contiguous().view(k.shape[0], -1)
         self.rotary.forward(positions, q_view, k_view)
         return q_view.view_as(q), k_view.view_as(k)
 
     @nvtx_annotate("MHA")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
         positions = ctx.batch.positions
         T = x.shape[0]
@@ -109,13 +122,24 @@ class Gemma4Attention(BaseOP):
         v = v_lin.view(T, self.num_kv_heads, self.head_dim)
 
         q = self.q_norm.forward(q)
-        k = self.k_norm.forward(k)
-        v = self.v_norm.forward(v)
 
-        q, k = self._apply_rope(positions, q, k)
+        if self.kv_source_layer_id is None:
+            k = self.k_norm.forward(k)
+            v = self.v_norm.forward(v)
+            q, k = self._apply_rope(positions, q, k)
+            k = k.reshape(T, self.num_kv_heads * self.head_dim)
+            v = v.reshape(T, self.num_kv_heads * self.head_dim)
+            if shared_kv_states is not None and self.layer_id in self.kv_source_layers:
+                shared_kv_states[self.layer_id] = (k, v)
+        else:
+            q, _ = self._apply_rope(positions, q, None)
+            if shared_kv_states is None or self.kv_source_layer_id not in shared_kv_states:
+                raise RuntimeError(
+                    f"Gemma4 layer {self.layer_id} requires KV from source layer "
+                    f"{self.kv_source_layer_id}, which has not run"
+                )
+            k, v = shared_kv_states[self.kv_source_layer_id]
 
-        k = k.reshape(T, self.num_kv_heads * self.head_dim)
-        v = v.reshape(T, self.num_kv_heads * self.head_dim)
         o = ctx.attn_backend.forward(
             q.contiguous(),
             k.contiguous(),

@@ -187,6 +187,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_sm_scale=1.0,
         final_logit_softcapping=getattr(cfg, "final_logit_softcapping", None),
         embedding_scale=float(cfg.hidden_size) ** 0.5,
+        per_layer_input_dim=int(getattr(cfg, "hidden_size_per_layer_input", 0) or 0),
+        per_layer_input_vocab_size=int(
+            getattr(cfg, "vocab_size_per_layer_input", cfg.vocab_size) or cfg.vocab_size
+        ),
         vision_config=_parse_vision_config(top_cfg, cfg.hidden_size),
         image_token_id=getattr(top_cfg, "image_token_id", None),
         attention_groups=(

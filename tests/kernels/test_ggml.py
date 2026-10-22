@@ -5,7 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from freetoken.kernel import ggml
+from freetoken.kernel import ggml, gguf
+from freetoken.layers.gguf import GGUFLinear
+from freetoken.models.gguf.dequant import GGML_Q6_K, row_bytes
 from freetoken.third_party.gguf import GGMLQuantizationType as QType
 from freetoken.third_party.gguf import quants
 
@@ -37,6 +39,8 @@ def test_q4_dequantize_and_rows(dtype):
     w, ref = _q4_weights((64, 256))
     actual = ggml.dequantize(w, int(QType.Q4_0), 256, dtype)
     torch.testing.assert_close(actual.cpu(), ref.to(dtype), atol=0, rtol=0)
+    compat = gguf.ggml_dequantize(w, int(QType.Q4_0), 64, 256, dtype)
+    torch.testing.assert_close(compat.cpu(), ref.to(dtype), atol=0, rtol=0)
     ids = torch.tensor([63, 0, 17, 17], dtype=torch.int32, device="cuda")
     rows = ggml.get_rows(w, int(QType.Q4_0), 256, ids, dtype)
     torch.testing.assert_close(rows.cpu(), ref[ids.cpu().long()].to(dtype), atol=0, rtol=0)
@@ -70,6 +74,55 @@ def test_q4_shared_q8_matches_internal_quantization(dtype):
     expected = ggml.mul_mat(w, int(QType.Q4_0), x)
     actual = ggml.mul_mat(w, int(QType.Q4_0), x, xq=ggml.quantize_q8_1(x))
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_q6_k_mmq_adds_missing_zero_tail():
+    weight = torch.zeros(
+        64, row_bytes(256, GGML_Q6_K), dtype=torch.uint8, device="cuda"
+    )
+    x = _activation((17, 256), torch.bfloat16)
+    expected_storage_bytes = weight.numel() + ggml._mmq_tail_bytes(GGML_Q6_K, 256)
+
+    output = ggml.mul_mat(weight, GGML_Q6_K, x)
+
+    assert weight.untyped_storage().nbytes() >= expected_storage_bytes
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+def test_gguf_linear_pads_mmq_weight_before_forward():
+    linear = GGUFLinear(256, 64, GGML_Q6_K)
+    weight = torch.zeros(
+        64, row_bytes(256, GGML_Q6_K), dtype=torch.uint8, device="cuda"
+    )
+    linear.load_state_dict({"qweight": weight})
+    expected_storage_bytes = weight.numel() + ggml._mmq_tail_bytes(GGML_Q6_K, 256)
+    assert linear.qweight.untyped_storage().nbytes() >= expected_storage_bytes
+
+    output = linear.forward(_activation((17, 256), torch.bfloat16))
+
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("batch", [1, 17])
+def test_gguf_compat_wrappers_use_shared_ggml_kernels(dtype, batch):
+    w, ref = _q4_weights((64, 256))
+    x = _activation((batch, 256), dtype)
+    actual = gguf.ggml_mul_mat_a8(w, x, int(QType.Q4_0), 64)
+    expected = F.linear(x.cpu().float(), ref).to(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_gguf_moe_vector_wrapper_routes_via_shared_ggml_kernel(dtype):
+    w, ref = _q4_weights((4, 64, 256))
+    x = _activation((3, 256), dtype)
+    ids = torch.tensor([[0, 1], [2, 3], [3, 0]], dtype=torch.int32, device="cuda")
+    actual = gguf.ggml_moe_a8_vec(x, w, ids, 2, int(QType.Q4_0), 64, 3)
+    expected = torch.einsum("tk,tjok->tjo", x.cpu().float(), ref[ids.cpu().long()]).reshape(
+        6, 64
+    ).to(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
 
 
 def test_q4_nondefault_stream():

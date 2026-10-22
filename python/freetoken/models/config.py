@@ -342,6 +342,12 @@ class ModelConfig:
     has_router_bias: bool = False
     moe_weight_format: str | None = None
     gguf_model_path: str | None = None
+    # Gemma 4 per-layer input embeddings (PLE); zero for models without PLE.
+    per_layer_input_dim: int = 0
+    per_layer_input_vocab_size: int | None = None
+    gguf_per_layer_embedding_type: int | None = None
+    # For Gemma 4 shared-KV models, source layer per decoder layer; None means local KV.
+    shared_kv_source_layers: Tuple[int | None, ...] = ()
     # Raw GGUF block_count, which may include trailing NextN/MTP blocks excluded from the
     # decoder stack used for ordinary text generation.
     gguf_block_count: int | None = None

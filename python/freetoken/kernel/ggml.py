@@ -52,14 +52,33 @@ def _mmq_tail_bytes(ggml_type: int, k: int) -> int:
     return _module().mmq_tail_bytes(ggml_type, k)
 
 
-def _check_mmq_tail(w: torch.Tensor, ggml_type: int, k: int) -> None:
-    """MMQ tiles read up to MATRIX_ROW_PADDING values past the last row of ``w``, so its storage must hold them."""
+def pad_mmq_tail(w: torch.Tensor, ggml_type: int, k: int) -> torch.Tensor:
+    """Provide zeroed MMQ overread padding for packed weights that lack it."""
     tail = _mmq_tail_bytes(ggml_type, k)
     if tail == 0 or w.numel() == 0:
-        return
+        return w
+    if w.dtype != torch.uint8:
+        raise TypeError(f"expected packed uint8 GGUF weights, got {w.dtype}")
+
     end = w.storage_offset() + sum((n - 1) * s for n, s in zip(w.shape, w.stride())) + 1
-    if end + tail > w.untyped_storage().nbytes():
-        raise ValueError(f"ggml type {ggml_type} K={k} weight needs {tail} bytes of zero padding after its last row for MMQ")
+    end_bytes = end * w.element_size()
+    storage = w.untyped_storage()
+    if end_bytes + tail <= storage.nbytes():
+        return w
+
+    if w.is_contiguous() and w.storage_offset() == 0:
+        storage.resize_(end_bytes + tail)
+        padding = torch.empty(0, dtype=torch.uint8, device=w.device).set_(
+            storage, end_bytes, (tail,), (1,)
+        )
+        padding.zero_()
+        return w
+
+    padded = torch.empty(w.numel() + tail, dtype=torch.uint8, device=w.device)
+    packed = padded[: w.numel()].view(w.shape)
+    packed.copy_(w)
+    padded[w.numel() :].zero_()
+    return packed
 
 
 def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tensor | None = None, xq: torch.Tensor | None = None) -> torch.Tensor:
@@ -71,7 +90,7 @@ def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tens
     if out is None:
         out = torch.empty(m, w.shape[0], dtype=x.dtype, device=x.device)
     if not uses_mmvq(ggml_type, m):
-        _check_mmq_tail(w, ggml_type, k)
+        w = pad_mmq_tail(w, ggml_type, k)
     _module().mul_mat(w, ggml_type, x.contiguous(), out, xq)
     return out
 
@@ -103,7 +122,7 @@ def mul_mat_id(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tens
     t, top_k = ids.shape
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if t > mmvq_max_tokens(ggml_type):
-        _check_mmq_tail(w, ggml_type, x.shape[-1])
+        w = pad_mmq_tail(w, ggml_type, x.shape[-1])
     _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out, scale)
     return out
 
@@ -163,6 +182,7 @@ __all__ = [
     "mul_mat",
     "mul_mat_id",
     "mul_mat_id_glu",
+    "pad_mmq_tail",
     "quantize_q8_1",
     "uses_mmvq",
 ]
