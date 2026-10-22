@@ -99,6 +99,12 @@ def load_gguf_tokenizer(model_path: str):
             pre_tokenizers.Split(Regex(GGUF_PRE_TOKENIZER_SPLITS["llama3"]), behavior="isolated"),
             pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
         ])
+    elif pre in ("qwen2", "qwen35"):
+        # every Qwen release's tokenizer.json applies NFC (Unicode Normalization Form C) before the
+        # byte-level BPE, but a GGUF carries no normalizer; without it decomposed text differs
+        from tokenizers import normalizers
+
+        fast.normalizer = normalizers.NFC()
     elif pre == "joyai-llm":
         from tokenizers import Regex, pre_tokenizers
 

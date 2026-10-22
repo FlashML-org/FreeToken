@@ -35,6 +35,8 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "qwen3moe": "Qwen3MoeGGUFForCausalLM",
     "qwen35": "Qwen3_5GGUFForCausalLM",
     "qwen35moe": "Qwen3_5MoeGGUFForCausalLM",
+    "qwen3vl": "Qwen3VLGGUFForCausalLM",
+    "qwen3vlmoe": "Qwen3VLMoeGGUFForCausalLM",
     "qwen4exp": "Qwen4ExpGGUFForCausalLM",
 }
 # (GGUF architecture, mmproj projector) -> registry key, for text GGUFs whose release is told apart only by its mmproj

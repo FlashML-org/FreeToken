@@ -142,7 +142,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
-        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM"),  # Qwen3-VL-30B-A3B: same text tower
+        # Qwen3-VL-30B-A3B: same text tower
+        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM", "Qwen3VLMoeGGUFForCausalLM"),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -395,7 +396,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Qwen3ForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
-        arch_aliases=("Qwen3VLForConditionalGeneration", "Qwen3GGUFForCausalLM"),  # Qwen3-VL-8B: same text tower
+        # Qwen3-VL: same text tower
+        arch_aliases=("Qwen3VLForConditionalGeneration", "Qwen3GGUFForCausalLM", "Qwen3VLGGUFForCausalLM"),
     ),
     AotModel(
         name="mistralai/Mistral-7B-Instruct-v0.3",
