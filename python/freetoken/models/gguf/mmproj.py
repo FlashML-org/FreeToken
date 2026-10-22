@@ -103,11 +103,19 @@ def _find(model_path: str, override: str) -> Mmproj | None:
         if not found:
             logger.warning("vision: %s holds mmproj files of several models (%s); pick one with --mmproj", folder, ", ".join(sorted(map(str, names))))
             return None
-    if not found:
-        return None
+    from .config import mm_fields
+
     found.sort(key=lambda f: f[:2])
-    _, path, described = found[0]
-    return Mmproj(path, "auto-discovered", *described[:2], skipped=tuple(f[1] for f in found[1:]))
+    for i, (_, path, described) in enumerate(found):
+        mmproj = Mmproj(path, "auto-discovered", *described[:2], skipped=tuple(f[1] for f in found[i + 1 :]))
+        try:
+            # the family's own checks (tower type, image tokens); a file that fails them leaves the model text only
+            mm_fields(model_path, mmproj)
+        except (KeyError, ValueError) as e:
+            logger.warning("vision: skipping %s: %s", path, e)
+            continue
+        return mmproj
+    return None
 
 
 def find_mmproj(model_path: str) -> Mmproj | None:

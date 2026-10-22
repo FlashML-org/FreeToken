@@ -96,6 +96,14 @@ def _mm_fields(module: str, model_path: str, mmproj: Mmproj, vocab_size: int) ->
     return importlib.import_module(module).gguf_mm_config(load_gguf_metadata(model_path), mmproj, vocab_size)
 
 
+def mm_fields(model_path: str, mmproj: Mmproj) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The HF config keys and the preprocessor config that the family of the text GGUF ``model_path`` derives from ``mmproj``."""
+    from freetoken.models.register import get_model_spec
+
+    spec = get_model_spec(GGUF_ARCH_TO_REGISTRY[gguf_architecture(model_path)])
+    return _mm_fields(spec.module, model_path, mmproj, _vocab_size(model_path))
+
+
 def build_gguf_shim(model_path: str) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
@@ -129,7 +137,7 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
     mmproj = find_mmproj(model_path) if spec.encoders else None
     if mmproj is not None:
         registry_key = GGUF_MMPROJ_TO_REGISTRY.get((arch, mmproj.projector), registry_key)
-    hf_fields, preprocessor_config = ({}, None) if mmproj is None else _mm_fields(spec.module, model_path, mmproj, vocab_size)
+    hf_fields, preprocessor_config = ({}, None) if mmproj is None else mm_fields(model_path, mmproj)
     return GgufConfigShim(
         architectures=[registry_key],
         model_path=model_path,

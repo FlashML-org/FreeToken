@@ -36,14 +36,8 @@ _BLOCK = {
     "ln1": "norm1",
     "ln2": "norm2",
 }
-_DEEPSTACK = {"norm": "norm", "fc1": "linear_fc1", "fc2": "linear_fc2"}
 _BLOCK_RE = re.compile(r"^v\.blk\.(\d+)\.(\w+)\.(weight|bias)$")
-_DEEPSTACK_RE = re.compile(r"^v\.deepstack\.(\d+)\.(\w+)\.(weight|bias)$")
 _PATCH = ("v.patch_embd.weight", "v.patch_embd.weight.1")
-
-
-def _deepstack_layers(md: dict[str, Any]) -> list[int]:
-    return [i for i, tap in enumerate(md.get("clip.vision.is_deepstack_layers") or []) if tap]
 
 
 def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -51,6 +45,8 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int) -> 
     if mmproj.projector != _PROJECTOR:
         raise ValueError(f"mmproj {mmproj.path} is a {mmproj.projector!r} tower; Qwen VL needs {_PROJECTOR!r}")
     md, index = load_gguf_metadata(mmproj.path), gguf_tensor_index(mmproj.path)
+    if any(md.get("clip.vision.is_deepstack_layers") or []):
+        raise ValueError(f"mmproj {mmproj.path} is a Qwen3-VL tower with DeepStack layers; Qwen3.5 and later read none")
 
     def kv(key: str):
         return md[f"clip.vision.{key}"]
@@ -75,7 +71,7 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int) -> 
         "out_hidden_size": text_hidden,
         # ggml order [kw, kh, in, out]
         "in_channels": int(index[_PATCH[0]].ne[2]),
-        "deepstack_visual_indexes": _deepstack_layers(md),
+        "deepstack_visual_indexes": [],
     }
     hf_fields = {
         "vision_config": vision_config,
@@ -97,25 +93,22 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int) -> 
     return hf_fields, preprocessor
 
 
-def _name(gguf_name: str, deepstack: list[int]) -> str:
+def _name(gguf_name: str) -> str:
     if gguf_name in _TOP:
         return _TOP[gguf_name]
     if (m := _BLOCK_RE.match(gguf_name)) and m[2] in _BLOCK:
         return f"blocks.{m[1]}.{_BLOCK[m[2]]}.{m[3]}"
-    if (m := _DEEPSTACK_RE.match(gguf_name)) and m[2] in _DEEPSTACK and int(m[1]) in deepstack:
-        return f"deepstack_merger_list.{deepstack.index(int(m[1]))}.{_DEEPSTACK[m[2]]}.{m[3]}"
     raise ValueError(f"unexpected tensor {gguf_name!r} in a {_PROJECTOR} mmproj")
 
 
 def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
     """The tower state dict under ``visual.``, named as the HF checkpoints load."""
     index = gguf_tensor_index(mmproj.path)
-    deepstack = _deepstack_layers(load_gguf_metadata(mmproj.path))
     slices = [mmproj_tensor(index[n]) for n in _PATCH if n in index]
     yield "visual.patch_embed.proj.weight", torch.stack(slices, dim=2)
     for gguf_name, info in index.items():
         if gguf_name not in _PATCH:
-            yield f"visual.{_name(gguf_name, deepstack)}", mmproj_tensor(info)
+            yield f"visual.{_name(gguf_name)}", mmproj_tensor(info)
 
 
 __all__ = ["gguf_mm_config", "iter_mmproj_weights"]
