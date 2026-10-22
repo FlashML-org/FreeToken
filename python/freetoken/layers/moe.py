@@ -10,7 +10,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 
 
 from .base import BaseOP
-from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
+from .quantization import ExpertView, LayerKind, QuantConfig, RoutedExperts, quant_method_for
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -366,6 +366,7 @@ class OffloadMoELayer(MoELayer):
                 views=cache.pool_bank_views(self.layer_id),
                 n=cache.pool_slots(self.layer_id),
                 alphas=cache.alphas_for_slots(self.layer_id),
+                routed=RoutedExperts(self.num_experts, cache.alphas_for_layer(self.layer_id)),
                 is_prefill=True,
             )
         if cache.prefill_overlap:
@@ -424,12 +425,13 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
+        routed: RoutedExperts | None = None,
     ) -> torch.Tensor:
         from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
         view = ExpertView(
             {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-            slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+            slots=None if n is not None else topk_ids, n=n, alphas=alphas, routed=routed,
         )
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill

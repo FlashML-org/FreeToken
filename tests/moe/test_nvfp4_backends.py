@@ -364,12 +364,36 @@ def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatc
     decode_stats = demand_cache.lru_stats.clone()
     slots = demand_cache.load_prefill_experts(1, topk_ids)
     demanded = fused_experts_nvfp4(
-        hidden, *demand_cache.pool_bank_views(1), topk_weights, slots, demand_cache.pool_slots(1), "silu", False
+        hidden, *demand_cache.pool_bank_views(1), topk_weights, slots, demand_cache.pool_slots(1), "silu", False,
+        routed_experts=E,
     )
 
     assert not torch.equal(slots, topk_ids), "the admission must have mapped expert ids to slots"
     assert torch.equal(demanded, streamed)
     assert torch.equal(demand_cache.lru_stats, decode_stats)
+
+
+def test_triton_prefill_over_cache_slots_sizes_its_tiles_by_the_routed_layer(monkeypatch):
+    """The Triton prefill over a demand chunk's slots aligns over the slots and hands the GEMM the layer's experts to
+    size its tiles by, as the stream's banks would."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization import ExpertView, RoutedExperts
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+    from freetoken.moe import fused_nvfp4
+
+    seen = {}
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4", lambda *args, **kwargs: seen.update(args=args, kwargs=kwargs))
+    slots = 1100
+    banks = {role: torch.zeros(slots, 1) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
+    view = ExpertView(banks, n=slots, routed=RoutedExperts(E))
+    TritonNvfp4MoEKernel().apply(
+        SimpleNamespace(activation="silu", alpha=1.702, limit=7.0, apply_router_weight_on_input=False),
+        torch.zeros(4, H), torch.ones(4, TOPK), torch.zeros(4, TOPK, dtype=torch.int32), view, is_prefill=True,
+    )
+
+    assert seen["args"][9] == slots
+    assert seen["kwargs"]["routed_experts"] == E
 
 
 def test_w4a4_prefill_over_cache_slots_takes_the_routed_layers_scales_and_tiles(monkeypatch):

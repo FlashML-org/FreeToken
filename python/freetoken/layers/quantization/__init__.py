@@ -22,6 +22,7 @@ from .moe import (
     Mxfp4MoEMethod,
     Mxfp8MoEMethod,
     Nvfp4MoEMethod,
+    RoutedExperts,
     UnquantizedMoEMethod,
 )
 from .quant_backend import QuantBackend, get_quant_backend, set_quant_backend
@@ -47,7 +48,7 @@ __all__ = [
     "EmbeddingConfig", "EmbeddingKernel", "EmbeddingMethod", "UnquantizedEmbeddingMethod", "GGUFEmbeddingMethod",
     "LinearConfig", "LinearKernel", "LinearMethod",
     "UnquantizedLinearMethod", "Fp8TensorLinearMethod", "Fp8BlockLinearMethod", "Mxfp8LinearMethod", "Nvfp4LinearMethod",
-    "BankSpec", "ExpertView", "MoEConfig", "MoEKernel", "MoEMethod",
+    "BankSpec", "ExpertView", "MoEConfig", "MoEKernel", "MoEMethod", "RoutedExperts",
     "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod",
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
     "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "GGUFConfig", "Mxfp4Config",
