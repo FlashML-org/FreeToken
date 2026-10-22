@@ -37,7 +37,7 @@ If you want to implement something on the [Roadmap](https://github.com/FlashML-o
 - Link the issue it addresses. Features that are not on the Roadmap should start as an issue, not a PR.
 - State what you tested on: GPU, CPU, driver, the checkpoint's Hugging Face / ModelScope ID, and the exact command.
 - For performance changes, include A/B end-to-end results: the same model, prompt and settings on `main` and on your branch, with tokens/s (and TTFT if prefill is affected) for both, and the commands used.
-- For bug fixes, add a test that fails before the change and passes after, where the code allows it.
+- For bug fixes, show that the failing command or request from the issue now works. New tests, for fixes and features alike, must meet [What earns a place here](tests/README.md#what-earns-a-place-here) in the tests README.
 
 ## Development setup
 
