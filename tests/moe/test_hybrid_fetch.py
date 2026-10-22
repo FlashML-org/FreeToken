@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from freetoken.moe.bench_profile import PROFILE_VERSION, default_profile_path, fetch_fraction, layer_kind_key, load_layer_kinds
+from freetoken.moe.bench_profile import PROFILE_VERSION, default_profile_path, fetch_fraction, layer_kind_key, load_layer_kinds, locked_fetch_fraction
 
 
 def test_layer_kind_rows_give_fetch_fractions(tmp_path):
@@ -32,6 +32,9 @@ def test_layer_kind_rows_give_fetch_fractions(tmp_path):
     assert fetch_fraction(rows[bf16]) == pytest.approx(0.4)
     # overlapped pair preferred: pcie_ov / (pcie_ov + cpu_ov)
     assert fetch_fraction(rows[gguf]) == pytest.approx(0.25)
+    # a locked layer's fetch adds a memcpy at the CPU MoE rate before the gather: p / (2p + c), from the same pair
+    assert locked_fetch_fraction(rows[bf16]) == pytest.approx(40 / 180)
+    assert locked_fetch_fraction(rows[gguf]) == pytest.approx(30 / 150)
     # another thread count is another kind
     assert layer_kind_key("bf16", {}, 2048, 768, 8, 6) not in rows
     # a profile from different hardware is ignored

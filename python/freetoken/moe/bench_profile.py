@@ -128,6 +128,19 @@ def fetch_fraction(row: dict | None) -> float | None:
     return None
 
 
+def locked_fetch_fraction(row: dict | None) -> float | None:
+    """The fetch split of a locked layer of this row's kind: p / (2p + c) from the same pair as ``fetch_fraction``.
+
+    A locked fetch is a CPU memcpy into staging, then the PCIe gather; taking the memcpy rate as the CPU MoE rate c, the two steps in series run at p*c / (p + c), which against the CPU compute gives p / (2p + c)."""
+    if not isinstance(row, dict):
+        return None
+    for cpu_key, pcie_key in (("cpu_moe_overlap_gbs", "pcie_gather_overlap_gbs"), ("cpu_moe_gbs", "pcie_gather_gbs")):
+        cpu, pcie = row.get(cpu_key), row.get(pcie_key)
+        if cpu and pcie:
+            return pcie / (2 * pcie + cpu)
+    return None
+
+
 def load_layer_kinds(gpu_name: str | None = None, path: str | None = None, gpu_uuid: str | None = None) -> dict | None:
     """The rows of the usable profile for this GPU (key -> row), or None without one."""
     prof = _usable_profile(gpu_name, path, gpu_uuid)

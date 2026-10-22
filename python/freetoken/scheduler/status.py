@@ -12,6 +12,8 @@ class SchedulerStatusReporter:
     log: Callable[[str], None]
     clock: Callable[[], float] = time.perf_counter
     decode_log_interval: int = 40
+    # --moe-collect-stats: one more line per decode log line (the stats since the previous one), or None to skip
+    moe_stats: Callable[[], str | None] | None = None
     _last_prefill_time: float = field(init=False)
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
@@ -122,6 +124,8 @@ class SchedulerStatusReporter:
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
+        if self.moe_stats is not None and (line := self.moe_stats()):
+            self.log(line)
 
 
 def _usage_ratio(used: int, total: int) -> float:

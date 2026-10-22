@@ -44,8 +44,9 @@ inline void flag_store_release(volatile int64_t* p, int64_t v) {
 
 class GpuSync {
  public:
-  // Allocates the handshake memory; throws if this runtime cannot.
-  GpuSync();
+  // Allocates the handshake memory; throws if this runtime cannot, or lacks stream memops while require_memops.
+  // Without memops only the words, cpu_poll and cpu_done serve: kernels write the words and wait on them.
+  explicit GpuSync(bool require_memops = true);
   ~GpuSync();
   GpuSync(const GpuSync&) = delete;
   GpuSync& operator=(const GpuSync&) = delete;

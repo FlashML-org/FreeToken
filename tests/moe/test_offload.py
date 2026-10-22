@@ -428,7 +428,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton" if torch.version.hip is not None else "fi",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -920,6 +920,98 @@ def test_slot_pools_keep_each_layer_in_its_own_slots(target):
     assert [v[0].shape[0] for v in map(cache.pool_bank_views, range(L))] == [8, 8, 24]
 
 
+def _hybrid_ensure_reference(st, layer, ids, weights, num_experts, pool, frac, mode, kernel_fetch):
+    """One hybrid ensure call on CPU copies of the cache state, written from the LRU contract."""
+    base, size = pool
+    step = int(st["step"]) + 1
+    slot_for_id, recency = st["slot_for_id"], st["expert_recency"]
+    p_ids, p_usage = st["id_of_slot"][base : base + size], st["usage"][base : base + size]
+    active = sorted(set(ids.tolist()))
+    hits = [e for e in active if slot_for_id[layer, e] >= 0]
+    missing = [e for e in active if slot_for_id[layer, e] < 0]
+    m, fq = len(missing), min(1 << 16, max(0, round(frac * (1 << 16))))
+    lo, room = (m * fq) >> 16, size - len(hits)
+    if mode == "min-wait":
+        cost_lo = max(lo * ((1 << 16) - fq), (m - lo) * fq)
+        cost_hi = max((lo + 1) * ((1 << 16) - fq), (m - lo - 1) * fq)
+        num_fetch = min(m, lo if cost_lo <= cost_hi else lo + 1, room)
+    elif mode == "prefer-fetch":
+        num_fetch = min(m, (m * fq + 0xFFFF) >> 16, room)
+    else:
+        allowed = {min(m, lo, room)} if (m * fq) & 0xFFFF == 0 else {min(m, lo, room), min(m, lo + 1, room)}
+        assert kernel_fetch in allowed
+        num_fetch = kernel_fetch
+    taken = torch.zeros(size, dtype=torch.bool)
+    for e in hits:
+        p_usage[slot_for_id[layer, e]] = step
+        taken[slot_for_id[layer, e]] = True
+    plan = []
+    for e in sorted(missing, key=lambda e: (-int(recency[layer, e]), e))[:num_fetch]:
+        victim = int(torch.argmin(p_usage.masked_fill(taken, torch.iinfo(torch.int64).max)))  # first minimum
+        old = int(p_ids[victim])
+        if old >= 0:
+            slot_for_id.view(-1)[old] = -1
+        p_ids[victim] = layer * num_experts + e
+        slot_for_id[layer, e] = victim
+        p_usage[victim] = step
+        taken[victim] = True
+        plan.append((victim, e))
+    recency[layer, active] = step
+    st["step"] = torch.tensor(step)
+    slots = slot_for_id[layer, ids.long()]
+    on_gpu = slots >= 0
+    return st, plan, slots, torch.where(on_gpu, -1, ids), torch.where(on_gpu, weights, 0.0), m, active
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mode", ["min-wait", "stochastic", "prefer-fetch"])
+@pytest.mark.parametrize("clamp", [False, True])
+@pytest.mark.parametrize("layout", ["global", "global-tiled", "per-layer"])
+def test_hybrid_ensure_matches_lru_reference(monkeypatch, layout, clamp, mode):
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FETCH_ROUND", offload_kernels._HYBRID_FETCH_ROUNDING[mode])
+    torch.manual_seed(0)
+    # global-tiled: more slots than one Phase 2 tile, so victims come from the tiled scan
+    L, E, top_k = (20, 512, 10) if layout == "global-tiled" else (4, 128, 8)
+    size = {"global": 300, "global-tiled": offload_kernels._HYBRID_EVICT_CHUNK + 808, "per-layer": 4 * 96}[layout]
+    pools = {"pool_of_layer": list(range(L)), "pool_sizes": [96] * L} if layout == "per-layer" else {}
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=size, device=torch.device("cuda"),
+        decode_target="hybrid", hybrid_max_fetch=1, **pools,
+    )
+    popularity = 1.0 / torch.arange(1, E + 1, dtype=torch.float64) ** 0.6
+    names = ["slot_for_id", "id_of_slot", "usage", "step", "expert_recency"]
+
+    # fetch every miss until every pool is full, then the benched-style fraction
+    for frac, calls in ((1.0, 4000), (0.413, 60 * L)):
+        for call in range(calls):
+            layer = call % L
+            if frac == 1.0 and bool((cache.id_of_slot >= 0).all()) and layer == 0:
+                break
+            cache.hybrid_fetch_fraction = [frac] * L
+            ids = torch.cat([torch.multinomial(popularity, top_k) for _ in range(2)]).to(torch.int32)
+            weights = torch.rand(ids.numel())
+            st = {n: getattr(cache, n).cpu().clone() for n in names}
+            p = cache.pool_of_layer[layer]
+            routes = cache.ensure_experts_hybrid(layer, ids.cuda(), weights.cuda(), clamp=clamp)
+            n = int(cache.num_indices)
+            st, plan, slots, cpu_ids, gpu_w, m, active = _hybrid_ensure_reference(
+                st, layer, ids, weights, E, (cache.pool_bases[p], cache.pool_sizes[p]), frac, mode, n
+            )
+            assert int(cache.num_missing_full) == m and n == len(plan)
+            assert cache.evict_slots[:n].cpu().tolist() == [v for v, _ in plan]
+            assert cache.src_indices[:n].cpu().tolist() == [e for _, e in plan]
+            assert torch.equal(routes.gpu_slots.cpu(), slots.clamp(min=0) if clamp else slots)
+            assert torch.equal(routes.cpu_ids.cpu(), cpu_ids) and torch.equal(routes.gpu_w.cpu(), gpu_w)
+            assert cache.active_mask.cpu().nonzero().flatten().tolist() == active
+            for name in names:
+                assert torch.equal(getattr(cache, name).cpu(), st[name]), name
+        assert bool((cache.id_of_slot >= 0).all())
+
+
 def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
     """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
     from freetoken.moe.host_banks import HostResidency
@@ -1028,6 +1120,101 @@ def test_locked_layer_copy_missing_rejects_ensure_experts_staging():
     cache._pending_whole_layer = False
     with pytest.raises(RuntimeError, match="unpinned"):
         cache.copy_missing()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("memops", [True, False])
+def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch, memops):
+    # a locked layer's hybrid decode fetches at most max_fetch misses per step into its slots through the pinned staging; the rest go to the CPU
+    # memops: the GPU waits on the doorbell with a stream memop, else the gather kernel spins on it
+    from types import SimpleNamespace
+
+    from freetoken.moe.locked_fetch import LockedLayerFetch
+
+    monkeypatch.setenv("FREETOKEN_LOCKED_FETCH_THREADS", "2")
+    torch.manual_seed(0)
+    cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
+    cache.decode_target = "hybrid"
+    cache.locked_hybrid = frozenset({1})
+    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops))
+
+    top_k = 3
+    ids = torch.zeros(top_k, dtype=torch.int32, device="cuda")
+    weights = torch.rand(top_k, device="cuda")
+    out = {}
+
+    def step():
+        slots, _, cpu_ids = cache.ensure_experts_hybrid(1, ids, weights)
+        cache.copy_missing()
+        out["slots"], out["cpu"] = slots, cpu_ids
+
+    cache.collect_stats = True
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    cache.reset()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+
+    def replay(graph, steps):
+        resident = set()
+        for _ in range(steps):
+            experts = torch.randperm(4)[:top_k].to(torch.int32)
+            ids.copy_(experts)
+            graph.replay()
+            torch.cuda.synchronize()
+            slots, cpu_ids = out["slots"].tolist(), out["cpu"].tolist()
+            fetched = [e for e, s in zip(experts.tolist(), slots) if s >= 0 and e not in resident]
+            assert len(fetched) <= 2
+            for e, s, c in zip(experts.tolist(), slots, cpu_ids):
+                assert (s >= 0) != (c >= 0)
+                if s >= 0:
+                    for (src, _), view in zip(cache.banks, cache.pool_bank_views(1)):
+                        assert torch.equal(view[s].cpu(), src[1][e])
+            resident = {e for e, s in enumerate(cache.slot_for_id[1].tolist()) if s >= 0}
+
+    replay(graph, 12)
+    # --moe-collect-stats: the locked layer reports as its own group, and each line clears the counters
+    line = cache.decode_stats_line()
+    assert "locked 1 layer: hit" in line and "pinned" not in line, line
+    assert cache.decode_stats_line() is None
+    # a runtime rebuild reallocates evict_slots and the slot caches; the fetch follows and a new capture still copies right
+    del graph
+    cache.rebuild(12)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    replay(graph, 6)
+
+
+def test_pin_probe_pins_middle_layers_until_refused(monkeypatch):
+    # --moe-cpu-layers auto: deferred banks pin middle-out until the (simulated) quota refuses one; the rest lock, and the margin gives back the last pinned layer
+    import freetoken.kernel.pinned as pinned
+    import freetoken.moe.host_banks as hb
+
+    monkeypatch.setattr(pinned, "host_register", lambda addr, nbytes: None)
+    monkeypatch.setattr(pinned, "host_unregister", lambda addr: None)
+    monkeypatch.setattr(hb, "_os_lock", lambda addr, nbytes: None)
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    monkeypatch.setattr(hb, "_sim_pinned", 0)
+    monkeypatch.setenv("FREETOKEN_SIMULATE_PIN_CAP_GB", str(3 * hb._BLK / 2**30))
+    deferred = [hb.HostResidency.DEFERRED.value] * 6
+
+    def probe(margin):
+        banks = {"gate_up": [hb.HostBank((4,), torch.uint8) for _ in range(6)]}
+        with hb.requested_residency(deferred) as plan:
+            hb.pin_banks(banks)
+        labels = hb.probe_pin(plan, 6, margin_bytes=margin)
+        for bank in banks["gate_up"]:
+            bank.unpin()
+        return [i for i, r in enumerate(labels) if r == hb.HostResidency.LOCKED.value]
+
+    # order 2, 3, 1, 4, 0, 5: the quota takes three, layer 4 is refused
+    assert probe(0) == [0, 4, 5]
+    assert probe(hb._BLK) == [0, 1, 4, 5]
 
 
 def test_requested_residency_routes_layer_settles(monkeypatch):

@@ -13,6 +13,7 @@
 // pointer-to-pointer copies with ONE runtime call, on an explicit (non-legacy)
 // stream. Callers hand pre-resolved raw addresses; copies within a batch are
 // unordered, so entries must be pairwise independent.
+// ROCm uses hipMemcpyBatchAsync with its nine-argument signature (failIdx).
 struct BatchMemcpy {
     static void run(
         tvm::ffi::TensorView dst_ptrs,
@@ -20,7 +21,7 @@ struct BatchMemcpy {
         tvm::ffi::TensorView sizes,
         int64_t stream_handle
     ) {
-#if CUDART_VERSION >= 13000
+#if FREETOKEN_USE_ROCM || CUDART_VERSION >= 13000
         using namespace host;
         auto N = SymbolicSize{"batch length"};
         auto ptr_dtype = SymbolicDType{};
@@ -34,7 +35,30 @@ struct BatchMemcpy {
         if (n == 0) {
             return;
         }
-        RuntimeCheck(stream_handle != 0, "cudaMemcpyBatchAsync rejects the legacy NULL stream");
+        RuntimeCheck(stream_handle != 0, "batch memcpy requires an explicit non-NULL stream");
+#if FREETOKEN_USE_ROCM
+        auto attr = ::hipMemcpyAttributes{};
+        attr.srcAccessOrder = ::hipMemcpySrcAccessOrderStream;
+        std::size_t attr_idx = 0;
+        std::size_t fail_idx = SIZE_MAX;
+        const auto status = ::hipMemcpyBatchAsync(
+            reinterpret_cast<void**>(dst_ptrs.data_ptr()),
+            reinterpret_cast<void**>(src_ptrs.data_ptr()),
+            reinterpret_cast<std::size_t*>(sizes.data_ptr()),
+            n,
+            &attr,
+            &attr_idx,
+            1,
+            &fail_idx,
+            reinterpret_cast<::hipStream_t>(stream_handle)
+        );
+        if (status != ::hipSuccess) {
+            ::host::panic(
+                std::source_location::current(),
+                "hipMemcpyBatchAsync failed (failIdx=", fail_idx, "): ", ::hipGetErrorString(status)
+            );
+        }
+#else
         auto attr = ::cudaMemcpyAttributes{};
         attr.srcAccessOrder = ::cudaMemcpySrcAccessOrderStream;
         std::size_t attr_idx = 0;
@@ -48,6 +72,7 @@ struct BatchMemcpy {
             1,
             reinterpret_cast<::cudaStream_t>(stream_handle)
         ));
+#endif
 #else
         ::host::panic(
             std::source_location::current(),

@@ -127,7 +127,7 @@ class OffloadMoeCache:
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
-    # of re-crossing PCIe; only the misses are H2D'd (one cudaMemcpyBatchAsync of
+    # of re-crossing PCIe; only the misses are H2D'd (one CUDA/HIP batch memcpy of
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
@@ -194,6 +194,9 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # hybrid: locked (unpinned) layers that keep slots of their own pools and fetch part of their misses through locked_fetch's pinned staging
+        self.locked_hybrid: frozenset = frozenset()
+        self.locked_fetch = None  # moe.locked_fetch.LockedLayerFetch, set by the engine with locked_hybrid
         # Bank row layouts, set by set_bank_sources: layouts[g][k] is (dtype, row shape) of bank k (layouts of two quant tags may be equal), layer_layout[l] is layer l's g.
         # With one (dtype, row shape) per bank a bank cache is typed [cache_size, *row]; with several, or with pads, it is a byte segment each pool views with its own layout.
         self.layouts: list[tuple[tuple[torch.dtype, tuple[int, ...]], ...]] = []
@@ -256,7 +259,7 @@ class OffloadMoeCache:
             self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
-        # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
+        # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor (locked_hybrid ones also from their slots) and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
@@ -314,6 +317,7 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        self._pending_fetch_cap: int | None = None  # the last hybrid ensure's cap on its fetch count
         # The two prefill staging buffers are the first 2 * _stage_bytes[k] bytes of every bank, on top of the first pools.
         # _stage_views[g][b] are buffer b's per-bank [num_experts, ...] views for layout g; _inval[b] are the global slots it overwrites.
         self._stage_bytes: list[int] = []
@@ -468,7 +472,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must be in ``cpu_layer_ids`` (set BEFORE this call) and the copy plan skips their rows. Prefill moves them with ``copy_missing``'s whole-layer pageable branch, so prefill overlap is incompatible with them; ``locked_hybrid`` layers also fetch decode misses through ``locked_fetch``.
 
         ``layer_tags`` names each layer's quant (see :func:`bank_layouts`); layers of different tags never share a pool.
 
@@ -784,11 +788,11 @@ class OffloadMoeCache:
 
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
-        return layer_id in self.cpu_layer_ids
+        return layer_id in self.cpu_layer_ids and layer_id not in self.locked_hybrid
 
     def is_unpinned_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE): the GPU slot-gather paths cannot serve it.
-        ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
+        ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id; a locked_hybrid layer's decode fetches go through ``locked_fetch`` instead."""
         return layer_id in self._unpinned_layers
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -931,7 +935,7 @@ class OffloadMoeCache:
                 f"(every slot lies under the prefill staging buffers of {2 * self.num_experts} experts)"
             )
         elif not self._resolve_batch_memcpy():
-            reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
+            reason = "batch memcpy is unavailable"  # resolve logged the specifics
         else:
             return True
         if not self._hit_d2d_fallback_logged:
@@ -961,7 +965,7 @@ class OffloadMoeCache:
         fixed-shape gather indices (no host round trip), then fast_index_copy_multi
         moves the rows. Serializing the gather before this layer's GEMMs costs its
         plain duration instead of nondeterministic SM contention. Misses cross
-        PCIe as ONE cudaMemcpyBatchAsync of coalesced expert-id runs on the copy
+        PCIe as ONE batch memcpy of coalesced expert-id runs on the copy
         stream, under the existing release/ready event discipline; its host-built
         run list comes from the begin-of-chunk snapshot because the batch API
         takes HOST pointer arrays. Live-vs-snapshot cannot disagree: the only
@@ -1096,7 +1100,12 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         fraction = self.hybrid_fetch_fraction[layer_id] if self.hybrid_fetch_fraction is not None else 0.0
-        return ensure_experts_hybrid(self, layer_id, expert_ids, weights, self.hybrid_max_fetch, fraction, clamp)
+        max_fetch, cap = self.hybrid_max_fetch, None
+        if layer_id in self.locked_hybrid:
+            # a locked layer fetches through the staging, so at most its rows per step
+            (max_fetch, fraction), cap = self.locked_fetch.plan[layer_id], self.locked_fetch.max_fetch
+        self._pending_fetch_cap = cap
+        return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
@@ -1155,6 +1164,29 @@ class OffloadMoeCache:
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
         }
+
+    def decode_stats_line(self) -> str | None:
+        """Decode stats since the last call by layer group (pinned, locked with slots, CPU-only), as one log line; zeroes the counters."""
+        if self.decode_target == "hybrid":
+            rows = torch.stack([self.stat_steps_layer, self.stat_active_layer, self.stat_missing_layer, self.stat_fetched_layer], 1).tolist()
+        else:
+            # offload copies every miss
+            cols = self.lru_stats.t()
+            rows = torch.stack([cols[Stat.CALLS], cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.MISS]], 1).tolist()
+        self.reset_stats()
+        groups = (("pinned", [l for l in range(self.num_layers) if l not in self.cpu_layer_ids]), ("locked", sorted(self.locked_hybrid)))
+        parts = []
+        for name, layers in groups:
+            steps, active, missing, fetched = (sum(rows[l][k] for l in layers) for k in range(4))
+            if steps and active:
+                parts.append(
+                    f"{name} {_layers(len(layers))}: hit {1 - missing / active:.1%}, per layer-step "
+                    f"miss {missing / steps:.2f} fetch {fetched / steps:.2f} cpu {(missing - fetched) / steps:.2f}"
+                )
+        cpu_only = self.cpu_layer_ids - self.locked_hybrid
+        if cpu_only:
+            parts.append(f"cpu-only {_layers(len(cpu_only))}")
+        return "MoE decode, " + "; ".join(parts) if parts else None
 
     def decode_miss_stats_per_layer(self) -> dict:
         """Per-MoE-layer realized decode stats for one (reset_stats-delimited) window.
@@ -1224,13 +1256,16 @@ class OffloadMoeCache:
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
+                if layer_id in self.locked_hybrid:
+                    self.locked_fetch.copy(self, layer_id)
+                    return
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
                     f"pageable materialize (position == expert id); ensure_experts's "
                     f"LRU slot remap cannot be honored without a device alias"
                 )
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into staging buffer 0 with position == expert id -- a plain synchronous pageable H2D copy
-            # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
+            # never CUDA-graph captured: prefill is not captured, and decode of an unpinned layer routes to the CPU executor or, locked_hybrid, to the staged fetch above
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, 0)):
                 view.copy_(per_layer[layer_id])
             return
@@ -1267,6 +1302,10 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+
+
+def _layers(n: int) -> str:
+    return f"{n} layer" if n == 1 else f"{n} layers"
 
 
 def iter_offload_moe_layers(model) -> Iterator:

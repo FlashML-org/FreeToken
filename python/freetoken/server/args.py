@@ -795,9 +795,11 @@ def parse_args(
             "With --moe-strategy offload/hybrid: which MoE layers compute on the "
             "CPU executor instead of the GPU offload/PCIe path (where CUDA pinning "
             "is quota-capped, e.g. WSL, their banks are OS-locked instead of pinned). Explicit id list ('3,7,11'), a count ('8' = 8 "
-            "layers evenly strided), a fraction ('0.5'), or 'auto'. 'auto' is for Windows/WSL "
-            "only, where CUDA pinned memory is capped: it locks just enough head+tail layers "
-            "for the banks over the pin budget. Any value, 'auto' included, commits to CPU "
+            "layers evenly strided), a fraction ('0.5'), or 'auto'. 'auto' is for hosts that cap CUDA "
+            "pinned memory (Windows/WSL): it pins the banks layer by layer from the middle out until CUDA "
+            "refuses one and OS-locks the rest. FREETOKEN_PIN_BUDGET_GB, FTW checkpoints and models the CPU executor "
+            "cannot serve lock head+tail layers from a size estimate instead. Under hybrid, locked layers still decode from GPU slots "
+            "(--moe-locked-fetch). Any value, 'auto' included, commits to CPU "
             "decode before the model is built, so the expert format must have a CPU executor "
             "path (bf16, fp8_block, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
             "GPU; a boot whose banks exceed a known pin budget stops and asks for this flag."
@@ -815,6 +817,29 @@ def parse_args(
             "step's misses (perfect overlap; needs the `ft bench bw` row of the layer's kind, "
             "from `ft bench bw --model <checkpoint>`, else 1). "
             "0 = never fetch (all misses on CPU); large = behaves like plain offload."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-locked-fetch",
+        type=float,
+        default=ServerArgs.moe_locked_fetch,
+        help=(
+            "For --moe-strategy hybrid with locked layers (banks over the pin quota, OS-locked instead of pinned): "
+            "the share of a locked layer's misses fetched per decode step into GPU slots of its own pools, through "
+            "pinned staging that CPU threads fill; the rest are computed on the CPU. -1 (default) = auto: per layer from "
+            "the `ft bench bw` row of its kind, p / (2p + c) of the overlapped PCIe and CPU MoE rates (at most 1 expert "
+            "per step without a row). 0 = locked layers decode on the CPU only."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-locked-max-fetch",
+        type=int,
+        default=ServerArgs.moe_locked_max_fetch,
+        help=(
+            "For --moe-locked-fetch: the most experts a locked layer fetches per decode step. Sizes the pinned "
+            "staging: this many rows of the widest expert, per bank."
         ),
     )
 
@@ -846,6 +871,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "With the offload-family strategies: after each decode log line, log the decode MoE stats since the "
+            "previous one (hit rate, and per layer-step the misses, experts fetched to the GPU and experts computed "
+            "on the CPU) for pinned layers, locked layers with GPU slots and CPU-only layers. Adds counter updates "
+            "to every decode step."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",
@@ -853,7 +890,7 @@ def parse_args(
         help=(
             "During prefill prefetch, copy cache-resident experts device-side into "
             "the double buffer and stream only the misses over PCIe "
-            "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
+            "(CUDA >= 13.0 or HIP with batch-copy support). Effective with "
             "--moe-cache-size > 2 * num_experts."
         ),
     )

@@ -206,15 +206,29 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.deepseek_v4",
         "DeepseekV4ForCausalLM",
         # the checkpoint has no ``model.`` root
-        checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
+        checkpoint_roots=(("model.layers", "layers"), ("model.embed", "embed"), ("model.head", "head")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
-        # the head, the KV compressors, the indexer's scorer and the vision tower + aligner ship bf16;
-        # the fp8 config has no modules_to_not_convert (patterns match checkpoint names, like V4.1)
+        # the embed, the head, the KV compressors, the indexer's scorer and the vision tower +
+        # aligner ship bf16; the fp8 config has no modules_to_not_convert (patterns match
+        # checkpoint names, like V4.1)
         unquantized_modules=(
-            "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj", "vision.*", "aligner.*",
+            "embed", "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj", "vision.*", "aligner.*",
         ),
         mm_processor=_DSV4_PROCESSOR,
         encoders=_DSV4_ENCODERS,
+    ),
+    # llama.cpp deepseek4 GGUF (unsloth DeepSeek-V4-Flash-0731-GGUF; text only): the same model
+    # classes with every tensor in its packed ggml type
+    "DeepseekV4GGUFForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v4",
+        "DeepseekV4ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        # the GGUF scheme reads expert types in (gate, up, down) order
+        packed_modules_mapping=_EXPERTS_W132_PACKED,
+        # the KV compressors read their weights through a dense bf16 einsum, so the reader
+        # dequantizes them instead of serving the packed ggml rows
+        unquantized_modules=("*.compressor.wkv", "*.compressor.wgate"),
     ),
     # DeepSeek-V4.1-Flash (model_type deepseek_v41): multimodal wrapper config (text tower in
     # text_config). The checkpoint has no ``model.`` root; the compressors, the indexer's key projection /

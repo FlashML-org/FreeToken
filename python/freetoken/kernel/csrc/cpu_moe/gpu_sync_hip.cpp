@@ -162,7 +162,8 @@ struct GpuSync::Impl {
   hipStreamBatchMemOpParams wait_op{};
 };
 
-GpuSync::GpuSync() : impl_(std::make_unique<Impl>()) {
+// The memop-free mode serves only the locked fetch, which ROCm keeps off: every GpuSync here needs memops.
+GpuSync::GpuSync(bool) : impl_(std::make_unique<Impl>()) {
   hipError_t rc = alloc_signal(&impl_->ready);
   if (rc == hipSuccess) rc = alloc_signal(&impl_->done);
   if (rc != hipSuccess) {

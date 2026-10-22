@@ -54,6 +54,8 @@ class ExpertBanks:
     row_tail_bytes: dict[str, list[int]] | None = None
     # per-layer quant_format of experts in several formats (``quant_format``/``kind``/``kernel`` then name the most common one); None = every layer is ``quant_format``
     layer_formats: list[str] | None = None
+    # the residency plan holding DEFERRED layers' banks, for host_banks.probe_pin; None when nothing was deferred
+    deferred_plan: object | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -439,6 +441,45 @@ def load_expert_banks(
     return _echo_residency(banks, layer_residency, residency_plan)
 
 
+def pin_probe_enabled(config, mixed_formats: bool) -> bool:
+    """Whether ``--moe-cpu-layers auto`` finds the pin limit by pinning until refused.
+
+    Only where pinning is known to be capped; FREETOKEN_PIN_BUDGET_GB fixes the limit instead (then a failed pin is an error)."""
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+    from freetoken.moe.host_banks import pin_capped
+
+    return (
+        (config.moe_cpu_layers or "").strip() == "auto"
+        and pin_capped()
+        and not os.environ.get("FREETOKEN_PIN_BUDGET_GB")
+        and config.moe_strategy in ("offload", "hybrid")
+        and not mixed_formats
+        and not config.use_dummy_weight
+        and not (config.model_path and is_ftw_checkpoint(config.model_path))  # FTW settles its banks itself
+    )
+
+
+def probe_banks(banks: ExpertBanks, num_layers: int) -> tuple[ExpertBanks, frozenset[int]]:
+    """Settle DEFERRED banks with host_banks.probe_pin; returns the banks and the OS-locked layers."""
+    import dataclasses
+    import time
+
+    from freetoken.moe.host_banks import HostResidency, probe_pin
+
+    plan = banks.deferred_plan
+    if plan is None:
+        return banks, frozenset()  # the loader settled the banks itself (pinned)
+    t0 = time.perf_counter()
+    labels = probe_pin(plan, num_layers)
+    locked = frozenset(i for i, r in enumerate(labels) if r != HostResidency.PINNED.value)
+    pinned_bytes = sum(b.nbytes for l, bs in plan.deferred.items() if l not in locked for b in bs)
+    logger.info_rank0(
+        f"--moe-cpu-layers auto (pin probe): pinned {num_layers - len(locked)} MoE layers ({pinned_bytes / 2**30:.2f} GiB) "
+        f"in {time.perf_counter() - t0:.1f}s, locked {len(locked)} {sorted(locked)}"
+    )
+    return dataclasses.replace(banks, layer_residency=labels, deferred_plan=None), locked
+
+
 def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
     """Stamp an honored residency request onto the ExpertBanks; keep None (and warn) when no settle point consulted the plan."""
     if requested is None or banks.layer_residency is not None:
@@ -446,6 +487,8 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
     if plan is not None and plan.applied:
         import dataclasses
 
+        if plan.deferred:
+            return dataclasses.replace(banks, layer_residency=list(requested), deferred_plan=plan)
         labels = [plan.actual.get(i, r) for i, r in enumerate(requested)]
         downgraded = [i for i, r in enumerate(requested) if labels[i] != r]
         if downgraded:

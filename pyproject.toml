@@ -23,7 +23,6 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
     "Environment :: GPU :: NVIDIA CUDA",
-    "Environment :: GPU :: AMD ROCm",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
