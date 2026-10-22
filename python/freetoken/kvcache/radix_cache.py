@@ -34,6 +34,11 @@ class RadixTreeNode:
         self.mamba_value: int | None = None
         self.mamba_ref_count: int = 0
 
+        # Second residence for the SAME boundary (LinearStatePool.to_host). Its own ref count: a
+        # restoring request pins the source, and the device counters feed VRAM admission math.
+        self.mamba_host: int | None = None
+        self.mamba_host_ref_count: int = 0
+
         # SWA second currency (SWARadixCache). Unlike the GDN snapshot above, SWA stores NO
         # separate slot: ``value`` (full-pool page indices) is canonical and the swa KV is
         # reached via the pool's full->swa mapping. ``swa_tombstone`` marks that the swa KV for

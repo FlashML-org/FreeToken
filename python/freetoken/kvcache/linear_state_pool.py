@@ -52,6 +52,7 @@ class LinearStatePool:
         device: torch.device,
         tp_size: int | None = None,
         slot_states: tuple[SlotStateSpec, ...] = (),
+        host_slots: int = 0,
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
@@ -94,6 +95,43 @@ class LinearStatePool:
         # flows between them by demand. Unused by the op harness (which assigns slots by hand).
         self.padding_slot = 0
         self._free_slots: list[int] = list(range(1, num_slots))
+
+        # Host tier of the SAME snapshot currency (HybridRadixCache.mamba_host): a chunk's frozen
+        # checkpoint copied to pinned RAM, where it costs no VRAM and outlives its device slot.
+        self._alloc_host_bank(host_slots, n_layers, local_conv_dim, local_v_heads)
+
+    def _alloc_host_bank(
+        self, host_slots: int, n_layers: int, local_conv_dim: int, local_v_heads: int
+    ) -> None:
+        group = self._group
+        self._num_host_slots = max(0, int(host_slots))
+        self._free_host_slots: list[int] = list(range(1, self._num_host_slots))
+        self.host_conv_states: torch.Tensor | None = None
+        self.host_recurrent_states: torch.Tensor | None = None
+        self.host_slot_states: dict[str, torch.Tensor] = {}
+        if self._num_host_slots <= 1:
+            return
+        # Pinned so the D2H archive at a chunk drain is async; raises without a device (CPU tests).
+        # Allocated pinned directly: pin_memory() on a tensor copies, doubling a multi-GB bank.
+        opts = {"device": "cpu", "pin_memory": self._device.type == "cuda"}
+        self.host_conv_states = torch.zeros(
+            (n_layers, self._num_host_slots, local_conv_dim, group.conv_kernel_dim - 1),
+            dtype=self._conv_dtype, **opts,
+        )
+        self.host_recurrent_states = torch.zeros(
+            (n_layers, self._num_host_slots, local_v_heads,
+             group.key_head_dim, group.value_head_dim),
+            dtype=ssm_state_dtype(), **opts,
+        )
+        self.host_slot_states = {
+            spec.name: torch.full(
+                (max(1, len(spec.layer_ids)), self._num_host_slots, *spec.shape),
+                spec.fill_value,
+                dtype=spec.dtype if spec.dtype is not None else self._conv_dtype,
+                **opts,
+            )
+            for spec in self._slot_specs
+        }
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
         return {
@@ -193,8 +231,62 @@ class LinearStatePool:
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
 
+    # ------------------------------------------------------------------ host tier
+    # A host slot holds the same payload as a device slot: ``to_host``/``from_host`` are the
+    # cross-tier twins of ``copy_from``, on the stream already ordered after the writer.
+
+    @property
+    def num_host_slots(self) -> int:
+        return self._num_host_slots
+
+    @property
+    def num_free_host_slots(self) -> int:
+        return len(self._free_host_slots)
+
+    def host_bytes_per_slot(self) -> int:
+        if self.host_conv_states is None:
+            return 0
+        per = self.host_conv_states[0].numel() * self.host_conv_states.element_size()
+        per += self.host_recurrent_states[0].numel() * self.host_recurrent_states.element_size()
+        for t in self.host_slot_states.values():
+            per += t[0].numel() * t.element_size()
+        return per
+
+    def alloc_host(self, n: int = 1) -> list[int]:
+        if n > len(self._free_host_slots):
+            raise RuntimeError(f"mamba host bank exhausted: need {n}, have {len(self._free_host_slots)}")
+        return [self._free_host_slots.pop() for _ in range(n)]
+
+    def free_host(self, slots) -> None:
+        """Return host slot ids to the bank free-list. Accepts an int, list, or 1-D tensor."""
+        if isinstance(slots, torch.Tensor):
+            slots = slots.flatten().tolist()
+        elif isinstance(slots, int):
+            slots = [slots]
+        self._free_host_slots.extend(int(s) for s in slots)
+
+    def reclaim_all_host_slots(self) -> None:
+        """Idle-only, mirrors ``reclaim_all_slots``: the caller discards the tree that owned the
+        bank-resident snapshots, so every bank slot is free again."""
+        self._free_host_slots = list(range(1, self._num_host_slots))
+
+    def to_host(self, src: int, dst: int) -> None:
+        """Archive a device checkpoint into a bank slot (D2H, async from pinned RAM)."""
+        self.host_conv_states[:, dst].copy_(self.conv_states[:, src], non_blocking=True)
+        self.host_recurrent_states[:, dst].copy_(self.recurrent_states[:, src], non_blocking=True)
+        for name, t in self.host_slot_states.items():
+            t[:, dst].copy_(self.slot_states[name][:, src], non_blocking=True)
+
+    def from_host(self, src: int, dst: int) -> None:
+        """Restore a bank checkpoint into a live device slot (H2D) -- the resume path."""
+        self.conv_states[:, dst].copy_(self.host_conv_states[:, src], non_blocking=True)
+        self.recurrent_states[:, dst].copy_(self.host_recurrent_states[:, src], non_blocking=True)
+        for name, t in self.host_slot_states.items():
+            self.slot_states[name][:, dst].copy_(t[:, src], non_blocking=True)
+
     def is_linear_layer(self, layer_id: int) -> bool:
         return layer_id in self._local_index
+
 
     def local_index(self, layer_id: int) -> int:
         return self._local_index[layer_id]
