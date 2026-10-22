@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -545,7 +546,10 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
+                # Offline requests can share SamplingParams; clip only this request.
+                msg = replace(
+                    msg, sampling_params=replace(msg.sampling_params, max_tokens=max_output_len)
+                )
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )

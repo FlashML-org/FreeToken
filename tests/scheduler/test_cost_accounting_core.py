@@ -26,6 +26,7 @@ from freetoken.message import (
     UserReply,
 )
 from freetoken.scheduler.io import SchedulerIOMixin
+from freetoken.scheduler.prefill import PrefillManager
 from freetoken.scheduler.scheduler import Scheduler
 from freetoken.server.api_server import FrontendManager
 from freetoken.tokenizer.server import (
@@ -149,6 +150,29 @@ def test_scheduler_rejection_emits_error_but_no_admission():
     assert added == []
     assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
     assert not any(isinstance(msg, PromptAdmittedMsg) for msg in sent)
+
+
+@pytest.mark.parametrize("prompt_lengths,expected_budgets", [
+    ((56, 48, 8), (8, 16, 32)),
+    ((8, 48, 56), (32, 16, 8)),
+])
+def test_context_clipping_preserves_shared_output_budgets(prompt_lengths, expected_budgets):
+    """Offline requests can share parameters, but each has its own context limit."""
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(max_seq_len=64)
+    scheduler.prefill_manager = PrefillManager.__new__(PrefillManager)
+    scheduler.prefill_manager.pending_list = []
+    shared = SamplingParams(max_tokens=32)
+
+    for uid, length in enumerate(prompt_lengths):
+        scheduler._process_one_msg(UserMsg(
+            uid=uid,
+            input_ids=torch.arange(length, dtype=torch.int32),
+            sampling_params=shared,
+        ))
+
+    assert tuple(req.output_len for req in scheduler.prefill_manager.pending_list) == expected_budgets
+    assert shared.max_tokens == 32
 
 
 def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():
