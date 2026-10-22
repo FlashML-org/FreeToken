@@ -136,6 +136,35 @@ def test_expert_banks_exposes_optional_loader_metadata():
     assert banks.deferred_plan is deferred_plan
 
 
+def test_q8_0_expert_provider_registers_mmq_tail_bytes(monkeypatch):
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes
+    from freetoken.models.gguf.dequant import GGML_Q8_0
+    from freetoken.models import weight
+    from freetoken.moe import expert_banks
+
+    monkeypatch.setattr(
+        weight,
+        "load_q8_0_moe_expert_sources",
+        lambda *_args, **_kwargs: {"gate_up": [], "down": []},
+    )
+    config = type(
+        "Config",
+        (),
+        {"num_layers": 2, "hidden_size": 256, "moe_intermediate_size": 256},
+    )()
+
+    banks = expert_banks._q8_0_banks(
+        "test.gguf", config, torch.device("cpu"), torch.float32, False
+    )
+
+    expected_tail = mmq_tail_bytes(GGML_Q8_0, 256)
+    assert expected_tail > 0
+    assert banks.row_tail_bytes == {
+        "gate_up": [expected_tail, expected_tail],
+        "down": [expected_tail, expected_tail],
+    }
+
+
 def test_load_expert_banks_keeps_ftw_fast_path(monkeypatch):
     from types import SimpleNamespace
 

@@ -222,11 +222,19 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
             "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
         )
     from freetoken.models.weight import load_q4_0_moe_expert_sources
+    from freetoken.models.gguf.dequant import GGML_Q4_0
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes
 
     sink = None if dummy else layer_sink
     sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
     return ExpertBanks(
-        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
+        "q4_0",
+        {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]},
+        streamed=sink is not None,
+        row_tail_bytes={
+            "gate_up": [mmq_tail_bytes(GGML_Q4_0, model_config.hidden_size)] * model_config.num_layers,
+            "down": [mmq_tail_bytes(GGML_Q4_0, model_config.moe_intermediate_size)] * model_config.num_layers,
+        },
     )
 
 
@@ -234,11 +242,19 @@ def _q8_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     if parallel:
         raise NotImplementedError("parallel reader not implemented for q8_0 GGUF experts")
     from freetoken.models.weight import load_q8_0_moe_expert_sources
+    from freetoken.models.gguf.dequant import GGML_Q8_0
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes
 
     sink = None if dummy else layer_sink
     sources = load_q8_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
     return ExpertBanks(
-        "q8_0", {name: sources[name] for name in _BANK_SCHEMAS["q8_0"]}, streamed=sink is not None
+        "q8_0",
+        {name: sources[name] for name in _BANK_SCHEMAS["q8_0"]},
+        streamed=sink is not None,
+        row_tail_bytes={
+            "gate_up": [mmq_tail_bytes(GGML_Q8_0, model_config.hidden_size)] * model_config.num_layers,
+            "down": [mmq_tail_bytes(GGML_Q8_0, model_config.moe_intermediate_size)] * model_config.num_layers,
+        },
     )
 
 

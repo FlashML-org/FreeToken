@@ -6,6 +6,8 @@ import re
 from typing import TYPE_CHECKING, Iterator
 
 import torch
+from tqdm import tqdm
+
 from freetoken.layers import BaseOP
 
 from freetoken.models.config import (
@@ -16,7 +18,7 @@ from freetoken.models.config import (
 )
 from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q8_0, GGML_Q6_K, dequantize, row_bytes
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.gguf.tensors import check_scales, float_tensor, matrix
+from freetoken.models.gguf.tensors import check_scales, float_tensor, matrix, weight_scale
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -1002,6 +1004,7 @@ def load_q4_0_expert_sources(
     and the sink may release banks it has written out, so the returned tensors are only
     valid until then (the caller owns that tradeoff).
     """
+    from freetoken.distributed import get_tp_info
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.moe.host_banks import HostBank, LayerCompletionTracker, PinPipeline
 
@@ -1024,32 +1027,50 @@ def load_q4_0_expert_sources(
     }
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     seen_gu, seen_dn = set(), set()
+    completed = set()
     pending_gu: dict[int, dict[str, torch.Tensor]] = {}
+    expert_tensors = [
+        t
+        for t in tensors.values()
+        if t.name.startswith("blk.")
+        and t.name.endswith(
+            (
+                "ffn_gate_up_exps.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            )
+        )
+    ]
 
     def _load(sink) -> None:
         tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None  # gate_up + down
-        for t in tensors.values():
-            if not t.name.startswith("blk."):
-                continue
-            layer = int(t.name.split(".")[1])
-            if t.name.endswith("ffn_gate_up_exps.weight"):
-                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, t.row_bytes))
-                seen_gu.add(layer)
-            elif t.name.endswith("ffn_gate_exps.weight") or t.name.endswith("ffn_up_exps.weight"):
-                slot = "gate" if t.name.endswith("ffn_gate_exps.weight") else "up"
-                parts = pending_gu.setdefault(layer, {})
-                parts[slot] = t.packed().reshape(E, I, t.row_bytes)
-                if len(parts) == 2:
-                    banks["gate_up"][layer].copy_(torch.cat([parts["gate"], parts["up"]], dim=1))
+        with tqdm(
+            total=L,
+            desc="Loading Gemma GGUF expert banks",
+            disable=not get_tp_info().is_primary(),
+        ) as progress:
+            for t in expert_tensors:
+                layer = int(t.name.split(".")[1])
+                if t.name.endswith("ffn_gate_up_exps.weight"):
+                    banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, t.row_bytes))
                     seen_gu.add(layer)
-                    del pending_gu[layer]
-            elif t.name.endswith("ffn_down_exps.weight"):
-                banks["down"][layer].copy_(t.packed().reshape(E, H, t.row_bytes))
-                seen_dn.add(layer)
-            else:
-                continue
-            if tracker is not None:
-                tracker.note(layer)
+                elif t.name.endswith("ffn_gate_exps.weight") or t.name.endswith("ffn_up_exps.weight"):
+                    slot = "gate" if t.name.endswith("ffn_gate_exps.weight") else "up"
+                    parts = pending_gu.setdefault(layer, {})
+                    parts[slot] = t.packed().reshape(E, I, t.row_bytes)
+                    if len(parts) == 2:
+                        banks["gate_up"][layer].copy_(torch.cat([parts["gate"], parts["up"]], dim=1))
+                        seen_gu.add(layer)
+                        del pending_gu[layer]
+                elif t.name.endswith("ffn_down_exps.weight"):
+                    banks["down"][layer].copy_(t.packed().reshape(E, H, t.row_bytes))
+                    seen_dn.add(layer)
+                if tracker is not None:
+                    tracker.note(layer)
+                if layer not in completed and layer in seen_gu and layer in seen_dn:
+                    completed.add(layer)
+                    progress.update()
 
     if layer_sink is not None:
         _load(layer_sink)

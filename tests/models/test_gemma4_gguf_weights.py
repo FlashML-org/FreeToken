@@ -12,7 +12,7 @@ from freetoken.models.gemma4.gguf import (
     parse_gguf_config,
     to_gguf,
 )
-from freetoken.models.gguf.dequant import GGML_F32
+from freetoken.models.gguf.dequant import GGML_F32, GGML_Q8_0
 
 
 def test_causal_lm_applies_gguf_module_conversion(monkeypatch):
@@ -63,6 +63,85 @@ def test_hf_nvfp4_weight_loader_maps_router_scales():
     assert _rename_hf_nvfp4_tensor_name("blk.0.ffn_down_exps.scale") == (
         "model.layers.0.feed_forward.router.per_expert_scale"
     )
+
+
+def test_q8_expert_scale_check_uses_shared_gguf_helper():
+    from freetoken.models.gemma4 import gguf
+
+    assert gguf.weight_scale(SimpleNamespace(ggml_type=GGML_Q8_0)) is None
+
+
+def test_gguf_expert_loader_reports_completed_layers(monkeypatch):
+    from freetoken import distributed
+    from freetoken.models.gemma4 import gguf
+    from freetoken.models.gguf import reader
+    from freetoken.models.gguf.dequant import GGML_Q4_0
+
+    class TensorInfo:
+        def __init__(self, name, rows):
+            self.name = name
+            self.row_bytes = 2
+            self.ggml_type = GGML_Q4_0
+            self.ne = (256, rows, 2)
+            self.path = "missing-test-file.gguf"
+            self._packed = torch.zeros(2 * rows * self.row_bytes, dtype=torch.uint8)
+
+        def packed(self):
+            return self._packed
+
+    class Progress:
+        def __init__(self, iterable=None, *, total=None, **kwargs):
+            self.iterable = iterable
+            self.total = total
+            self.n = 0
+
+        def __enter__(self):
+            progress_bars.append(self)
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def update(self, count=1):
+            self.n += count
+
+    progress_bars = []
+    infos = []
+    index = {}
+    for layer_id in range(2):
+        gate_up = TensorInfo(f"blk.{layer_id}.ffn_gate_up_exps.weight", 4)
+        down = TensorInfo(f"blk.{layer_id}.ffn_down_exps.weight", 4)
+        infos.extend((gate_up, down))
+        index[gate_up.name] = gate_up
+        index[down.name] = down
+
+    monkeypatch.setattr(
+        distributed,
+        "get_tp_info",
+        lambda: SimpleNamespace(is_primary=lambda: True),
+    )
+    monkeypatch.setattr(gguf, "_require_tp1", lambda _: None)
+    monkeypatch.setattr(gguf, "gguf_tensor_index", lambda _: index)
+    monkeypatch.setattr(reader, "iter_gguf_tensors", lambda _: iter(infos))
+    monkeypatch.setattr(gguf, "tqdm", Progress)
+
+    sources = gguf.load_q4_0_expert_sources(
+        "test.gguf",
+        SimpleNamespace(
+            num_layers=2,
+            num_experts=2,
+            hidden_size=4,
+            moe_intermediate_size=2,
+        ),
+        layer_sink=lambda *_: None,
+    )
+
+    assert len(sources["gate_up"]) == len(sources["down"]) == 2
+    assert len(progress_bars) == 1
+    assert progress_bars[0].total == progress_bars[0].n == 2
 
 
 def test_gemma4_gguf_scalar_and_per_layer_kv_head_counts():
