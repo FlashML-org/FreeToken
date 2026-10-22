@@ -9,9 +9,12 @@ the raw GGUF metadata dict, and a few derived facts that need the tensor table
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import functools
+import importlib
+from dataclasses import dataclass, field
 from typing import Any
 
+from .mmproj import Mmproj, find_mmproj, refuse_inline_vision
 from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
@@ -34,9 +37,13 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "qwen35moe": "Qwen3_5MoeGGUFForCausalLM",
     "qwen4exp": "Qwen4ExpGGUFForCausalLM",
 }
+# (GGUF architecture, mmproj projector) -> registry key, for text GGUFs whose release is told apart only by its mmproj
+GGUF_MMPROJ_TO_REGISTRY: dict[tuple[str, str], str] = {
+    ("gemma4", "gemma4uv"): "Gemma4UnifiedGGUFForCausalLM",
+}
 
 
-@dataclass(frozen=True)
+@dataclass
 class GgufConfigShim:
     architectures: list[str]
     model_path: str
@@ -44,6 +51,16 @@ class GgufConfigShim:
     metadata: dict[str, Any]
     vocab_size: int
     tie_word_embeddings: bool
+    # HF config.json keys the family derives for its encoders (vision_config, image_token_id, ...), read as attributes like a HF config
+    hf_fields: dict[str, Any] = field(default_factory=dict)
+    # the encoder's preprocessor_config.json; None without an encoder
+    preprocessor_config: dict[str, Any] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        from freetoken.utils.hf import RawConfigShim
+
+        # __dict__ lookup: copy.copy probes attributes before the fields exist
+        return getattr(RawConfigShim(self.__dict__.get("hf_fields") or {}), name)
 
     def to_dict(self) -> dict[str, Any]:
         """Minimal HF-config-like dict for trunk code that introspects the config
@@ -55,6 +72,7 @@ class GgufConfigShim:
             "torch_dtype": "bfloat16",
             "vocab_size": self.vocab_size,
             "tie_word_embeddings": self.tie_word_embeddings,
+            **self.hf_fields,
         }
 
 
@@ -73,6 +91,11 @@ def _vocab_size(model_path: str) -> int:
     raise ValueError(f"GGUF {model_path}: no token_embd.weight to size the vocab")
 
 
+@functools.cache
+def _mm_fields(module: str, model_path: str, mmproj: Mmproj, vocab_size: int) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    return importlib.import_module(module).gguf_mm_config(load_gguf_metadata(model_path), mmproj, vocab_size)
+
+
 def build_gguf_shim(model_path: str) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
@@ -82,6 +105,7 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
             f"(known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
         )
     names = gguf_tensor_names(model_path)
+    refuse_inline_vision(model_path, names)
     metadata = load_gguf_metadata(model_path)
     if names:
         # No separate output projection -> embeddings are tied.
@@ -98,14 +122,24 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
                 "reconvert the checkpoint with the current freetoken.checkpoint.convert"
             )
         tie_word_embeddings = not present
+    from freetoken.models.register import get_model_spec
+
+    vocab_size = _vocab_size(model_path)
+    spec = get_model_spec(registry_key)
+    mmproj = find_mmproj(model_path) if spec.encoders else None
+    if mmproj is not None:
+        registry_key = GGUF_MMPROJ_TO_REGISTRY.get((arch, mmproj.projector), registry_key)
+    hf_fields, preprocessor_config = ({}, None) if mmproj is None else _mm_fields(spec.module, model_path, mmproj, vocab_size)
     return GgufConfigShim(
         architectures=[registry_key],
         model_path=model_path,
         model_type=arch,
         metadata=metadata,
-        vocab_size=_vocab_size(model_path),
+        vocab_size=vocab_size,
         tie_word_embeddings=tie_word_embeddings,
+        hf_fields=hf_fields,
+        preprocessor_config=preprocessor_config,
     )
 
 
-__all__ = ["GgufConfigShim", "GGUF_ARCH_TO_REGISTRY", "build_gguf_shim"]
+__all__ = ["GgufConfigShim", "GGUF_ARCH_TO_REGISTRY", "GGUF_MMPROJ_TO_REGISTRY", "build_gguf_shim"]

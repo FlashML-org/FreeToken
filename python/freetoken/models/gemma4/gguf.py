@@ -13,8 +13,9 @@ routed experts load as GGUF expert banks (``freetoken.models.gguf.experts``).
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
+import numpy as np
 import torch
 
 from freetoken.models.config import (
@@ -23,8 +24,11 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
 )
-from freetoken.models.gguf.reader import gguf_tensor_index
+from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
+from freetoken.models.gguf.reader import gguf_tensor_index, load_gguf_metadata
 from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, weight_scale
+
+from .config import _parse_vision_config
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -45,6 +49,162 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
     # released gemma4 sets partial_rotary_factor 0.25 on the full layers, and the converter
     # asserts rope_type == "proportional" (llama.cpp conversion/gemma.py).
     return full_head_dim // 4
+
+
+# --------------------------------------------------------------------------------------
+# Vision: the tower from a llama.cpp mmproj file. gemma4v is the ViT of the 26B-A4B and 31B releases, gemma4uv the linear embedder of the 12B "unified" release.
+# --------------------------------------------------------------------------------------
+
+_VIT, _UNIFIED = "gemma4v", "gemma4uv"
+_TOKENS = {"image_token_id": "<|image|>", "boi_token_id": "<|image>", "eoi_token_id": "<image|>"}
+# llama.cpp hardcodes these and the mmproj does not store them; the values match the HF configs
+_POOLING_KERNEL = 3
+_ROPE_THETA = 100.0
+_MAX_SOFT_TOKENS = 280
+
+_VIT_TOP = {
+    "v.position_embd.weight": "vision_tower.patch_embedder.position_embedding_table",
+    "v.std_bias": "vision_tower.std_bias",
+    "v.std_scale": "vision_tower.std_scale",
+    "mm.input_projection.weight": "embed_vision.embedding_projection.weight",
+}
+_VIT_BLOCK = {
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_out": "self_attn.o_proj",
+    "attn_q_norm": "self_attn.q_norm",
+    "attn_k_norm": "self_attn.k_norm",
+    "ln1": "input_layernorm",
+    "attn_post_norm": "post_attention_layernorm",
+    "ln2": "pre_feedforward_layernorm",
+    "ffn_post_norm": "post_feedforward_layernorm",
+    "ffn_gate": "mlp.gate_proj",
+    "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj",
+}
+_VIT_BLOCK_RE = re.compile(r"^v\.blk\.(\d+)\.(\w+)\.weight$")
+# tensors over the patch features, stored channel-major
+_UNIFIED_PATCH = {
+    "v.patch_embd.weight": "vision_embedder.patch_dense.weight",
+    "v.patch_norm.1.weight": "vision_embedder.patch_ln1.weight",
+    "v.patch_norm.1.bias": "vision_embedder.patch_ln1.bias",
+}
+_UNIFIED_TOP = {
+    "v.patch_embd.bias": "vision_embedder.patch_dense.bias",
+    "v.patch_norm.2.weight": "vision_embedder.patch_ln2.weight",
+    "v.patch_norm.2.bias": "vision_embedder.patch_ln2.bias",
+    "v.patch_norm.3.weight": "vision_embedder.pos_norm.weight",
+    "v.patch_norm.3.bias": "vision_embedder.pos_norm.bias",
+    "mm.input_projection.weight": "embed_vision.embedding_projection.weight",
+}
+
+
+def _f32_value(v: float) -> float:
+    """The shortest decimal of a float32 metadata value: 1e-06, as the HF config writes it, not 9.99999997e-07."""
+    return float(str(np.float32(v)))
+
+
+def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The HF config.json keys and the preprocessor_config.json of the tower in ``mmproj``, for the text GGUF whose metadata is ``text_md``."""
+    if mmproj.projector not in (_VIT, _UNIFIED):
+        raise ValueError(f"mmproj {mmproj.path} is a {mmproj.projector!r} tower; Gemma 4 needs {_VIT!r} or {_UNIFIED!r}")
+    md, index = load_gguf_metadata(mmproj.path), gguf_tensor_index(mmproj.path)
+
+    def kv(key: str):
+        return md[f"clip.vision.{key}"]
+
+    text_hidden = int(text_md["gemma4.embedding_length"])
+    if int(kv("projection_dim")) != text_hidden:
+        raise ValueError(f"mmproj {mmproj.path} projects to {int(kv('projection_dim'))} but the text model is {text_hidden} wide")
+    tokens = text_md["tokenizer.ggml.tokens"]
+    missing = [t for t in _TOKENS.values() if t not in tokens]
+    if missing:
+        raise ValueError(f"the text GGUF tokenizer has no {missing} tokens")
+    patch_size = int(kv("patch_size"))
+    eps = _f32_value(kv("attention.layer_norm_epsilon"))
+    if mmproj.projector == _VIT:
+        head_dim = int(index["v.blk.0.attn_q_norm.weight"].ne[0])
+        vision_config = {
+            "hidden_size": int(kv("embedding_length")),
+            "num_hidden_layers": int(kv("block_count")),
+            "num_attention_heads": int(kv("attention.head_count")),
+            "num_key_value_heads": int(index["v.blk.0.attn_k.weight"].ne[1]) // head_dim,
+            "head_dim": head_dim,
+            "intermediate_size": int(kv("feed_forward_length")),
+            "patch_size": patch_size,
+            # ggml order [hidden, table, axis]
+            "position_embedding_size": int(index["v.position_embd.weight"].ne[1]),
+            "pooling_kernel_size": _POOLING_KERNEL,
+            "rms_norm_eps": eps,
+            "rope_parameters": {"rope_theta": _ROPE_THETA},
+            "hidden_activation": "gelu_pytorch_tanh",
+            "standardize": "v.std_bias" in index,
+        }
+        processor_type = "Gemma4ImageProcessor"
+    else:
+        # ggml order [patch_dim, hidden]; patch_dim = 3 * model_patch_size**2
+        patch_dim = int(index["v.patch_embd.weight"].ne[0])
+        vision_config = {
+            "mm_embed_dim": int(index["v.patch_embd.weight"].ne[1]),
+            "model_patch_size": round((patch_dim // 3) ** 0.5),
+            "mm_posemb_size": int(index["v.position_embd.weight"].ne[1]),
+            "patch_size": patch_size,
+            "pooling_kernel_size": _POOLING_KERNEL,
+            "rms_norm_eps": eps,
+        }
+        processor_type = "Gemma4UnifiedImageProcessor"
+    hf_fields = {"vision_config": vision_config, **{key: tokens.index(t) for key, t in _TOKENS.items()}}
+    preprocessor = {
+        "image_processor_type": processor_type,
+        "patch_size": patch_size,
+        "pooling_kernel_size": _POOLING_KERNEL,
+        "max_soft_tokens": _MAX_SOFT_TOKENS,
+        "image_mean": [float(v) for v in kv("image_mean")],
+        "image_std": [float(v) for v in kv("image_std")],
+        "resample": 3,
+        "do_convert_rgb": True,
+        "do_resize": True,
+        "do_rescale": True,
+        "rescale_factor": 1 / 255,
+        "do_normalize": False,
+    }
+    return hf_fields, preprocessor
+
+
+def _hwc(t: torch.Tensor, patch: int) -> torch.Tensor:
+    """Patch features from llama.cpp's channel-major order back to the HF processor's (y, x, channel) order, along the last dim."""
+    lead = t.shape[:-1]
+    return t.reshape(*lead, 3, patch, patch).movedim(-3, -1).reshape(*lead, -1)
+
+
+def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tower state dict, named as the HF checkpoints load; audio tensors of a unified mmproj are skipped."""
+    index = gguf_tensor_index(mmproj.path)
+    for name, info in index.items():
+        if name.startswith(("a.", "mm.a.")):
+            continue
+        t = mmproj_tensor(info)
+        if mmproj.projector == _VIT:
+            if name == "v.patch_embd.weight":
+                # [hidden, 3, p, p] -> [hidden, p * p * 3]
+                yield "vision_tower.patch_embedder.input_proj.weight", _hwc(t.flatten(1), t.shape[-1])
+            elif name in _VIT_TOP:
+                yield _VIT_TOP[name], t
+            elif (m := _VIT_BLOCK_RE.match(name)) and m[2] in _VIT_BLOCK:
+                yield f"vision_tower.encoder.layers.{m[1]}.{_VIT_BLOCK[m[2]]}.weight", t
+            else:
+                raise ValueError(f"unexpected tensor {name!r} in a {_VIT} mmproj")
+            continue
+        if name in _UNIFIED_PATCH:
+            yield _UNIFIED_PATCH[name], _hwc(t, round((t.shape[-1] // 3) ** 0.5))
+        elif name == "v.position_embd.weight":
+            # [axis, table, hidden] -> [table, axis, hidden]
+            yield "vision_embedder.pos_embedding", t.transpose(0, 1)
+        elif name in _UNIFIED_TOP:
+            yield _UNIFIED_TOP[name], t
+        else:
+            raise ValueError(f"unexpected tensor {name!r} in a {_UNIFIED} mmproj")
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -68,6 +228,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
 
+    vision_config = _parse_vision_config(shim, hidden)
     swa_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if is_swa)
     full_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if not is_swa)
 
@@ -120,6 +281,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
         embedding_scale=float(hidden) ** 0.5,
+        vision_config=vision_config,
+        image_token_id=getattr(shim, "image_token_id", None),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
@@ -137,6 +300,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
                 head_dim=swa_head_dim,
                 rotary_config=swa_rotary,
                 sliding_window=int(g("attention.sliding_window")),
+                # every Gemma 4 vision release sets use_bidirectional_attention="vision"
+                bidirectional_mm_blocks=vision_config is not None,
             ),
         ),
     )
@@ -221,6 +386,7 @@ def iter_gguf_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """The dense state dict from the GGUF; the routed experts load as GGUF expert banks (``freetoken.models.gguf.experts``)."""
     if not include_non_moe:
@@ -229,6 +395,8 @@ def iter_gguf_weights(
 
     _require_tp1("weight loading")
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
     index = gguf_tensor_index(model_path)
     hidden = config.hidden_size
 
@@ -264,8 +432,13 @@ def iter_gguf_weights(
         yield from fused(f"{base}.feed_forward.shared_mlp.gate_up_proj", [gate, up], [matrix(gate), matrix(up)], hidden)
         yield from fused(f"{base}.feed_forward.shared_mlp.down_proj", [down], [matrix(down)], int(down.ne[0]))
 
+    if vision:
+        yield from iter_mmproj_weights(find_mmproj(model_path))
+
 
 __all__ = [
+    "gguf_mm_config",
+    "iter_mmproj_weights",
     "parse_gguf_config",
     "iter_gguf_weights",
     "to_gguf",

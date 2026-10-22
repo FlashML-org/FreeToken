@@ -7,7 +7,7 @@ Run from the repo root with `PYTHONPATH=python` and transformers 5.18.
 |---|---|---|
 | `fetch_headers.py` | network | nothing, writes header-only stubs of HF GGUF files |
 | `probe_kernels.py` | GPU | which ggml ops this build runs per ggml type |
-| `check.py` | CPU | config, dry load, expert banks, kernel coverage, tokenizer, chat template per file |
+| `check.py` | CPU | config, dry load, expert banks, kernel coverage, tokenizer, chat template, and the vision tower of an mmproj next to the file, per file |
 | `tok_compare.py` | CPU | GGUF tokenizer vs the model's HF `tokenizer.json` |
 
 ## Coverage: most published files load

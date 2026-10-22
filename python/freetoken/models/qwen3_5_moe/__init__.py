@@ -1,5 +1,5 @@
 from .config import parse_config
-from .gguf import iter_gguf_weights, parse_gguf_config, to_gguf
+from .gguf import gguf_mm_config, iter_gguf_weights, parse_gguf_config, to_gguf
 from .model import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
@@ -19,6 +19,7 @@ __all__ = [
     "iter_weights_parallel",
     "iter_expert_pieces",
     "nvfp4_expert_spec",
+    "gguf_mm_config",
     "iter_gguf_weights",
     "parse_gguf_config",
     "to_gguf",

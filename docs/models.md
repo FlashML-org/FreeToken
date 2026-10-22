@@ -37,6 +37,12 @@ These families accept image input by default; pass `--text-model-only` to skip t
 | MiniMax-M3 (`minimax_m3`: CLIP-style ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, dynamic resolution | pixel areas in `size.shortest_edge` / `longest_edge`; checkpoint defaults 4 to 576 tokens | `{"size": {"longest_edge": 1048576}}` |
 | DeepSeek-V4-Flash-Vision (`deepseek_v4`: native-resolution ViT tower, streamed under `--mm-encoder-weights host`) | one token per 3x3 grid of 14x14 patches, against a per-image cap; the block carries sentinel tokens and lead pads that align it to a 4-token compression stride, so its length depends on where it lands in the prompt | the maximum is a cap on the block (`vision_max_n_token`, checkpoint default 384) and lowers it, the minimum is read as the checkpoint's upscale floor and has no effect | not read |
 
+GGUF files take image input when a llama.cpp mmproj file sits in the same folder or is passed with `--mmproj` (see the
+[CLI reference](cli.md#image-input)): Qwen3.5 / Qwen3.6 / Qwen3.8 (llama.cpp `qwen35`, `qwen35moe`, `qwen4exp`) with a `qwen3vl_merger` mmproj, and
+Gemma-4 26B-A4B, 31B and 12B (llama.cpp `gemma4`) with a `gemma4v` mmproj (the ViT tower) or, for the 12B, a `gemma4uv` one (the linear embedder;
+its audio part is not loaded). The tower runs in bf16 whatever the mmproj stores; a quantized mmproj keeps its quantization error. Image tokens
+and budgets are those of the family's row above.
+
 ## MoE strategies
 
 `ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):

@@ -12,6 +12,7 @@ from .hf import (
     download_hf_weight,
     load_eos_token_ids,
     load_generation_sampling,
+    load_image_processor,
     load_tokenizer,
     load_toolcall_anchor_id,
 )

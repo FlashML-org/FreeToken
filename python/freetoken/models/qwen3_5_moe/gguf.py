@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from freetoken.layers.quantization.ggml_types import is_quantized
+from freetoken.models.gguf.mmproj import find_mmproj, log_mmproj
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
 from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
+from freetoken.models.qwen3_vl.gguf import gguf_mm_config, iter_mmproj_weights
 
 from .config import parse_config
 
@@ -123,7 +125,8 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         text_config=text,
         model_type="qwen3_5_moe" if moe else "qwen3_5",
         architectures=list(shim.architectures),
-        vision_config=None,
+        vision_config=getattr(shim, "vision_config", None),
+        image_token_id=getattr(shim, "image_token_id", None),
     )
     config = parse_config(hf_like)
     return replace(config, expert_quant="gguf") if moe else config
@@ -155,6 +158,8 @@ def iter_gguf_weights(
     from freetoken.utils import cached_load_hf_config
 
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
     index = gguf_tensor_index(model_path)
     g = config.linear_attention_group()
     hidden = config.hidden_size
@@ -217,5 +222,8 @@ def iter_gguf_weights(
             yield from fused(f"{mlp}.gate_up_proj", [fg, fu], [matrix(fg), matrix(fu)], hidden)
             yield from fused(f"{mlp}.down_proj", [fd], [matrix(fd)], config.intermediate_size)
 
+    if vision:
+        yield from iter_mmproj_weights(find_mmproj(model_path))
 
-__all__ = ["iter_gguf_weights", "parse_gguf_config", "to_gguf"]
+
+__all__ = ["gguf_mm_config", "iter_gguf_weights", "parse_gguf_config", "to_gguf"]

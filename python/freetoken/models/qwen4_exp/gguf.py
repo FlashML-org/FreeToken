@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from freetoken.layers.quantization.ggml_types import is_quantized
+from freetoken.models.gguf.mmproj import find_mmproj, log_mmproj
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
 from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
+from freetoken.models.qwen3_vl.gguf import gguf_mm_config, iter_mmproj_weights
 
 from .config import parse_config
 
@@ -142,13 +144,16 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         heads_per_ngram=int(kv("ple.heads_per_ngram")),
         eos_token_id=int(kv("ple.eos_token_id")),
     )
-    image_token_id = md.get(f"{_ARCH}.ple.image_token_id")
+    # with an mmproj, the id the image processor places; ple.image_token_id names the same token for text-only files
+    image_token_id = getattr(shim, "image_token_id", None)
+    if image_token_id is None:
+        image_token_id = md.get(f"{_ARCH}.ple.image_token_id")
     hf_like = SimpleNamespace(
         text_config=text,
         model_type="qwen4_exp",
         architectures=list(shim.architectures),
         image_token_id=None if image_token_id is None else int(image_token_id),
-        vision_config=None,
+        vision_config=getattr(shim, "vision_config", None),
     )
     config = parse_config(hf_like)
     return replace(config, expert_quant="gguf", qwen4_args=replace(config.qwen4_args, gdn_out_heads_tiled=True))
@@ -180,6 +185,8 @@ def iter_gguf_weights(
     from freetoken.utils import cached_load_hf_config
 
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
     index = gguf_tensor_index(model_path)
     md = cached_load_hf_config(model_path).metadata
     g = config.linear_attention_group()
@@ -263,9 +270,12 @@ def iter_gguf_weights(
             yield f"{ple}.ple_embedding.ngram_heads_vocab_sizes", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.head_vocab_sizes"]], dtype=torch.int64)
             yield f"{ple}.ple_embedding.ngram_heads_offsets", torch.tensor([int(x) for x in md[f"{_ARCH}.ple.head_offsets"]], dtype=torch.int64)
 
+    if vision:
+        yield from iter_mmproj_weights(find_mmproj(model_path))
+
 
 def ple_table_info(model_path: str) -> GgufTensorInfo:
     return gguf_tensor_index(model_path)["per_layer_token_embd.weight"]
 
 
-__all__ = ["iter_gguf_weights", "parse_gguf_config", "ple_table_info", "to_gguf"]
+__all__ = ["gguf_mm_config", "iter_gguf_weights", "parse_gguf_config", "ple_table_info", "to_gguf"]

@@ -266,24 +266,28 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
     ),
-    # llama.cpp qwen35 / qwen35moe GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp qwen35 / qwen35moe GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Qwen3_5GGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
-        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
-        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA
@@ -297,14 +301,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
     ),
-    # llama.cpp qwen4exp GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp qwen4exp GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Qwen4ExpGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen4_exp",
-        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
         packed_modules_mapping=_QWEN4_EXP_GGUF_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
@@ -380,14 +386,27 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
     ),
-    # llama.cpp gemma4 GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp gemma4 GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Gemma4GGUFForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
-        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
+        mm_processor=_GEMMA4_PROCESSOR,
+        encoders=_GEMMA4_ENCODERS,
+    ),
+    # the same text GGUF with a gemma4uv mmproj (12B): the text GGUF does not tell the 12B apart, so build_gguf_shim picks this row from the projector
+    "Gemma4UnifiedGGUFForCausalLM": ModelSpec(
+        "freetoken.models.gemma4",
+        "Gemma4UnifiedForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_segments=_GEMMA4_SEGMENTS,
+        packed_modules_mapping=_GEMMA4_PACKED,
+        mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
+        encoders=_GEMMA4_ENCODERS,
     ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",

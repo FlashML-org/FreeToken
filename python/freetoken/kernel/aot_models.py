@@ -360,7 +360,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Gemma4UnifiedForConditionalGeneration",
         hidden_size=3840,
         kv_groups=((1, 512), (8, 256)),
-        arch_aliases=("Gemma4UnifiedForCausalLM",),
+        arch_aliases=("Gemma4UnifiedForCausalLM", "Gemma4UnifiedGGUFForCausalLM"),
     ),
     AotModel(
         name="nvidia/Gemma-4-31B-IT-NVFP4",

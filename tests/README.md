@@ -61,6 +61,9 @@ checkpoint is set:
 | `FREETOKEN_TEST_MOE_CACHE_SIZE` | `e2e/test_aime.py` — >0 switches to the offload MoE backend with this cache size |
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — a SMALL local model dir; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
+| `FREETOKEN_QWEN_MMPROJ`    | `models/test_qwen_vl_gguf.py` — a BF16 llama.cpp `qwen3vl_merger` mmproj; checked against `FREETOKEN_QWEN36_MODEL`, the HF checkpoint it was converted from |
+| `FREETOKEN_GEMMA4_MMPROJ`  | `models/test_gemma4_gguf_vision.py` — a BF16 llama.cpp `gemma4v` mmproj; checked against `FREETOKEN_GEMMA4_MODEL`, the HF checkpoint it was converted from |
+| `FREETOKEN_GEMMA4_UNIFIED_MMPROJ` | `models/test_gemma4_gguf_vision.py` — a BF16 llama.cpp `gemma4uv` mmproj (gemma-4-12B); checked against `FREETOKEN_GEMMA4_UNIFIED_MODEL` |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
 | `FREETOKEN_TEST_MODELS_ROOT` | `models/test_quant_config.py` — directory whose checkpoints the stored-tensor scheme scan checks (default `/mnt/nvme/models`) |
 | `FREETOKEN_DSV4_VL_MODEL` | `tokenizer/test_mm_tokenize.py` - local DeepSeek-V4 vision checkpoint |
