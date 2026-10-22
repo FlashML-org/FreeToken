@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, NamedTuple
+from typing import ClassVar, Literal, NamedTuple, TypeAlias
 
 import torch
 from freetoken.utils import div_even, init_logger, mem_GB
 
 logger = init_logger(__name__)
+
+# Where a pool keeps its paged K/V: device memory, or pinned host memory the GPU reads in place.
+KVPlacement: TypeAlias = Literal["device", "host"]
 
 
 class CacheRebuildRejected(Exception):
@@ -16,23 +19,32 @@ class CacheRebuildRejected(Exception):
     this is recoverable, unlike a failure after the free."""
 
 
-def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
-    per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
-    branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
-
-    ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
-    ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
-    per_token = (
+def spec_kv_slab_bytes_per_token(spec, config) -> int:
+    """One paged-KV group's K/V slab bytes per token: (1|2 slabs) x head_dim x local kv heads
+    x dtype x layers."""
+    return (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
         * config.dtype.itemsize
         * spec.num_layers
     )
-    return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
+
+
+def spec_index_bytes_per_token(spec) -> int:
+    """The bf16 index-key slab's bytes per token when the spec carries indexer dims.
+    (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc hardcodes; keep the two in
+    lockstep if the slab dtype ever changes.) ``index_ratio`` > 1 (QSA) stores one index key
+    per token group, not per token; that slab's ring and scratch rows are fixed-size and priced
+    in QSAKVCache.kv_cost instead."""
+    return spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
+
+
+def spec_kv_bytes_per_token(spec, config) -> int:
+    """One paged-KV group's bytes per token: its K/V slab plus its index-key slab. Pure
+    per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
+    branching here."""
+    return spec_kv_slab_bytes_per_token(spec, config) + spec_index_bytes_per_token(spec)
 
 
 @dataclass(frozen=True)
@@ -91,7 +103,7 @@ class BaseKVCachePool(ABC):
         real_kv_size = num_pages * cache_per_page + fixed_cache_size
         logger.info(
             f"Allocating {num_pages * config.page_size} tokens for KV cache, "
-            f"K + V = {mem_GB(real_kv_size)}"
+            f"{mem_GB(real_kv_size)} of it on the device"
         )
         return num_pages
 

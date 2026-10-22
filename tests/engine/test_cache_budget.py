@@ -147,6 +147,7 @@ def _dsv4_adjust_cfg(**over):
         moe_cpu_layers = None
         num_page_override = None
         num_token_override = None
+        kv_placement = "device"
 
         @property
         def model_config(self):
@@ -220,6 +221,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         attention_backend = "triton" if torch.version.hip is not None else "fi"
         num_page_override = None
         num_token_override = 5000
+        kv_placement = "device"
 
         @property
         def model_config(self):
@@ -457,6 +459,7 @@ def _generic_rotary_cfg(max_position, override, scaling=None):
         attention_backend = "triton"
         num_page_override = None
         num_token_override = None
+        kv_placement = "device"
         max_seq_len_override = None
 
         @property
