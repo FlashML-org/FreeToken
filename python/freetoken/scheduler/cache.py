@@ -429,6 +429,11 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         insert_len = align_down(req.cached_len, self.page_size)
+        if not finished and self.prefix_cache.has_locked_tombstone(
+                req.input_ids[:insert_len], old_handle.cached_len):
+            # insert would free our copy of a tombstone another request still locks, and the
+            # windowed re-match may stop before it (#204). Keep the pages; commit at finish.
+            return
         freed = page_indices[:0]
         if insert_len > 0:
             # insert reconciles tombstones (revives the in-window ones by ADOPTING the request's
