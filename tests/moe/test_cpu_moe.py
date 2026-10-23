@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as Fn
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytest.importorskip("freetoken.kernel._cpu_moe", reason="the CPU MoE executor is not built on this platform (setup.py)")
 
 
 def _make_cache(L, E, H, I, scale=0.1):

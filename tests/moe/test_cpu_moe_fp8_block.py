@@ -7,12 +7,17 @@ Two things this is really guarding:
 
 from __future__ import annotations
 
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 BLK = 128
+needs_cpu_moe = pytest.mark.skipif(
+    importlib.util.find_spec("freetoken.kernel._cpu_moe") is None,
+    reason="the CPU MoE executor is not built on this platform (setup.py)",
+)
 
 
 def _nb(n: int) -> int:
@@ -55,6 +60,7 @@ def _make_fp8_block_cache(L, E, H, I, seed=0):
     )
 
 
+@needs_cpu_moe
 def test_cpu_fp8_block_accepts_qwen38_padded_scale_bank():
     from freetoken.kernel.aot_models import fp8_block_scale_pad
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -139,6 +145,7 @@ def _reference_fp8_block_gemv(weights, scales, x):
     return (weights[0].to(torch.float64) * scale) @ x.to(torch.float64)
 
 
+@needs_cpu_moe
 @pytest.mark.parametrize("codes", ["finite", "subnormal"])
 @pytest.mark.parametrize("isa", ["scalar", "avx2", "avx512"])
 def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, codes):
@@ -178,6 +185,7 @@ def test_cpu_fp8_block_matches_float64_reference(monkeypatch, isa, codes):
     assert rel < 5e-3, f"max relative error {rel.item()}"
 
 
+@needs_cpu_moe
 @pytest.mark.parametrize("isa", ["scalar", "avx2", "avx512", "avx512bf16"])
 def test_cpu_fp8_block_isa_override(monkeypatch, isa):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -206,6 +214,7 @@ def test_cpu_fp8_block_isa_override(monkeypatch, isa):
 _ISA_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f"}
 
 
+@needs_cpu_moe
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("isa", list(_ISA_TIERS))
 @pytest.mark.parametrize("bs", [1, 2, 5])

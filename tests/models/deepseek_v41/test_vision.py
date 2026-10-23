@@ -22,7 +22,7 @@ from freetoken.models.deepseek_v41.config import VisionConfig
 from freetoken.scheduler.mm import mm_rows_after, plan_mm_batch
 from freetoken.utils.torch_utils import torch_dtype
 
-from .common import DIM, VOCAB, requires_cuda, tiny_text_config, write_tiny_checkpoint
+from .common import DIM, VOCAB, requires_cuda, requires_row_store, tiny_text_config, write_tiny_checkpoint
 from .reference.vision import Aligner, ViT
 
 VC = asdict(VisionConfig(num_hidden_layers=2, hidden_size=32, num_attention_heads=4, intermediate_size=48,
@@ -144,6 +144,7 @@ def test_vision_encoder_matches_official_with_padded_grid(tmp_path, placement):
     eng.model.place_encoder_weights('gpu')
 
 
+@requires_row_store
 @requires_cuda
 @pytest.mark.parametrize('quantized', [False, True])
 def test_image_logits_and_decode_match_reference(tmp_path, quantized):
@@ -179,6 +180,7 @@ def test_image_logits_and_decode_match_reference(tmp_path, quantized):
         _compare(f'image decode {step}', got, want, tol=tol)
 
 
+@requires_row_store
 @requires_cuda
 @pytest.mark.parametrize('mode', ['exact', 'bounded'])
 def test_images_survive_chunking_and_prefix_replay(tmp_path, mode):

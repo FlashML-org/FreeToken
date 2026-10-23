@@ -68,9 +68,9 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
             "because it links against the CUDA runtime API."
         )
     cuda_home = Path(CUDA_HOME)
-    library_dirs = [str(cuda_home / "lib64")]
-    if (cuda_home / "lib").exists():
-        library_dirs.append(str(cuda_home / "lib"))
+    # Windows toolkits keep the import libraries in lib/x64.
+    candidates = (cuda_home / "lib64", cuda_home / "lib", cuda_home / "lib" / "x64")
+    library_dirs = [str(path) for path in candidates if path.exists()]
     return [str(cuda_home / "include")], library_dirs
 
 
@@ -89,7 +89,8 @@ else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
     runtime_link_args = []
-    extra_compile = ["-O3", "-std=c++20"]
+    # cl ignores GCC's -O3 and -std with only a warning (D9002), so it takes its own spellings.
+    extra_compile = ["/O2", "/std:c++20"] if sys.platform == "win32" else ["-O3", "-std=c++20"]
     # Device sources (.cu, built by nvcc): SASS for each major arch, which also runs on the newer minors of that major,
     # plus PTX for the oldest arch nvcc 13 supports, which the driver builds for any other GPU at load.
     # Naming archs also stops torch from picking them, which fails on a build machine without a GPU.
@@ -263,25 +264,28 @@ setup(
         # use per-function target attributes (avx512bf16/avx512f) + a runtime
         # __builtin_cpu_supports dispatch, so the single binary stays portable
         # (scalar fallback) -- no global -march is set.
-        CppExtension(
-            name="freetoken.kernel._cpu_moe",
-            sources=[
-                "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
-                "python/freetoken/kernel/csrc/cpu_moe/locked_fetch.cpp",
-                "python/freetoken/kernel/csrc/cpu_moe/locked_fetch_io.cu",
-                f"python/freetoken/kernel/csrc/cpu_moe/gpu_sync_{'hip' if IS_ROCM else 'cuda'}.cpp",
-                "python/freetoken/kernel/csrc/cpu_moe/gpu_sync_io.cu",
-                *sorted(
-                    str(p.relative_to(ROOT))
-                    for p in (ROOT / "python/freetoken/kernel/csrc/cpu_moe/kernels").glob("*.cpp")
-                ),
-            ],
-            include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
-            library_dirs=runtime_library_dirs,
-            libraries=[runtime_lib],
-            extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
-            extra_link_args=runtime_link_args,
-        ),
+        # GCC target attributes and pthreads have no MSVC form; Windows serves the GPU offload path only.
+        *([
+            CppExtension(
+                name="freetoken.kernel._cpu_moe",
+                sources=[
+                    "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
+                    "python/freetoken/kernel/csrc/cpu_moe/locked_fetch.cpp",
+                    "python/freetoken/kernel/csrc/cpu_moe/locked_fetch_io.cu",
+                    f"python/freetoken/kernel/csrc/cpu_moe/gpu_sync_{'hip' if IS_ROCM else 'cuda'}.cpp",
+                    "python/freetoken/kernel/csrc/cpu_moe/gpu_sync_io.cu",
+                    *sorted(
+                        str(p.relative_to(ROOT))
+                        for p in (ROOT / "python/freetoken/kernel/csrc/cpu_moe/kernels").glob("*.cpp")
+                    ),
+                ],
+                include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs, str(ROOT / GGML_DIR / "freetoken")],
+                library_dirs=runtime_library_dirs,
+                libraries=[runtime_lib],
+                extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
+                extra_link_args=runtime_link_args,
+            )
+        ] if sys.platform != "win32" else []),
         # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
         *([
             CppExtension(

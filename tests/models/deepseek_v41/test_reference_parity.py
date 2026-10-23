@@ -13,9 +13,9 @@ from dataclasses import asdict, fields
 import pytest
 import torch
 
-from .common import VOCAB, requires_cuda, tiny_text_config, write_tiny_checkpoint
+from .common import VOCAB, requires_cuda, requires_row_store, tiny_text_config, write_tiny_checkpoint
 
-pytestmark = requires_cuda
+pytestmark = [requires_cuda, requires_row_store]
 
 # The sparse-attention implementations accumulate in different orders.
 ATOL = RTOL = 1e-2
