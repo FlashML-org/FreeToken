@@ -35,12 +35,13 @@ from freetoken.server.supervisor import (
 
 class _FakeState:
     """Stand-in for FrontendManager exposing exactly what dispatch_rebuild / _resolve_rebuild /
-    fail_pending_rebuilds read: rebuild_futures, maintenance_state, fatal_error, last_rebuild,
+    fail_pending_rebuilds read: rebuild_futures, flush_futures, maintenance_state, fatal_error, last_rebuild,
     the event loop (_loop, for cross-thread future resolution), and an async send_one delegating
     to an injected impl (so a test can make the enqueue succeed or raise)."""
 
     def __init__(self, send_impl, *, maintenance_state="serving", fatal_error=None):
         self.rebuild_futures: dict = {}
+        self.flush_futures: dict = {}
         self.maintenance_state = maintenance_state
         self.fatal_error = fatal_error
         self.last_rebuild = None
@@ -204,6 +205,8 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
         await asyncio.sleep(0)
         assert state.rebuild_futures          # a waiter is parked
         assert state.maintenance_state == "rebuilding"
+        flush_fut = asyncio.get_running_loop().create_future()
+        state.flush_futures["flush"] = flush_fut  # a /v1/cache/flush waiter has no HTTP timeout either
 
         proc._alive = False  # …and the scheduler crashes mid-rebuild
 
@@ -214,6 +217,8 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
         assert state.maintenance_state == "failed"  # escaped "rebuilding" to a definite state
         assert "scheduler" in state.fatal_error
         assert state.rebuild_futures == {}          # waiter resolved and cleared, not leaked
+        assert (await asyncio.wait_for(flush_fut, timeout=5.0)).status == "failed"
+        assert state.flush_futures == {}
         sup.join(timeout=1.0)
 
     asyncio.run(_run())

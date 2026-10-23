@@ -95,3 +95,10 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+
+
+@dataclass
+class FlushCacheBackendMsg(BaseBackendMsg):
+    # tokenizer worker -> scheduler: drop every unlocked prefix-cache entry. timeout > 0 waits that many seconds for the scheduler to go idle.
+    request_id: str
+    timeout: float = 0.0

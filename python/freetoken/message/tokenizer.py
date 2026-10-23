@@ -105,6 +105,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class FlushCacheMsg(BaseTokenizerMsg):
+    # api server -> tokenizer worker (pure passthrough to FlushCacheBackendMsg).
+    request_id: str
+    timeout: float = 0.0
+
+
+@dataclass
+class FlushCacheResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to FlushCacheReply).
+    request_id: str
+    status: str  # "ok" | "busy" | "timeout" | "unsupported"
+    error: str | None = None
+
+
+@dataclass
 class ErrorReplyMsg(BaseTokenizerMsg):
     # scheduler -> tokenizer/detokenizer worker -> frontend: a request the scheduler cannot
     # serve (e.g. its prompt exceeds the KV budget). The worker translates it into a terminal

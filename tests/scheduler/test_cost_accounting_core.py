@@ -204,6 +204,7 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
     scheduler._pending_rebuild = None
+    scheduler._pending_flush = None
     scheduler.receive_msg = lambda blocking: [AbortBackendMsg(uid=5)]
     scheduler._schedule_next_batch = lambda: None
     sent = []

@@ -68,3 +68,11 @@ class CacheRebuildReply(BaseFrontendMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+
+
+@dataclass
+class FlushCacheReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a /v1/cache/flush request.
+    request_id: str
+    status: str  # "ok" | "busy" | "timeout" | "unsupported" | "failed"
+    error: str | None = None
