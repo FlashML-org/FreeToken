@@ -250,18 +250,21 @@ def test_cache_manager_flush_returns_every_pool_slot(cache_type):
     assert cm.match_req(pending).cuda_handle.cached_len == 0
 
 
-def test_deferred_flush_runs_at_idle_and_times_out_while_busy(monkeypatch):
+@pytest.mark.parametrize("loop", ["normal", "overlap"])
+def test_deferred_flush_runs_at_idle_and_times_out_while_busy(monkeypatch, loop):
     from freetoken.message import FlushCacheBackendMsg
     from freetoken.scheduler import scheduler as scheduler_mod
     from freetoken.scheduler.scheduler import Scheduler
 
     clock = [0.0]
     monkeypatch.setattr(scheduler_mod, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    sched, _ = _stub_scheduler(prefill_runnable=False, decode_runnable=True, pending=None)
+    sched, _ = _stub_scheduler(prefill_runnable=False, decode_runnable=False, pending=None)
     sched.prefill_manager.pending_list = []
     sched.decode_manager.running_reqs = set()
     sched.config = SimpleNamespace(tp_info=SimpleNamespace(size=1))
     sched._last_data = None
+    sched.stream = SimpleNamespace(wait_stream=lambda stream: None)
+    sched.engine = SimpleNamespace(stream=None)
     flushed = []
     sched.cache_manager = SimpleNamespace(flush=lambda: flushed.append(True) or 0, check_integrity=lambda: None)
     sent = []
@@ -269,35 +272,40 @@ def test_deferred_flush_runs_at_idle_and_times_out_while_busy(monkeypatch):
     blocked = []
     sched.receive_msg = lambda blocking: blocked.append(blocking) or []
 
+    def step(busy: bool) -> None:
+        if loop == "normal":
+            sched.decode_manager.runnable = busy
+            Scheduler.normal_loop(sched)
+        else:
+            # Only the in-flight batch keeps the overlap scheduler busy here.
+            Scheduler.overlap_loop(sched, object() if busy else None)
+
     Scheduler._process_one_msg(sched, FlushCacheBackendMsg(request_id="a", timeout=10.0))
     Scheduler._process_one_msg(sched, FlushCacheBackendMsg(request_id="b", timeout=10.0))
     assert sent == [("b", "busy")]
 
     # Busy before the deadline: still waiting.
     clock[0] = 5.0
-    Scheduler.normal_loop(sched)
+    step(busy=True)
     assert len(sent) == 1 and not flushed
 
     # Idle: runs without new traffic, so the loop must not block on receive.
-    sched.decode_manager.runnable = False
-    Scheduler.normal_loop(sched)
+    step(busy=False)
     assert blocked[-1] is False
     assert flushed == [True] and sent[-1] == ("a", "ok")
     assert sched._pending_flush is None
 
     # Busy past the deadline: fails and clears the slot.
-    sched.decode_manager.runnable = True
     Scheduler._process_one_msg(sched, FlushCacheBackendMsg(request_id="c", timeout=10.0))
     clock[0] = 15.0
-    Scheduler.normal_loop(sched)
+    step(busy=True)
     assert sent[-1] == ("c", "timeout")
     assert flushed == [True] and sched._pending_flush is None
 
     # timeout=0 never waits: busy fails in the same iteration, idle flushes in the same iteration.
     Scheduler._process_one_msg(sched, FlushCacheBackendMsg(request_id="d", timeout=0.0))
-    Scheduler.normal_loop(sched)
+    step(busy=True)
     assert sent[-1] == ("d", "busy") and sched._pending_flush is None
-    sched.decode_manager.runnable = False
     Scheduler._process_one_msg(sched, FlushCacheBackendMsg(request_id="e", timeout=0.0))
-    Scheduler.normal_loop(sched)
+    step(busy=False)
     assert sent[-1] == ("e", "ok") and flushed == [True, True]
