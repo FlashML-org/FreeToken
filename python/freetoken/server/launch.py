@@ -59,6 +59,14 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
 
+    import threading
+
+    from tqdm import tqdm
+
+    # Only rank 0 draws a bar, so no bar lock spans processes; tqdm's default one is a multiprocessing
+    # semaphore, which this worker leaves to resource_tracker as leaked when a signal ends it.
+    tqdm.set_lock(threading.RLock())
+
     # published (not bound) here: the engine binds it after the allocator setup
     from freetoken.gpu_select import set_assigned_gpu
 
