@@ -23,18 +23,20 @@ def _bf16_offload_layer(layer_id: int, num_experts: int, top_k: int, hidden_size
     )
 
 
-def _make_layer_and_cache():
+def _make_layer_and_cache(num_experts: int = 4, cache_size: int = 6):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    layer = _bf16_offload_layer(0, 4, 2, 8, 16)
+    layer = _bf16_offload_layer(0, num_experts, 2, 8, 16)
     cache = OffloadMoeCache(
         num_layers=1,
-        num_experts=4,
-        cache_size=6,
+        num_experts=num_experts,
+        cache_size=cache_size,
         device=torch.device("cpu"),
     )
-    cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]})
+    cache.set_bank_sources(
+        {"gate_up": [torch.randn(num_experts, 32, 8)], "down": [torch.randn(num_experts, 8, 16)]}
+    )
     layer.offload_cache = cache
     return layer, cache
 
@@ -381,6 +383,101 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
     assert calls["topk_weights"] is topk_weights
     assert calls["topk_ids"].dtype == torch.int32
     assert calls["topk_ids"].tolist() == [[5, 0]]
+
+
+def test_offload_moe_layer_wide_decode_step_loads_its_experts_128_at_a_time(monkeypatch):
+    from freetoken.moe import offload_kernels
+
+    layer, cache = _make_layer_and_cache(num_experts=160, cache_size=192)
+    cache.collect_decode_freq = True
+    cache.collect_stats = True
+    # 150 decode rows route 300 times, past one call's 256, to all 160 experts; the first 7 are resident already
+    routes = torch.arange(300, dtype=torch.int32).remainder(160).view(150, 2)
+    cache.slot_for_id[0, :7] = cache.cache_size - 1 - torch.arange(7, dtype=torch.int32)
+    events = []
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (
+            torch.rand(hidden_states.shape[0], 2), routes[: hidden_states.shape[0]].clone()
+        ),
+    )
+    monkeypatch.setattr(cache, "copy_missing", lambda: events.append(("copied",)))
+
+    def admit(cache, layer_id, expert_ids, *, record_stats=True):
+        # the slot cache's contract: every queried expert resident, the query rewritten to its slots in place,
+        # and num_indices the count of experts it had to copy in
+        query = expert_ids.view(-1)
+        events.append(("admitted", query.tolist(), record_stats))
+        cache.num_indices[0] = query[cache.slot_for_id[layer_id, query.long()] < 0].unique().numel()
+        cache.slot_for_id[layer_id, query.long()] = cache.cache_size - 1 - query
+        query.copy_(cache.cache_size - 1 - query)
+
+    monkeypatch.setattr(offload_kernels, "ensure_experts", admit)
+
+    def fake_fused_decode(hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation,
+                          apply_router_weight_on_input, act_alpha=1.0, act_limit=float("inf")):
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_decode_impl", fake_fused_decode)
+
+    layer.decode_forward(torch.randn(150, 8), torch.randn(150, 160))
+
+    admissions = [event for event in events if event[0] == "admitted"]
+    # lru_ensure takes at most 128 ids a query, never a step's routes
+    assert [len(query) for _, query, _ in admissions] == [128, 32]
+    # each query's misses are copied before the next query can evict
+    assert events == [event for admission in admissions for event in (admission, ("copied",))]
+    assert sorted(expert for _, query, _ in admissions for expert in query) == list(range(160))
+    assert torch.equal(calls["topk_ids"], cache.cache_size - 1 - routes)
+    # counted as one step: 160 experts met, the 153 not resident missed, every route in the histogram once
+    assert not any(record_stats for *_, record_stats in admissions)
+    assert cache.lru_stats[0].tolist() == [160, 153, 1]
+    assert cache.decode_freq[0].tolist() == torch.bincount(routes.flatten().long(), minlength=160).tolist()
+
+    events.clear()
+    narrow = torch.arange(8, dtype=torch.int32).view(4, 2)
+    assert cache.load_experts(0, narrow) is narrow
+    assert events == [("admitted", list(range(8)), True), ("copied",)]
+
+
+def test_dsv4_offload_layer_wide_on_demand_chunk_loads_its_experts_128_at_a_time(monkeypatch):
+    from freetoken.layers.quantization import NoQuantConfig
+    from freetoken.models.deepseek_v4.args import DeepseekV4Args
+    from freetoken.models.deepseek_v4.moe import DSV4OffloadMoELayer
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    args = DeepseekV4Args(dim=8, moe_inter_dim=16, n_routed_experts=640, n_activated_experts=2, swiglu_limit=None)
+    layer = DSV4OffloadMoELayer(0, args, quant_config=NoQuantConfig(), prefix="model.layers.0.mlp.experts")
+    cache = OffloadMoeCache(num_layers=1, num_experts=640, cache_size=768, device=torch.device("cpu"))
+    cache.set_bank_sources({"gate_up": [torch.randn(640, 32, 8)], "down": [torch.randn(640, 8, 16)]})
+    layer.offload_cache = cache
+    # 150 tokens route 300 times, past one call's 256 and under the 640 experts that would stream the layer
+    routes = torch.arange(300, dtype=torch.int32).view(150, 2)
+    queries = []
+    gemm = {}
+
+    def admit(cache, layer_id, expert_ids, *, record_stats=True):
+        query = expert_ids.view(-1)
+        queries.append(query.tolist())
+        cache.slot_for_id[layer_id, query.long()] = cache.cache_size - 1 - query
+        query.copy_(cache.cache_size - 1 - query)
+
+    monkeypatch.setattr(offload_kernels, "ensure_experts", admit)
+    monkeypatch.setattr(cache, "copy_missing", lambda: None)
+    monkeypatch.setattr(
+        layer, "_expert_gemm",
+        lambda cache, hidden_states, topk_weights, topk_ids, **_: gemm.setdefault("topk_ids", topk_ids.clone()),
+    )
+
+    layer._prefill_routed(torch.randn(150, 8), torch.rand(150, 2), routes.clone())
+
+    assert [len(query) for query in queries] == [128, 128, 44]
+    assert torch.equal(gemm["topk_ids"], cache.cache_size - 1 - routes)
 
 
 
