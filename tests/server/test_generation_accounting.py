@@ -24,6 +24,7 @@ from freetoken.server.generation import (  # noqa: E402
     GenSpec,
     generate_events,
     generate_full,
+    timings_block,
 )
 
 
@@ -206,3 +207,46 @@ def test_ttft_mean_is_zero_without_samples():
     request_ring.reset()
     request_ring.record_request(_row(ttft_ms=None))
     assert request_ring.requests_ttft_mean_ms() == 0
+
+
+def test_timings_block_follows_llama_cpp_semantics():
+    t = timings_block(prompt_tokens=1000, completion_tokens=21, cached_tokens=800,
+                      prompt_ms=2500.0, predicted_ms=2000.0)
+    # prompt_n excludes the cache; decode steps are n - 1 (llama.cpp semantics).
+    assert t["cache_n"] == 800
+    assert t["prompt_n"] == 200
+    assert t["prompt_per_second"] == 80.0  # 200 evaluated tokens / 2.5 s
+    assert t["predicted_n"] == 21
+    assert t["predicted_per_second"] == 10.0  # 20 decode steps / 2.0 s
+    assert t["prompt_ms"] == 2500.0 and t["predicted_ms"] == 2000.0
+
+
+def test_timings_block_rates_survive_the_edge_shapes():
+    assert timings_block(10, 0, 0, 0.0, 0.0) is None  # nothing was measured
+    t = timings_block(10, 1, 0, 100.0, 0.0)  # one token: no decode steps
+    assert t["predicted_per_second"] == 0.0 and t["predicted_per_token_ms"] == 0.0
+    t = timings_block(0, 2, 0, 100.0, 50.0)  # fully cached / empty prompt
+    assert t["prompt_per_second"] == 0.0 and t["prompt_per_token_ms"] == 0.0
+
+
+def test_gen_done_and_result_carry_measured_spans():
+    st = FakeState([_ack(prompt=7, completion=1, out="x"), _ack(completion=4, out="yz", finished=True)])
+
+    async def drain():
+        done = None
+        async for ev in generate_events(42, _spec(), st):
+            if isinstance(ev, GenDone):
+                done = ev
+        return done
+
+    done = asyncio.run(drain())
+    assert done.prompt_ms > 0.0
+    assert done.predicted_ms >= 0.0
+    assert timings_block(done.prompt_tokens, done.completion_tokens, done.cached_tokens,
+                         done.prompt_ms, done.predicted_ms) is not None
+
+    result = asyncio.run(generate_full(42, _spec(), FakeState(
+        [_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True)]
+    )))
+    assert result.prompt_ms > 0.0
+    assert result.predicted_ms >= 0.0
