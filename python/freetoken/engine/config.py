@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import sys
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, List, Mapping
@@ -32,8 +33,9 @@ class EngineConfig:
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
     quant_backend: str | None = None
-    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
-    ple_backend: str = "disk"
+    # PLE table backend: "disk" reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
+    # The default is "disk" where setup.py builds its row store (Linux), "pinned" elsewhere.
+    ple_backend: str = "disk" if sys.platform == "linux" else "pinned"
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"

@@ -4,6 +4,7 @@ a Reindex layer) and synthetic bf16 and FP8/MXFP4 checkpoints in the real tensor
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from types import SimpleNamespace
@@ -12,6 +13,10 @@ import pytest
 import torch
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+requires_row_store = pytest.mark.skipif(
+    importlib.util.find_spec("freetoken.kernel._row_store") is None,
+    reason="the disk row store is not built on this platform (setup.py)",
+)
 
 VOCAB = 512
 DIM = 256

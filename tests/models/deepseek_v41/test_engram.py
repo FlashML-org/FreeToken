@@ -11,7 +11,7 @@ import torch
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 from freetoken.models.deepseek_v41.engram import EngramHash, bucket_primes, hash_multipliers
 
-from .common import VOCAB, requires_cuda, tiny_hf_config, write_tiny_checkpoint
+from .common import VOCAB, requires_cuda, requires_row_store, tiny_hf_config, write_tiny_checkpoint
 
 
 def _args(**over) -> DeepseekV41Args:
@@ -75,6 +75,7 @@ def test_hash_matches_the_reference_across_a_prefill_decode_split():
         EngramHash(args, list(range(VOCAB)), VOCAB + 1)
 
 
+@requires_row_store
 @requires_cuda
 def test_disk_table_matches_the_dequantized_shard(tmp_path):
     from freetoken.models.deepseek_v41.engram_table import EngramDiskTable, engram_row_source
@@ -119,6 +120,7 @@ def test_disk_table_matches_the_dequantized_shard(tmp_path):
     assert torch.equal(out, oracle(dec_rows))
 
 
+@requires_row_store
 @requires_cuda
 def test_eager_staging_does_not_overwrite_an_in_flight_lookup(tmp_path):
     """The overlap scheduler stages batch k+1 while batch k's lookup copy is still queued behind
@@ -148,6 +150,7 @@ def test_eager_staging_does_not_overwrite_an_in_flight_lookup(tmp_path):
         assert torch.equal(out, oracle(rows)), f"batch {i} read another batch's rows"
 
 
+@requires_row_store
 @requires_cuda
 @torch.inference_mode()
 def test_host_fills_a_graph_decode_step_from_a_worker_thread(tmp_path):
@@ -192,6 +195,7 @@ def test_host_fills_a_graph_decode_step_from_a_worker_thread(tmp_path):
     host.close()
 
 
+@requires_row_store
 @requires_cuda
 def test_host_surfaces_a_failed_deferred_fill_at_dispatch_exit(tmp_path):
     from types import SimpleNamespace
@@ -224,6 +228,7 @@ def test_host_surfaces_a_failed_deferred_fill_at_dispatch_exit(tmp_path):
     host.close()
 
 
+@requires_row_store
 def test_ftw_side_files_carry_the_tables_and_reopen(tmp_path):
     """An FTW conversion copies the shards holding the Engram tables next to it (the converter's
     ``ftw_side_files`` hook, which skips the HF index); the row source resolves the copies through
