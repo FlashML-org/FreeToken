@@ -123,7 +123,7 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
-        # A /v1/cache/flush that arrived while busy, with its time.monotonic() deadline.
+        # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
         self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
@@ -748,21 +748,31 @@ class Scheduler(SchedulerIOMixin):
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
 
-    def _is_fully_idle(self) -> bool:
-        return self._last_data is None and not (
-            self.prefill_manager.runnable or self.decode_manager.runnable
-        )
-
     def _handle_flush(self, msg: FlushCacheBackendMsg) -> None:
-        # Same idle/timeout contract as sglang's /flush_cache: flush now if idle, else fail or wait up to msg.timeout.
+        # Same idle/timeout contract as sglang's /flush_cache. Even timeout=0 waits for this iteration's safe point.
         if self.config.tp_info.size > 1:
             # each rank checks the deadline on its own clock, so a deferred flush could run on only some ranks
             self._reply_flush(msg.request_id, "unsupported", "cache flush unsupported under TP > 1")
         elif self._pending_flush is not None:
             self._reply_flush(msg.request_id, "busy", "another cache flush is already waiting")
-        elif self._is_fully_idle():
-            self._flush_cache(msg.request_id)
-        elif msg.timeout <= 0:
+        else:
+            self._pending_flush = (msg, time.monotonic() + msg.timeout)
+
+    def _check_pending_flush(self) -> None:
+        """Run the pending flush once the scheduler is fully idle, or fail it at its deadline."""
+        if self._pending_flush is None:
+            return
+        msg, deadline = self._pending_flush
+        if self._last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._pending_flush = None
+            freed = self.cache_manager.flush()
+            self.cache_manager.check_integrity()
+            logger.info_rank0(f"Cache flushed: {freed} prefix-cache tokens freed")
+            self._reply_flush(msg.request_id, "ok")
+        elif time.monotonic() >= deadline:
+            self._pending_flush = None
             error = (
                 "scheduler is not idle: "
                 f"{len(self.prefill_manager.pending_list)} queued, "
@@ -770,27 +780,7 @@ class Scheduler(SchedulerIOMixin):
                 + (", last batch still in flight" if self._last_data is not None else "")
             )
             logger.warning_rank0(f"Cache not flushed, {error}")
-            self._reply_flush(msg.request_id, "busy", error)
-        else:
-            self._pending_flush = (msg, time.monotonic() + msg.timeout)
-
-    def _check_pending_flush(self) -> None:
-        if self._pending_flush is None:
-            return
-        msg, deadline = self._pending_flush
-        if self._is_fully_idle():
-            self._pending_flush = None
-            self._flush_cache(msg.request_id)
-        elif time.monotonic() >= deadline:
-            self._pending_flush = None
-            logger.warning_rank0("Deferred cache flush timed out waiting for idle")
-            self._reply_flush(msg.request_id, "timeout", "timed out waiting for the scheduler to go idle")
-
-    def _flush_cache(self, request_id: str) -> None:
-        freed = self.cache_manager.flush()
-        self.cache_manager.check_integrity()
-        logger.info_rank0(f"Cache flushed: {freed} prefix-cache tokens freed")
-        self._reply_flush(request_id, "ok")
+            self._reply_flush(msg.request_id, "timeout" if msg.timeout > 0 else "busy", error)
 
     def _reply_flush(self, request_id: str, status: str, error: str | None = None) -> None:
         self.send_result([FlushCacheResultMsg(request_id=request_id, status=status, error=error)])
