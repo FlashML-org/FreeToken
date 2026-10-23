@@ -37,6 +37,10 @@ class EngineConfig:
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"
+    # DeepSeek-V4.1 Encoder SWA Bounded Replay: "bounded" (default) lets a prefix hit keep the full
+    # global-KV match and replay the hit's last window through the encoder when that window KV was
+    # evicted; "exact" truncates the hit to the windowed-safe boundary and re-prefills exactly.
+    swa_encoder_replay: str = "bounded"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the

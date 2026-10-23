@@ -65,7 +65,7 @@ def plan_mm_chunk(
 
 
 def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem], List[Tuple[int, int, int, int, int, int]], List[int], List[int]]:
-    """Jobs, plan, the batch rows of every gathered embedding row and, per batch token, the end of the image span holding it (0 for text), over the reqs in batch order (each spans [cached_len, device_len))."""
+    """Jobs, plan, the batch rows of every gathered embedding row and, per batch token, the end of the image span holding it (0 for text), over the reqs in batch order (each spans [chunk_lo, device_len); an encoder-bounded-replay chunk re-gathers its image-span rows from the cached item)."""
     jobs: List[MMItem] = []
     plan: List[Tuple[int, int, int, int, int, int]] = []
     rows: List[int] = []
@@ -73,7 +73,8 @@ def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem
     offset = 0
     for req in reqs:
         if req.mm_items:
-            req_jobs, req_plan = plan_mm_chunk(req.uid, req.mm_items, req.cached_len, req.device_len, encoder_cache)
+            lo = req.chunk_lo
+            req_jobs, req_plan = plan_mm_chunk(req.uid, req.mm_items, lo, req.device_len, encoder_cache)
             jobs.extend(req_jobs)
             plan.extend(req_plan)
             for _, _, row_lo, row_hi, _, pos in req_plan:
@@ -82,8 +83,8 @@ def plan_mm_batch(reqs, encoder_cache: EncoderCache | None) -> tuple[List[MMItem
                 block_ends = [0] * sum(r.extend_len for r in reqs)
             for item in req.mm_items:
                 for span_lo, span_hi in item.offsets:
-                    for i in range(max(span_lo, req.cached_len), min(span_hi, req.device_len)):
-                        block_ends[offset + i - req.cached_len] = span_hi
+                    for i in range(max(span_lo, lo), min(span_hi, req.device_len)):
+                        block_ends[offset + i - lo] = span_hi
         offset += req.extend_len
     return jobs, plan, rows, block_ends
 
