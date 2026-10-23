@@ -85,7 +85,7 @@ def e4m3_act_dtype() -> torch.dtype:
 
 @constexpr_function
 def _f32_cast_rounds_once_cx():
-    return target_info.cuda_capability_geq(9, 0)
+    return not target_info.is_cuda() or target_info.cuda_capability_geq(9, 0)
 
 
 @constexpr_function
@@ -155,6 +155,7 @@ def f32_to_e4m3(x):
     value just above an e4m3 midpoint (triton-lang/triton#11753); emit the direct cvt there."""
     if _f32_cast_rounds_once_cx():
         return x.to(tl.float8e4nv)
+    # FIXME: remove the sm_89 inline asm once the minimum Triton is 3.9 (triton-lang/triton#11924).
     # cvt packs its first source into the high byte, so the low byte is fp8(x)
     h = tl.inline_asm_elementwise(
         "cvt.rn.satfinite.e4m3x2.f32 $0, 0f00000000, $1;", "=h,r", [x], dtype=tl.uint16, is_pure=True, pack=1)
