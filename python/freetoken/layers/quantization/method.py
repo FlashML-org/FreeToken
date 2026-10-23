@@ -63,27 +63,12 @@ class QuantMethod(ABC):
 
 def finalize_quant(root: Any) -> int:
     """Call ``quant_method.finalize(layer)`` on every layer under ``root``; returns the count."""
-    from freetoken.layers.base import BaseOP
+    from freetoken.layers.base import iter_ops
 
-    seen: set[int] = set()
     count = 0
-
-    def walk(op: Any) -> None:
-        nonlocal count
-        if id(op) in seen:
-            return
-        seen.add(id(op))
+    for op in iter_ops(root):
         method = getattr(op, "quant_method", None)
         if method is not None:
             method.finalize(op)
             count += 1
-        for value in vars(op).values():
-            if isinstance(value, BaseOP):
-                walk(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, BaseOP):
-                        walk(item)
-
-    walk(root)
     return count

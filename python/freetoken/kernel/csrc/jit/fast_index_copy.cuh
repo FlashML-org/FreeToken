@@ -1,3 +1,4 @@
+#include <freetoken/pinned.h>
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -161,37 +162,6 @@ __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec)
 }
 
 
-
-// Pinned host memory is GPU-dereferenceable at its host VA only where UVA identity
-// holds (Linux). On Windows/WDDM, cudaHostRegister'd memory maps to a different device
-// address, so host-resident tensors are translated here -- the one point their pointer
-// enters kernel params. Cached once per process: FreeToken pins one CUDA device per
-// process (set at engine launch).
-inline bool host_ptr_identity() {
-    static const bool identity = [] {
-        int device = 0;
-        if (cudaGetDevice(&device) != cudaSuccess) {
-            return false;  // fail closed: translate (and surface errors), don't assume identity
-        }
-        int uva = 0, reg = 0;
-        cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
-        cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
-        return uva == 1 && reg == 1;
-    }();
-    return identity;
-}
-
-inline void* device_alias(void* ptr, DLDevice dev) {
-    if (dev.device_type == kDLCUDA || dev.device_type == kDLROCM || host_ptr_identity()) {
-        return ptr;
-    }
-    void* mapped = nullptr;
-    const auto err = cudaHostGetDevicePointer(&mapped, ptr, 0);
-    host::RuntimeCheck(err == cudaSuccess,
-        "fast_index_copy: host tensor must be pinned+mapped (cudaHostGetDevicePointer: ",
-        cudaGetErrorString(err), ")");
-    return mapped;
-}
 
 struct IndexKernelParams {
     void* __restrict__ dst;

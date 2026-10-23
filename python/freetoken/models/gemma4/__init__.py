@@ -2,10 +2,12 @@ from .attention import Gemma4Attention
 from .config import parse_config
 from .gguf import (
     dummy_q4_0_expert_sources,
+    gguf_mm_config,
     iter_gguf_weights,
     load_q4_0_expert_sources,
     load_q8_0_expert_sources,
     parse_gguf_config,
+    to_gguf,
 )
 from .model import Gemma4ForCausalLM, Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration
 from .moe import Gemma4Router
@@ -33,9 +35,11 @@ __all__ = [
     "iter_weights",
     "iter_weights_parallel",
     "setup_offload_expert_banks",
+    "gguf_mm_config",
     "parse_gguf_config",
     "iter_gguf_weights",
     "load_q4_0_expert_sources",
     "load_q8_0_expert_sources",
     "dummy_q4_0_expert_sources",
+    "to_gguf",
 ]

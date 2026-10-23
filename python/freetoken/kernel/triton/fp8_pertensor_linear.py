@@ -31,6 +31,7 @@ from freetoken.kernel.triton.e4m3_compat import (
     e4m3_native,
     e4m3_native_cx,
     e4m3_u8_to_f32,
+    f32_to_e4m3,
 )
 
 FP8 = torch.float8_e4m3fn
@@ -253,7 +254,7 @@ def _static_quant_kernel(x_ptr, out_ptr, scale_ptr, n_elements, BLOCK: tl.conste
     inv = 1.0 / tl.load(scale_ptr).to(tl.float32)
     v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32) * inv
     v = tl.minimum(tl.maximum(v, -448.0), 448.0)
-    tl.store(out_ptr + offs, v.to(tl.float8e4nv), mask=mask)
+    tl.store(out_ptr + offs, f32_to_e4m3(v), mask=mask)
 
 
 def _static_quant(a: torch.Tensor, input_scale: torch.Tensor) -> torch.Tensor:

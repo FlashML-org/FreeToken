@@ -1,9 +1,11 @@
 # FreeToken test suite
 
 Directories mirror the `python/freetoken/` subsystem a test primarily exercises —
-put a new test next to the module it protects. There is no per-model directory:
-a model-specific test lives in the subsystem it stresses, and says which model
-in its filename (`kvcache/test_dsv4_pool.py`, `models/test_glm4_nvfp4.py`).
+put a new test next to the module it protects. A test specific to one model
+lives in `models/<model>/`, mirroring `python/freetoken/models/<model>/`
+(`models/deepseek_v41/`, `models/qwen4_exp/`). Older model-specific tests still
+sit flat in `models/` (`models/test_glm5_next_model.py`), in subsystem
+directories (`kvcache/test_dsv4_pool.py`) or in `dsv4/`, and will move there.
 
 | directory    | subsystem under test |
 |--------------|----------------------|
@@ -14,8 +16,14 @@ in its filename (`kvcache/test_dsv4_pool.py`, `models/test_glm4_nvfp4.py`).
 | `tokenizer/` | `freetoken.tokenizer` — tokenize/detokenize request plumbing, thinking-mode resolution |
 | `engine/`    | `freetoken.engine` — cache budget planning, config resolution, backend gating |
 | `kernels/`   | `freetoken.kernel` / `freetoken.layers` — attention, rope, fused ops, JIT cache, pinned memory |
+| `attention/` | `freetoken.attention` — attention backends against eager references |
+| `layers/`    | `freetoken.layers` — whole layer modules (mHC); a layer's kernels and fused ops go in `kernels/` |
 | `moe/`       | `freetoken.moe` — offload cache, CPU/GPU expert kernels, quantized backends (fp8/nvfp4/mxfp4/gguf) |
-| `models/`    | `freetoken.models` — the registry, and the loading machinery every model shares (sharding, qkv/expert merge, streaming layers into banks) |
+| `models/`    | `freetoken.models` — the registry, and the loading machinery every model shares (sharding, qkv/expert merge, streaming layers into banks); one directory per model for tests specific to it |
+| `mm/`        | `freetoken.mm` — multimodal processor, placeholder expansion, encoder cache |
+| `checkpoint/` | `freetoken.checkpoint` — FTW read/write and replay |
+| `utils/`     | `freetoken.utils` — HF config loading, ROCm arch detection |
+| `dsv4/`      | DeepSeek-V4 tests that predate `models/<model>/` |
 | `e2e/`       | real-server gates: AIME 24/25/26 generation, runtime cache rebuild |
 
 The CLI surface itself is not unit-tested. `ft` dispatch, `ft ctl`, `ft launch` and
@@ -85,17 +93,31 @@ FREETOKEN_REBUILD_TEST_MODEL=<small model dir> uv run pytest tests/e2e/test_cach
 
 ## What earns a place here
 
-A test must be able to fail on a plausible regression of production code.
+A test must be able to fail on a plausible regression of production code: name
+the future change that would turn it red. If the only answer is editing the
+test, do not write it. A test earns its place by guarding one of:
+
+- A bug a normal run would not reveal: a wrong number that still looks like a
+  number, a wrong cache slot, tool calls that quietly stop parsing, a crash only
+  one interleaving or one checkpoint hits.
+- A property that took reasoning to get right, checked against something
+  independent of the code (see below).
+- Bookkeeping that is easy to forget: every registry entry names exports its
+  package has, every registered architecture gets a parser the factories know.
+
+Not admitted: happy-path tests that repeat what the code obviously does,
+assertions that restate the branches just written, config tests that echo
+fixture values back, stress loops that cannot hit the bug, and tests whose only
+check is `assert_called*` or "no exception".
 
 Weigh that against how the bug would be found otherwise. Application-facing
 surfaces — the terminal UI, the access-log filter, the request ring, the status
 and health endpoints, the CLI — announce their own breakage the moment anyone
 uses them, and they change shape often enough that a unit test mostly restates
 today's implementation. Those belong to `e2e/` and to actually running the
-thing. What earns a unit test is logic that fails *silently*: a wrong number
-that still looks like a number, a model family that quietly stops having its
-tool calls parsed, a cache that returns the wrong slot. Prefer covering that
-where it lives rather than through the surface that happens to expose it.
+thing. What earns a unit test is logic that fails *silently*, like the bugs
+listed above. Prefer covering that where it lives rather than through the
+surface that happens to expose it.
 
 Writing a test in the same commit as the feature is right; what matters is where
 its expectations come from. A test that checks the result against something
@@ -111,3 +133,51 @@ reference (round-trip, dequant oracle, CPU mirror), not against the
 implementation's own output. Registry-style tests should iterate the live
 registry rather than hand-maintained whitelists, so new entries are covered
 automatically.
+
+## Adding, sizing and removing tests
+
+- **Extend before you create.** Add a case to an existing `parametrize` or
+  table first, then a function in the existing file for that module. In an
+  existing file, reuse its fixtures unless they stand in for FreeToken objects;
+  build new setup with real objects (below).
+  A new file, directory, fixture or helper needs a reason.
+- **One strong case beats several weak ones.** Each extra case must guard a
+  different failure. If the test diff dwarfs the change, cut setup and
+  duplicate cases, not the independent check.
+- **New models.** A model's own tests go in `models/<model>/` and meet the same
+  bar: parity against its reference implementation, and properties specific to
+  it (chunked prefill against single-shot, its vision tower against the
+  reference tower). What every model needs comes from shared tests: the model
+  adds rows where they keep a table (a new tool-call format in
+  `server/test_streaming_model_matrix.py`, a new attention kind in
+  `engine/test_attention_backend_matrix.py`), and live-registry tests such as
+  `server/test_parser_auto_selection.py` and `models/test_models_registry.py`
+  cover it with no change. Do not copy config, registry or smoke tests into the
+  model's directory.
+- **Remove what a change makes redundant.** If a change makes a test wrong,
+  update it. If it makes a test redundant, propose deleting it: a case can go
+  when deleting it lets no regression past the remaining tests.
+
+## Writing a test
+
+- **Real objects on the lightest real path.** Build FreeToken's own objects
+  (requests, batches, pools) with their real constructors; do not stand them in
+  with `SimpleNamespace` or `MagicMock`, set private attributes, or patch methods
+  to reach a state. Objects that need a model to construct (the scheduler, the
+  engine) may be stood in for, limited to the attributes the code under test
+  reads. Fakes are also fine for what comes from outside the engine: an HF
+  config, a checkpoint file, an HTTP peer. A kernel or layer test does not need
+  a server or a model.
+- **Show it catches the bug.** Revert only the fix's logic and check that the
+  test fails on the assertion that guards the bug, not on an import or
+  signature error; then restore the fix and check it passes. Put both runs in
+  the PR.
+- **Deterministic and tight.** Unit and kernel tests use greedy sampling or a
+  fixed seed (the AIME gate samples on purpose, see above). Assert equality
+  where the result is exact, and keep tolerances as tight as the math allows.
+  Order a race with events and wait on a condition with a timeout, never a
+  fixed `sleep`.
+- **Never loosen a test to make it pass.** No wider `atol`/`rtol`, lower
+  thresholds, retries, or skips to turn a red test green; skipping on missing
+  hardware, packages or weights is fine. Find out whether the failure comes
+  from your change or also happens on `main`.

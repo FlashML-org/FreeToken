@@ -3,7 +3,7 @@
 Triton rejects the fp8e4nv type anywhere in a kernel compiled for sm < 89 -- the
 check sits in ``dtype.to_ir``, so even an fp8 *pointer argument* is illegal.
 Affected kernels branch on :func:`e4m3_native_cx` (a compile-time constexpr): the
-native branch stays byte-identical on sm_89+, the emulated branch is dead-code
+native branch casts fp32 through :func:`f32_to_e4m3`, the emulated branch is dead-code
 eliminated there. When the emulated branch is active, wrappers must pass e4m3
 tensors as ``.view(torch.uint8)`` and allocate act-quant outputs as bf16 -- use
 the host-side twin :func:`e4m3_native` for those decisions.
@@ -84,6 +84,11 @@ def e4m3_act_dtype() -> torch.dtype:
 
 
 @constexpr_function
+def _f32_cast_rounds_once_cx():
+    return not target_info.is_cuda() or target_info.cuda_capability_geq(9, 0)
+
+
+@constexpr_function
 def e4m3_native_cx():
     """Compile-time: does the compilation target have native fp8e4nv (sm_89+)?
     Delegates to ``target_info`` (reads the active driver's target, so
@@ -140,3 +145,18 @@ def round_e4m3(x):
     y_norm = ((b + 524287 + lsb) & 0xFFF00000).to(tl.float32, bitcast=True)
     y_sub = (x + 24576.0) - 24576.0
     return tl.where(tl.abs(x) >= 0.015625, y_norm, y_sub)
+
+
+@jit
+def f32_to_e4m3(x):
+    """Native-branch fp32 -> fp8e4nv cast with one RNE rounding (satfinite).
+
+    Triton 3.8 lowers this cast on sm_89 as fp32 -RTZ-> fp16 -RNE-> e4m3, which double-rounds a
+    value just above an e4m3 midpoint (triton-lang/triton#11753); emit the direct cvt there."""
+    if _f32_cast_rounds_once_cx():
+        return x.to(tl.float8e4nv)
+    # FIXME: remove the sm_89 inline asm once the minimum Triton is 3.9 (triton-lang/triton#11924).
+    # cvt packs its first source into the high byte, so the low byte is fp8(x)
+    h = tl.inline_asm_elementwise(
+        "cvt.rn.satfinite.e4m3x2.f32 $0, 0f00000000, $1;", "=h,r", [x], dtype=tl.uint16, is_pure=True, pack=1)
+    return h.to(tl.uint8).to(tl.float8e4nv, bitcast=True)

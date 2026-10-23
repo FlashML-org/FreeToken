@@ -130,8 +130,7 @@ class EngramDiskTable:
         self._eager_slot = 0
         self._eager_dev = None
         self._grow_eager(max_extend_tokens)
-        self.flag = alloc_pinned_tensor(1, dtype=torch.int64)
-        self.flag.zero_()
+        self.flag = None
         self.wait_sync = False  # set by the host coordinator after its probe
 
     def _grow_eager(self, num_tokens: int) -> None:
@@ -209,6 +208,11 @@ class EngramHost:
         self.wait_sync = probe_wait_sync(sync_mode, device)
         for t in self.tables:
             t.wait_sync = self.wait_sync
+            if self.wait_sync:
+                from freetoken.kernel.row_store import alloc_sync_flag
+
+                with torch.cuda.device(device):
+                    t.flag = alloc_sync_flag()
         self._token_readback = alloc_pinned_tensor(min(t.max_graph_rows for t in self.tables), dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-fill")

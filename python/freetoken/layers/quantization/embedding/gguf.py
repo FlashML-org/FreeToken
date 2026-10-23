@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from ..ggml_types import NVFP4, Segment, pad_rows, row_bytes
+from ..ggml_types import Segment, pad_rows, row_bytes
 from ..linear.gguf import GgmlLinearKernel
 from ..registry import LayerKind, register_method
 from ..scheme import QuantKind, gguf_types
@@ -20,8 +20,8 @@ class GgmlEmbeddingKernel(EmbeddingKernel):
     def unusable_reason(self, cfg: EmbeddingConfig) -> str | None:
         if cfg.tp_size > 1:
             return "GGUF tables are not sharded over TP"
-        # the vendored get_rows has no NVFP4 case, and the table's weight_scale_2 would need applying too
-        return "NVFP4 GGUF tables are not supported" if NVFP4 in gguf_types(cfg.scheme) else None
+        # llama.cpp reads no token_embd scale and refuses a tied NVFP4 head that has one
+        return "GGUF tables with a weight scale are not supported" if cfg.scheme.weight.scale is not None else None
 
     def embed(self, layer: Any, ids: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel import ggml

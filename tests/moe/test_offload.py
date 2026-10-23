@@ -677,6 +677,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     monkeypatch.setattr("torch.cuda.empty_cache", lambda: None)
     monkeypatch.setattr("torch.cuda.reset_peak_memory_stats", lambda device=None: None)
     monkeypatch.setattr("freetoken.engine.graph.get_free_memory", lambda device: 1024)
+    monkeypatch.setattr("freetoken.engine.graph._upload_graph", lambda graph, stream: None)
 
     dummy_req = Req(
         input_ids=torch.tensor([0], dtype=torch.int32),

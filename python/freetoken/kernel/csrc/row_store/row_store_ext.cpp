@@ -8,10 +8,11 @@
 //                Hash reference: tests/models/qwen4_exp/test_ple_disk.py.
 //
 // Platform seams: TableFile (O_DIRECT+pread; Win: NO_BUFFERING), BatchReader (io_uring,
-// pread-pool fallback = the portable shape), cumemop_* (dlopen libcuda; Win: nvcuda).
+// pread-pool fallback = the portable shape), stream memops (CUDA driver or HIP signal memory).
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -41,6 +42,10 @@
 
 #include <torch/extension.h>
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+#include <hip/hip_runtime.h>
+#endif
+
 namespace py = pybind11;
 
 namespace {
@@ -62,6 +67,109 @@ uint8_t *page_aligned_alloc(size_t bytes) {
   if (posix_memalign(&p, kPage, bytes) != 0) throw std::bad_alloc();
   return static_cast<uint8_t *>(p);
 }
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+
+hipError_t alloc_signal(int64_t **out) {
+  void *word = nullptr;
+  // Like CPU MoE, HIP stream waits require signal memory, not a pinned staging allocation.
+  const auto rc = hipExtMallocWithFlags(&word, sizeof(int64_t), hipMallocSignalMemory);
+  if (rc == hipSuccess) {
+    *out = static_cast<int64_t *>(word);
+    release_store_i64(*out, 0);
+  }
+  return rc;
+}
+
+torch::Tensor alloc_signal_tensor() {
+  int64_t *word = nullptr;
+  const auto rc = alloc_signal(&word);
+  TORCH_CHECK(rc == hipSuccess, "HIP signal allocation failed: ", hipGetErrorString(rc));
+  return torch::from_blob(word, {1}, [](void *p) { (void)hipFree(p); },
+                          torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+}
+
+int memop_write(uintptr_t stream, uintptr_t addr, uint64_t value) {
+  return hipStreamWriteValue64(reinterpret_cast<hipStream_t>(stream),
+                               reinterpret_cast<void *>(addr), value, hipStreamWriteValueDefault);
+}
+
+int memop_wait_geq(uintptr_t stream, uintptr_t addr, uint64_t value) {
+  return hipStreamWaitValue64(reinterpret_cast<hipStream_t>(stream),
+                              reinterpret_cast<void *>(addr), value, hipStreamWaitValueGte, UINT64_MAX);
+}
+
+// Capability failures must not poison gating fallback or hide a caller's earlier error.
+struct ProbeErrorScope {
+  ProbeErrorScope() {
+    TORCH_CHECK(hipPeekAtLastError() == hipSuccess, "HIP error pending before row-store sync probe");
+  }
+  ~ProbeErrorScope() { (void)hipGetLastError(); }
+};
+
+bool capture_memops_supported() {
+  ProbeErrorScope errors;
+  int device = 0;
+  int can_wait = 0;
+  if (hipGetDevice(&device) != hipSuccess ||
+      hipDeviceGetAttribute(&can_wait, hipDeviceAttributeCanUseStreamWaitValue, device) != hipSuccess || can_wait == 0)
+    return false;
+
+  int64_t *ready = nullptr;
+  int64_t *done = nullptr;
+  hipStream_t stream = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  auto rc = alloc_signal(&ready);
+  if (rc == hipSuccess) rc = alloc_signal(&done);
+  if (rc == hipSuccess) rc = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+  // A runtime that executes the WAIT during capture must not block the probe.
+  if (rc == hipSuccess) release_store_i64(done, 1);
+  if (rc == hipSuccess) rc = hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed);
+  const bool started = rc == hipSuccess;
+  if (rc == hipSuccess) rc = static_cast<hipError_t>(memop_write(
+      reinterpret_cast<uintptr_t>(stream), reinterpret_cast<uintptr_t>(ready), 1));
+  if (rc == hipSuccess) rc = static_cast<hipError_t>(memop_wait_geq(
+      reinterpret_cast<uintptr_t>(stream), reinterpret_cast<uintptr_t>(done), 1));
+  if (started) {
+    const auto end_rc = hipStreamEndCapture(stream, &graph);
+    if (rc == hipSuccess) rc = end_rc;
+  }
+  if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
+  size_t nodes = 0;
+  if (rc == hipSuccess) rc = hipGraphGetNodes(graph, nullptr, &nodes);
+  // Older HIP runtimes execute memops during capture without recording them.
+  if (rc == hipSuccess && nodes != 2) rc = hipErrorNotSupported;
+  if (rc == hipSuccess) rc = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  bool served = false;
+  if (rc == hipSuccess) {
+    release_store_i64(ready, 0);
+    release_store_i64(done, 0);
+    std::thread responder([&] {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      served = __atomic_load_n(ready, __ATOMIC_ACQUIRE) == 1;
+      // The graph never resets done, so even a launch arriving after the deadline is released.
+      release_store_i64(done, 1);
+    });
+    rc = hipGraphLaunch(exec, stream);
+    if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
+    responder.join();
+  }
+  const bool ok = rc == hipSuccess && served;
+  if (exec != nullptr) (void)hipGraphExecDestroy(exec);
+  if (graph != nullptr) (void)hipGraphDestroy(graph);
+  if (stream != nullptr) {
+    (void)hipStreamSynchronize(stream);
+    (void)hipStreamDestroy(stream);
+  }
+  if (ready != nullptr) (void)hipFree(ready);
+  if (done != nullptr) (void)hipFree(done);
+  return ok;
+}
+
+#else
 
 // Stream memops for the flag-sync fast path, resolved from the driver at runtime.
 using CuMemOp64Fn = int (*)(void *stream, unsigned long long addr, unsigned long long value,
@@ -96,6 +204,8 @@ int memop_wait_geq(uintptr_t stream, uintptr_t addr, uint64_t value) {
   if (!cumemop_resolve()) return -1;
   return g_cu_wait64(reinterpret_cast<void *>(stream), addr, value, kCuWaitValueGeq);
 }
+
+#endif
 
 // WAIT(>=1) then RESET: resetting first would race a fast host signal and deadlock the stream.
 void memop_wait_reset(uintptr_t stream, uintptr_t flag_addr) {
@@ -674,4 +784,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_reset", &memop_wait_reset, py::arg("stream"), py::arg("flag_addr"));
   m.def("signal_flag", &signal_flag, py::arg("flag_addr"));
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+  m.def("alloc_signal_tensor", &alloc_signal_tensor);
+  m.def("capture_memops_supported", &capture_memops_supported);
+#endif
 }

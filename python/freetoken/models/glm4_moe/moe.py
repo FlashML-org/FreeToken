@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Tuple
 
 import torch
-import torch.nn.functional as F
+from freetoken.kernel.triton.moe_router import fused_topk_sigmoid
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
 
 from .mlp import GlmGatedMLP
@@ -52,29 +52,17 @@ class Glm4MoeSparseBlock(BaseOP):
             prefix=f"{prefix}.shared_experts",
         )
 
-    def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
-        m = scores_for_choice.shape[0]
-        e, g = self.num_experts, self.n_group
-        group_scores = scores_for_choice.view(m, g, e // g).topk(2, dim=-1)[0].sum(dim=-1)
-        group_idx = torch.topk(group_scores, self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1.0)
-        score_mask = group_mask.unsqueeze(-1).expand(m, g, e // g).reshape(m, e)
-        return scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
-
     def _route(self, hidden_states: torch.Tensor) -> TopK:
-        # HF computes the router logits in fp32; the gate is tiny so we match it exactly.
-        logits = F.linear(hidden_states.float(), self.gate.weight.float())
-        scores = logits.sigmoid()
-        scores_for_choice = scores + self.e_score_correction_bias.float()
-        if self.n_group > 1:
-            scores_for_choice = self._group_limited(scores_for_choice)
-        _, topk_ids = torch.topk(scores_for_choice, self.top_k, dim=-1)
-        topk_weights = scores.gather(-1, topk_ids)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous()
+        logits = torch.mm(hidden_states, self.gate.weight.t(), out_dtype=torch.float32)
+        return fused_topk_sigmoid(
+            logits,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.norm_topk_prob,
+            routed_scale=self.routed_scaling_factor,
+            n_group=self.n_group,
+            topk_group=self.topk_group,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

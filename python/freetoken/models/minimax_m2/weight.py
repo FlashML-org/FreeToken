@@ -82,6 +82,8 @@ def iter_weights(
                         world_size=tp_info.size,
                         num_kv_heads=config.num_kv_heads,
                     )
+                    if name.endswith(".e_score_correction_bias"):
+                        tensor = tensor.float()
                     yield name, tensor
 
     yield from iter_merged_tensors(raw(), _MERGE_RULES, model_name="minimax_m2")

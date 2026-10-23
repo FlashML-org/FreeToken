@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken import __version__
 from freetoken.core import SamplingParams
@@ -26,6 +26,8 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    FlushCacheMsg,
+    FlushCacheReply,
     TokenizeMsg,
     UserReply,
 )
@@ -151,6 +153,8 @@ class FrontendManager:
     # CacheRebuildReply; guard against that stale latch by reopening the gate once the backend
     # has clearly stopped resolving it.
     rebuild_started_at: float | None = None
+    # /v1/cache/flush waiters by request_id; the scheduler owns the deadline, so there is no HTTP timeout.
+    flush_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -257,6 +261,11 @@ class FrontendManager:
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
+            if isinstance(msg, FlushCacheReply):
+                fut = self.flush_futures.pop(msg.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+                continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
@@ -334,7 +343,8 @@ class FrontendManager:
         caller blocked in dispatch_rebuild's ``await`` would otherwise hang until its full
         timeout (up to 300s). Runs the resolution ON the event loop via call_soon_threadsafe —
         asyncio Futures are not thread-safe, and _resolve_rebuild only ever calls set_result
-        from the loop thread (the listen() task), so we mirror that here from off-thread."""
+        from the loop thread (the listen() task), so we mirror that here from off-thread.
+        Pending /v1/cache/flush waiters fail the same way."""
         loop = self._loop
         if loop is None:
             return  # listener never started -> no futures could be pending
@@ -345,6 +355,10 @@ class FrontendManager:
                 fut = self.rebuild_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(dict(result))
+            for request_id in list(self.flush_futures):
+                fut = self.flush_futures.pop(request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(FlushCacheReply(request_id=request_id, status="failed", error=message))
 
         try:
             loop.call_soon_threadsafe(_resolve_all)
@@ -644,14 +658,11 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
 
 
-@app.post("/v1/cache/rebuild")
-async def cache_rebuild(req: CacheRebuildRequest):
-    """Trigger a runtime KV/MoE cache resize. Blocks until the scheduler reports a result
-    (or timeout). New generation is gated (503) while a rebuild is in flight."""
-    state = get_global_state()
+def _maintenance_rejection(state: FrontendManager, action: str) -> JSONResponse | None:
+    """The /v1/cache/* refusal while the engine is not serving, or None to proceed."""
     if state.maintenance_state == "loading":
         return JSONResponse(
-            {"status": "loading", "error": "model is still loading; cannot rebuild cache yet"},
+            {"status": "loading", "error": f"model is still loading; cannot {action} yet"},
             status_code=503,
         )
     if state.maintenance_state == "failed":
@@ -669,6 +680,16 @@ async def cache_rebuild(req: CacheRebuildRequest):
             {"status": "busy", "error": "engine stop is in progress"},
             status_code=409,
         )
+    return None
+
+
+@app.post("/v1/cache/rebuild")
+async def cache_rebuild(req: CacheRebuildRequest):
+    """Trigger a runtime KV/MoE cache resize. Blocks until the scheduler reports a result
+    (or timeout). New generation is gated (503) while a rebuild is in flight."""
+    state = get_global_state()
+    if (rejection := _maintenance_rejection(state, "rebuild cache")) is not None:
+        return rejection
     if req.num_swa_pages is not None and req.swa_full_tokens_ratio is not None:
         return JSONResponse(
             {"status": "failed", "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both"},
@@ -695,6 +716,33 @@ async def cache_rebuild(req: CacheRebuildRequest):
     if result["status"] == "timeout":
         return JSONResponse(result, status_code=504)
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
+
+
+@app.api_route("/v1/cache/flush", methods=["GET", "POST"])
+async def cache_flush(timeout: float = Query(0.0, ge=0.0)):
+    """Drop every prefix-cache entry once the scheduler is idle, waiting up to ``timeout`` seconds."""
+    state = get_global_state()
+    if (rejection := _maintenance_rejection(state, "flush cache")) is not None:
+        return rejection
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.flush_futures[request_id] = fut
+    try:
+        await state.send_one(FlushCacheMsg(request_id=request_id, timeout=timeout))
+    except Exception as e:  # noqa: BLE001
+        state.flush_futures.pop(request_id, None)
+        return JSONResponse(
+            {"status": "failed", "error": f"failed to dispatch flush: {e!r}"}, status_code=503
+        )
+    try:
+        reply = await fut
+    finally:
+        state.flush_futures.pop(request_id, None)
+    body = {"status": reply.status}
+    if reply.error is not None:
+        body["error"] = reply.error
+    status_code = {"ok": 200, "timeout": 504}.get(reply.status, 503)
+    return JSONResponse(body, status_code=status_code)
 
 
 def _cache_limits(geo: dict, unit_bytes: dict, pool_budget: int, floors: dict) -> dict:

@@ -14,7 +14,8 @@ addressed by page tables, and sparse attention is a physical-slot gather (see
 """
 
 from .args import DeepseekV4Args, load_args
-from .config import DSV4VisionConfig, parse_config, parse_vision_config
+from .config import DSV4VisionConfig, model_config_from_args, parse_config, parse_vision_config
+from .gguf import iter_gguf_weights, parse_gguf_config, to_gguf
 from .model import DeepseekV4ForCausalLM
 from .vision import DSV4Aligner, DSV4Vision, DSV4VisionTower
 from .weight import iter_expert_pieces, iter_vision_weights, iter_weights
@@ -26,10 +27,14 @@ __all__ = [
     "DSV4VisionConfig",
     "DSV4VisionTower",
     "load_args",
+    "model_config_from_args",
     "parse_config",
+    "parse_gguf_config",
     "parse_vision_config",
     "DeepseekV4ForCausalLM",
+    "iter_gguf_weights",
     "iter_weights",
     "iter_expert_pieces",
     "iter_vision_weights",
+    "to_gguf",
 ]

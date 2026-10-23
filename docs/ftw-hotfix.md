@@ -17,6 +17,9 @@ python scripts/ftw_hotfix.py --ftw ~/models/Qwen3.8-Flash-Next-NVFP4-FTW --sourc
 # Qwen3-VL FTW converted before image input: add the vision encoder (about 1 GiB) from the Hub, in place
 python scripts/ftw_hotfix.py --ftw ~/models/Qwen3-VL-8B-Instruct-FTW --repo Qwen/Qwen3-VL-8B-Instruct
 
+# old GLM-5.2 FTW: restore the fp32 router selection biases from the Hub, in place
+python scripts/ftw_hotfix.py --ftw ~/models/GLM-5.2-NVFP4-FTW --repo nvidia/GLM-5.2-NVFP4
+
 # just show what would change
 python scripts/ftw_hotfix.py --ftw ~/models/GLM-5.2-NVFP4-FTW --dry-run
 ```
@@ -33,13 +36,14 @@ byte range, never the whole checkpoint; `--revision` pins the Hub revision to re
 | `RuntimeError: Unexpected keys ... .weight_scale` | nvidia/GLM-5.2-NVFP4 | dequantize the old runtime-fp8 weights back to bf16 | none |
 | `PLE shard indices are not contiguous 0..N-1: []` | Qwen3.8-Flash-Next (FTWs converted before #420) | write the PLE table as `ple-table-*.safetensors` | 47.7 GiB |
 | `ValueError: ... stores NVFP4 global scales as fp16` | NVFP4 FTWs converted by older builds | none: the fp16 rounding cannot be undone, so the script refuses; reconvert with `ft checkpoint` | - |
+| none: loads, but expert selection uses a bf16-rounded selection bias | nvidia/GLM-5.2-NVFP4 FTWs converted by older builds | restore the fp32 `e_score_correction_bias` from the source and compact every dense shard that held the old values; without `--repo` or `--source` the script only prints a note | about 75 KiB, plus the source's index and shard headers |
 | none: loads, but the output is wrong | Qwen3.5 / Qwen3.6 / Qwen3.8-27B FTWs converted by older builds (norm weights stored as bf16(1 + w)) | none: the script does not detect it; reconvert with `ft checkpoint` | - |
 | `ValueError: ... holds no vision encoder tensors` | image-input families (Qwen3-VL, Qwen3.6, Qwen3.8-Flash-Next, Gemma-4, GLM-5.3-Flash, Muse-Glimmer, MiniMax-M3) converted before the family served images | add the vision encoder: the tower's checkpoint tensors are fetched and the family's own weight reader emits them as the converter would | 1 to 4 GiB |
 
 The script decides by itself: it builds the current model from the FTW's `config.json`, compares
 the FTW index with the tensors the model declares, and applies only the repairs that are needed.
 Before writing anything it checks that the FTW matches the model (shapes, dtypes, byte counts,
-shard files) and refuses one that does not. An FTW that loads as is is left untouched.
+shard files) and refuses one that does not. An FTW that needs no repair is left untouched.
 
 ## What it writes
 

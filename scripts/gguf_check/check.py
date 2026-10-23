@@ -9,6 +9,7 @@ Per file, through the code the server runs:
 - dry load: the model builds on the meta device, and the family's weight reader yields exactly its state dict (names, shapes, packed vs float); the expert banks build for every MoE layer with the shapes the model needs
 - kernels: every quantized ggml type a GGUF linear, embedding or expert bank uses has the ops it needs in the ``probe_kernels.py`` table
 - tokenizer: it builds, the chat template renders, and the file names an EOS token
+- vision: with an ``mmproj`` next to the file (or ``FREETOKEN_MMPROJ``), the tower config, its weights in the dry load, the image processor, and an image message rendering the processor's placeholder
 
 The weight reader runs on meta tensors, so no weight bytes are read or copied. A reader that needs real values (a numpy dequant) gets a second run on the real bytes, once enough RAM is free.
 The files can be real or ``fetch_headers.py`` stubs. Passing does not prove the weights are right or that the model fits in memory.
@@ -148,12 +149,14 @@ def _prod(dims) -> int:
 
 def _clear_caches() -> None:
     """Drop the caches that hold a file's metadata, config or rope tables."""
+    import freetoken.models.gguf.config as gguf_config
+    import freetoken.models.gguf.mmproj as mmproj
     import freetoken.models.gguf.reader as reader
     from freetoken.layers import rotary
     from freetoken.utils import hf
 
     for fn in (reader._reader, reader.load_gguf_metadata, reader.gguf_split_paths, reader.gguf_tensor_index,
-               rotary.get_rope, rotary._cos_sin_table, hf._load_hf_config):
+               rotary.get_rope, rotary._cos_sin_table, hf._load_hf_config, mmproj._find, mmproj.log_mmproj, gguf_config._mm_fields):
         fn.cache_clear()
 
 
@@ -181,18 +184,17 @@ def _init_worker(kernels: dict | None, in_flight, min_free_gb: float) -> None:
 
 
 def _build_model(path: str):
-    """The engine's config and the model it builds for ``path`` (experts offloaded), on the meta device."""
+    """The engine's config and the model it builds for ``path`` (experts offloaded, encoders the file serves), on the meta device."""
     import torch
 
     from freetoken.distributed import try_get_tp_info
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
-    from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
+    from freetoken.mm.config import MultimodalConfig
     from freetoken.models import create_model
     from freetoken.utils.torch_utils import torch_dtype
 
-    config = EngineConfig(model_path=path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload",
-                          mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+    config = EngineConfig(model_path=path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy="offload", mm=MultimodalConfig())
     object.__setattr__(config.model_config, "moe_strategy", "offload")
     object.__setattr__(config.model_config, "decode_target", _decode_target(config))
     with torch.device("meta"), torch_dtype(torch.bfloat16):
@@ -331,10 +333,12 @@ def _dry_load(path: str, config, model, *, meta: bool) -> list[str]:
     spec = config.model_spec
     expected = model.state_dict()
     problems, seen = [], set()
+    # the same keyword the engine passes, only to families that register an encoder
+    kwargs = {"include_vision": bool(config.active_encoders)} if spec.encoders else {}
     _swap_readers(meta)
     try:
         with _meta_wins()() if meta else contextlib.nullcontext():
-            for key, t in _load_attr(spec.module, spec.iter_weights)(path, torch.device("cpu"), include_moe_experts=False, include_non_moe=True):
+            for key, t in _load_attr(spec.module, spec.iter_weights)(path, torch.device("cpu"), include_moe_experts=False, include_non_moe=True, **kwargs):
                 ref = expected.get(key)
                 if ref is None:
                     problems.append(f"unexpected tensor {key}")
@@ -398,6 +402,28 @@ def _check_tokenizer(path: str) -> dict:
     return {"problems": problems, "eos": eos, "template_tail": tail}
 
 
+def _check_vision(path: str) -> tuple[dict, list[str]]:
+    """The mmproj in use, and problems of the image processor and of an image message in the chat template."""
+    from freetoken.mm.processor import get_mm_processor
+    from freetoken.models.gguf.mmproj import find_mmproj
+    from freetoken.models.gguf.tokenizer import load_gguf_tokenizer
+
+    mm = find_mmproj(path)
+    info = {"mmproj": mm.path, "source": mm.source, "projector": mm.projector, "type": mm.weight_type}
+    problems = []
+    processor = get_mm_processor(path)
+    processor._image_processor()
+    tok = load_gguf_tokenizer(path)
+    if tok.chat_template is not None:
+        message = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "hi"}]}]
+        text = tok.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+        ids = tok.encode(text, add_special_tokens=False)
+        n = len(processor.placeholder)
+        if not any(list(ids[i : i + n]) == processor.placeholder for i in range(len(ids) - n + 1)):
+            problems.append(f"chat template: an image message renders no image placeholder {processor.placeholder}")
+    return info, problems
+
+
 def check(path: str) -> dict:
     from freetoken.models.gguf.config import GGUF_ARCH_TO_REGISTRY
     from freetoken.models.gguf.reader import gguf_architecture, load_gguf_metadata
@@ -436,6 +462,9 @@ def check(path: str) -> dict:
                 _TOKENIZERS[key] = {"problems": [f"tokenizer: {type(e).__name__}: {str(e)[:200]}"]}
         tok = _TOKENIZERS[key]
         problems.extend(tok["problems"])
+        if config.active_encoders:
+            out["vision"], vision_problems = _check_vision(path)
+            problems.extend(vision_problems)
         out["tokenizer"] = {"hash": key, "pre": meta.get("tokenizer.ggml.pre"), "eos": tok.get("eos"), "template_tail": tok.get("template_tail")}
     except Exception as e:
         problems.append(f"{type(e).__name__}: {str(e)[:300]}")

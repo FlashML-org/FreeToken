@@ -37,6 +37,14 @@ _BOS_PRE = frozenset((
 # Llama 3 and GLM pre-tokenizers, whose HF tokenizer and llama.cpp take a word that is one vocabulary token as is instead of merging it
 _IGNORE_MERGES_PRE = frozenset(("llama3", "llama-v3", "llama-bpe", "glm4", "glm5"))
 
+# DeepSeek-V4's pre-tokenizer (llama.cpp spells it "joyai-llm"; transformers maps no split
+# for it): the three splits of the model's own tokenizer.json, in order
+_JOYAI_LLM_SPLITS = (
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r'''[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+''',
+)
+
 
 def _add_bos(meta: dict) -> bool:
     if "tokenizer.ggml.add_bos_token" in meta:
@@ -94,7 +102,7 @@ def load_gguf_tokenizer(model_path: str):
     from tokenizers.pre_tokenizers import ByteLevel
     from tokenizers import AddedToken
 
-    arch, converter_tok_dict, _ = get_gguf_tokenizer(model_path)
+    arch, converter_tok_dict, special = get_gguf_tokenizer(model_path)
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
     tok_dict: dict[str, Any] = {
@@ -125,6 +133,7 @@ def load_gguf_tokenizer(model_path: str):
     # checkpoints can carry the same marker but use their own SentencePiece-compatible
     # converter; only Qwen GPT2/BPE vocabularies belong in this custom ByteLevel path.
     hf_nvfp4 = arch.startswith("qwen") and tok_dict.get("model") == "gpt2"
+    pre = meta.get("tokenizer.ggml.pre") if tok_dict.get("model") == "gpt2" else None
     if hf_nvfp4:
         # The embedded Qwen vocabulary is GPT-2 byte-level BPE. Treating it like a
         # SentencePiece vocabulary turns spaces into the fallback unknown token.
@@ -148,6 +157,7 @@ def load_gguf_tokenizer(model_path: str):
         fast.add_special_tokens([AddedToken(token, special=True) for token in _QWEN_ADDED_TOKENS])
     else:
         fast, _extra = convert_gguf_tokenizer(arch, converter_tok_dict)
+        fast = _fix_added_tokens(fast, meta)
         # Gemma's vocabulary uses SentencePiece's U+2581 word marker. Some versions of
         # the GGUF converter build the tokenizer model but leave a byte/BPE-style decoder
         # attached, exposing ``▁`` and replacement characters in generated text. Restore
@@ -155,15 +165,39 @@ def load_gguf_tokenizer(model_path: str):
         if tok_dict.get("model") != "gpt2":
             fast.decoder = Metaspace()
 
+    if pre in ("glm4", "glm5"):
+        from tokenizers import Regex, pre_tokenizers
+        from transformers.integrations.gguf.gguf_tokenizer_mapping import GGUF_PRE_TOKENIZER_SPLITS
+
+        fast.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.Split(Regex(GGUF_PRE_TOKENIZER_SPLITS["llama3"]), behavior="isolated"),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ])
+    elif pre in ("qwen2", "qwen35"):
+        from tokenizers import normalizers
+
+        fast.normalizer = normalizers.NFC()
+    elif pre == "joyai-llm":
+        from tokenizers import Regex, pre_tokenizers
+
+        fast.pre_tokenizer = pre_tokenizers.Sequence(
+            [pre_tokenizers.Split(Regex(r), behavior="isolated") for r in _JOYAI_LLM_SPLITS]
+            + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)]
+        )
+    if pre in _IGNORE_MERGES_PRE:
+        fast.model.ignore_merges = True
+
     # gemma4 chat turns end with <turn|>; prefer it as eos so chat generation halts
     # (the formal <eos> is also a stop id, see gguf_eos_token_ids).
-    turn_end = "<turn|>" if "<turn|>" in tokens else None
+    special = _known_specials(special, fast)
+    turn_end = "<turn|>" if arch == "gemma4" and "<turn|>" in tokens else None
+    if turn_end is not None:
+        special["eos_token"] = turn_end
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=fast,
-        bos_token=tok_for("bos_token_id", "<bos>"),
-        eos_token=turn_end or tok_for("eos_token_id", "<eos>"),
-        unk_token=unknown_token,
-        pad_token=tok_for("padding_token_id", "<pad>"),
+        **special,
+        add_bos_token=_add_bos(meta),
+        add_eos_token=bool(meta.get("tokenizer.ggml.add_eos_token")),
     )
     if not hf_nvfp4 and tok_dict.get("model") != "gpt2":
         # Reassign after the HF wrapper is built as well. The GGUF converter and some

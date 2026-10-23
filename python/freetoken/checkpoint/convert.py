@@ -220,8 +220,12 @@ def convert_checkpoint(
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
     dense_bytes = 0
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    # an FTW keeps only a GGUF's text metadata, so it cannot build an mmproj tower
+    include_vision = gguf_config_source(model_path) is None
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
-                                              include_moe_experts=include_moe_experts),
+                                              include_moe_experts=include_moe_experts, include_vision=include_vision),
                                   "Converting dense weights"):
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1

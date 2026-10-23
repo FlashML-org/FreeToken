@@ -292,7 +292,11 @@ setup(
                 sources=[
                     "python/freetoken/kernel/csrc/row_store/row_store_ext.cpp",
                 ],
+                include_dirs=runtime_include_dirs if IS_ROCM else [],
+                library_dirs=runtime_library_dirs if IS_ROCM else [],
+                libraries=[runtime_lib] if IS_ROCM else [],
                 extra_compile_args=["-O3", "-std=c++20"],
+                extra_link_args=runtime_link_args if IS_ROCM else [],
             )
         ] if sys.platform == "linux" else []),
         *ggml_cpu_modules,

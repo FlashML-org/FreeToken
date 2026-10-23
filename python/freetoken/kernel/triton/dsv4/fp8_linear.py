@@ -33,6 +33,7 @@ from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
     e4m3_native_cx,
     e4m3_u8_to_f32,
+    f32_to_e4m3,
     round_e4m3,
 )
 
@@ -74,7 +75,7 @@ def _act_quant_fp8_kernel(
     s = tl.exp2(e.to(tl.float32))
     y = tl.clamp(x / s[:, None], -448.0, 448.0)
     if e4m3_native_cx():
-        y = y.to(tl.float8e4nv)
+        y = f32_to_e4m3(y)
     else:
         y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
     tl.store(
@@ -133,7 +134,7 @@ def _act_quant_inplace_kernel(
     if FP4:
         q = _round_fp4(q)
     elif e4m3_native_cx():
-        q = q.to(tl.float8e4nv).to(tl.float32)
+        q = f32_to_e4m3(q).to(tl.float32)
     else:
         q = round_e4m3(q)
     optrs = o_ptr + offs_m[:, None] * stride_om + offs_k[None, :] * stride_on
@@ -344,7 +345,7 @@ def _fp8_gemv_kernel(
                     sa = tl.exp2(_log2_ceil(amax * (1.0 / 448.0)).to(tl.float32))  # [NSLAB]
                     q = tl.clamp(xs / sa[:, None], -448.0, 448.0)
                     if e4m3_native_cx():
-                        q = q.to(tl.float8e4nv).to(tl.float32)
+                        q = f32_to_e4m3(q).to(tl.float32)
                     else:
                         q = round_e4m3(q).to(tl.float32)
                 else:

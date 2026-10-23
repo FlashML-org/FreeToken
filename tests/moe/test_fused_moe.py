@@ -369,3 +369,52 @@ def test_fused_topk_softmax_is_cuda_graph_capturable():
     torch.cuda.synchronize()
     assert (ids[:3] != -1).all()
     assert (ids[3:] == -1).all()
+
+
+def _reference_sigmoid_topk(logits, bias, topk, renormalize, scale, n_group, topk_group, num_token_non_padded):
+    """The torch routing of the GLM / MiniMax MoE blocks: sigmoid, bias for selection only, optional group-limited top-k."""
+    scores = logits.float().sigmoid()
+    choice = scores + bias.float()
+    if n_group > 1:
+        m, e = choice.shape
+        group_scores = choice.view(m, n_group, e // n_group).topk(2, dim=-1)[0].sum(dim=-1)
+        group_idx = torch.topk(group_scores, topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1.0).bool()
+        choice = choice.masked_fill(~group_mask.repeat_interleave(e // n_group, dim=1), float("-inf"))
+    _, ids = torch.topk(choice, topk, dim=-1)
+    weights = scores.gather(-1, ids)
+    if renormalize:
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    ids = ids.to(torch.int32)
+    ids[torch.arange(ids.shape[0], device=ids.device) >= num_token_non_padded] = -1
+    return weights * scale, ids
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_tokens", [1, 7, 2048])
+@pytest.mark.parametrize(
+    "num_experts,topk,n_group,topk_group,renormalize,scale",
+    [
+        (128, 8, 1, 1, True, 1.0),  # GLM-4.5-Air
+        (160, 8, 1, 1, True, 2.5),  # GLM-4.7
+        (288, 8, 1, 1, True, 2.5),  # GLM-5.3-Flash
+        (128, 4, 1, 1, True, 2.0),  # MiniMax-M3
+        (256, 8, 8, 4, True, 2.5),  # DeepSeek-V3 group-limited top-k
+        (96, 6, 3, 2, False, 1.0),  # odd group count, no renormalization
+    ],
+)
+def test_fused_topk_sigmoid_matches_torch_reference(num_tokens, num_experts, topk, n_group, topk_group, renormalize, scale):
+    from freetoken.kernel.triton.moe_router import fused_topk_sigmoid
+
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens * 31 + num_experts * 7 + topk)
+    logits = torch.randn(num_tokens, num_experts, generator=gen, device="cuda")
+    bias = torch.randn(num_experts, generator=gen, device="cuda") * 0.1
+    limit = torch.tensor(max(1, num_tokens - 3), dtype=torch.int32, device="cuda")
+
+    weights, ids = fused_topk_sigmoid(logits, bias, topk, renormalize, scale, n_group, topk_group, limit)
+    ref_w, ref_i = _reference_sigmoid_topk(logits, bias, topk, renormalize, scale, n_group, topk_group, limit)
+
+    assert weights.dtype == torch.float32 and ids.dtype == torch.int32
+    assert torch.equal(ids, ref_i)
+    torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)

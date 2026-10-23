@@ -1,2 +1,16 @@
 amd:
   - '/\b(ROCm|HIP|RCCL|RDNA\s?\d?|CDNA\s?\d?|gfx\d{3,4}[a-z]?|MI\d{3}X?|RX\s?\d{4}|Radeon(?!\s*(\d{3}M|Graphics|Vega))|AMD[\s-]*(GPUs?|graphics|cards?|Instinct))\b|\bAMD[\s-]*显卡|\(amd\)|(?<!\w)A卡/i'
+perf:
+  - '/^perf(\([^)]*\))?!?:/i'
+gguf:
+  - '/\b(gguf|ggml|mmproj|I?Q[1-8]_K(_[SMLX]{1,2})?|IQ[1-4]_(XXS|XS|NL|S|M))\b/i'
+documentation:
+  - '/^docs(\([^)]*\))?!?:/i'
+refactor:
+  - '/^refactor(\([^)]*\))?!?:/i'
+multimodal:
+  - '/\b(multi-?modal|vision|VLM?|ViT|(?<!(kernel|docker|container)\s)images?|video|audio|mmproj|omni)\b|多模态|图片|视觉/i'
+multi-gpu:
+  - '/\b(multi[- ]?GPUs?|(tensor|pipeline|expert)[- ]parallel(ism)?|NCCL|NVLink(?!-C2C)|TP|\d\s?[x×]\s?(RTX|GPUs?|A100|H100|H200|B200|3090|4090|5090)|dual[- ]GPUs?)\b|多卡|双卡/i'
+legacy-gpu:
+  - '/\b(pre-?sm_?(70|75|80)|sm_?([356]\d|7[05])|Turing|Volta|Pascal|Maxwell|V100|P100|P40|T4|GTX\s?1[06]\d0|RTX\s?20[5-8]0|Titan\s?[VX]p?|Quadro)\b/i'

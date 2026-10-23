@@ -243,7 +243,10 @@ class Glm5NextDSABackend(DSAAttnBackend):
             md.sel.clear()
             md.sel[layer_id] = (sel, cnt)
         sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+        if q_pe.shape[-1] == 0:  # NoPE: the cat would be a full-width copy
+            q_cat = q_nope.unsqueeze(1)
+        else:
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
         o = self._attend(q_cat, layer_id, sel, cnt)
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 

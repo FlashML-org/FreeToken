@@ -2,7 +2,8 @@
 
 Boots ``ft serve`` on a small checkpoint and drives POST /v1/cache/rebuild for real: the whole
 chain of HTTP route -> control message -> scheduler idle gate -> engine teardown -> pool resize
--> page-table refresh -> CUDA-graph re-capture, then checks the server still generates.
+-> page-table refresh -> CUDA-graph re-capture, then checks the server still generates. The same
+boot also drives /v1/cache/flush, which drops the prefix cache without touching the pools.
 
 This is the primary gate for the rebuild path. The destructive orchestration has no in-process
 seam worth stubbing -- what matters is that a rebuild lands on a live engine and the server keeps
@@ -131,6 +132,7 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
             "--host", "127.0.0.1",
             "--port", str(port),
             "--num-pages", str(BOOT_PAGES),
+            "--enable-cache-report",
         ],
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -143,6 +145,27 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
         geometry = _get(base, "/v1/cache/status")["geometry"]
         assert geometry["num_pages"] == BOOT_PAGES
         assert _generate(base)  # a baseline generation, before anything is torn down
+
+        # 0. Flush the prefix cache. Long enough for a hybrid model to snapshot a reusable prefix.
+        chat = {
+            "model": "rebuild-test",
+            "messages": [{"role": "user", "content": "Summarize in one word: " + "the cache keeps every prompt it has seen. " * 40}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        code, cold = _post(base, "/v1/chat/completions", chat)
+        assert code == 200, cold
+        code, warm = _post(base, "/v1/chat/completions", chat)
+        assert code == 200, warm
+        assert warm["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+        code, reply = _post(base, "/v1/cache/flush", {})
+        assert (code, reply["status"]) == (200, "ok"), reply
+        code, flushed = _post(base, "/v1/chat/completions", chat)
+        assert code == 200, flushed
+        assert "prompt_tokens_details" not in flushed["usage"]  # nothing left to hit
+        # A cold run after the flush computes exactly what the cold run before it did.
+        assert flushed["choices"][0]["message"]["content"] == cold["choices"][0]["message"]["content"]
 
         # 1. Grow the KV pool. The reply carries the geometry the engine actually landed on.
         code, reply = _post(base, "/v1/cache/rebuild", {"num_pages": GROWN_PAGES})

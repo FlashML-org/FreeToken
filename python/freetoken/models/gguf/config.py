@@ -9,24 +9,52 @@ the raw GGUF metadata dict, and a few derived facts that need the tensor table
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import functools
+import importlib
+from dataclasses import dataclass, field
 from typing import Any
 
-from .reader import GGML_NVFP4, GGUF_FORMAT_KV, gguf_architecture, load_gguf_metadata, gguf_tensor_names
+from .mmproj import Mmproj, find_mmproj, warn_inline_vision
+from .reader import (
+    GGML_NVFP4,
+    GGUF_FORMAT_KV,
+    gguf_architecture,
+    load_gguf_metadata,
+    gguf_tensor_names,
+)
 
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
 # reuses the model classes but a GGUF parse_config / iter_weights).
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
+    "deepseek4": "DeepseekV4GGUFForCausalLM",
     "gemma4": "Gemma4GGUFForCausalLM",
-    "qwen3": "Qwen3ForCausalLM",
-    "qwen3_moe": "Qwen3MoeForCausalLM",
-    "qwen3_5_moe": "Qwen3_5MoeForCausalLM",
-    "qwen3_5": "Qwen3_5MoeForCausalLM",
-    "qwen35moe": "Qwen3_5MoeForCausalLM",
+    "glm4moe": "Glm4MoeGGUFForCausalLM",
+    # glm5-next: the llama.cpp spelling; glm5next: unsloth's first release
+    "glm5-next": "Glm5NextGGUFForCausalLM",
+    "glm5next": "Glm5NextGGUFForCausalLM",
+    "llama": "LlamaGGUFForCausalLM",
+    "minimax-m2": "MiniMaxM2GGUFForCausalLM",
+    "minimax-m3": "MiniMaxM3GGUFForCausalLM",
+    "muse-glimmer": "MuseGlimmerGGUFForCausalLM",
+    "qwen2": "Qwen2GGUFForCausalLM",
+    "qwen3": "Qwen3GGUFForCausalLM",
+    "qwen3moe": "Qwen3MoeGGUFForCausalLM",
+    "qwen35": "Qwen3_5GGUFForCausalLM",
+    "qwen35moe": "Qwen3_5MoeGGUFForCausalLM",
+    "qwen3vl": "Qwen3VLGGUFForCausalLM",
+    "qwen3vlmoe": "Qwen3VLMoeGGUFForCausalLM",
+    "qwen4exp": "Qwen4ExpGGUFForCausalLM",
+    "qwen3_moe": "Qwen3MoeGGUFForCausalLM",
+    "qwen3_5_moe": "Qwen3_5MoeGGUFForCausalLM",
+    "qwen3_5": "Qwen3_5MoeGGUFForCausalLM",
+}
+# (GGUF architecture, mmproj projector) -> registry key, for text GGUFs whose release is told apart only by its mmproj
+GGUF_MMPROJ_TO_REGISTRY: dict[tuple[str, str], str] = {
+    ("gemma4", "gemma4uv"): "Gemma4UnifiedGGUFForCausalLM",
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class GgufConfigShim:
     architectures: list[str]
     model_path: str
@@ -34,6 +62,16 @@ class GgufConfigShim:
     metadata: dict[str, Any]
     vocab_size: int
     tie_word_embeddings: bool
+    # HF config.json keys the family derives for its encoders (vision_config, image_token_id, ...), read as attributes like a HF config
+    hf_fields: dict[str, Any] = field(default_factory=dict)
+    # the encoder's preprocessor_config.json; None without an encoder
+    preprocessor_config: dict[str, Any] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        from freetoken.utils.hf import RawConfigShim
+
+        # __dict__ lookup: copy.copy probes attributes before the fields exist
+        return getattr(RawConfigShim(self.__dict__.get("hf_fields") or {}), name)
 
     @property
     def is_hf_nvfp4(self) -> bool:
@@ -59,6 +97,7 @@ class GgufConfigShim:
             "torch_dtype": "bfloat16",
             "vocab_size": self.vocab_size,
             "tie_word_embeddings": self.tie_word_embeddings,
+            **self.hf_fields,
         }
 
 
@@ -77,6 +116,19 @@ def _vocab_size(model_path: str) -> int:
     raise ValueError(f"GGUF {model_path}: no token_embd.weight to size the vocab")
 
 
+@functools.cache
+def _mm_fields(module: str, model_path: str, mmproj: Mmproj, vocab_size: int) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    return importlib.import_module(module).gguf_mm_config(load_gguf_metadata(model_path), mmproj, vocab_size)
+
+
+def mm_fields(model_path: str, mmproj: Mmproj) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The HF config keys and the preprocessor config that the family of the text GGUF ``model_path`` derives from ``mmproj``."""
+    from freetoken.models.register import get_model_spec
+
+    spec = get_model_spec(GGUF_ARCH_TO_REGISTRY[gguf_architecture(model_path)])
+    return _mm_fields(spec.module, model_path, mmproj, _vocab_size(model_path))
+
+
 def build_gguf_shim(model_path: str) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
     names = gguf_tensor_names(model_path)
@@ -88,6 +140,7 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
             f"GGUF architecture {arch!r} is not supported "
             f"(known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
         )
+    warn_inline_vision(model_path, names)
     metadata = load_gguf_metadata(model_path)
     if names:
         # No separate output projection -> embeddings are tied.
@@ -104,14 +157,24 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
                 "reconvert the checkpoint with the current freetoken.checkpoint.convert"
             )
         tie_word_embeddings = not present
+    from freetoken.models.register import get_model_spec
+
+    vocab_size = _vocab_size(model_path)
+    spec = get_model_spec(registry_key)
+    mmproj = find_mmproj(model_path) if spec.encoders else None
+    if mmproj is not None:
+        registry_key = GGUF_MMPROJ_TO_REGISTRY.get((arch, mmproj.projector), registry_key)
+    hf_fields, preprocessor_config = ({}, None) if mmproj is None else mm_fields(model_path, mmproj)
     return GgufConfigShim(
         architectures=[registry_key],
         model_path=model_path,
         model_type=arch,
         metadata=metadata,
-        vocab_size=_vocab_size(model_path),
+        vocab_size=vocab_size,
         tie_word_embeddings=tie_word_embeddings,
+        hf_fields=hf_fields,
+        preprocessor_config=preprocessor_config,
     )
 
 
-__all__ = ["GgufConfigShim", "GGUF_ARCH_TO_REGISTRY", "build_gguf_shim"]
+__all__ = ["GgufConfigShim", "GGUF_ARCH_TO_REGISTRY", "GGUF_MMPROJ_TO_REGISTRY", "build_gguf_shim"]

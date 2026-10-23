@@ -9,6 +9,7 @@ FTW index against the tensors that model declares, and repairs the differences:
 - renames (DeepSeek-V4: the dense tree moved under ``model.`` and ``.scale`` became ``.weight_scale_inv``)
 - fp8 weights the current model declares as bf16 (old runtime fp8 residue) are dequantized, their ``.weight_scale`` dropped
 - tensors the model declares but the FTW lacks (``input_scale``) are fetched from the HF repo by byte range
+- router selection biases an older build rounded to bf16 (GLM-5.2) are restored in fp32 from the source checkpoint
 - an FTW converted before its family served images gets its vision encoder: the tower's checkpoint tensors are fetched into a scratch checkpoint dir and the family's own weight reader emits them under the names the FTW needs
 - a Qwen3.8-Flash-Next FTW without the PLE n-gram table gets it written as ``ple-table-*.safetensors``
 
@@ -63,6 +64,7 @@ _PLE_SHARD_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
 _PLE_FILE_RE = re.compile(r"^ple-table-\d{5}\.safetensors$")
 _PLE_FILE_BYTES = 4 << 30
+_BIAS_SUFFIX = ".e_score_correction_bias"
 # tensors an old FTW may carry that the text model does not declare; they are kept and never count as errors
 _IGNORED_PREFIXES = VISION_KEY_PREFIXES
 _VERBOSE = False
@@ -233,6 +235,40 @@ def plan(arch: str, entries: list[dict], expected: dict, name_map: NameMap, quan
 
     leftovers = [n for n in names if n not in expected and n not in drops]
     return renames, dequants, fetches, drops, leftovers
+
+
+def rounded_biases(entries: list[dict], expected: dict, renames: dict[str, str]) -> dict[str, dict]:
+    """Router selection biases the FTW stores narrower than the fp32 the model reads; the rounding can change the selected experts."""
+    out: dict[str, dict] = {}
+    for e in entries:
+        name = renames.get(e["name"], e["name"])
+        exp = expected.get(name)
+        if (e["kind"] == "weight" and name.endswith(_BIAS_SUFFIX) and exp is not None and exp[1] == torch.float32
+                and _dtype_of(e["dtype"]) in (torch.bfloat16, torch.float16)):
+            out[name] = e
+    return out
+
+
+def resolve_biases(biases: dict[str, dict], source: TensorSource, ftw_dir: str, index: dict) -> tuple[dict[str, torch.Tensor], int, list[str]]:
+    """Fetch the fp32 source tensor of each rounded bias; a source that stores it narrow too has nothing to restore."""
+    restored: dict[str, torch.Tensor] = {}
+    same, errors = 0, []
+    for n, e in biases.items():
+        # GLM checkpoints keep the bias under the router gate; the readers drop the ``gate.``
+        names = [n, n[: -len(_BIAS_SUFFIX)] + ".gate" + _BIAS_SUFFIX]
+        src = next((c for c in names if source.has(c)), None)
+        if src is None:
+            errors.append(f"no source tensor for {n}: tried {names}")
+        elif source.meta(src)["dtype"] != "F32":
+            same += 1
+        else:
+            t = source.get(src)
+            # the FTW must hold this very tensor, rounded; anything else means a different source checkpoint
+            if torch.equal(t.to(_dtype_of(e["dtype"])), read_entry(ftw_dir, index, e)):
+                restored[n] = t
+            else:
+                errors.append(f"{src} in the source does not round to the FTW's {n}; pass the checkpoint this FTW was converted from")
+    return restored, same, errors
 
 
 def resolve_fetches(fetches, source: TensorSource) -> tuple[dict[str, tuple[list[str], bool]], list[str]]:
@@ -813,6 +849,8 @@ def main(argv: list[str] | None = None) -> int:
     log(f"{arch}: model declares {len(expected)} dense tensors")
     source = TensorSource(ns.repo, ns.source, ns.revision) if (ns.repo or ns.source) else None
     renames, dequants, fetches, drops, leftovers = plan(arch, index["tensors"], expected, name_map, quant)
+    # only the old GLM-5.2 reader rounded the bias; other families store it as the checkpoint does
+    biases = rounded_biases(index["tensors"], expected, renames) if arch == "GlmMoeDsaForCausalLM" else {}
     # the encoder comes from the family reader, not from by-name fetches
     vision_missing = sorted(n for n, *_ in fetches if is_vision(n))
     fetches = [f for f in fetches if not is_vision(f[0])]
@@ -823,6 +861,10 @@ def main(argv: list[str] | None = None) -> int:
     ple_status, ple_detail, ple_files = chk["ple"]
     need_ple = ple_status in ("missing", "partial")
     next_num, orphans = shard_numbers(ns.ftw, index)
+    bias_vals: dict[str, torch.Tensor] = {}
+    bias_same, bias_errors = 0, []
+    if biases and source is not None and not problems:
+        bias_vals, bias_same, bias_errors = resolve_biases(biases, source, ns.ftw, index)
 
     print(f"{arch}: {len(expected)} expected dense tensors, FTW has {sum(e['kind'] == 'weight' for e in index['tensors'])}")
     print(f"  renames {len(renames)}  dequantize {len(dequants)}  fetch {len(fetches)}  drop {len(drops)}  leftover {len(leftovers)}"
@@ -842,7 +884,7 @@ def main(argv: list[str] | None = None) -> int:
     for n in leftovers[:8]:
         print(f"    leftover (not declared by the model): {n}")
     if orphans:
-        removing = not ns.out and bool(renames or dequants or fetches or drops or need_ple or dirty)
+        removing = not ns.out and bool(renames or dequants or fetches or vision_missing or bias_vals or drops or need_ple or dirty)
         print(f"  note: {len(orphans)} shard file(s) not referenced by the index, left by an interrupted run"
               + (", will be removed: " if removing else ", left as is: ") + str(orphans[:3]))
 
@@ -868,6 +910,16 @@ def main(argv: list[str] | None = None) -> int:
         for msg in errors:
             print(f"ERROR: {msg}", file=sys.stderr)
             bad = True
+    if biases and source is None:
+        print(f"  note: {len(biases)} router selection biases (e.g. {next(iter(biases))}) are stored narrower than the fp32 the model reads; "
+              "rerun with --repo or --source to restore them")
+    for msg in bias_errors:
+        print(f"ERROR: {msg}", file=sys.stderr)
+        bad = True
+    if bias_vals:
+        print(f"  restore {len(bias_vals)} router selection biases in fp32 from the source")
+    if bias_same:
+        print(f"  {bias_same} router selection biases are narrow in the source as well; nothing to restore")
     # the converter transforms most tensors on the way in (norm offsets, fusion, packing); only the
     # activation scale scalars are stored as the checkpoint has them, so only they can be fetched raw
     unfetchable = [n for n, *_ in fetches if not n.endswith(".input_scale")]
@@ -905,7 +957,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"ERROR: {n}: reader shape {list(tower[n].shape)} != model shape {list(expected[n][0])}", file=sys.stderr)
             return 2
 
-    replaced = dequant_names | set(fetch_srcs) | set(vision_missing)
+    replaced = dequant_names | set(fetch_srcs) | set(vision_missing) | set(bias_vals)
     keep: list[tuple[dict, str]] = []
     for e in index["tensors"]:
         name = renames.get(e["name"], e["name"]) if e["kind"] == "weight" else e["name"]
@@ -932,7 +984,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  disk: about {need / 2**30:.1f} GiB needed under {work} ({free / 2**30:.1f} GiB free)")
     if ns.dry_run:
         return 0
-    if not (renames or dequants or fetch_srcs or vision_missing or drops or need_ple or dirty or ns.out):
+    if not (renames or dequants or fetch_srcs or vision_missing or bias_vals or drops or need_ple or dirty or ns.out):
         print("nothing to do; the FTW loads as is")
         return 0
     if free < need + (1 << 30):
@@ -958,9 +1010,12 @@ def main(argv: list[str] | None = None) -> int:
                 vals = [1.0 / v for v in vals]
             # a fused projection shares one activation scale; the reader takes the max over its parts
             w.add_tensor(n, torch.stack(vals).max().reshape(()))
+        for n, t in bias_vals.items():
+            log(f"  restore {n} in fp32")
+            w.add_tensor(n, t)
 
     hotfix = {"from": os.path.abspath(ns.ftw), "renamed": len(renames), "dequantized": len(dequants),
-              "fetched": len(fetch_srcs) + len(vision_missing), "dropped": len(drops), "compacted": 0, "source": ns.repo or ns.source}
+              "fetched": len(fetch_srcs) + len(vision_missing), "restored": len(bias_vals), "dropped": len(drops), "compacted": 0, "source": ns.repo or ns.source}
     compacted = 0
     if ns.out:
         log(f"--out: writing a fresh FTW -> {work}")
@@ -994,7 +1049,7 @@ def main(argv: list[str] | None = None) -> int:
             os.remove(os.path.join(work, f))
         new_entries: list[dict] = []
         new_shards: list[dict] = []
-        if dequants or fetch_srcs or vision_missing:
+        if dequants or fetch_srcs or vision_missing or bias_vals:
             log(f"in place: appending shard {_SHARD_FMT.format(next_num)} -> {work}")
             w = ShardWriter(work, index["shard_limit"], first_shard=next_num, global_off=index["total_bytes"])
             try:
@@ -1013,7 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
         if renames or new_entries or drops:
             # rollback stays possible only while no shard gets replaced: keep the old index then
             bak = os.path.join(work, INDEX_NAME + ".bak")
-            if not drops and not dirty and not os.path.exists(bak):
+            if not drops and not dirty and not bias_vals and not os.path.exists(bak):
                 shutil.copy2(os.path.join(work, INDEX_NAME), bak)
             write_index(work, new_index)
             log(f"index written: {os.path.join(work, INDEX_NAME)}")

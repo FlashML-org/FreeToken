@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -18,6 +19,8 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
+    FlushCacheBackendMsg,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -120,6 +123,8 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
+        self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -227,6 +232,7 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -238,6 +244,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        self._check_pending_flush()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -272,6 +279,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -283,6 +291,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        self._check_pending_flush()
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -616,6 +625,8 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, FlushCacheBackendMsg):
+            self._handle_flush(msg)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -736,6 +747,43 @@ class Scheduler(SchedulerIOMixin):
         # mistaken for a rebuild failure and roll back the geometry the engine now serves.
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
+
+    def _handle_flush(self, msg: FlushCacheBackendMsg) -> None:
+        # Same idle/timeout contract as sglang's /flush_cache. Even timeout=0 waits for this iteration's safe point.
+        if self.config.tp_info.size > 1:
+            # each rank checks the deadline on its own clock, so a deferred flush could run on only some ranks
+            self._reply_flush(msg.request_id, "unsupported", "cache flush unsupported under TP > 1")
+        elif self._pending_flush is not None:
+            self._reply_flush(msg.request_id, "busy", "another cache flush is already waiting")
+        else:
+            self._pending_flush = (msg, time.monotonic() + msg.timeout)
+
+    def _check_pending_flush(self) -> None:
+        """Run the pending flush once the scheduler is fully idle, or fail it at its deadline."""
+        if self._pending_flush is None:
+            return
+        msg, deadline = self._pending_flush
+        if self._last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._pending_flush = None
+            freed = self.cache_manager.flush()
+            self.cache_manager.check_integrity()
+            logger.info_rank0(f"Cache flushed: {freed} prefix-cache tokens freed")
+            self._reply_flush(msg.request_id, "ok")
+        elif time.monotonic() >= deadline:
+            self._pending_flush = None
+            error = (
+                "scheduler is not idle: "
+                f"{len(self.prefill_manager.pending_list)} queued, "
+                f"{len(self.decode_manager.running_reqs)} running"
+                + (", last batch still in flight" if self._last_data is not None else "")
+            )
+            logger.warning_rank0(f"Cache not flushed, {error}")
+            self._reply_flush(msg.request_id, "timeout" if msg.timeout > 0 else "busy", error)
+
+    def _reply_flush(self, request_id: str, status: str, error: str | None = None) -> None:
+        self.send_result([FlushCacheResultMsg(request_id=request_id, status=status, error=error)])
 
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and

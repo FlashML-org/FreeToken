@@ -97,7 +97,9 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             hidden_size=args.dim,
             intermediate_size=args.moe_inter_dim,
             renormalize=True,
-            activation="silu",
+            # the clamped SwiGLU the reference runs (up to +-limit, gate to max limit); the
+            # GGUF MoE path keys on this name and plain "silu" would drop the clamp
+            activation="swiglu_clamp",
             limit=args.swiglu_limit,
             strategy=strategy,
             decode_target=decode_target,

@@ -1,3 +1,4 @@
+#include <freetoken/pinned.h>
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -114,9 +115,10 @@ struct IndexKernel {
     auto weights_dtype_ = SymbolicDType{};
     auto indices_dtype_ = SymbolicDType{};
 
+    // the table may live in pinned host memory, read zero-copy
     TensorMatcher({-1, D}) //
         .with_dtype(weights_dtype_)
-        .with_device<kDLCUDA, kDLROCM>(device_)
+        .with_device<kDLCUDA, kDLROCM, kDLCUDAHost, kDLROCMHost, kDLCPU>()
         .verify(weights);
     TensorMatcher({L, D}) //
         .with_dtype(weights_dtype_)
@@ -128,6 +130,10 @@ struct IndexKernel {
         .verify(indices);
 
     const auto device = device_.unwrap();
+    const auto weights_device = weights.device();
+    RuntimeCheck(weights_device.device_type != device.device_type ||
+                     weights_device.device_id == device.device_id,
+                 "IndexKernel: weights are on another GPU than the output.");
     const auto use_int32 = indices_dtype_.unwrap().bits == 32;
     const auto num_indices = L.unwrap();
     const auto entry_size = dtype_bytes(weights_dtype_.unwrap()) * D.unwrap();
@@ -144,7 +150,8 @@ struct IndexKernel {
     const auto num_blocks = div_ceil(num_warps, kWarpPerBlock);
     const auto params = IndexKernelParams{
         .output = static_cast<char *>(output.data_ptr()),
-        .weight = static_cast<const char *>(weights.data_ptr()),
+        .weight = static_cast<const char *>(
+            device_alias(weights.data_ptr(), weights_device)),
         .indice = indices.data_ptr(),
         .num_warps = num_warps,
     };

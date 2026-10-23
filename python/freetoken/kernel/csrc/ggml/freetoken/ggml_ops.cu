@@ -10,6 +10,8 @@
 #include "mmq.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
+// after the ggml headers, so their HIP macros win over hip_compat.h
+#include <freetoken/pinned.h>
 
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -436,7 +438,8 @@ void op_dequantize(TensorView w, int64_t type_id, int64_t k, TensorView out) {
 void op_get_rows(TensorView w, int64_t type_id, int64_t k, TensorView ids, TensorView out) {
     RuntimeCheck(is_dtype(ids.dtype(), kDLInt, 32) && ids.ndim() == 1 && ids.IsContiguous(), "ids must be a contiguous int32 vector");
     RuntimeCheck(w.ndim() == 2, "get_rows takes w[rows, row_bytes]");
-    const DeviceGuard guard(w.device());
+    // w may be a pinned host table read zero-copy, so the launch device comes from out
+    const DeviceGuard guard(out.device());
     const ggml_type type = (ggml_type) type_id;
     check_weight(w, type, k);
     const int64_t n = ids.size(0);
@@ -446,8 +449,8 @@ void op_get_rows(TensorView w, int64_t type_id, int64_t k, TensorView ids, Tenso
         return;
     }
     const size_t nb01 = w.stride(0), esz = otype == GGML_TYPE_F32 ? 4 : 2;
-    get_rows_cuda(w.data_ptr(), type, (const int32_t *) ids.data_ptr(), out.data_ptr(), otype, k, nb01, nb01 * w.size(0), nb01 * w.size(0),
-                  n, 1, 1, 4, 4 * n, 4 * n, k * esz, k * esz * n, k * esz * n, current_stream(w.device()));
+    get_rows_cuda(host::device_alias(w.data_ptr(), w.device()), type, (const int32_t *) ids.data_ptr(), out.data_ptr(), otype, k, nb01, nb01 * w.size(0), nb01 * w.size(0),
+                  n, 1, 1, 4, 4 * n, 4 * n, k * esz, k * esz * n, k * esz * n, current_stream(out.device()));
 }
 
 bool op_uses_mmvq(int64_t type_id, int64_t m) { return ggml_cuda_should_use_mmvq((ggml_type) type_id, device_cc(), m); }

@@ -19,6 +19,10 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    FlushCacheBackendMsg,
+    FlushCacheMsg,
+    FlushCacheReply,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserMsg,
@@ -196,10 +200,25 @@ def tokenize_worker(
                             error=m.error,
                         )
                     )
+                elif isinstance(m, FlushCacheMsg):
+                    send_backend.put(
+                        FlushCacheBackendMsg(request_id=m.request_id, timeout=m.timeout)
+                    )
+                elif isinstance(m, FlushCacheResultMsg):
+                    send_frontend.put(
+                        FlushCacheReply(request_id=m.request_id, status=m.status, error=m.error)
+                    )
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (
+                        CacheRebuildMsg,
+                        CacheRebuildResultMsg,
+                        FlushCacheMsg,
+                        FlushCacheResultMsg,
+                        ErrorReplyMsg,
+                        PromptAdmittedMsg,
+                    ),
                 )
                 for m in pending_msg
             )
