@@ -3,9 +3,10 @@
 ``RowStore`` reads fixed-width rows straight out of checkpoint shard files (io_uring or a pread pool,
 O_DIRECT) into pinned staging by row id; ``PleStore`` adds PLE's n-gram hashing.
 
-Graph sync: a captured graph cannot wait for host I/O, so a captured ``lookup`` WAITs on a pinned
-flag through a stream memop (``wait_reset``) that the host ``signal``s once the fill landed; where
-the driver rejects memops in capture, the caller falls back to launch-gating (fill before replay).
+Graph sync: a captured graph cannot wait for host I/O, so a captured ``lookup`` WAITs on a host-visible
+flag (pinned on CUDA, signal memory on HIP) through a stream memop (``wait_reset``). The host
+``signal``s once the fill landed; where the driver rejects memops in capture, the caller falls back
+to launch-gating (fill before replay).
 ``probe_wait_sync`` decides which, once, at startup.
 """
 

@@ -203,13 +203,9 @@ class DiskRowTable:
 
         self._wait_sync = probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), self._device)
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
-        if torch.version.hip is not None:
-            from freetoken.kernel.row_store import alloc_sync_flag
+        from freetoken.kernel.row_store import alloc_sync_flag
 
-            self._flag = alloc_sync_flag() if self._wait_sync else None
-        else:
-            self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
-            self._flag.zero_()
+        self._flag = alloc_sync_flag() if self._wait_sync else None
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
         sync = "wait-sync" if self._wait_sync else "launch-gating"
@@ -220,28 +216,28 @@ class DiskRowTable:
         )
         self._pending: Future | None = None
         self._failed = False
-        self._closed = False
 
-    def _start_fill(self, reqs, bs: int):
-        histories = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
+    def _fill_decode(self, histories: Sequence[Sequence[int]], bs: int) -> None:
+        try:
+            self._readback_event.synchronize()
+            tokens = self._token_readback[:bs].to(torch.int64).tolist()
+            runs = [torch.tensor([*history, t], dtype=torch.int64)
+                    for history, t in zip(histories, tokens)]
+            self.fill(runs, graph=True)
+        except BaseException:
+            from freetoken.kernel.row_store import signal
 
+            # unblock the stream before surfacing; the step's output is discarded
+            signal(self._flag)
+            raise
+
+    def _start_fill(self, histories: Sequence[Sequence[int]], bs: int) -> None:
         @torch.inference_mode()
         def _complete() -> None:
-            try:
-                self._readback_event.synchronize()
-                tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                runs = [torch.tensor([*history, t], dtype=torch.int64)
-                        for history, t in zip(histories, tokens)]
-                self.fill(runs, graph=True)
-            except BaseException:
-                from freetoken.kernel.row_store import signal
-
-                signal(self._flag)
-                raise
+            self._fill_decode(histories, bs)
 
         # Like Engram, release HIP's WAIT independently of a queue-blocked graph launch.
         self._pending = self._worker.submit(_complete)
-        return self._await_pending
 
     def _await_pending(self) -> None:
         if self._pending is not None:
@@ -254,15 +250,6 @@ class DiskRowTable:
                     # An interrupted waiter must drain the fill before recording its consumed event.
                     self._worker.shutdown(wait=True)
                 raise
-
-    def close(self) -> None:
-        self._closed = True
-        if self._worker is not None:
-            self._worker.shutdown(wait=True)
-            try:
-                self._await_pending()
-            finally:
-                self._graph_consumed.synchronize()
 
     def __del__(self) -> None:
         worker = getattr(self, "_worker", None)
@@ -297,11 +284,11 @@ class DiskRowTable:
         return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
-        """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
+        """Stage this batch's rows; returns the deferred fill for wait-sync without a worker."""
         if torch.version.hip is not None:
             self._await_pending()
-            if self._failed or self._closed:
-                raise RuntimeError("PLE disk table is closed or failed; recreate the engine before dispatch")
+            if self._failed:
+                raise RuntimeError("PLE disk table failed; recreate the engine before dispatch")
         eos = self.eos_token_id
         if batch.is_decode:
             reqs = list(batch.reqs)
@@ -309,22 +296,13 @@ class DiskRowTable:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
+                histories = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
                 if self._worker is not None:
-                    return self._start_fill(reqs, bs)
+                    self._start_fill(histories, bs)
+                    return None
 
                 def _complete() -> None:
-                    try:
-                        self._readback_event.synchronize()
-                        tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
-                        self.fill(runs, graph=True)
-                    except BaseException:
-                        from freetoken.kernel.row_store import signal
-
-                        # unblock the stream before surfacing; the step's output is discarded
-                        signal(self._flag)
-                        raise
+                    self._fill_decode(histories, bs)
 
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
@@ -345,7 +323,7 @@ class DiskRowTable:
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
-        """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
+        """Around one dispatch: stage on enter, finish the fill+signal on exit."""
         deferred = self.host_fill_batch(batch, use_graph)
         if self._worker is not None:
             try:

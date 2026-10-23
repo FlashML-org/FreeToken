@@ -101,7 +101,7 @@ def test_disk_table_matches_the_dequantized_shard(tmp_path):
     from freetoken.kernel.row_store import probe_wait_sync
 
     table.wait_sync = probe_wait_sync("auto", torch.device("cuda"))
-    if table.wait_sync and torch.version.hip is not None:
+    if table.wait_sync:
         from freetoken.kernel.row_store import alloc_sync_flag
 
         table.flag = alloc_sync_flag()
