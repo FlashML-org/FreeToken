@@ -60,6 +60,27 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
 
 
+class TokenizeRequest(BaseModel):
+    """POST /v1/tokenize: count tokens for a prompt without generating.
+
+    Two input shapes, both accepted:
+    - raw text: ``{"input": "..."}`` (llama.cpp /tokenize-compatible)
+    - messages: ``{"messages": [...]}`` — rendered through the SAME chat
+      template a generation would use, so the count matches the
+      ``usage.prompt_tokens`` a real request would report.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    input: str | list[str] | None = None
+    messages: list[Message] | None = None
+    add_special_tokens: bool = True
+
+
+class TokenizeResponse(BaseModel):
+    tokens: int
+    token_ids: list[int] = Field(default_factory=list)
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
