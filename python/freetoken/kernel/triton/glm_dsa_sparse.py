@@ -380,6 +380,9 @@ def glm_dsa_sparse_attn(
         o = out
         assert o.shape == (b, m, h, d_v), (o.shape, (b, m, h, d_v))
         assert o.dtype == q.dtype and o.device == q.device, (o.dtype, o.device, q.dtype, q.device)
+    # The kernels address q and o with int32 offsets.
+    reach = max(sum((n - 1) * st for n, st in zip(t.shape, t.stride())) for t in (q, o))
+    assert reach < 2**31, f"q/o span {reach} elements, past int32 addressing; lower --max-prefill-length"
 
     has_counts = counts is not None
     if has_counts:
