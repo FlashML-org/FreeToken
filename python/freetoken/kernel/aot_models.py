@@ -347,6 +347,17 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=2304,
         expert_formats=("ds_fp4",),
     ),
+    AotModel(
+        name="RecursiveSI/flint",
+        architecture="FlintForCausalLM",
+        hidden_size=2048,
+        kv_groups=((4, 128),),
+        top_k=6,
+        moe_intermediate_size=512,
+        expert_formats=("bf16", *_NVFP4_FORMATS),
+        aliases=("FutureMLS-Lab/flint-nvfp4-coldgptq",),
+        arch_aliases=("FlintGGUFForCausalLM",),
+    ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
         name="Qwen/Qwen3.6-27B",

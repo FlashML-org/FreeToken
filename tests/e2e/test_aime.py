@@ -198,41 +198,14 @@ def build_llm(model_path: Path) -> LLM:
     return LLM(**kwargs)
 
 
-def visible_gpu_index() -> int:
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not visible:
-        return 0
-    first = visible.split(",", 1)[0].strip()
-    return int(first)
-
-
 def free_gpu_memory_gib() -> float:
-    if torch.version.hip is not None:
-        # Query logical device zero without initializing the engine's parent process.
-        result = subprocess.run(
-            [sys.executable, "-c", "import torch; print(torch.cuda.mem_get_info(0)[0])"],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-        return int(result.stdout.strip()) / (1 << 30)
-
+    # A child respects UUID visibility and CUDA_DEVICE_ORDER without initializing
+    # the engine's parent process, on both CUDA and ROCm.
     result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,memory.free",
-            "--format=csv,noheader,nounits",
-        ],
-        check=True,
-        text=True,
-        capture_output=True,
+        [sys.executable, "-c", "import torch; print(torch.cuda.mem_get_info(0)[0])"],
+        check=True, text=True, capture_output=True,
     )
-    target = visible_gpu_index()
-    for line in result.stdout.splitlines():
-        index, free_mib = [part.strip() for part in line.split(",", 1)]
-        if int(index) == target:
-            return int(free_mib) / 1024
-    raise RuntimeError(f"GPU {target} is not visible in nvidia-smi")
+    return int(result.stdout.strip()) / (1 << 30)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="AIME e2e needs CUDA")

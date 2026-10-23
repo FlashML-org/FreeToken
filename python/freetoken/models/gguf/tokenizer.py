@@ -10,7 +10,8 @@ import json
 
 from .reader import load_gguf_metadata
 
-# end-of-generation token names from llama.cpp (llama_vocab::impl::load in src/llama-vocab.cpp): a GGUF stores one eos id and no stop list
+# End-of-generation names for GGUFs without an explicit eog_token_ids array.
+# See llama.cpp llama_vocab::impl::load in src/llama-vocab.cpp.
 _EOG_NAMES = frozenset((
     "<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>", "<|calls|>", "<end_of_turn>",
     "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]", "<|end_of_text|>", "<end_of_utterance>",
@@ -32,6 +33,15 @@ _JOYAI_LLM_SPLITS = (
     "[一-龥぀-ゟ゠-ヿ]+",
     r'''[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+''',
 )
+
+# RecursiveSI/flint's tokenizer.json applies these splits in sequence.
+_FLINT_SPLITS = (
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
+_CUSTOM_SPLITS = {"joyai-llm": _JOYAI_LLM_SPLITS, "flint": _FLINT_SPLITS}
 
 
 def _add_bos(meta: dict) -> bool:
@@ -105,11 +115,11 @@ def load_gguf_tokenizer(model_path: str):
         from tokenizers import normalizers
 
         fast.normalizer = normalizers.NFC()
-    elif pre == "joyai-llm":
+    elif pre in _CUSTOM_SPLITS:
         from tokenizers import Regex, pre_tokenizers
 
         fast.pre_tokenizer = pre_tokenizers.Sequence(
-            [pre_tokenizers.Split(Regex(r), behavior="isolated") for r in _JOYAI_LLM_SPLITS]
+            [pre_tokenizers.Split(Regex(r), behavior="isolated") for r in _CUSTOM_SPLITS[pre]]
             + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)]
         )
     if pre in _IGNORE_MERGES_PRE:
@@ -129,6 +139,7 @@ def gguf_eos_token_ids(model_path: str) -> set[int]:
     tokens = meta["tokenizer.ggml.tokens"]
     ids = {i for i, t in enumerate(tokens) if t in _EOG_NAMES}
     ids |= {int(meta[f"tokenizer.ggml.{k}_token_id"]) for k in ("eos", "eot", "eom") if f"tokenizer.ggml.{k}_token_id" in meta}
+    ids |= {int(i) for i in meta.get("tokenizer.ggml.eog_token_ids", ())}
     names = {tokens[i]: i for i in ids if i < len(tokens)}
     # llama.cpp's exceptions: <|end|> only ends a message when <|call|> and <|return|> end the turn (gpt-oss), and gemma4's </s> is a normal token
     if "<|end|>" in names and names.keys() & {"<|call|>", "<|calls|>"} and names.keys() & {"<|return|>", "<|flush|>"}:

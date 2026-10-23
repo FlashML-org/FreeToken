@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from freetoken.server.reasoning_parser import ReasoningParser
+from freetoken.server.generation import GenSpec, _make_reasoning_parser
 
 
 def _stream(parser: ReasoningParser, chunks):
@@ -13,6 +18,21 @@ def _stream(parser: ReasoningParser, chunks):
     reasoning += fr
     content += fc
     return reasoning, content
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"enable_thinking": True}, {"enable_thinking": False}])
+@pytest.mark.parametrize("tools", [None, [{"type": "function", "function": {"name": "read"}}]])
+def test_flint_streaming_opens_reasoning_only_on_a_think_tag(kwargs, tools):
+    spec = GenSpec(messages=[], sampling_params=SimpleNamespace(), chat_template_kwargs=kwargs, template_tools=tools)
+    state = SimpleNamespace(config=SimpleNamespace(reasoning_parser="flint"))
+    thought = "The literal <tool_call> here is a quotation."
+    text = f"<think>{thought}</think>42"
+    for size in (1, 3, 7, len(text)):
+        parser = _make_reasoning_parser(spec, state)
+        assert _stream(parser, [text[i:i+size] for i in range(0, len(text), size)]) == (thought, "42")
+    parser = _make_reasoning_parser(spec, state)
+    assert _stream(parser, ["A direct ", "answer."]) == ("", "A direct answer.")
+    assert _make_reasoning_parser(spec, state).parse_non_stream("A direct answer.") == ("", "A direct answer.")
 
 
 # --------------------------------------------------------------- gpt-oss harmony
