@@ -26,9 +26,13 @@ CACHE_TARGETS = (
 
 
 class ControlCliError(Exception):
-    def __init__(self, message: str, *, exit_code: int = 1) -> None:
+    def __init__(
+        self, message: str, *, exit_code: int = 1, document: dict[str, Any] | None = None
+    ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        # The status document a refusal carried (/health while not serving, a rejected rebuild).
+        self.document = document
 
 
 def parse_count(token: str) -> int:
@@ -68,6 +72,16 @@ def _decode_error_body(raw: bytes) -> str:
     return text
 
 
+def _status_document(raw: bytes) -> dict[str, Any] | None:
+    """The JSON object of an error response that is an answer in its own right (it carries a
+    status), the way ``shell/client.py`` reads one."""
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) and doc.get("status") else None
+
+
 def _request_json(
     method: str,
     base_url: str,
@@ -78,17 +92,22 @@ def _request_json(
     timeout: float = 10.0,
     api_key: str | None,
 ) -> dict[str, Any]:
-    with _open_request(
-        method,
-        base_url,
-        path,
-        body=body,
-        query=query,
-        accept="application/json",
-        timeout=timeout,
-        api_key=api_key,
-    ) as response:
-        raw = response.read()
+    try:
+        with _open_request(
+            method,
+            base_url,
+            path,
+            body=body,
+            query=query,
+            accept="application/json",
+            timeout=timeout,
+            api_key=api_key,
+        ) as response:
+            raw = response.read()
+    except ControlCliError as exc:
+        if exc.document is None:
+            raise
+        return exc.document
 
     if not raw:
         return {}
@@ -150,8 +169,11 @@ def _open_request(
     try:
         return urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        message = _decode_error_body(exc.read()) or exc.reason
-        raise ControlCliError(f"HTTP {exc.code}: {message}", exit_code=1) from exc
+        raw = exc.read()
+        message = _decode_error_body(raw) or exc.reason
+        raise ControlCliError(
+            f"HTTP {exc.code}: {message}", exit_code=1, document=_status_document(raw)
+        ) from exc
     except urllib.error.URLError as exc:
         raise ControlCliError(f"failed to reach {base_url}: {exc.reason}", exit_code=1) from exc
     except TimeoutError as exc:
