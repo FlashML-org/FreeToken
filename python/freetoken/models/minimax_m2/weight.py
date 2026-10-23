@@ -82,7 +82,6 @@ def iter_weights(
                         world_size=tp_info.size,
                         num_kv_heads=config.num_kv_heads,
                     )
-                    # fp32 like the router reads it, so an FTW stores it that way too
                     if name.endswith(".e_score_correction_bias"):
                         tensor = tensor.float()
                     yield name, tensor

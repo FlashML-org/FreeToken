@@ -34,7 +34,6 @@ class GlmMoeDsaSparseBlock(BaseOP):
         self.topk_group = config.topk_group
 
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
-        # Keep selection bias in fp32: rounding can change the selected experts.
         self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 
         # The offload cache indexes experts by *MoE* layer (global layer minus
@@ -54,7 +53,6 @@ class GlmMoeDsaSparseBlock(BaseOP):
         )
 
     def _route(self, hidden_states: torch.Tensor) -> TopK:
-        # bf16 gate, fp32 logits: the cuBLAS path of sglang's MoEGate and vLLM's GateLinear for GLM-5.
         logits = torch.mm(hidden_states, self.gate.weight.t(), out_dtype=torch.float32)
         return fused_topk_sigmoid(
             logits,

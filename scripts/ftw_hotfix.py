@@ -849,7 +849,8 @@ def main(argv: list[str] | None = None) -> int:
     log(f"{arch}: model declares {len(expected)} dense tensors")
     source = TensorSource(ns.repo, ns.source, ns.revision) if (ns.repo or ns.source) else None
     renames, dequants, fetches, drops, leftovers = plan(arch, index["tensors"], expected, name_map, quant)
-    biases = rounded_biases(index["tensors"], expected, renames)
+    # only the old GLM-5.2 reader rounded the bias; other families store it as the checkpoint does
+    biases = rounded_biases(index["tensors"], expected, renames) if arch == "GlmMoeDsaForCausalLM" else {}
     # the encoder comes from the family reader, not from by-name fetches
     vision_missing = sorted(n for n, *_ in fetches if is_vision(n))
     fetches = [f for f in fetches if not is_vision(f[0])]
@@ -911,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
             bad = True
     if biases and source is None:
         print(f"  note: {len(biases)} router selection biases (e.g. {next(iter(biases))}) are stored narrower than the fp32 the model reads; "
-              "if the source checkpoint stores them in fp32, rerun with --repo or --source to restore them")
+              "rerun with --repo or --source to restore them")
     for msg in bias_errors:
         print(f"ERROR: {msg}", file=sys.stderr)
         bad = True

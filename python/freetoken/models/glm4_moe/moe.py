@@ -53,7 +53,6 @@ class Glm4MoeSparseBlock(BaseOP):
         )
 
     def _route(self, hidden_states: torch.Tensor) -> TopK:
-        # bf16 gate, fp32 logits: the cuBLAS path of sglang's MoEGate and vLLM's GateLinear for GLM-5.
         logits = torch.mm(hidden_states, self.gate.weight.t(), out_dtype=torch.float32)
         return fused_topk_sigmoid(
             logits,

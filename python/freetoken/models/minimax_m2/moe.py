@@ -22,7 +22,6 @@ class MiniMaxM2SparseMoeBlock(BaseOP):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
         self.norm_topk_prob = config.norm_topk_prob
-        # Router gate and bias in fp32, like the original checkpoint, vLLM and sglang.
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.gate.weight = torch.empty(config.num_experts, config.hidden_size, dtype=torch.float32)
         # DeepSeek-style selection bias; not an nn.Parameter in HF (a registered buffer).
