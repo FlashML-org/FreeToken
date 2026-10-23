@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import Any, Dict, Generic, List, TypeAlias, TypeVar
+from typing import Any, Dict, Generic, Iterator, List, TypeAlias, TypeVar
 
 import torch
 
@@ -97,3 +97,23 @@ class OPList(BaseOP, Generic[T]):
 
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+
+def iter_ops(root: BaseOP) -> Iterator[BaseOP]:
+    """Each op under ``root`` once, ``root`` first; an op's attributes are read after it is yielded."""
+    seen: set[int] = set()
+
+    def walk(op: BaseOP) -> Iterator[BaseOP]:
+        if id(op) in seen:
+            return
+        seen.add(id(op))
+        yield op
+        for value in vars(op).values():
+            if isinstance(value, BaseOP):
+                yield from walk(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, BaseOP):
+                        yield from walk(item)
+
+    return walk(root)

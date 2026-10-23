@@ -15,7 +15,7 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import BaseOP, OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, set_rope_device
+from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
@@ -285,44 +285,21 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             )
 
 
-def _untied_embeddings(model: BaseOP) -> list[VocabParallelEmbedding]:
-    """Embedding tables under ``model`` that no LM head reads as its weight."""
-    found: list[VocabParallelEmbedding] = []
-    tied: set[int] = set()
-    seen: set[int] = set()
-
-    def walk(op: BaseOP) -> None:
-        if id(op) in seen:
-            return
-        seen.add(id(op))
-        if isinstance(op, ParallelLMHead):
-            if op.tied_embedding is not None:
-                tied.add(id(op.tied_embedding))
-            return
-        if isinstance(op, VocabParallelEmbedding):
-            found.append(op)
-        for value in vars(op).values():
-            if isinstance(value, BaseOP):
-                walk(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, BaseOP):
-                        walk(item)
-
-    walk(model)
-    return [op for op in found if id(op) not in tied]
-
-
-def _host_embedding_keys(model: BaseOP, embed_weights: str) -> frozenset[str]:
+def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
     """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
-    if embed_weights != "host":
+    if config.embed_weights != "host":
         return frozenset()
-    tables = {id(op.weight) for op in _untied_embeddings(model)}
-    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
-    if not keys:
+    if config.model_config.tie_word_embeddings:
         raise ValueError(
             "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
             "every step; serve it with --embed-weights gpu"
+        )
+    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding}
+    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if not keys:
+        raise ValueError(
+            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
+            "on the GPU); serve it with --embed-weights gpu"
         )
     return keys
 
@@ -483,7 +460,7 @@ class Engine:
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        host_embeds = [op for op in _untied_embeddings(self.model) if not op.weight.is_cuda]
+        host_embeds = [op for op in iter_ops(self.model) if type(op) is VocabParallelEmbedding and not op.weight.is_cuda]
         self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
         if host_embeds:
             logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
@@ -639,7 +616,7 @@ class Engine:
         resident = [layer for layer in iter_moe_layers(self.model) if not isinstance(layer, OffloadMoELayer)]
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
-        host_keys = _host_embedding_keys(self.model, config.embed_weights)
+        host_keys = _host_embedding_keys(self.model, config)
         with _weight_load_context():
             self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
         finalize_quant(self.model)
