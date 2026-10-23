@@ -24,6 +24,7 @@ from freetoken.kernel.triton.e4m3_compat import (
     e4m3_u8_to_f32,
     round_e4m3,
 )
+from freetoken.utils.arch import is_arch_supported
 
 FP8 = torch.float8_e4m3fn
 _FP8_MAX = 448.0  # e4m3 finite max
@@ -114,8 +115,9 @@ def _block_fp8_gemm_kernel(
         else:
             # bf16 dot on the same e4m3 grid: operands exact in bf16, fp32 acc
             p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(tl.bfloat16)), out_dtype=tl.float32)
-        sa = tl.load(sa_ptr + offs_m * stride_sam + k * stride_sak, mask=m_mask, other=0.0).to(tl.float32)
-        sb = tl.load(sb_ptr + pid_n * stride_sbn + k * stride_sbk).to(tl.float32)
+        sa = tl.load(sa_ptr + offs_m * stride_sam + (k * BLOCK_K) // 128 * stride_sak, mask=m_mask, other=0.0).to(tl.float32)
+        sb_n = (pid_n * BLOCK_N) // 128
+        sb = tl.load(sb_ptr + sb_n * stride_sbn + (k * BLOCK_K) // 128 * stride_sbk).to(tl.float32)
         acc += p * sa[:, None] * sb
         a_ptrs += BLOCK_K * stride_ak
         w_ptrs += BLOCK_K * stride_wk
@@ -141,15 +143,28 @@ def block_fp8_matmul(
     # Larger M-tile for compute-bound prefill (better fp8 tensor-core utilization).
     block_m = 64 if M >= 64 else 32
     nwarps = 8 if M >= 64 else 4
-    grid = (triton.cdiv(M, block_m), triton.cdiv(N, _BLOCK))
+    block_n = block_k = _BLOCK
+    num_stages = 3
+    # Pre-Volta caps a block at 48 KiB smem and has no fp8 tensor cores: with BLOCK_K=128
+    # the 3-stage pipeline's tiles need 64 KiB (OutOfResources) and even a single stage
+    # (~16 KiB weight tile) leaves the kernel fully exposed to DRAM latency (~530 ms per
+    # 1536x12288x2048 GEMM on GP102). Halving BLOCK_K halves both tiles so a 2-stage
+    # pipeline fits (~24 KiB) and the loads overlap the FMA loop: ~53 ms, 10x. The
+    # per-128 scale indices are derived from BLOCK_K, so the K-block split only changes
+    # the fp32 accumulation order. Sweep-verified on GP102 with and without a concurrent
+    # 12 GB/s prefetch DMA on a second stream.
+    if not is_arch_supported(7, 0):
+        block_m, nwarps = 32, 4
+        block_n, block_k, num_stages = 64, 64, 2
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     _block_fp8_gemm_kernel[grid](
         a_fp8, w, a_scale, weight_scale, out,
         M, N, K,
         a_fp8.stride(0), a_fp8.stride(1), w.stride(0), w.stride(1),
         a_scale.stride(0), a_scale.stride(1), weight_scale.stride(0), weight_scale.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_M=block_m, BLOCK_N=_BLOCK, BLOCK_K=_BLOCK, compute_type=_TL_DTYPE[compute],
-        num_warps=nwarps, num_stages=3,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, compute_type=_TL_DTYPE[compute],
+        num_warps=nwarps, num_stages=num_stages,
     )
     return out
 
