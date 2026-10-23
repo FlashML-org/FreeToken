@@ -6,6 +6,12 @@ mHC x4 residual streams, 288-expert sigmoid/noaux_tc MoE with a shared expert an
 clamped SwiGLU), so ``parse_gguf_config`` derives a text-config-shaped namespace from
 the GGUF KV metadata and reuses ``glm5_next.config.parse_config`` wholesale.
 
+A ``glm5v`` mmproj beside the text file adds the vision tower: its metadata becomes
+the HF ``vision_config`` keys and the image processor config, and its tensors load
+under ``visual.`` as the HF checkpoints do. The llama.cpp converter splits the Conv3d
+patch embedding into two temporal halves (``v.patch_embd.weight`` and ``.weight.1``),
+stacked back at load; every other tower tensor is stored in HF layout.
+
 The llama.cpp converter (unsloth's glm5-next writer; tensor names identical across
 the ``glm5-next`` and the older ``glm5next`` arch spellings) stores KDA's ``A_log``
 pre-transformed as ``-exp(A_log)`` -- inverted at load -- and splits the MLA
@@ -22,13 +28,19 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import numpy as np
 import torch
 
 from freetoken.layers.quantization.ggml_types import is_quantized
-from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names
+from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
+from freetoken.models.gguf.reader import (
+    GgufTensorInfo,
+    gguf_tensor_index,
+    gguf_tensor_names,
+    load_gguf_metadata,
+)
 from freetoken.models.gguf.tensors import check_scales, fused, matrix
 
 from .config import parse_config
@@ -227,11 +239,134 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         text_config=text,
         model_type="glm5_next",
         architectures=list(shim.architectures),
-        vision_config=None,
-        image_token_id=None,
+        vision_config=getattr(shim, "vision_config", None),
+        image_token_id=getattr(shim, "image_token_id", None),
     )
     config = parse_config(hf_like)
     return replace(config, expert_quant="gguf")
+
+
+# ----------------------------------------------------------------------------------------------
+# Vision tower (a glm5v mmproj)
+# ----------------------------------------------------------------------------------------------
+
+_PROJECTOR = "glm5v"
+_IMAGE_TOKEN = "<|image|>"
+_PATCH = ("v.patch_embd.weight", "v.patch_embd.weight.1")
+
+# tower / merger tensors in HF layout already; only the patch embedding is split
+_TOP = {
+    "v.patch_embd.bias": "patch_embed.proj.bias",
+    "v.post_ln.weight": "post_layernorm.weight",
+    "mm.patch_merger.weight": "downsample.weight",
+    "mm.patch_merger.bias": "downsample.bias",
+    "mm.model.fc.weight": "merger.proj.weight",
+    "mm.post_norm.weight": "merger.post_projection_norm.weight",
+    "mm.post_norm.bias": "merger.post_projection_norm.bias",
+    "mm.gate.weight": "merger.gate_proj.weight",
+    "mm.up.weight": "merger.up_proj.weight",
+    "mm.down.weight": "merger.down_proj.weight",
+}
+_BLOCK = {
+    "attn_qkv": "attn.qkv",
+    "attn_out": "attn.proj",
+    "attn_q_norm": "attn.q_norm",
+    "attn_k_norm": "attn.k_norm",
+    "ffn_gate": "mlp.gate_proj",
+    "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj",
+    "ln1": "norm1",
+    "ln2": "norm2",
+}
+_BLOCK_RE = re.compile(r"^v\.blk\.(\d+)\.(\w+)\.(weight|bias)$")
+
+
+def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The HF config.json keys and the preprocessor_config.json of the tower in ``mmproj``, for the text GGUF whose metadata is ``text_md``."""
+    if mmproj.projector != _PROJECTOR:
+        raise ValueError(f"mmproj {mmproj.path} is a {mmproj.projector!r} tower; GLM-5.3-Flash needs {_PROJECTOR!r}")
+    md, index = load_gguf_metadata(mmproj.path), gguf_tensor_index(mmproj.path)
+    # the converter writes use_silu=True only for the silu tower; a gelu tower carries
+    # use_gelu or neither key, and the model has no gelu epilogue
+    if md.get("clip.use_silu") is not True:
+        raise NotImplementedError(f"mmproj {mmproj.path}: only the silu tower is served")
+
+    def kv(key: str):
+        return md[f"clip.vision.{key}"]
+
+    arch = text_md["general.architecture"]
+    text_hidden = int(text_md[f"{arch}.embedding_length"])
+    if int(kv("projection_dim")) != text_hidden:
+        raise ValueError(f"mmproj {mmproj.path} projects to {int(kv('projection_dim'))} but the text model is {text_hidden} wide")
+    tokens = text_md["tokenizer.ggml.tokens"]
+    if _IMAGE_TOKEN not in tokens:
+        raise ValueError(f"the text GGUF tokenizer has no {_IMAGE_TOKEN} token")
+    # the converter only splits a temporal-2 patch embedding, so a glm5v file always
+    # carries both halves; one without the second is not this tower
+    if _PATCH[1] not in index:
+        raise ValueError(f"mmproj {mmproj.path}: the second patch-embedding half {_PATCH[1]!r} is missing")
+    temporal = 2
+    patch, merge = int(kv("patch_size")), int(kv("spatial_merge_size"))
+    # llama.cpp stores the canvas budget in single-frame pixels; the processor counts
+    # soft tokens, one per (patch * merge) square of pixels per frame
+    per_token = patch * patch * merge * merge
+    budget = {}
+    for key in ("image_min_pixels", "image_max_pixels"):
+        pixels = int(kv(key))
+        if pixels % per_token:
+            raise ValueError(f"mmproj {mmproj.path}: {key} {pixels} is not a whole number of {per_token}-pixel tokens")
+        budget[key] = pixels // per_token
+    vision_config = {
+        "hidden_act": "silu",
+        "hidden_size": int(kv("embedding_length")),
+        "depth": int(kv("block_count")),
+        "num_heads": int(kv("attention.head_count")),
+        "intermediate_size": int(kv("feed_forward_length")),
+        # ggml order [in, out]: the gate's out features are the merger's intermediate width
+        "projection_intermediate_size": int(index["mm.gate.weight"].ne[1]),
+        "out_hidden_size": text_hidden,
+        # ggml order [kw, kh, in, out]
+        "in_channels": int(index[_PATCH[0]].ne[2]),
+        "patch_size": patch,
+        "temporal_patch_size": temporal,
+        "spatial_merge_size": merge,
+        "rms_norm_eps": float(kv("attention.layer_norm_epsilon")),
+        "swiglu_limit": float(kv("swiglu_clamp")),
+        "attention_bias": "v.blk.0.attn_qkv.bias" in index,
+    }
+    hf_fields = {
+        "vision_config": vision_config,
+        "image_token_id": tokens.index(_IMAGE_TOKEN),
+    }
+    preprocessor = {
+        "image_processor_type": "Glm5NextImageProcessor",
+        "patch_size": patch,
+        "temporal_patch_size": temporal,
+        "merge_size": merge,
+        "image_mean": [float(v) for v in kv("image_mean")],
+        "image_std": [float(v) for v in kv("image_std")],
+        "min_image_tokens": budget["image_min_pixels"],
+        "max_image_tokens": budget["image_max_pixels"],
+    }
+    return hf_fields, preprocessor
+
+
+def _vision_name(gguf_name: str) -> str:
+    if gguf_name in _TOP:
+        return _TOP[gguf_name]
+    if (m := _BLOCK_RE.match(gguf_name)) and m[2] in _BLOCK:
+        return f"blocks.{m[1]}.{_BLOCK[m[2]]}.{m[3]}"
+    raise ValueError(f"unexpected tensor {gguf_name!r} in a {_PROJECTOR} mmproj")
+
+
+def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tower state dict under ``visual.``, named as the HF checkpoints load."""
+    index = gguf_tensor_index(mmproj.path)
+    slices = [mmproj_tensor(index[n]) for n in _PATCH]
+    yield "visual.patch_embed.proj.weight", torch.stack(slices, dim=2)
+    for gguf_name, info in index.items():
+        if gguf_name not in _PATCH:
+            yield f"visual.{_vision_name(gguf_name)}", mmproj_tensor(info)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -279,6 +414,8 @@ def iter_gguf_weights(
     from freetoken.utils import cached_load_hf_config
 
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
     args = config.glm5_args
     index = gguf_tensor_index(model_path)
     hidden = config.hidden_size
@@ -363,5 +500,8 @@ def iter_gguf_weights(
                 info = t(f"{blk}.{src}")
                 yield from fused(f"{mlp}.shared_experts.{proj}", [info], [matrix(info)], k)
 
+    if vision:
+        yield from iter_mmproj_weights(find_mmproj(model_path))
 
-__all__ = ["iter_gguf_weights", "parse_gguf_config", "to_gguf"]
+
+__all__ = ["gguf_mm_config", "iter_gguf_weights", "iter_mmproj_weights", "parse_gguf_config", "to_gguf"]
