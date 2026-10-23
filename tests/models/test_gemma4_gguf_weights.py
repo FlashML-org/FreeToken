@@ -60,6 +60,9 @@ def test_hf_nvfp4_weight_loader_maps_router_scales():
     assert _rename_hf_nvfp4_tensor_name("blk.0.ffn_gate_inp.scale") == (
         "model.layers.0.feed_forward.router.scale"
     )
+    assert _rename_hf_nvfp4_tensor_name(
+        "model.language_model.layers.0.router.scale"
+    ) == "model.layers.0.feed_forward.router.scale"
     assert _rename_hf_nvfp4_tensor_name("blk.0.ffn_down_exps.scale") == (
         "model.layers.0.feed_forward.router.per_expert_scale"
     )
@@ -247,7 +250,12 @@ def test_parse_gguf_config_supports_dense_ple_and_shared_kv(monkeypatch):
         architectures=["Gemma4GGUFForCausalLM"],
         is_hf_nvfp4=False,
     )
-    monkeypatch.setattr(gguf, "check_scales", lambda *args, **kwargs: None)
+    scale_checks = []
+    monkeypatch.setattr(
+        gguf,
+        "check_scales",
+        lambda *args, **kwargs: scale_checks.append(kwargs.get("known")),
+    )
     monkeypatch.setattr(gguf, "_full_rotary_dim", lambda *_: 2)
     monkeypatch.setattr(gguf, "gguf_tensor_index", lambda _: tensor_index)
     monkeypatch.setattr(gguf, "_gguf_expert_quant", lambda _: "q4_0")
@@ -260,3 +268,6 @@ def test_parse_gguf_config_supports_dense_ple_and_shared_kv(monkeypatch):
     assert config.per_layer_input_dim == 2
     assert config.gguf_per_layer_embedding_type == 14
     assert config.shared_kv_source_layers == (None, None, 0, 1)
+    assert scale_checks == [
+        ("ffn_gate_inp.scale", "ffn_down_exps.scale", "router.scale")
+    ]

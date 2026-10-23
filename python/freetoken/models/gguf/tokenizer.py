@@ -133,6 +133,7 @@ def load_gguf_tokenizer(model_path: str):
     # checkpoints can carry the same marker but use their own SentencePiece-compatible
     # converter; only Qwen GPT2/BPE vocabularies belong in this custom ByteLevel path.
     hf_nvfp4 = arch.startswith("qwen") and tok_dict.get("model") == "gpt2"
+    gemma_gpt2 = arch == "gemma4" and tok_dict.get("model") == "gpt2"
     pre = meta.get("tokenizer.ggml.pre") if tok_dict.get("model") == "gpt2" else None
     if hf_nvfp4:
         # The embedded Qwen vocabulary is GPT-2 byte-level BPE. Treating it like a
@@ -156,6 +157,10 @@ def load_gguf_tokenizer(model_path: str):
         # the visible fragment ``|im_end|>`` instead of terminating the assistant turn.
         fast.add_special_tokens([AddedToken(token, special=True) for token in _QWEN_ADDED_TOKENS])
     else:
+        if gemma_gpt2:
+            # Gemma stores raw ▁ and newline pieces, so GPT-2 byte-encoding its
+            # vocabulary makes the unencoded GGUF merge operands invalid.
+            converter_tok_dict = {**converter_tok_dict, "tokenizer_type": "llama"}
         fast, _extra = convert_gguf_tokenizer(arch, converter_tok_dict)
         fast = _fix_added_tokens(fast, meta)
         # Gemma's vocabulary uses SentencePiece's U+2581 word marker. Some versions of
@@ -199,7 +204,7 @@ def load_gguf_tokenizer(model_path: str):
         add_bos_token=_add_bos(meta),
         add_eos_token=bool(meta.get("tokenizer.ggml.add_eos_token")),
     )
-    if not hf_nvfp4 and tok_dict.get("model") != "gpt2":
+    if gemma_gpt2 or tok_dict.get("model") != "gpt2":
         # Reassign after the HF wrapper is built as well. The GGUF converter and some
         # transformers versions replace the backend decoder during wrapping, which leaves
         # SentencePiece's ``▁`` marker and malformed byte sequences visible in Gemma text.

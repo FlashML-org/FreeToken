@@ -326,7 +326,10 @@ def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
-    check_scales(shim.model_path, known=("ffn_gate_inp.scale", "ffn_down_exps.scale"))
+    check_scales(
+        shim.model_path,
+        known=("ffn_gate_inp.scale", "ffn_down_exps.scale", "router.scale"),
+    )
     m = shim.metadata
 
     def g(key: str):
