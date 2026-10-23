@@ -227,6 +227,15 @@ CASES = [
         "model.layers.{full}.self_attn.qkv_proj": FP8T, "model.layers.{lin}.mlp.shared_expert.gate_up_proj": FP8T,
         "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod, "model.layers.{lin}.mlp.gate": BF16, "lm_head": BF16,
     }, check=_qwen35_fp8),
+    # the vendor's own Ornith-1.5 export: static per-tensor fp8 attention and GDN, W4A16 NVFP4 for the
+    # experts, the shared expert and lm_head; the 122B lists config_groups next to quantized_layers
+    Case("ornith-ai/Ornith-1.5-122B-NVFP4", ModelOptConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{lin}.linear_attn.out_proj": FP8T, "model.layers.{full}.self_attn.qkv_proj": FP8T,
+        "model.layers.{full}.self_attn.o_proj": FP8T, "model.layers.{lin}.mlp.shared_expert.gate_up_proj": NVFP4,
+        "model.layers.{lin}.mlp.shared_expert.down_proj": NVFP4, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod,
+        "model.layers.{lin}.mlp.gate": BF16, "model.layers.{lin}.mlp.shared_expert_gate": BF16, "lm_head": NVFP4,
+    }, check=_qwen35_nvfp4),
     # block-fp8 attention / GDN / shared expert with NVFP4 experts, shipped as one model.safetensors without an index
     Case("kyaky/Qwen3.6-35B-A3B-Uncensored-NVFP4", CompressedTensorsConfig, {
         "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8B, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
