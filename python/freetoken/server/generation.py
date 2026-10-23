@@ -115,6 +115,8 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    prompt_ms: float = 0.0
+    predicted_ms: float = 0.0
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -130,6 +132,35 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    prompt_ms: float = 0.0
+    predicted_ms: float = 0.0
+
+
+def timings_block(
+    prompt_tokens: int, completion_tokens: int, cached_tokens: int,
+    prompt_ms: float, predicted_ms: float,
+) -> dict[str, Any] | None:
+    """llama.cpp's timings shape (server_slot_stats::to_json), which frontends like
+    llama-swap parse off the response. prompt_n counts only the tokens evaluated after
+    the cached prefix and decode runs n_gen - 1 steps (the first token rides the last
+    prompt batch), matching llama.cpp's own arithmetic."""
+    if prompt_ms <= 0.0:
+        return None
+    prompt_s = prompt_ms / 1000.0
+    predicted_s = predicted_ms / 1000.0
+    processed = prompt_tokens - cached_tokens
+    gen_steps = max(completion_tokens - 1, 0)
+    return {
+        "cache_n": cached_tokens,
+        "prompt_n": processed,
+        "prompt_ms": round(prompt_ms, 2),
+        "prompt_per_token_ms": round(prompt_ms / processed, 2) if processed > 0 else 0.0,
+        "prompt_per_second": round(processed / prompt_s, 2) if prompt_s > 0 else 0.0,
+        "predicted_n": completion_tokens,
+        "predicted_ms": round(predicted_ms, 2),
+        "predicted_per_token_ms": round(predicted_ms / gen_steps, 2) if gen_steps > 0 else 0.0,
+        "predicted_per_second": round(gen_steps / predicted_s, 2) if predicted_s > 0 else 0.0,
+    }
 
 
 @dataclass
@@ -608,6 +639,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     completion_tokens = 0
     cached_tokens = 0
     pending = ""
+    started = time.monotonic()
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
     specials = _leaked_special_tokens(state)
@@ -696,12 +728,19 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    first_output_at: float | None = None
+    last_output_at: float | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if ack.completion_tokens_delta > 0:
+            now = time.monotonic()
+            if first_output_at is None:
+                first_output_at = now
+            last_output_at = now
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -781,9 +820,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
         elif parse_tools and pending:
             yield ContentDelta(strip_special_tokens(pending, specials))
 
+    # No output ever arrived: the whole span is prefill.
+    ended = time.monotonic()
+    prompt_ms = ((first_output_at if first_output_at is not None else ended) - started) * 1000.0
+    predicted_ms = (last_output_at - first_output_at) * 1000.0 if first_output_at is not None else 0.0
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        prompt_ms=prompt_ms, predicted_ms=predicted_ms,
     )
 
 
@@ -794,6 +838,9 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    started = time.monotonic()
+    first_output_at: float | None = None
+    last_output_at: float | None = None
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
@@ -802,11 +849,20 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if ack.completion_tokens_delta > 0:
+            now = time.monotonic()
+            if first_output_at is None:
+                first_output_at = now
+            last_output_at = now
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
             break
+
+    ended = time.monotonic()
+    prompt_ms = ((first_output_at if first_output_at is not None else ended) - started) * 1000.0
+    predicted_ms = (last_output_at - first_output_at) * 1000.0 if first_output_at is not None else 0.0
 
     reasoning_text, content_text = _split_reasoning(full_content, spec, state)
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
@@ -828,4 +884,6 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        prompt_ms=prompt_ms,
+        predicted_ms=predicted_ms,
     )
