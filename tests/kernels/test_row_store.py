@@ -4,6 +4,8 @@ it is covered by ``tests/models/qwen4_exp/test_ple_disk.py``."""
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 
@@ -27,6 +29,8 @@ def _stage(store, ids: torch.Tensor, dst_stride: int = 0) -> torch.Tensor:
 
 @pytest.mark.parametrize("use_io_uring", [True, False])
 def test_rows_come_back_bitwise_across_extents_and_files(tmp_path, use_io_uring):
+    tmp_path = tmp_path / "rows-\u6d4b\u8bd5"
+    tmp_path.mkdir()
     # two files; file 0 carries extents 0 and 2 behind an unrelated header, file 1 carries extent 1
     per_extent = 1000
     table = _table(3 * per_extent, seed=1)
@@ -62,6 +66,57 @@ def test_rows_come_back_bitwise_across_extents_and_files(tmp_path, use_io_uring)
     flag = torch.zeros(1, dtype=torch.int64)
     store.flush(flag.data_ptr())
     assert int(flag[0]) == 1
+
+
+@pytest.mark.parametrize("use_io_uring", [True, False])
+def test_short_read_is_reported_and_the_next_fill_recovers(tmp_path, use_io_uring):
+    table = _table(64, seed=4)
+    path = tmp_path / "table.bin"
+    payload = table.numpy().tobytes()
+    path.write_bytes(payload)
+    store = _row_store.RowStore(
+        paths=[str(path)], extent_file=[0], extent_base=[0], rows_per_extent=64,
+        row_bytes=ROW_BYTES, row_stride=ROW_BYTES, use_io_uring=use_io_uring,
+    )
+    ids = torch.arange(64, dtype=torch.int64)
+    with path.open("r+b") as file:
+        file.truncate(len(payload) - 1)
+    with pytest.raises(RuntimeError, match="short read"):
+        _stage(store, ids)
+    path.write_bytes(payload)
+    assert torch.equal(_stage(store, ids), table)
+
+
+def test_positioned_read_beyond_four_gib(tmp_path):
+    table = _table(3, seed=5)
+    path = tmp_path / "large-offset.bin"
+    offset = (1 << 32) + 4096
+    with path.open("w+b") as file:
+        if sys.platform == "win32":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            ioctl = ctypes.WinDLL("kernel32", use_last_error=True).DeviceIoControl
+            ioctl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                              ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                              ctypes.c_void_p]
+            ioctl.restype = wintypes.BOOL
+            returned = wintypes.DWORD()
+            # Mark the file sparse so this offset test does not allocate 4 GiB.
+            if not ioctl(msvcrt.get_osfhandle(file.fileno()), 0x900C4, None, 0, None, 0,
+                         ctypes.byref(returned), None):
+                pytest.skip("filesystem does not support sparse files")
+        file.seek(offset)
+        file.write(table.numpy().tobytes())
+    store = _row_store.RowStore(
+        paths=[str(path)], extent_file=[0], extent_base=[offset], rows_per_extent=3,
+        row_bytes=ROW_BYTES, row_stride=ROW_BYTES, use_io_uring=False,
+    )
+    ids = torch.tensor([2, 0, 1, 2], dtype=torch.int64)
+    assert torch.equal(_stage(store, ids), table[ids])
+    del store
+    path.unlink()
 
 
 def test_geometry_and_bounds_are_checked_up_front(tmp_path):

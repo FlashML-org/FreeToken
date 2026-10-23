@@ -12,7 +12,7 @@ from setuptools.command.build_clib import build_clib
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CppExtension, ROCM_HOME
 
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent
 KERNEL_INCLUDE = str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "include")
 
 
@@ -68,28 +68,24 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
             "because it links against the CUDA runtime API."
         )
     cuda_home = Path(CUDA_HOME)
-    library_dirs = [str(cuda_home / "lib64")]
-    if (cuda_home / "lib").exists():
-        library_dirs.append(str(cuda_home / "lib"))
+    candidates = (cuda_home / "lib64", cuda_home / "lib", cuda_home / "lib" / "x64")
+    library_dirs = [str(path) for path in candidates if path.exists()]
     return [str(cuda_home / "include")], library_dirs
 
 
 IS_ROCM = _is_rocm()
+IS_WINDOWS = sys.platform == "win32"
+extra_compile = ["/O2", "/std:c++20"] if IS_WINDOWS else ["-O3", "-std=c++20"]
 
 if IS_ROCM:
     runtime_include_dirs, runtime_library_dirs, runtime_lib = _rocm_paths()
     runtime_link_args = [f"-Wl,-rpath,{runtime_library_dirs[0]}"]
-    # Host sources. BuildExtension supplies the ROCm
-    # platform defines to the C++ compiler; offload architecture flags belong on
-    # HIP device sources and would be rejected by the host compiler here.
-    extra_compile = ["-O3", "-std=c++20"]
     # Device sources (.cu, built by hipcc); BuildExtension adds the offload architectures.
     device_compile = ["-O3", "-std=c++20"]
 else:
     runtime_include_dirs, runtime_library_dirs = _cuda_runtime_paths()
     runtime_lib = "cudart"
     runtime_link_args = []
-    extra_compile = ["-O3", "-std=c++20"]
     # Device sources (.cu, built by nvcc): SASS for each major arch, which also runs on the newer minors of that major,
     # plus PTX for the oldest arch nvcc 13 supports, which the driver builds for any other GPU at load.
     # Naming archs also stops torch from picking them, which fails on a build machine without a GPU.
@@ -263,7 +259,8 @@ setup(
         # use per-function target attributes (avx512bf16/avx512f) + a runtime
         # __builtin_cpu_supports dispatch, so the single binary stays portable
         # (scalar fallback) -- no global -march is set.
-        CppExtension(
+        # The CPU MoE executor uses pthreads and GCC target attributes.
+        *([CppExtension(
             name="freetoken.kernel._cpu_moe",
             sources=[
                 "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
@@ -281,17 +278,17 @@ setup(
             libraries=[runtime_lib],
             extra_compile_args={"cxx": extra_compile + ["-pthread"], "nvcc": device_compile},
             extra_link_args=runtime_link_args,
-        ),
-        # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
+        )] if not IS_WINDOWS else []),
+        # disk-backed row store (PLE / Engram tables)
         *([
             CppExtension(
                 name="freetoken.kernel._row_store",
                 sources=[
                     "python/freetoken/kernel/csrc/row_store/row_store_ext.cpp",
                 ],
-                extra_compile_args=["-O3", "-std=c++20"],
+                extra_compile_args=extra_compile,
             )
-        ] if sys.platform == "linux" else []),
+        ] if sys.platform in ("linux", "win32") else []),
         *ggml_cpu_modules,
     ],
     cmdclass={"build_clib": BuildClib, "build_ext": BuildExt.with_options(use_ninja=True)},

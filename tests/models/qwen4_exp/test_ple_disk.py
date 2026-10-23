@@ -354,6 +354,8 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
 
     # gate mode: the hook fills inline and returns no deferred
     monkeypatch.setenv("FREETOKEN_PLE_SYNC", "gate")
-    gated, _, _ = _make_table(tmp_path)
+    gate_path = tmp_path / "gate-\u6d4b\u8bd5"
+    gate_path.mkdir()
+    gated, _, _ = _make_table(gate_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
