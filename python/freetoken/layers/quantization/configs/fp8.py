@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import Any, ClassVar
 
 from ..linear import LinearConfig
@@ -8,8 +9,13 @@ from ..moe import MoEConfig
 from ..names import is_routed_expert, name_set, substr_set
 from ..registry import LayerKind, register_dialect
 from ..scheme import QuantKind, QuantScheme
-from ..scheme import FP8_BLOCK_SIZES, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
+from ..scheme import FP8_BLOCK_SIZES, fp8_block_qat_scheme, fp8_block_scheme, fp8_tensor_scheme, mxfp4_scheme
 from .base import QuantConfig, Stored, cfg_get
+
+
+def _fp8_lm_head_enabled() -> bool:
+    # opt-in: quantize the (bf16) lm_head to fp8 block-scale at load; default OFF to preserve logit quality
+    return os.environ.get("FREETOKEN_FP8_LM_HEAD", "0").lower() not in ("", "0", "false", "no")
 
 
 @register_dialect
@@ -23,6 +29,8 @@ class Fp8BlockConfig(QuantConfig):
     SCHEMES: ClassVar[dict[str, QuantScheme]] = {
         "BLOCK": fp8_block_scheme("float"),
         "BLOCK_E8M0": fp8_block_scheme("e8m0"),
+        # lm_head: bf16 in the checkpoint, block-quantized to fp8 at load (opt-in, see scheme_for_name)
+        "BLOCK_QAT": fp8_block_qat_scheme("float"),
         # HF ``modules_to_convert``: a table (Qwen3.8-Flash-Next PLE) stored e4m3 with one scalar scale
         "TABLE": fp8_tensor_scheme("float"),
         "EXPERT_MXFP4": mxfp4_scheme(),
@@ -30,6 +38,7 @@ class Fp8BlockConfig(QuantConfig):
     # transformers' fp8 names; DeepSeek-V4's e8m0 export calls every scale ``scale`` (see storage)
     STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
         QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "weight_scale_inv"},
+        QuantKind.FP8_BLOCK_QAT: {"weight": "weight"},  # only the bf16 weight ships; scale made at load
         QuantKind.FP8_TENSOR: {"weight": "weight", "weight_scale": "weight_scale"},
         QuantKind.MXFP4: {"weight": "weight", "weight_scale": "scale"},
     }
@@ -64,6 +73,9 @@ class Fp8BlockConfig(QuantConfig):
     def scheme_for_name(self, name: str) -> QuantScheme | None:
         if self.convert_tables(name):
             return self.SCHEMES["TABLE"]
+        # opt-in: override the default lm_head exclusion to fp8-quantize it at load (decode bandwidth)
+        if _fp8_lm_head_enabled() and "lm_head" in name and not self.e8m0:
+            return self.SCHEMES["BLOCK_QAT"]
         if self.not_convert(name) or self.not_convert_substr(name):
             return None
         if self.expert_fp4 and is_routed_expert(name):

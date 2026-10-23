@@ -270,10 +270,27 @@ def dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, block: int = _B
     return (weight.to(torch.float32) * s).to(torch.bfloat16)
 
 
+def per_block_quant_fp8(weight: torch.Tensor, block: int = _BLOCK):
+    """Quantize a bf16 weight ``[N, K]`` to fp8-e4m3 ``weight`` + ``[N//block, K//block]`` bf16 scale.
+
+    Exact inverse of :func:`dequant_block_fp8`: ``weight_bf16[i,j] ≈ w_fp8[i,j] * scale[i//block, j//block]``
+    with ``scale = amax(block) / 448`` (e4m3 finite max). ``N``/``K`` must be divisible by ``block``.
+    Used to quantize a weight the checkpoint ships in bf16 (e.g. lm_head) at load time."""
+    N, K = weight.shape
+    if N % block or K % block:
+        raise ValueError(f"per_block_quant_fp8 needs [N,K] divisible by {block}, got {N}x{K}")
+    w = weight.to(torch.float32).reshape(N // block, block, K // block, block)
+    amax = w.abs().amax(dim=(1, 3), keepdim=True)
+    scale = (amax / _FP8_MAX).clamp(min=1e-12)  # all-zero block -> tiny scale keeps w_fp8 = 0
+    w_fp8 = (w / scale).clamp(-_FP8_MAX, _FP8_MAX).to(FP8).reshape(N, K)
+    return w_fp8, scale.reshape(N // block, K // block).to(torch.bfloat16)
+
+
 __all__ = [
     "FP8",
     "block_fp8_linear",
     "block_fp8_matmul",
     "per_token_group_quant_fp8",
     "dequant_block_fp8",
+    "per_block_quant_fp8",
 ]
