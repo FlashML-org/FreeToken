@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -69,12 +70,21 @@ uint8_t *page_aligned_alloc(size_t bytes) {
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
 
-torch::Tensor alloc_signal_tensor() {
+hipError_t alloc_signal(int64_t **out) {
   void *word = nullptr;
   // Like CPU MoE, HIP stream waits require signal memory, not a pinned staging allocation.
   const auto rc = hipExtMallocWithFlags(&word, sizeof(int64_t), hipMallocSignalMemory);
+  if (rc == hipSuccess) {
+    *out = static_cast<int64_t *>(word);
+    release_store_i64(*out, 0);
+  }
+  return rc;
+}
+
+torch::Tensor alloc_signal_tensor() {
+  int64_t *word = nullptr;
+  const auto rc = alloc_signal(&word);
   TORCH_CHECK(rc == hipSuccess, "HIP signal allocation failed: ", hipGetErrorString(rc));
-  release_store_i64(static_cast<int64_t *>(word), 0);
   return torch::from_blob(word, {1}, [](void *p) { (void)hipFree(p); },
                           torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
 }
@@ -89,43 +99,73 @@ int memop_wait_geq(uintptr_t stream, uintptr_t addr, uint64_t value) {
                               reinterpret_cast<void *>(addr), value, hipStreamWaitValueGte, UINT64_MAX);
 }
 
+// Capability failures must not poison gating fallback or hide a caller's earlier error.
+struct ProbeErrorScope {
+  ProbeErrorScope() {
+    TORCH_CHECK(hipPeekAtLastError() == hipSuccess, "HIP error pending before row-store sync probe");
+  }
+  ~ProbeErrorScope() { (void)hipGetLastError(); }
+};
+
 bool capture_memops_supported() {
-  TORCH_CHECK(hipPeekAtLastError() == hipSuccess, "HIP error pending before row-store sync probe");
-  auto flag = alloc_signal_tensor();
-  const auto addr = reinterpret_cast<uintptr_t>(flag.data_ptr<int64_t>());
-  release_store_i64(flag.data_ptr<int64_t>(), 7);
+  ProbeErrorScope errors;
+  int device = 0;
+  int can_wait = 0;
+  if (hipGetDevice(&device) != hipSuccess ||
+      hipDeviceGetAttribute(&can_wait, hipDeviceAttributeCanUseStreamWaitValue, device) != hipSuccess || can_wait == 0)
+    return false;
+
+  int64_t *ready = nullptr;
+  int64_t *done = nullptr;
   hipStream_t stream = nullptr;
   hipGraph_t graph = nullptr;
   hipGraphExec_t exec = nullptr;
-  auto rc = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+  auto rc = alloc_signal(&ready);
+  if (rc == hipSuccess) rc = alloc_signal(&done);
+  if (rc == hipSuccess) rc = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+  // A runtime that executes the WAIT during capture must not block the probe.
+  if (rc == hipSuccess) release_store_i64(done, 1);
   if (rc == hipSuccess) rc = hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed);
   const bool started = rc == hipSuccess;
-  if (rc == hipSuccess) rc = static_cast<hipError_t>(memop_write(reinterpret_cast<uintptr_t>(stream), addr, 7));
-  if (rc == hipSuccess) rc = static_cast<hipError_t>(memop_wait_geq(reinterpret_cast<uintptr_t>(stream), addr, 7));
+  if (rc == hipSuccess) rc = static_cast<hipError_t>(memop_write(
+      reinterpret_cast<uintptr_t>(stream), reinterpret_cast<uintptr_t>(ready), 1));
+  if (rc == hipSuccess) rc = static_cast<hipError_t>(memop_wait_geq(
+      reinterpret_cast<uintptr_t>(stream), reinterpret_cast<uintptr_t>(done), 1));
   if (started) {
     const auto end_rc = hipStreamEndCapture(stream, &graph);
     if (rc == hipSuccess) rc = end_rc;
   }
+  if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
   size_t nodes = 0;
   if (rc == hipSuccess) rc = hipGraphGetNodes(graph, nullptr, &nodes);
   // Older HIP runtimes execute memops during capture without recording them.
   if (rc == hipSuccess && nodes != 2) rc = hipErrorNotSupported;
   if (rc == hipSuccess) rc = hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  bool served = false;
   if (rc == hipSuccess) {
-    release_store_i64(flag.data_ptr<int64_t>(), 0);
+    release_store_i64(ready, 0);
+    release_store_i64(done, 0);
+    std::thread responder([&] {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (__atomic_load_n(ready, __ATOMIC_ACQUIRE) == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      served = __atomic_load_n(ready, __ATOMIC_ACQUIRE) == 1;
+      // The graph never resets done, so even a launch arriving after the deadline is released.
+      release_store_i64(done, 1);
+    });
     rc = hipGraphLaunch(exec, stream);
+    if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
+    responder.join();
   }
-  if (rc == hipSuccess) rc = hipStreamSynchronize(stream);
-  const bool ok = rc == hipSuccess && *flag.data_ptr<int64_t>() == 7;
+  const bool ok = rc == hipSuccess && served;
   if (exec != nullptr) (void)hipGraphExecDestroy(exec);
   if (graph != nullptr) (void)hipGraphDestroy(graph);
   if (stream != nullptr) {
     (void)hipStreamSynchronize(stream);
     (void)hipStreamDestroy(stream);
   }
-  (void)hipGetLastError();
-  TORCH_CHECK(rc == hipSuccess || rc == hipErrorNotSupported,
-              "HIP row-store sync probe failed: ", hipGetErrorString(rc));
+  if (ready != nullptr) (void)hipFree(ready);
+  if (done != nullptr) (void)hipFree(done);
   return ok;
 }
 
