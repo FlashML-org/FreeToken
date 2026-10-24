@@ -110,6 +110,42 @@ def test_explicit_trtllm_allowed_on_sm100_family(monkeypatch):
     assert config.page_size in (16, 32, 64)
 
 
+def test_explicit_fa_rejected_outside_sm90_family(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=8)
+    config = _engine_config(attention_backend="fa")
+    with pytest.raises(RuntimeError, match="9.x"):
+        _adjust_config(config)
+
+
+def test_explicit_fa_allowed_on_sm90_family(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=9)
+    config = _engine_config(attention_backend="fa")
+    _adjust_config(config)
+    assert config.attention_backend == "fa"
+
+
+def test_explicit_fa_allowed_on_sm100_family(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=10)
+    config = _engine_config(attention_backend="fa")
+    _adjust_config(config)
+    assert config.attention_backend == "fa"
+
+
+def test_explicit_fa_rejected_on_consumer_blackwell(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=12)
+    config = _engine_config(attention_backend="fa")
+    with pytest.raises(RuntimeError, match="9.x"):
+        _adjust_config(config)
+
+
 def test_fa_backend_rejects_cc12(monkeypatch):
     from freetoken.attention.fa import FlashAttentionBackend
 
