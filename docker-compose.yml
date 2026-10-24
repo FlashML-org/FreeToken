@@ -1,0 +1,27 @@
+services:
+  freetoken:
+    image: freetoken:latest
+    container_name: freetoken-server
+    ipc: host
+    ports:
+      - "1919:1919"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - "--model"
+      - "${MODEL_NAME:-Qwen/Qwen3.6-35B-A3B}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "1919"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
