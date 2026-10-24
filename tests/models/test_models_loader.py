@@ -58,22 +58,31 @@ def test_iter_weight_files_reads_shards_from_an_indexed_subdirectory(tmp_path):
     assert all(os.path.exists(f) for f in files)
 
 
-def test_iter_weight_files_prefers_root_shards_over_the_index(tmp_path):
-    """Root-level shards keep the historical path; the index fallback is only for subdirectory layouts."""
+def test_iter_weight_files_lets_the_index_decide_which_shards_load(tmp_path):
+    """The index is authoritative: it may name root and subdirectory shards; an unlisted root file is not loaded."""
     import json
     from freetoken.models.loader import iter_weight_files
 
-    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"")
+    root = tmp_path / "model-00001-of-00002.safetensors"
+    root.write_bytes(b"")
+    (tmp_path / "unlisted.safetensors").write_bytes(b"")
     sub = tmp_path / "tensors"
     sub.mkdir()
-    (sub / "model-00001-of-00002.safetensors").write_bytes(b"")
+    (sub / "model-00002-of-00002.safetensors").write_bytes(b"")
     (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.embed_tokens.weight": "tensors/model-00001-of-00002.safetensors"}})
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                    "lm_head.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
     )
 
     files = iter_weight_files(str(tmp_path))
 
-    assert files == [str(tmp_path / "model-00001-of-00001.safetensors")]
+    assert files == [str(root), str(sub / "model-00002-of-00002.safetensors")]
 
 
 def test_iter_root_safetensor_files_from_index_keeps_only_root_index_shards(tmp_path):
