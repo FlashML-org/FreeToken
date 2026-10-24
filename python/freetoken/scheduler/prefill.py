@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_LAYER_MAJOR_MAX_EXTEND_TOKENS = 32_768
+
 
 def _maybe_pinned(t: torch.Tensor) -> torch.Tensor:
     """Pinning only buys the async H2D copy below; without a device it just raises."""
@@ -49,6 +51,7 @@ class PrefillAdder:
     encoder_cache: EncoderCache | None = None
     # end a chunk before an image it would cut; only models whose image spans attend in both directions need it
     keep_images_whole: bool = False
+    layer_major: bool = False
     # the whole budget of this pass; token_budget shrinks as requests are admitted
     pass_budget: int = 0
     # SWA-pool tokens charged to reqs admitted so far this pass. Mirrors reserved_size: swa is
@@ -146,6 +149,15 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        if (
+            self.layer_major
+            and remain_len > self.token_budget
+            and remain_len <= _LAYER_MAJOR_MAX_EXTEND_TOKENS
+            and pending_req.mm_items is None
+            and not self.cache_manager.swa_paged
+        ):
+            # The engine splits this measured-size whole request internally.
+            chunk_size = remain_len
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -277,6 +289,7 @@ class PrefillManager:
     decode_manager: DecodeManager
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
+    layer_major: bool = False
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -303,6 +316,7 @@ class PrefillManager:
             table_manager=self.table_manager,
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
+            layer_major=self.layer_major and len(self.pending_list) == 1,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
