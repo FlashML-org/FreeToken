@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
@@ -81,6 +82,18 @@ class TritonAttentionBackend(BaseAttnBackend):
             default=int(getattr(config, "head_dim", 1)),
         )
         self.kv_heads = sorted({group.num_kv_heads for group in kv_groups}) or [int(getattr(config, "num_kv_heads", 1))]
+        self._output_gate_fusion = (
+            os.getenv("FREETOKEN_TRITON_FUSE_OUTPUT_GATE", "1") != "0"
+            and self.device.type == "cuda"
+            and bool(torch.version.hip)
+            and self.num_q_heads == 16 and self.max_head_dim == 256 and 2 in self.kv_heads
+            and getattr(torch.cuda.get_device_properties(self.device), "gcnArchName", "").split(":")[0] == "gfx1201"
+        )
+        if self._output_gate_fusion:
+            from freetoken.kernel.triton.attention import _decode_gate_sigmoid_table
+
+            _decode_gate_sigmoid_table(self.device.index if self.device.index is not None else torch.cuda.current_device())
+
 
     def _split_cap(self, bs: int) -> int:
         """The most decode KV splits any layer group takes at this batch size."""
@@ -113,6 +126,51 @@ class TritonAttentionBackend(BaseAttnBackend):
             (bs, num_q_heads, splits),
             dtype=torch.float32,
             device=self.device,
+        )
+
+    def forward_gated(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        gate: torch.Tensor,
+        attn_spec: AttentionSpec | None = None,
+    ) -> torch.Tensor:
+        # Automatic fusion is limited to the B1/512 Graph validated end to end.
+        metadata = batch.attn_metadata
+        spec = attn_spec or AttentionSpec()
+        eligible = (
+            self._output_gate_fusion
+            and isinstance(metadata, TritonMetadata) and metadata.is_decode
+            and torch.cuda.is_current_stream_capturing()
+            and q.dtype == gate.dtype == torch.bfloat16
+            and q.shape == (1, 16, 256) and metadata.indices.numel() == 512
+            and gate.shape in (q.shape, (q.shape[0], 4096))
+            and gate.device == q.device and q.is_contiguous() and gate.is_contiguous()
+            and spec.sliding_window is None and spec.sinks is None
+            and spec.sm_scale is None and not spec.bidirectional_mm_blocks
+        )
+        if eligible:
+            k_raw, v_raw = self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id)
+            eligible = (k_raw.shape[-2:] == v_raw.shape[-2:] == (2, 256)
+                        and k_raw.dtype == v_raw.dtype == torch.bfloat16
+                        and k_raw.device == v_raw.device == q.device
+                        and k_raw.is_contiguous() and v_raw.is_contiguous())
+        if not eligible:
+            return super().forward_gated(q, k, v, layer_id, batch, gate, attn_spec=attn_spec)
+
+        from freetoken.kernel.triton.attention import decode_paged_attention
+
+        self._ensure_decode_scratch(metadata, q.shape[0], q.shape[1], q.shape[2])
+        # Decide before storing: the fallback must also write each KV row once.
+        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        return decode_paged_attention(
+            q, k_raw.view(-1, 2, 256), v_raw.view(-1, 2, 256),
+            metadata.indptr, metadata.indices, metadata.q_positions,
+            metadata.attn_logits[:q.shape[0]], metadata.attn_lse[:q.shape[0]],
+            q.shape[-1] ** -0.5, output_gate=gate.view_as(q),
         )
 
     def forward(

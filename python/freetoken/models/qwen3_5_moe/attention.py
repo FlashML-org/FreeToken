@@ -81,16 +81,12 @@ class Qwen3_5Attention(BaseOP):
         q, k = self.rotary.forward(positions, q, k)
         return q.view(-1, self.num_q, self.head_dim), k, v, gate
 
-    def _combine(self, attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        gated = attn_out.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
-        return self.o_proj.forward(gated)
-
     @nvtx_annotate("MHA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         q, k, v, gate = self._project(x)
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
-        return self._combine(o, gate)
+        gated = ctx.attn_backend.forward_gated(q, k, v, self.layer_id, ctx.batch, gate)
+        return self.o_proj.forward(gated.reshape(-1, self.qo_attn_dim))
 
 
 __all__ = ["Qwen3_5Attention"]
