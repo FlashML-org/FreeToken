@@ -32,7 +32,7 @@ class EngineConfig:
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
     quant_backend: str | None = None
-    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
+    # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM. NVFP4 (packed e2m1) tables fall back to "pinned" automatically; the disk row store streams native rows only.
     ple_backend: str = "disk"
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
