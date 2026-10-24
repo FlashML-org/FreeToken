@@ -232,8 +232,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_DSV4_PROCESSOR,
         encoders=_DSV4_ENCODERS,
     ),
-    # llama.cpp deepseek4 GGUF (unsloth DeepSeek-V4-Flash-0731-GGUF; text only): the same model
-    # classes with every tensor in its packed ggml type
+    # llama.cpp deepseek4 GGUF (unsloth DeepSeek-V4-Flash-0731-GGUF and the Vision-Exp
+    # release + its deepseek4v mmproj): the same model classes with every tensor in its
+    # packed ggml type
     "DeepseekV4GGUFForCausalLM": ModelSpec(
         "freetoken.models.deepseek_v4",
         "DeepseekV4ForCausalLM",
@@ -244,6 +245,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the KV compressors read their weights through a dense bf16 einsum, so the reader
         # dequantizes them instead of serving the packed ggml rows
         unquantized_modules=("*.compressor.wkv", "*.compressor.wgate"),
+        mm_processor=_DSV4_PROCESSOR,
+        encoders=_DSV4_ENCODERS,
     ),
     # DeepSeek-V4.1-Flash (model_type deepseek_v41): multimodal wrapper config (text tower in
     # text_config). The checkpoint has no ``model.`` root; the compressors, the indexer's key projection /

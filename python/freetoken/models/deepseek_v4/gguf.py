@@ -1,5 +1,5 @@
-"""DeepSeek-V4-Flash from a llama.cpp ``deepseek4`` GGUF (unsloth ``DeepSeek-V4-Flash-0731-GGUF``,
-text only): config from the GGUF metadata, tensor names, and the dense state dict.
+"""DeepSeek-V4-Flash from a llama.cpp ``deepseek4`` GGUF (unsloth ``DeepSeek-V4-Flash-0731-GGUF``
+and the Vision-Exp release): config from the GGUF metadata, tensor names, and the dense state dict.
 
 The GGUF geometry matches the HF checkpoint (43 MLA blocks with sliding-window sparse
 attention, per-layer KV compressors and a Lightning Indexer on the ratio-4 blocks, mHC x4
@@ -13,10 +13,17 @@ placeholder 0, so the per-layer compressor layout is recovered from the tensor t
 ``indexer.*`` tensor means ratio 4, a compressor without an indexer means 128, unless its
 ``wkv`` carries the CSA overlap's double rows (also ratio 4). Routed experts serve from
 the GGUF expert banks (``freetoken.models.gguf.experts``) like every GGUF family.
+
+A ``deepseek4v`` mmproj beside the Vision-Exp text file adds the vision tower under
+``visual.``: the converter splits the fused SwiGLU ``w1`` into ``ffn_gate`` / ``ffn_up``
+rows and reshapes the patch embedding into the conv layout (both undone at load); ggml-org
+writes the attention block fused and unsloth split. A vision trunk also carries the
+``exp_probs_b_vl`` router biases and drops the hash layers' never-applied text bias.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import replace
 from typing import TYPE_CHECKING, Iterator
@@ -25,12 +32,13 @@ import numpy as np
 import torch
 
 from freetoken.layers.quantization.ggml_types import is_quantized
-from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names
+from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
+from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names, load_gguf_metadata
 from freetoken.models.gguf.tensors import check_scales, fused, matrix
 from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
-from .config import model_config_from_args
+from .config import IMAGE_TOKEN_ID, model_config_from_args, parse_vision_config
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -111,8 +119,13 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     names = gguf_tensor_names(shim.model_path)
     if any(n.startswith(("vision.", "aligner.")) for n in names):
         raise NotImplementedError(
-            f"{shim.model_path}: deepseek4 GGUF with a vision tower is not served (the text-only 0731 release has none)"
+            f"{shim.model_path}: deepseek4 GGUF with an inline vision tower is not served "
+            "(llama.cpp ships the tower as a separate mmproj file)"
         )
+
+    # a deepseek4v mmproj beside the file fills the shim's flat vision fields; a text-only
+    # process nulls vision_n_layers on its copy, and None here is the same answer
+    vc = parse_vision_config(shim)
 
     # the clamp is per-layer in the GGUF (and the shared expert carries its own array); the model
     # takes one value, so anything non-uniform is refused instead of silently taking the first
@@ -209,10 +222,176 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         hc_sinkhorn_iters=int(need("hyper_connection.sinkhorn_iterations")),
         hc_eps=float(need("hyper_connection.epsilon")),
         n_mtp_layers=0,  # the converter drops the MTP blocks
-        vision_n_layers=0,
+        # vision fields only when a mmproj filled them (the defaults are the text model's)
+        **({} if vc is None else dict(
+            vision_n_layers=vc.vision_n_layers,
+            vision_dim=vc.vision_dim,
+            vision_n_heads=vc.vision_n_heads,
+            vision_inter_dim=vc.vision_inter_dim,
+            vision_patch_size=vc.vision_patch_size,
+            vision_rope_theta=vc.vision_rope_theta,
+            vision_downsample_ratio=vc.vision_downsample_ratio,
+            vision_max_n_token=vc.vision_max_n_token,
+            vision_min_pixels=vc.vision_min_pixels,
+            vision_max_wh_ratio=vc.vision_max_wh_ratio,
+        )),
     )
-    config = model_config_from_args(args, max_position=int(need("context_length")))
+    config = model_config_from_args(args, max_position=int(need("context_length")), vision_config=vc)
     return replace(config, expert_quant="gguf")
+
+
+# ----------------------------------------------------------------------------------------------
+# Vision tower (a deepseek4v mmproj)
+# ----------------------------------------------------------------------------------------------
+
+_PROJECTOR = "deepseek4v"
+_IMAGE_TOKEN = "<｜deepseek_image｜>"
+# no mmproj key carries these; llama.cpp hardcodes them and its converter asserts them
+_ROPE_THETA = 10000.0
+_MAX_N_TOKEN = 384
+_MAX_WH_RATIO = 8
+
+# top-level mmproj tensor -> the tower name under ``visual.``
+_MM_TOP: dict[str, str] = {
+    "v.patch_embd.bias": "vision.patch_embed.proj.bias",
+    "v.post_ln.weight": "vision.norm.weight",
+    "mm.1.weight": "aligner.w1.weight",
+    "mm.1.bias": "aligner.w1.bias",
+    "mm.2.weight": "aligner.w2.weight",
+    "mm.2.bias": "aligner.w2.bias",
+    "v.token_embd.img_start": "image_start",
+    "v.token_embd.img_end": "image_end",
+    "v.image_newline": "image_newline",
+    "v.token_embd.img_pad": "image_pad",
+}
+
+
+def gguf_mm_config(text_md: dict, mmproj: Mmproj, vocab_size: int, *, model_path: str = "") -> tuple[dict, dict]:
+    """The flat HF config keys (the vision dims sit at the top level on this family, like the
+    checkpoint's inference config) and the preprocessor dict of the tower in ``mmproj``, for
+    the text GGUF whose metadata is ``text_md``."""
+    if mmproj.projector != _PROJECTOR:
+        raise ValueError(f"mmproj {mmproj.path} is a {mmproj.projector!r} tower; DeepSeek-V4 needs {_PROJECTOR!r}")
+    md, index = load_gguf_metadata(mmproj.path), gguf_tensor_index(mmproj.path)
+    # the converter writes use_silu=True only for the SwiGLU tower; the module has no gelu MLP
+    if md.get("clip.use_silu") is not True:
+        raise NotImplementedError(f"mmproj {mmproj.path}: only the SwiGLU tower is served")
+
+    def kv(key: str):
+        return md[f"clip.vision.{key}"]
+
+    arch = text_md["general.architecture"]
+    text_hidden = int(text_md[f"{arch}.embedding_length"])
+    if int(kv("projection_dim")) != text_hidden:
+        raise ValueError(f"mmproj {mmproj.path} projects to {int(kv('projection_dim'))} but the text model is {text_hidden} wide")
+    tokens = text_md["tokenizer.ggml.tokens"]
+    if _IMAGE_TOKEN not in tokens:
+        raise ValueError(
+            f"the text GGUF tokenizer has no {_IMAGE_TOKEN} token (the 0731 text-only release "
+            "uses another dialect; pair the mmproj with a Vision-Exp text GGUF)"
+        )
+    # the model config and the processor hardcode the family id; a file with the token at
+    # another id would fail per request instead of here
+    if tokens.index(_IMAGE_TOKEN) != IMAGE_TOKEN_ID:
+        raise ValueError(
+            f"the text GGUF carries {_IMAGE_TOKEN} at id {tokens.index(_IMAGE_TOKEN)}, not the family's {IMAGE_TOKEN_ID}"
+        )
+    # a ValueError so auto-discovery skips this mmproj (text only); only --mmproj fails
+    if not any(n.endswith(".exp_probs_b_vl.bias") for n in gguf_tensor_names(model_path)):
+        raise ValueError(
+            f"the text trunk {os.path.basename(model_path)} predates vision routing "
+            "(no exp_probs_b_vl; converted before llama.cpp #28154) -- pair a Vision-Exp "
+            "text GGUF reconverted after 2026-09-02"
+        )
+    for sentinel in ("v.token_embd.img_start", "v.token_embd.img_end", "v.image_newline", "v.token_embd.img_pad"):
+        if sentinel not in index:
+            raise ValueError(f"mmproj {mmproj.path}: sentinel tensor {sentinel!r} is missing")
+    # the tower hardcodes eps 1e-6 (vision.py); the converter warns it is NOT the text 1e-20
+    if abs(float(kv("attention.layer_norm_epsilon")) - 1e-6) > 1e-9:
+        raise NotImplementedError(f"mmproj {mmproj.path}: vision layer_norm_epsilon {kv('attention.layer_norm_epsilon')} is not the served 1e-6")
+    # qkv dialect: ggml-org writes the fused attn_qkv, unsloth the split attn_q/k/v (clip.cpp loads both)
+    split = all(f"v.blk.0.attn_{q}.{part}" in index for q in "qkv" for part in ("weight", "bias"))
+    if split == ("v.blk.0.attn_qkv.weight" in index):
+        raise ValueError(f"mmproj {mmproj.path}: the attn tensors are neither the fused attn_qkv nor the split attn_q/k/v layout (or carry both)")
+    patch, dim = int(kv("patch_size")), int(kv("embedding_length"))
+    # the converter reshapes the Linear's [dim, 3*p*p] kernel into the conv [p, p, 3, dim]
+    if tuple(index["v.patch_embd.weight"].ne) != (patch, patch, 3, dim):
+        raise ValueError(f"mmproj {mmproj.path}: v.patch_embd.weight {tuple(index['v.patch_embd.weight'].ne)} is not the [p, p, 3, dim] conv layout")
+    # clip.vision.image_size (672) is deliberately unread: a converter compat/warmup value,
+    # the tower is native-resolution
+
+    hf_fields = {
+        "vision_n_layers": int(kv("block_count")),
+        "vision_dim": dim,
+        "vision_n_heads": int(kv("attention.head_count")),
+        "vision_inter_dim": int(kv("feed_forward_length")),
+        "vision_patch_size": patch,
+        "vision_rope_theta": _ROPE_THETA,
+        "vision_downsample_ratio": int(kv("projector.scale_factor")),
+        "vision_max_n_token": _MAX_N_TOKEN,
+        "vision_min_pixels": int(kv("image_min_pixels")),
+        "vision_max_wh_ratio": _MAX_WH_RATIO,
+        # parse_vision_config reads the aligner's target width off hidden_size
+        "hidden_size": text_hidden,
+        "image_token_id": tokens.index(_IMAGE_TOKEN),
+    }
+    preprocessor = {
+        # no transformers class exists; DSV4MMProcessor._image_processor returns None
+        "image_processor_type": "DeepseekV4ImageProcessor",
+        "patch_size": patch,
+        "temporal_patch_size": 1,
+        "merge_size": int(kv("projector.scale_factor")),
+        "image_mean": [float(v) for v in kv("image_mean")],
+        "image_std": [float(v) for v in kv("image_std")],
+        "min_pixels": int(kv("image_min_pixels")),
+        "max_n_token": _MAX_N_TOKEN,
+    }
+    return hf_fields, preprocessor
+
+
+def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tower state dict under ``visual.``, named as the HF checkpoints load."""
+    index = gguf_tensor_index(mmproj.path)
+    fused = "v.blk.0.attn_qkv.weight" in index
+    n_blocks = max(int(n.split(".")[2]) for n in index if n.startswith("v.blk.")) + 1
+
+    pe = index["v.patch_embd.weight"]
+    # ggml order [p, p, 3, out] -> torch [out, 3, p, p] -> the module's flat [out, 3*p*p]
+    yield "visual.vision.patch_embed.proj.weight", mmproj_tensor(pe).reshape(pe.ne[3], 3 * pe.ne[0] * pe.ne[0])
+    for gguf_name, ft_name in _MM_TOP.items():
+        yield f"visual.{ft_name}", mmproj_tensor(index[gguf_name])
+
+    consumed = {"v.patch_embd.weight", *_MM_TOP}
+    for layer in range(n_blocks):
+        blk, dst = f"v.blk.{layer}", f"visual.vision.blocks.{layer}"
+        if fused:
+            for part in ("weight", "bias"):
+                yield f"{dst}.attn.wqkv.{part}", mmproj_tensor(index[f"{blk}.attn_qkv.{part}"])
+            consumed.update((f"{blk}.attn_qkv.weight", f"{blk}.attn_qkv.bias"))
+        else:
+            for part in ("weight", "bias"):
+                yield f"{dst}.attn.wqkv.{part}", torch.cat(
+                    [mmproj_tensor(index[f"{blk}.attn_{q}.{part}"]) for q in "qkv"], dim=0
+                )
+            consumed.update(f"{blk}.attn_{q}.{part}" for q in "qkv" for part in ("weight", "bias"))
+        for part in ("weight", "bias"):
+            yield f"{dst}.attn.wo.{part}", mmproj_tensor(index[f"{blk}.attn_out.{part}"])
+        # the converter chunks the fused SwiGLU w1 rows into gate / up; cat them back
+        yield f"{dst}.mlp.w1.weight", torch.cat(
+            [mmproj_tensor(index[f"{blk}.ffn_gate.weight"]), mmproj_tensor(index[f"{blk}.ffn_up.weight"])], dim=0
+        )
+        yield f"{dst}.mlp.w2.weight", mmproj_tensor(index[f"{blk}.ffn_down.weight"])
+        yield f"{dst}.norm1.weight", mmproj_tensor(index[f"{blk}.ln1.weight"])
+        yield f"{dst}.norm2.weight", mmproj_tensor(index[f"{blk}.ln2.weight"])
+        consumed.update(
+            f"{blk}.attn_out.{part}" for part in ("weight", "bias")
+        )
+        consumed.update(f"{blk}.ffn_{m}.weight" for m in ("gate", "up", "down"))
+        consumed.update((f"{blk}.ln1.weight", f"{blk}.ln2.weight"))
+
+    leftovers = set(index) - consumed
+    if leftovers:
+        raise ValueError(f"mmproj {mmproj.path}: unexpected tensors {sorted(leftovers)[:5]}")
 
 
 # ----------------------------------------------------------------------------------------------
@@ -267,6 +446,8 @@ def iter_gguf_weights(
     from freetoken.utils import cached_load_hf_config
 
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
     args = config.dsv4_args
     index = gguf_tensor_index(model_path)
     hidden = config.hidden_size
@@ -331,14 +512,22 @@ def iter_gguf_weights(
         g = f"{pre}.ffn.gate"
         yield f"{g}.weight", bf16(f"{blk}.ffn_gate_inp")
         if layer < args.n_hash_layers:
-            # a vision checkpoint also gives its hash layers a text bias; the text model has no slot for it
             yield f"{g}.tid2eid", _tid2eid(t(f"{blk}.ffn_gate_tid2eid"))
+            if vision:
+                # the converter drops the hash layers' text bias (the reference never applies
+                # it); the module builds the slot on a vision build, so it zero-fills
+                yield f"{g}.bias", torch.zeros(args.n_routed_experts, dtype=torch.float32)
         else:
             yield f"{g}.bias", _float(t(f"{blk}.exp_probs_b.bias"))
+        if vision:
+            yield f"{g}.bias_vl", _float(t(f"{blk}.exp_probs_b_vl.bias"))
         for proj, src in (("w1", "ffn_gate_shexp"), ("w3", "ffn_up_shexp"), ("w2", "ffn_down_shexp")):
             info = t(f"{blk}.{src}")
             k = hidden if proj != "w2" else args.moe_inter_dim
             yield from fused(f"{pre}.ffn.shared_experts.{proj}", [info], [matrix(info)], k)
 
+    if vision:
+        yield from iter_mmproj_weights(find_mmproj(model_path))
 
-__all__ = ["iter_gguf_weights", "parse_gguf_config", "to_gguf"]
+
+__all__ = ["gguf_mm_config", "iter_gguf_weights", "iter_mmproj_weights", "parse_gguf_config", "to_gguf"]

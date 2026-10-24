@@ -105,7 +105,7 @@ def _f32_value(v: float) -> float:
     return float(str(np.float32(v)))
 
 
-def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, model_path: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
     """The HF config.json keys and the preprocessor_config.json of the tower in ``mmproj``, for the text GGUF whose metadata is ``text_md``."""
     if mmproj.projector not in (_VIT, _UNIFIED):
         raise ValueError(f"mmproj {mmproj.path} is a {mmproj.projector!r} tower; Gemma 4 needs {_VIT!r} or {_UNIFIED!r}")
