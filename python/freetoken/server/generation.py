@@ -410,6 +410,9 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
             or bool(ctk.get("enable_thinking"))
             or bool(ctk.get("thinking"))
         )
+    elif parser_name == "flint":
+        # Flint opens its own optional think block, including when tools are present.
+        force_reasoning = False
     elif parser_name == "minimax_m3":
         # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
         # model then emits just the closing tag); "adaptive" (default) leaves the
