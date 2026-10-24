@@ -51,7 +51,16 @@ def shard_tensor(
 def iter_weight_files(model_path: str) -> list[str]:
     model_folder = download_hf_weight(model_path)
     files = glob.glob(f"{model_folder}/*.safetensors")
-    return [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    if files:
+        return files
+    # Root-glob misses checkpoints that keep their shards in a subdirectory (nvidia's FP4-Local
+    # releases ship tensors/model-NNNNN-of-NNNNN.safetensors): the index's weight_map holds the
+    # shard paths relative to the model folder, so resolve them from there.
+    if not os.path.exists(os.path.join(model_folder, "model.safetensors.index.json")):
+        return files
+    shards = sorted({shard for shard in safetensors_weight_map(model_folder).values()})
+    return [os.path.join(model_folder, shard) for shard in shards]
 
 
 def safetensors_weight_map(folder: str) -> dict[str, str]:
