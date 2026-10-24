@@ -269,9 +269,15 @@ def test_every_kv_pool_answers_the_sizing_surface():
     from freetoken.kvcache.mha_pool import MHAKVCache
 
     for cls in (MHAKVCache, MLAKVCache, DSAKVCache, HybridSWAKVCache, DSV4PagedKVCache):
-        for hook in ("kv_cost", "solve_num_pages", "min_kv_tokens", "validate_rebuild"):
+        for hook in (
+            "kv_cost", "solve_num_pages", "min_kv_tokens", "validate_rebuild",
+            "rebuild_footprint",
+        ):
             assert callable(getattr(cls, hook, None)), f"{cls.__name__} is missing {hook}"
-    for hook in ("kv_cost", "solve_num_pages", "min_kv_tokens", "validate_rebuild"):
+    for hook in (
+        "kv_cost", "solve_num_pages", "min_kv_tokens", "validate_rebuild",
+        "rebuild_footprint",
+    ):
         assert hook in DSV4PagedKVCache.__dict__, f"DSV4 lost its {hook} override"
 
 
