@@ -224,6 +224,55 @@ def test_pinned_uva_zeroes_out_of_range_ids():
     assert torch.equal(rows[0], bank.tensor[0].cuda().to(torch.bfloat16))
 
 
+@requires_cuda
+def test_pinned_uva_fp4_matches_gpu_resident():
+    """The FP4-Local table: packed e2m1 rows + per-16 e4m3 scale rows + global scale, UVA against the oracle."""
+    from freetoken.moe.host_banks import HostBank
+
+    gen = torch.Generator().manual_seed(9)
+    rows, dim, scale = 4096, 160, 0.03125
+    value = HostBank((rows, dim // 2), torch.uint8)
+    value.tensor.copy_(torch.randint(0, 256, (rows, dim // 2), generator=gen))
+    value.pin()
+    scale_bank = HostBank((rows, dim // 16), torch.float8_e4m3fn)
+    scale_bank.tensor.copy_((torch.rand(rows, dim // 16, generator=gen) * 8).to(torch.float8_e4m3fn))
+    scale_bank.pin()
+
+    oracle = GpuResidentTable(
+        value.tensor.cuda(), scale, dtype=torch.bfloat16, scale_tensor=scale_bank.tensor.cuda()
+    )
+    pinned = PinnedUVATable(value.tensor, scale, scale_tensor=scale_bank.tensor)
+
+    ids = torch.randint(0, rows, (37, 16), device="cuda")
+    want = oracle.lookup(ids)
+    assert torch.equal(pinned.lookup(ids), want)
+
+    pinned.prefetch(ids)
+    assert torch.equal(pinned.lookup(ids), want)
+
+    other = torch.randint(0, rows, (37, 16), device="cuda")
+    assert torch.equal(pinned.lookup(other), oracle.lookup(other))
+    assert pinned.lookup(ids).shape == (37, 16 * dim)
+
+
+def test_gpu_resident_fp4_lookup_matches_the_lut():
+    """CPU oracle: e2m1 nibble decode, per-16 e4m3 scale rows, global scale."""
+    gen = torch.Generator().manual_seed(3)
+    rows, dim, scale = 64, 32, 0.5
+    packed = torch.randint(0, 256, (rows, dim // 2), generator=gen).to(torch.uint8)
+    scales = (torch.rand(rows, dim // 16, generator=gen) * 8).to(torch.float8_e4m3fn)
+    table = GpuResidentTable(packed, scale, dtype=torch.bfloat16, scale_tensor=scales)
+    ids = torch.randint(0, rows, (5, 16))
+
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    )
+    nibbles = packed.to(torch.int64)
+    values = torch.stack((lut[nibbles & 0x0F], lut[(nibbles >> 4) & 0x0F]), dim=2).reshape(rows, dim)
+    want = (values * scales.float().repeat_interleave(16, dim=1) * scale).to(torch.bfloat16)
+    assert torch.equal(table.lookup(ids).view(-1, dim), want[ids.reshape(-1)])
+
+
 @pytest.mark.skipif(
     not os.environ.get("FREETOKEN_QWEN4EXP_MODEL"), reason="needs FREETOKEN_QWEN4EXP_MODEL"
 )

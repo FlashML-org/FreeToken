@@ -22,6 +22,7 @@ from freetoken.utils import init_logger
 
 from .weight import (
     _PLE_SCALE_SUFFIX,
+    _PLE_SHARD_SCALE_RE,
     _PLE_SHARD_RE,
     _PLE_ST_DTYPES,
     _ple_table_files,
@@ -71,6 +72,15 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     shards: dict[int, tuple[int, int]] = {}
     for path in _ple_table_files(folder):
         header, base = _safetensors_header(path)
+        # a packed e2m1 table pairs U8 shard rows with per-shard e4m3 scale rows; plain
+        # checkpoints never carry those scale keys, so U8 there is just an unsupported dtype
+        if any(_PLE_SHARD_SCALE_RE.search(k) is not None for k in header) and any(
+            header[k]["dtype"] == "U8" for k in header if _PLE_SHARD_RE.search(k) is not None
+        ):
+            raise NotImplementedError(
+                f"the disk PLE backend reads native rows only; {path} holds a packed e2m1 "
+                "(NVFP4) table -- use the pinned backend (--ple-backend pinned)"
+            )
         for key, meta in header.items():
             if key == "__metadata__":
                 continue
