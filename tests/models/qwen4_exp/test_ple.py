@@ -240,6 +240,11 @@ def test_pinned_uva_real_table():
     args = SimpleNamespace(
         split_ngram_parts=text["split_ngram_parts"],
         ngram_head_dim=text["ple_embed_dim"] // heads,
+        ngram_size=text["ngram_size"],
+        heads_per_ngram=text["heads_per_ngram"],
+        ngram_vocab_size_base=text["ngram_vocab_size_base"],
+        make_ngram_vocab_size_divisible_by=text["make_ngram_vocab_size_divisible_by"],
+        ple_layer_ids=tuple(i - 1 for i in text["ple_layer_ids"]),  # HF stores them 1-based
     )
     table = load_ple_table(path, args)
     scale = float(table.weight_scale)
