@@ -23,6 +23,7 @@ writes the attention block fused and unsloth split. A vision trunk also carries 
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import replace
 from typing import TYPE_CHECKING, Iterator
@@ -122,15 +123,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             "(llama.cpp ships the tower as a separate mmproj file)"
         )
 
-    # a deepseek4v mmproj fills the shim's flat vision fields; a text-only process nulls
-    # vision_n_layers on its copy. The weight iterator re-parses a fresh shim, so the
-    # check below still fires there for a broken pairing.
+    # a deepseek4v mmproj beside the file fills the shim's flat vision fields; a text-only
+    # process nulls vision_n_layers on its copy, and None here is the same answer
     vc = parse_vision_config(shim)
-    if vc is not None and not any(n.endswith(".exp_probs_b_vl.bias") for n in names):
-        raise NotImplementedError(
-            f"{shim.model_path}: the text trunk predates vision routing (no exp_probs_b_vl; "
-            "converted before llama.cpp #28154) -- pair a Vision-Exp text GGUF reconverted after 2026-09-02"
-        )
 
     # the clamp is per-layer in the GGUF (and the shared expert carries its own array); the model
     # takes one value, so anything non-uniform is refused instead of silently taking the first
@@ -271,7 +266,7 @@ _MM_TOP: dict[str, str] = {
 }
 
 
-def gguf_mm_config(text_md: dict, mmproj: Mmproj, vocab_size: int) -> tuple[dict, dict]:
+def gguf_mm_config(text_md: dict, mmproj: Mmproj, vocab_size: int, *, model_path: str = "") -> tuple[dict, dict]:
     """The flat HF config keys (the vision dims sit at the top level on this family, like the
     checkpoint's inference config) and the preprocessor dict of the tower in ``mmproj``, for
     the text GGUF whose metadata is ``text_md``."""
@@ -300,6 +295,13 @@ def gguf_mm_config(text_md: dict, mmproj: Mmproj, vocab_size: int) -> tuple[dict
     if tokens.index(_IMAGE_TOKEN) != IMAGE_TOKEN_ID:
         raise ValueError(
             f"the text GGUF carries {_IMAGE_TOKEN} at id {tokens.index(_IMAGE_TOKEN)}, not the family's {IMAGE_TOKEN_ID}"
+        )
+    # a ValueError so auto-discovery skips this mmproj (text only); only --mmproj fails
+    if not any(n.endswith(".exp_probs_b_vl.bias") for n in gguf_tensor_names(model_path)):
+        raise ValueError(
+            f"the text trunk {os.path.basename(model_path)} predates vision routing "
+            "(no exp_probs_b_vl; converted before llama.cpp #28154) -- pair a Vision-Exp "
+            "text GGUF reconverted after 2026-09-02"
         )
     for sentinel in ("v.token_embd.img_start", "v.token_embd.img_end", "v.image_newline", "v.token_embd.img_pad"):
         if sentinel not in index:
