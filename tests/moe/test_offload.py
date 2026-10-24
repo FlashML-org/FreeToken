@@ -1299,3 +1299,41 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch):
+    """The RAM probe must size the shards the reader will actually open, indexed subdirectory layouts included."""
+    import builtins
+    import io
+    import json
+
+    from freetoken.moe.expert_banks import _host_ram_fits_parallel
+
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    for i in (1, 2):
+        (sub / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"x" * (1 << 20))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight": "tensors/model-00001-of-00002.safetensors",
+                    "model.layers.0.mlp.experts.0.down_proj.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    real_open = builtins.open
+
+    def fake_open(meminfo):
+        def open_(file, *args, **kwargs):
+            if str(file) == "/proc/meminfo":
+                return io.StringIO(meminfo)
+            return real_open(file, *args, **kwargs)
+
+        return open_
+
+    monkeypatch.setattr(builtins, "open", fake_open("MemAvailable:           512 kB\n"))
+    assert not _host_ram_fits_parallel(str(tmp_path))
+    monkeypatch.setattr(builtins, "open", fake_open("MemAvailable:     999999999 kB\n"))
+    assert _host_ram_fits_parallel(str(tmp_path))

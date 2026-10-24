@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from typing import Iterable, Iterator
 
 import torch
+
 from freetoken.utils import div_ceil, download_hf_weight
+from freetoken.utils.logger import init_logger
+
+logger = init_logger(__name__)
 
 SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj")
 SPLIT_DIM_1 = (".o_proj", ".down_proj")
@@ -48,19 +52,48 @@ def shard_tensor(
     return value
 
 
+def _index_weight_map(folder: str) -> dict[str, str] | None:
+    """The index's weight_map, or None when the checkpoint ships no usable one: a bad
+    index must not hide shards that are on disk."""
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        return None
+    try:
+        with open(index, encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+    except (OSError, ValueError, KeyError) as e:
+        logger.warning("ignoring unusable %s (%s); falling back to root shards", index, e)
+        return None
+    if not weight_map:
+        logger.warning("ignoring an empty weight_map in %s; falling back to root shards", index)
+        return None
+    return weight_map
+
+
 def iter_weight_files(model_path: str) -> list[str]:
     model_folder = download_hf_weight(model_path)
+    # The index is authoritative: it also names shards in subdirectories, which the root
+    # glob misses (nvidia's FP4-Local releases ship tensors/model-*.safetensors).
+    weight_map = _index_weight_map(model_folder)
+    if weight_map:
+        paths = []
+        root = os.path.abspath(model_folder)
+        for shard in sorted(set(weight_map.values())):
+            path = os.path.abspath(os.path.join(model_folder, shard))
+            if not path.startswith(root + os.sep):
+                raise ValueError(f"index shard {shard!r} escapes the model directory {model_folder}")
+            paths.append(path)
+        return paths
     files = glob.glob(f"{model_folder}/*.safetensors")
     return [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
 
 def safetensors_weight_map(folder: str) -> dict[str, str]:
     """Tensor name -> shard basename, from the index or from each shard's header when the checkpoint ships none."""
-    index = os.path.join(folder, "model.safetensors.index.json")
-    if os.path.exists(index):
-        with open(index, encoding="utf-8") as f:
-            return json.load(f)["weight_map"]
-    weight_map: dict[str, str] = {}
+    weight_map = _index_weight_map(folder)
+    if weight_map:
+        return weight_map
+    weight_map = {}
     for path in sorted(iter_weight_files(folder)):
         with open(path, "rb") as fh:
             n = struct.unpack("<Q", fh.read(8))[0]

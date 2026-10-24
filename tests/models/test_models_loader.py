@@ -31,6 +31,110 @@ def test_shard_tensor_splits_vocab_with_ceil_partition():
     assert rank1.tolist() == value[3:5].tolist()
 
 
+def test_iter_weight_files_reads_shards_from_an_indexed_subdirectory(tmp_path):
+    """FP4-Local releases keep shards in tensors/; the root glob alone finds nothing."""
+    import json
+    import os
+    from freetoken.models.loader import iter_weight_files
+
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    for i in (1, 2):
+        (sub / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "tensors/model-00001-of-00002.safetensors",
+                    "lm_head.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+
+    files = iter_weight_files(str(tmp_path))
+
+    assert len(files) == 2
+    assert all(os.path.exists(f) for f in files)
+
+
+def test_iter_weight_files_lets_the_index_decide_which_shards_load(tmp_path):
+    """The index is authoritative: it may name root and subdirectory shards; an unlisted root file is not loaded."""
+    import json
+    from freetoken.models.loader import iter_weight_files
+
+    root = tmp_path / "model-00001-of-00002.safetensors"
+    root.write_bytes(b"")
+    (tmp_path / "unlisted.safetensors").write_bytes(b"")
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    (sub / "model-00002-of-00002.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                    "lm_head.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+
+    files = iter_weight_files(str(tmp_path))
+
+    assert files == [str(root), str(sub / "model-00002-of-00002.safetensors")]
+
+
+def test_iter_weight_files_falls_back_to_root_shards_without_an_index(tmp_path):
+    """No index: the root glob loads, excluding consolidated.safetensors unless it is the only shard."""
+    from freetoken.models.loader import iter_weight_files
+
+    a = tmp_path / "model-00001-of-00002.safetensors"
+    b = tmp_path / "model-00002-of-00002.safetensors"
+    consolidated = tmp_path / "consolidated.safetensors"
+    for path in (a, b, consolidated):
+        path.write_bytes(b"")
+
+    assert sorted(iter_weight_files(str(tmp_path))) == sorted([str(a), str(b)])
+
+    a.unlink()
+    b.unlink()
+    assert iter_weight_files(str(tmp_path)) == [str(consolidated)]
+
+
+def test_iter_weight_files_falls_back_when_the_index_is_unusable(tmp_path):
+    """A broken or empty index must not hide shards that are on disk."""
+    import json
+
+    from freetoken.models.loader import iter_weight_files
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"")
+    index = tmp_path / "model.safetensors.index.json"
+
+    index.write_text("{not json")
+    assert iter_weight_files(str(tmp_path)) == [str(shard)]
+
+    index.write_text(json.dumps({"weight_map": {}}))
+    assert iter_weight_files(str(tmp_path)) == [str(shard)]
+
+
+def test_iter_weight_files_rejects_an_index_that_escapes_the_folder(tmp_path):
+    """Index keys are checkpoint-supplied: a ../ path must not make the loader read outside it."""
+    import json
+
+    import pytest
+
+    from freetoken.models.loader import iter_weight_files
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"x": "../outside.safetensors"}})
+    )
+
+    with pytest.raises(ValueError, match="escapes the model directory"):
+        iter_weight_files(str(tmp_path))
+
+
 def test_iter_root_safetensor_files_from_index_keeps_only_root_index_shards(tmp_path):
     import json
     from freetoken.models.loader import iter_root_safetensor_files_from_index
