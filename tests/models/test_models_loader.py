@@ -85,6 +85,56 @@ def test_iter_weight_files_lets_the_index_decide_which_shards_load(tmp_path):
     assert files == [str(root), str(sub / "model-00002-of-00002.safetensors")]
 
 
+def test_iter_weight_files_falls_back_to_root_shards_without_an_index(tmp_path):
+    """No index: the root glob loads, excluding consolidated.safetensors unless it is the only shard."""
+    from freetoken.models.loader import iter_weight_files
+
+    a = tmp_path / "model-00001-of-00002.safetensors"
+    b = tmp_path / "model-00002-of-00002.safetensors"
+    consolidated = tmp_path / "consolidated.safetensors"
+    for path in (a, b, consolidated):
+        path.write_bytes(b"")
+
+    assert sorted(iter_weight_files(str(tmp_path))) == sorted([str(a), str(b)])
+
+    a.unlink()
+    b.unlink()
+    assert iter_weight_files(str(tmp_path)) == [str(consolidated)]
+
+
+def test_iter_weight_files_falls_back_when_the_index_is_unusable(tmp_path):
+    """A broken or empty index must not hide shards that are on disk."""
+    import json
+
+    from freetoken.models.loader import iter_weight_files
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"")
+    index = tmp_path / "model.safetensors.index.json"
+
+    index.write_text("{not json")
+    assert iter_weight_files(str(tmp_path)) == [str(shard)]
+
+    index.write_text(json.dumps({"weight_map": {}}))
+    assert iter_weight_files(str(tmp_path)) == [str(shard)]
+
+
+def test_iter_weight_files_rejects_an_index_that_escapes_the_folder(tmp_path):
+    """Index keys are checkpoint-supplied: a ../ path must not make the loader read outside it."""
+    import json
+
+    import pytest
+
+    from freetoken.models.loader import iter_weight_files
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"x": "../outside.safetensors"}})
+    )
+
+    with pytest.raises(ValueError, match="escapes the model directory"):
+        iter_weight_files(str(tmp_path))
+
+
 def test_iter_root_safetensor_files_from_index_keeps_only_root_index_shards(tmp_path):
     import json
     from freetoken.models.loader import iter_root_safetensor_files_from_index

@@ -83,7 +83,7 @@ def group_names(names, limit: int = 4) -> str:
 
 
 def shard_files(path: str) -> list[str]:
-    """The root shards the loaders read: consolidated.safetensors only when it is the only one (loader.iter_weight_files)."""
+    """Root *.safetensors names, consolidated.safetensors only when it is the only one; subdirectory layouts are reached through safetensors_weight_map below."""
     files = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
     return [f for f in files if f != "consolidated.safetensors"] or files
 
