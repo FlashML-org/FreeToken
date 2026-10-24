@@ -73,6 +73,9 @@ def safetensors_weight_map(folder: str) -> dict[str, str]:
 
 def drop_page_cache(path: str) -> None:
     """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
+    # Windows has no posix_fadvise; its file cache is standby memory the memory manager repurposes on demand.
+    if not hasattr(os, "posix_fadvise"):
+        return
     try:
         fd = os.open(path, os.O_RDONLY)
         try:
