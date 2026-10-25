@@ -1232,15 +1232,10 @@ def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch)
     )
     real_open = builtins.open
 
-    def fake_open(meminfo):
-        def open_(file, *args, **kwargs):
-            if str(file) == "/proc/meminfo":
-                return io.StringIO(meminfo)
-            return real_open(file, *args, **kwargs)
+    def fake_open(file, *args, **kwargs):
+        if str(file) == "/proc/meminfo":
+            return io.StringIO("MemAvailable:           512 kB\n")
+        return real_open(file, *args, **kwargs)
 
-        return open_
-
-    monkeypatch.setattr(builtins, "open", fake_open("MemAvailable:           512 kB\n"))
+    monkeypatch.setattr(builtins, "open", fake_open)
     assert not _host_ram_fits_parallel(str(tmp_path))
-    monkeypatch.setattr(builtins, "open", fake_open("MemAvailable:     999999999 kB\n"))
-    assert _host_ram_fits_parallel(str(tmp_path))

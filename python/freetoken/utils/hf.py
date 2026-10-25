@@ -281,7 +281,7 @@ def _weight_allow_patterns(repo_id: str) -> list[str]:
             SAFE_WEIGHTS_INDEX_NAME, repo_id, e,
         )
         return ["*.safetensors"]
-    return [*shards, SAFE_WEIGHTS_INDEX_NAME] if shards else ["*.safetensors"]
+    return shards or ["*.safetensors"]
 
 
 def download_hf_weight(model_path: str) -> str:
