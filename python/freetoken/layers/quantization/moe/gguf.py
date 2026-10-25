@@ -69,6 +69,7 @@ def float_mul_mat_id(w: torch.Tensor, x: torch.Tensor, ids: torch.Tensor, topk_w
 class GgmlMoEKernel(MoEKernel):
     name = "ggml"
     cpu_format = "gguf"
+    supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not is_quantized(expert_types(cfg)[0]):
@@ -115,7 +116,8 @@ class GgmlMoEKernel(MoEKernel):
         def mul_mat_id(w: torch.Tensor, ggml_type: int, a: torch.Tensor) -> torch.Tensor:
             if is_quantized(ggml_type):
                 return ggml.mul_mat_id(w, ggml_type, a, ids)
-            return float_mul_mat_id(w, a, ids, topk_weights, config)
+            # the bf16 kernels read every route's slot: an inactive one reads slot 0 and gets weight 0
+            return float_mul_mat_id(w, a, ids.clamp_min(0), topk_weights, config)
 
         # llama.cpp's build_moe_ffn: each NVFP4 GEMM result times the expert's weight_scale_2, gate and up before the glu, down before the routing weight
         scales = view.tensors.get("global")
@@ -151,6 +153,7 @@ class GgmlMoEKernel(MoEKernel):
         if gate_up.dtype != x.dtype:
             raise NotImplementedError(f"GGUF {type_name(ggml_type)} experts need {gate_up.dtype} activations, got {x.dtype}")
         impl = fused_experts_impl if is_prefill or is_resident(layer) else fused_experts_decode_impl
+        topk_ids = topk_ids.clamp_min(0)  # as in apply: inactive routes read slot 0 with weight 0
         return impl(x, gate_up, down, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, float(layer.alpha), limit_or_inf(layer))
 
 

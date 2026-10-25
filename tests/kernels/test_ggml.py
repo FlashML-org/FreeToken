@@ -68,14 +68,20 @@ def test_q4_matrix_matches_cpu(dtype, batch):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("batch", [1, 17])
-def test_q4_moe_routes_match_cpu(dtype, batch):
+@pytest.mark.parametrize("batch", [1, 4, 17])
+@pytest.mark.parametrize("per_route_x", [False, True])
+@pytest.mark.parametrize("inactive", [False, True])
+def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive):
     w, ref = _q4_weights((4, 64, 256))
-    x = _activation((batch, 256), dtype)
+    x = _activation((batch, 2, 256) if per_route_x else (batch, 256), dtype)
     ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
+    if inactive:  # hybrid decode hands the GPU the CPU's routes as id -1: zero rows, no expert read
+        ids[::2, 0] = -1
     actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids)
-    expected = torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.cpu().long()]).to(dtype)
-    torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
+    xs = x.cpu().float() if per_route_x else x.cpu().float().unsqueeze(1).expand(-1, 2, -1)
+    expected = torch.einsum("tjk, tjok -> tjo", xs, ref[ids.cpu().long().clamp_min(0)])
+    expected[ids.cpu() < 0] = 0
+    torch.testing.assert_close(actual.cpu(), expected.to(dtype), atol=2e-4, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

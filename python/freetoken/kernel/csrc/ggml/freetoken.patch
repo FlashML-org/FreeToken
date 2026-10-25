@@ -67,7 +67,28 @@
      }
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
-@@ -177,3 +177,45 @@
+@@ -48,7 +48,8 @@
+         for (int it = 0; it < n_tokens; ++it) {
+             int iex_used = -1; // The index at which the expert is used, if any.
+             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+-                const int expert_used = ids[it*si1 + iex];
++                int expert_used = ids[it*si1 + iex];
++                expert_used = expert_used < 0 ? INT_MAX : expert_used; // FreeToken: an inactive route uses no expert
+                 nex_prev += expert_used < expert;
+                 if (expert_used == expert) {
+                     iex_used = iex;
+@@ -72,8 +73,9 @@
+             const int it = it0 + threadIdx.x / neu_padded;
+ 
+             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
+-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
++            int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+                 ids[it*si1 + iex] : INT_MAX;
++            expert_used = expert_used < 0 ? INT_MAX : expert_used; // FreeToken: an inactive route uses no expert
+             const int iex_used = expert_used == expert ? iex : -1;
+             nex_prev += expert_used < expert;
+ 
+@@ -177,3 +179,45 @@
              break;
      }
  }
@@ -181,7 +202,16 @@
              } else {
                  quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-@@ -299,6 +311,17 @@
+@@ -284,6 +296,8 @@
+     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
+     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
++    // FreeToken: inactive routes (negative ids) get no compact row, so their ids_src1 entries stay -1
++    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
+ 
+     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
+     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
+@@ -299,6 +313,17 @@
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -199,7 +229,7 @@
      const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
      ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
      ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-@@ -325,9 +348,21 @@
+@@ -325,9 +350,21 @@
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
              }
@@ -221,7 +251,7 @@
          } else {
              quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
-@@ -347,7 +382,7 @@
+@@ -347,7 +384,7 @@
          ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
          ne02, ne02, s02, s12, s2,
          ne03, ne13, s03, s13, s3,
@@ -613,7 +643,23 @@
          stride_col_dst = fusion.shared_stride_col_dst;
      }
  
-@@ -702,10 +706,10 @@
+@@ -642,6 +646,15 @@
+     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+     sample_dst = blockIdx.z;
+ 
++    // FreeToken: a negative id is an inactive route (hybrid decode): zero rows, no expert read
++    if (ncols_dst == 1 && ids && !shared_expert && int32_t(channel_x) < 0) {
++        if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block &&
++            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
++            dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + threadIdx.x] = ggml_cuda_cast<dst_t>(0.0f);
++        }
++        return;
++    }
++
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+     const uint32_t sample_y    = sample_dst;
+ 
+@@ -702,10 +715,10 @@
              }
              if constexpr (type == GGML_TYPE_NVFP4) {
                  if (use_scale) {
@@ -626,7 +672,7 @@
                  }
              }
          }
-@@ -837,7 +841,7 @@
+@@ -837,7 +850,7 @@
                          }
                      }
                  }
@@ -635,7 +681,7 @@
              }
          }
      }
-@@ -854,11 +858,11 @@
+@@ -854,11 +867,11 @@
  // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
  // Block: (warp_size, ncols_dst) - each warp handles one token independently.
  // No shared memory reduction needed since each warp works alone.
@@ -649,7 +695,7 @@
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
          const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
          const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-@@ -866,7 +870,7 @@
+@@ -866,7 +879,7 @@
      const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
      const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
      const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -658,7 +704,7 @@
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-@@ -878,7 +882,9 @@
+@@ -878,7 +891,9 @@
      const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
      if (shared_expert) {
          vx = fusion.shared_up;
@@ -669,7 +715,22 @@
          stride_col_dst = fusion.shared_stride_col_dst;
      }
  
-@@ -963,7 +969,7 @@
+@@ -920,6 +935,14 @@
+     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+ 
++    // FreeToken: a negative id is an inactive route (hybrid decode): zero rows, no expert read
++    if (!shared_expert && int32_t(channel_x) < 0) {
++        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
++            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = ggml_cuda_cast<dst_t>(0.0f);
++        }
++        return;
++    }
++
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+ 
+@@ -963,7 +986,7 @@
  
              if constexpr (type == GGML_TYPE_NVFP4) {
                  if (x_scale) {
@@ -678,7 +739,7 @@
                  }
              }
              if (x_bias) {
-@@ -973,7 +979,7 @@
+@@ -973,7 +996,7 @@
                  float gate_value = tmp_gate[threadIdx.x];
                  if constexpr (type == GGML_TYPE_NVFP4) {
                      if (gate_scale) {
@@ -687,7 +748,7 @@
                      }
                  }
                  if (gate_bias) {
-@@ -998,7 +1004,7 @@
+@@ -998,7 +1021,7 @@
                  }
              }
          }
@@ -696,7 +757,7 @@
      }
  
      if constexpr (!has_fusion) {
-@@ -1020,9 +1026,9 @@
+@@ -1020,9 +1043,9 @@
      return {block_nums, block_dims};
  }
  
@@ -708,7 +769,7 @@
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
          const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
          const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
-@@ -1035,7 +1041,7 @@
+@@ -1035,7 +1058,7 @@
      if constexpr (c_ncols_dst == 1) {
          if (has_fusion) {
              const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -717,7 +778,7 @@
                   vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                   channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                   sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-@@ -1046,15 +1052,15 @@
+@@ -1046,15 +1069,15 @@
      GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
  
      const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -736,7 +797,7 @@
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
          const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
          const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-@@ -1071,13 +1077,13 @@
+@@ -1071,13 +1094,13 @@
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
  
      if (has_fusion) {
@@ -752,7 +813,7 @@
              vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
              stride_row_x, stride_col_y, stride_col_dst,
              stride_channel_x, stride_channel_y, stride_channel_dst,
-@@ -1085,9 +1091,9 @@
+@@ -1085,9 +1108,9 @@
      }
  }
  
@@ -764,7 +825,7 @@
          const int ncols_x, const int nrows_x, const int ncols_dst,
          const int stride_row_x, const int stride_col_y, const int stride_col_dst,
          const int nchannels_x, const int nchannels_y, const int nchannels_dst,
-@@ -1277,8 +1283,10 @@
+@@ -1277,8 +1300,10 @@
              GGML_ABORT("fatal error");
      }
  }
@@ -776,7 +837,7 @@
          const int ncols_x, const int nrows_x, const int ncols_dst,
          const int stride_row_x, const int stride_col_y, const int stride_col_dst,
          const int nchannels_x, const int nchannels_y, const int nchannels_dst,
-@@ -1431,9 +1439,10 @@
+@@ -1431,9 +1456,10 @@
  
  void ggml_cuda_mul_mat_vec_q(
          ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
@@ -790,7 +851,7 @@
      GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
  
      GGML_TENSOR_BINARY_OP_LOCALS;
-@@ -1498,17 +1507,20 @@
+@@ -1498,17 +1524,20 @@
              GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
              fusion_local.gate_bias = fusion->gate_bias->data;
          }
@@ -813,7 +874,7 @@
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
-@@ -1526,12 +1538,22 @@
+@@ -1526,12 +1555,22 @@
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -839,7 +900,7 @@
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1556,11 +1578,23 @@
+@@ -1556,11 +1595,23 @@
  
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
@@ -916,7 +977,57 @@
      float amax = fabsf(xi);
      float sum = xi;
  
-@@ -452,10 +454,29 @@
+@@ -137,6 +139,9 @@
+     } else {
+         const int64_t i2  = blockIdx.y % ne2;
+         const int64_t i3  = blockIdx.y / ne2;
++        if (ids && ids[blockIdx.x] < 0) {
++            return; // FreeToken: a compact row past the active routes (inactive routes, hybrid decode)
++        }
+         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+         base_idx = i3 * s03 + i2 * s02 + i01 * s01;
+     }
+@@ -182,6 +187,9 @@
+ #pragma unroll
+                 for (int slot = 0; slot < n_expert_used; ++slot) {
+                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++                    if (i < 0) {
++                        continue; // FreeToken: an inactive route has no compact row
++                    }
+                     scale[i] = warp_amax[0];
+                 }
+             } else {
+@@ -308,6 +316,9 @@
+ #pragma unroll
+             for (int slot = 0; slot < n_expert_used; ++slot) {
+                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++                if (i < 0) {
++                    continue; // FreeToken: an inactive route has no compact row
++                }
+                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
+                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
+                 yqs[2 * sub + 0] = q0;
+@@ -374,6 +385,9 @@
+     } else {
+         const int64_t i2  = blockIdx.z % ne2;
+         const int64_t i3  = blockIdx.z / ne2;
++        if (ids && ids[blockIdx.x] < 0) {
++            return; // FreeToken: a compact row past the active routes (inactive routes, hybrid decode)
++        }
+         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+         base_pos = i3 * s03 + i2 * s02 + i01 * s01;
+     }
+@@ -427,6 +441,9 @@
+ #pragma unroll
+         for (int slot = 0; slot < n_expert_used; ++slot) {
+             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++            if (i < 0) {
++                continue; // FreeToken: an inactive route has no compact row
++            }
+             block_fp4_mmq * yb = y + (k_block * ne1 + i);
+             char2 * yqs2 = (char2 *) yb->qs;
+             if (lane_in_group == 0) {
+@@ -452,10 +469,29 @@
      GGML_UNUSED(n_expert_used);
  }
  
@@ -948,7 +1059,14 @@
          const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
          const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
  
-@@ -481,14 +502,13 @@
+@@ -477,18 +513,20 @@
+     } else {
+         const int64_t i2  = blockIdx.z % ne2;
+         const int64_t i3  = blockIdx.z / ne2;
++        if (ids && ids[blockIdx.x] < 0) {
++            return; // FreeToken: a compact row past the active routes (inactive routes, hybrid decode)
++        }
+         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
          base_idx = i3*s03 + i2*s02 + i01*s01;
      }
  
@@ -964,7 +1082,17 @@
      float amax = fabsf(xi.x);
      amax = fmaxf(amax, fabsf(xi.y));
      amax = fmaxf(amax, fabsf(xi.z));
-@@ -554,8 +574,9 @@
+@@ -526,6 +564,9 @@
+         int64_t ib;
+         if constexpr (scatter) {
+             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++            if (i < 0) {
++                continue; // FreeToken: an inactive route has no compact row
++            }
+             ib = k_block*ne1 + i;
+         } else {
+             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
+@@ -554,8 +595,9 @@
      GGML_UNUSED(n_expert_used);
  }
  
@@ -975,7 +1103,7 @@
          const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
          const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
      GGML_ASSERT(!ids);
-@@ -567,12 +588,13 @@
+@@ -567,12 +609,13 @@
      const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
      const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
      const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
@@ -991,7 +1119,7 @@
          const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
          const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
      GGML_ASSERT(ne00 % 4 == 0);
-@@ -584,15 +606,15 @@
+@@ -584,15 +627,15 @@
      const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
      switch (mmq_get_q8_1_ds_layout(type_src0)) {
          case MMQ_Q8_1_DS_LAYOUT_D4:
@@ -1010,7 +1138,7 @@
                  <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
              break;
          default:
-@@ -601,8 +623,9 @@
+@@ -601,8 +644,9 @@
  }
  
  // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
@@ -1021,7 +1149,7 @@
          const int64_t ne00, const int64_t stride_token, const int64_t ne0,
          const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
      GGML_ASSERT(ne00 % 4 == 0);
-@@ -613,15 +636,15 @@
+@@ -613,15 +657,15 @@
      const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
      switch (mmq_get_q8_1_ds_layout(type_src0)) {
          case MMQ_Q8_1_DS_LAYOUT_D4:
@@ -1040,7 +1168,7 @@
                  x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
              break;
          default:
-@@ -692,3 +715,15 @@
+@@ -692,3 +736,15 @@
          quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
      }
  }
