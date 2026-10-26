@@ -55,11 +55,20 @@ class FeatureSink(Protocol):
     wanted_layers: frozenset[int]
 
     def final_hidden(self, x: torch.Tensor) -> None:
-        """Every row's hidden state before the LM head; the first call in a forward wins, so a model may call it before the head does."""
+        """Every row's final hidden state, once per forward: the LM head's input, or what the model hands over itself before the head."""
         ...
 
     def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
         """A layer's output rows; called only for layers in ``wanted_layers``."""
+        ...
+
+
+@runtime_checkable
+class SupportsVerifyScratch(Protocol):
+    """A model with per-request state outside the GDN pool: a verify forward leaves that state as it was and stages its windows in the scratch, which Engine.commit_verify commits."""
+
+    def make_verify_scratch(self, max_rows: int, steps: int, device: torch.device, dtype: torch.dtype):
+        """An object with ``commit(pool, slots, counts, rows)``, or None when this model instance keeps no such state."""
         ...
 
 

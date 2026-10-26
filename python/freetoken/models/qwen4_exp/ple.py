@@ -617,6 +617,8 @@ class PLELayer(BaseOP):
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
+        if getattr(batch, "phase", None) == "verify":
+            return gated + self._verify_conv(x, meta, states, batch.verify.model_scratch)
         return gated + self._short_conv(x, meta, states)
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
@@ -667,6 +669,19 @@ class PLELayer(BaseOP):
         )
         return F.silu(out.to(x.dtype))
 
+    def _verify_conv(
+        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor, scratch: PLEVerifyScratch
+    ) -> torch.Tensor:
+        """The decode taps over every verify row with the live state read-only; the window goes to ``scratch`` for Engine.commit_verify."""
+        bs = meta.state_slots.numel()
+        steps = x.shape[0] // bs
+        history = scratch.conv[self.layer_id][:bs]
+        history[..., : self.state_len].copy_(self._read_state(meta, states, x.dtype))
+        history[..., self.state_len :].copy_(x.view(bs, steps, -1).transpose(1, 2))
+        window = history.unfold(2, self.state_len + 1, 1)[..., :: self.dilation].float()
+        out = (window * self.conv1d.weight.squeeze(1).float().unsqueeze(1)).sum(-1)
+        return F.silu(out.to(x.dtype)).transpose(1, 2).reshape(x.shape)
+
     def _prefill_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
     ) -> torch.Tensor:
@@ -716,6 +731,39 @@ class PLELayer(BaseOP):
         return packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
 
 
+class PLEVerifyScratch:
+    """A verify forward's PLE windows by verify-batch row: the old n-gram context then every verify token, and per layer the old conv history then every verify conv input."""
+
+    def __init__(self, layers: Sequence[PLELayer], max_rows: int, steps: int, device: torch.device, dtype: torch.dtype) -> None:
+        args = layers[0].args
+        self.ctx_len = args.ngram_size - 1
+        self.state_len = layers[0].state_len
+        self.ngram = torch.zeros(max_rows, self.ctx_len + steps, dtype=torch.int64, device=device)
+        self.conv = {
+            layer.layer_id: torch.zeros(max_rows, args.ple_state_width, layer.state_len + steps, dtype=dtype, device=device)
+            for layer in layers
+        }
+
+    def stash_ngram(self, meta: PLEMetadata) -> None:
+        bs = meta.state_slots.numel()
+        self.ngram[:bs, : self.ctx_len].copy_(meta.ngram_context)
+        self.ngram[:bs, self.ctx_len :].copy_(meta.input_ids.view(bs, -1))
+
+    def commit(self, pool, slots: List[int], counts: List[int], rows: List[int]) -> None:
+        """Write each slot's n-gram context and conv history as they stand after its first ``counts`` verify tokens."""
+        device = self.ngram.device
+        rows_t = torch.tensor(rows, dtype=torch.int64, device=device)
+        slots_t = torch.tensor(slots, dtype=torch.int64, device=device)
+        n = torch.tensor(counts, dtype=torch.int64, device=device).unsqueeze(1)
+        context = pool.slot_state(PLE_NGRAM_STATE)
+        context.index_copy_(0, slots_t, self.ngram[rows_t].gather(1, n + torch.arange(self.ctx_len, device=device)).to(context.dtype))
+        cols = (n + torch.arange(self.state_len, device=device)).unsqueeze(1)
+        for layer_id, history in self.conv.items():
+            states = pool.slot_state(PLE_CONV_STATE, layer_id)
+            window = history[rows_t].gather(2, cols.expand(-1, history.shape[1], -1))
+            states.index_copy_(0, slots_t, window.to(states.dtype))
+
+
 __all__ = [
     "GpuResidentTable",
     "NGramEmbedding",
@@ -723,6 +771,7 @@ __all__ = [
     "PLELayer",
     "PLEMetadata",
     "PLETableBackend",
+    "PLEVerifyScratch",
     "PinnedUVATable",
     "build_ple_metadata",
     "derive_ngram_hash_constants",

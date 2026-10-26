@@ -608,7 +608,13 @@ class Engine:
             if rows > 1 and self.linear_state_pool is not None
             else None
         )
-        self.model_verify_scratch = None
+        from freetoken.models.blocks import SupportsVerifyScratch
+
+        self.model_verify_scratch = (
+            self.model.make_verify_scratch(config.max_running_req, rows, self.device, self.dtype)
+            if rows > 1 and isinstance(self.model, SupportsVerifyScratch)
+            else None
+        )
         if self.spec is not None:
             self.spec.attach(self)
 

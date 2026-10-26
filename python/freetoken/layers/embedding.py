@@ -125,11 +125,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         return {} if result is None else result
 
     @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, export_hidden: bool = True) -> torch.Tensor:
+        """``export_hidden=False``: the model hands its own final hidden to ``batch.features``."""
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if (features := getattr(batch, "features", None)) is not None:
+        if export_hidden and (features := getattr(batch, "features", None)) is not None:
             features.final_hidden(x)
         if batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(bs)

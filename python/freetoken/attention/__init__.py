@@ -155,6 +155,7 @@ def create_m3_sparse_backend(config: ModelConfig):
         # 64-token pages: a 4-token compress group never straddles a page, so the
         # compressed row of a group is page_base // 4 + block-in-page.
         page_sizes=(64,),
+        uniform_extend_graph="device",
     ),
 )
 def create_qsa_sparse_backend(config: ModelConfig):
