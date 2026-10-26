@@ -10,7 +10,6 @@ import torch
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.spec.draft_head import SharedTargetHead
-from freetoken.spec.draft_kv import DraftPagedKV
 from freetoken.spec.proposer import DraftContext, Proposer
 from freetoken.spec.relay import HiddenRelay
 
@@ -90,11 +89,15 @@ class MTPProposer(Proposer):
 
     @classmethod
     def budget(cls, config) -> tuple[int, int]:
-        hidden_bytes = config.model_config.hidden_size * config.dtype.itemsize
+        from freetoken.kvcache.base import spec_kv_bytes_per_token
+
+        draft_cls = cls._draft_class(config)
+        relay_bytes = draft_cls.relay_width(config.model_config) * config.dtype.itemsize
         rows = config.max_running_req + 1
         # relay hidden and carry, and the verify hiddens
-        fixed = rows * (config.speculative_num_steps + 3) * hidden_bytes
-        return fixed, cls._draft_class(config).kv_bytes_per_token(config.model_config, config.dtype)
+        fixed = rows * (config.speculative_num_steps + 3) * relay_bytes
+        groups = draft_cls.draft_config(config.model_config).kv_cache_group_specs()
+        return fixed, sum(spec_kv_bytes_per_token(group, config) for group in groups)
 
     def __init__(self, config, target_model) -> None:
         super().__init__(config, target_model)
@@ -112,25 +115,30 @@ class MTPProposer(Proposer):
 
     def attach(self, ctx: DraftContext) -> None:
         from freetoken.attention import create_attention_backend
+        from freetoken.kvcache import create_kvcache_pool
 
         super().attach(ctx)
         cfg = self.draft.config
-        group = cfg.attention_groups[0]
+        rows = self.config.max_running_req + 1
+        # the draft's own layers on the target's slot ids: same page size, same pages plus the dummy page padded rows write to
         # a rebuild that keeps the target KV pool keeps this one, which the prefix cache still indexes
         if self.kv is None:
-            self.kv = DraftPagedKV(group.num_kv_heads, group.head_dim, 1, ctx.num_pages, self.config.page_size, self.dtype, ctx.device)
-        rows = self.config.max_running_req + 1
-        self.relay = HiddenRelay(rows, cfg.hidden_size, self.dtype, ctx.device)
-        self.verify_hidden = torch.zeros(rows * (self.k + 1), cfg.hidden_size, dtype=self.dtype, device=ctx.device)
+            self.kv = create_kvcache_pool(
+                model_config=cfg, num_pages=ctx.num_pages + 1, page_size=self.config.page_size, dtype=self.dtype,
+                device=ctx.device, num_req_slots=rows, num_speculative_tokens=self.k,
+            )
+        width = self.draft.relay_width(self.config.model_config)
+        self.relay = HiddenRelay(rows, width, self.dtype, ctx.device)
+        self.verify_hidden = torch.zeros(rows * (self.k + 1), width, dtype=self.dtype, device=ctx.device)
         # verify row of each request's last accepted position; padded rows keep stale but in-range values
         self.picked_rows = torch.arange(rows, dtype=torch.int64, device=ctx.device) * (self.k + 1)
         self.extend_graphs = self.chain_graphs = None
         parts = [p.strip() for p in self.config.attention_backend.split(",")]
-        extend = "fa" if "fa" in parts else "triton"
+        fixed = self.draft.attention_backend
         # backends bind the context's KV pool when they are built
         with get_global_ctx().override(kv_cache=self.kv):
-            self.extend_backend = create_attention_backend(extend, cfg)
-            self.chain_backend = create_attention_backend("triton", cfg)
+            self.extend_backend = create_attention_backend(fixed or ("fa" if "fa" in parts else "triton"), cfg)
+            self.chain_backend = create_attention_backend(fixed or "triton", cfg)
 
     def detach(self, *, keep_kv: bool) -> None:
         if self.extend_graphs is not None:
@@ -208,7 +216,7 @@ class MTPProposer(Proposer):
             ctx_override=dict(kv_cache=self.kv, attn_backend=self.extend_backend, hide_target_state=True),
             pool=pool,
         )
-        if self.k > 1:
+        if self.k > 1 and ChainGraphs.supports(self.chain_backend):
             self.chain_graphs = ChainGraphs(self, bs_list, self.extend_graphs.graph_pool)
 
     def propose(self, reqs: List[Req], cs: List[int], rows: torch.Tensor, token_pool: torch.Tensor) -> SpecProposal:
@@ -222,7 +230,7 @@ class MTPProposer(Proposer):
             views = [self._view(r, c + j - 1, c + j) for r, c in zip(reqs, cs)]
             batch = self._draft_batch(views, "decode", 1, self.chain_backend)
             hidden = self._forward(batch, self.chain_backend, self.draft.embed(token), hidden)
-            token = self.head.argmax(hidden)
+            token = self.head.argmax(self.draft.head_input(hidden))
             drafts.append(token)
         return SpecProposal(torch.stack(drafts, dim=1))
 
@@ -235,7 +243,7 @@ class MTPProposer(Proposer):
         n = input_ids.shape[0]
         hidden = self.draft.forward_hidden(self.draft.embed(input_ids), self.verify_hidden[:n])
         picked = hidden[self.picked_rows[: n // (self.k + 1)]]
-        return picked, self.head.argmax(picked)
+        return picked, self.head.argmax(self.draft.head_input(picked))
 
     def post_verify(self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor) -> None:
         """Redraft positions C..C+k from the target's verify hiddens, then relay each request's row at its last accepted position."""
@@ -250,6 +258,7 @@ class MTPProposer(Proposer):
         draft.positions = batch.positions
         draft.mrope_positions = batch.mrope_positions
         draft.out_loc = batch.out_loc
+        draft.active_table_idx = batch.active_table_idx
         self.picked_rows[:bs] = torch.arange(bs, device=self.device) * k1 + emitted
         self.extend_backend.prepare_metadata(draft)
         graphs = self.extend_graphs
@@ -312,4 +321,4 @@ class MTPProposer(Proposer):
             table = torch.tensor([r for _, r in finals], dtype=torch.int64, device=self.device)
             picked = out[idx]
             self.relay.hidden[table] = picked
-            self.relay.d1[table] = self.head.argmax(picked)
+            self.relay.d1[table] = self.head.argmax(self.draft.head_input(picked))

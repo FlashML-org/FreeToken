@@ -217,12 +217,12 @@ class DiskRowTable:
         self._pending: Future | None = None
         self._failed = False
 
-    def _fill_decode(self, histories: Sequence[Sequence[int]], bs: int) -> None:
+    def _fill_decode(self, histories: Sequence[Sequence[int]], bs: int, steps: int) -> None:
         try:
             self._readback_event.synchronize()
-            tokens = self._token_readback[:bs].to(torch.int64).tolist()
-            runs = [torch.tensor([*history, t], dtype=torch.int64)
-                    for history, t in zip(histories, tokens)]
+            tokens = self._token_readback[: bs * steps].to(torch.int64).tolist()
+            runs = [torch.tensor([*history, *tokens[i * steps : (i + 1) * steps]], dtype=torch.int64)
+                    for i, history in enumerate(histories)]
             self.fill(runs, graph=True)
         except BaseException:
             from freetoken.kernel.row_store import signal
@@ -231,10 +231,10 @@ class DiskRowTable:
             signal(self._flag)
             raise
 
-    def _start_fill(self, histories: Sequence[Sequence[int]], bs: int) -> None:
+    def _start_fill(self, histories: Sequence[Sequence[int]], bs: int, steps: int) -> None:
         @torch.inference_mode()
         def _complete() -> None:
-            self._fill_decode(histories, bs)
+            self._fill_decode(histories, bs, steps)
 
         # Like Engram, release HIP's WAIT independently of a queue-blocked graph launch.
         self._pending = self._worker.submit(_complete)
@@ -290,25 +290,27 @@ class DiskRowTable:
             if self._failed:
                 raise RuntimeError("PLE disk table failed; recreate the engine before dispatch")
         eos = self.eos_token_id
-        if batch.is_decode:
+        # decode and verify: rows_per_req tokens per request, the first at device_len - rows_per_req
+        steps = getattr(batch, "rows_per_req", None) or 1
+        if batch.is_decode or steps > 1:
             reqs = list(batch.reqs)
+            histories = [self._ple_context(r.input_ids, r.device_len - steps) for r in reqs]
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
-                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+                self._token_readback[: bs * steps].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
-                histories = [self._ple_context(r.input_ids, r.device_len - 1) for r in reqs]
                 if self._worker is not None:
-                    self._start_fill(histories, bs)
+                    self._start_fill(histories, bs, steps)
                     return None
 
                 def _complete() -> None:
-                    self._fill_decode(histories, bs)
+                    self._fill_decode(histories, bs, steps)
 
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*self._ple_context(r.input_ids, r.device_len - 1), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
+            runs = [torch.tensor([*history, *tokens[i * steps : (i + 1) * steps]], dtype=torch.int64)
+                    for i, history in enumerate(histories)]
             self.fill(runs, graph=use_graph)
             return None
         runs = [

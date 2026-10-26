@@ -15,7 +15,7 @@ from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.utils import torch_dtype
 
 from .model import Qwen3_5DecoderLayer
-from .weight import iter_mtp_expert_pieces, iter_mtp_weights
+from .weight import iter_mtp_weights
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -37,6 +37,14 @@ def draft_config(config: ModelConfig) -> ModelConfig:
 class Qwen3_5MTPDraft(BaseOP):
     """``h' = layer(fc(cat(norm_e(embed(token)), norm_h(h))))``: the next token's hidden from a token and the hidden before it."""
 
+    # the draft MTPProposer picks from the target's backends
+    attention_backend = None
+    draft_config = staticmethod(draft_config)
+
+    @staticmethod
+    def relay_width(config: ModelConfig) -> int:
+        return config.hidden_size
+
     def __init__(self, config: ModelConfig, target_model) -> None:
         self.config = draft_config(config)
         hidden = config.hidden_size
@@ -45,14 +53,8 @@ class Qwen3_5MTPDraft(BaseOP):
         self.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(hidden, eps=config.rms_norm_eps)
         self.layers = OPList([Qwen3_5DecoderLayer(self.config, 0, prefix="mtp.layers.0")])
         self.norm = GemmaPlusOneRMSNormFused(hidden, eps=config.rms_norm_eps)
-        # the target's own modules; underscore names keep them out of this module's state dict
+        # the target's own module; an underscore name keeps it out of this module's state dict
         self._embed_tokens = target_model.model.embed_tokens
-        self._lm_head = target_model.lm_head
-
-    @classmethod
-    def kv_bytes_per_token(cls, config: ModelConfig, dtype: torch.dtype) -> int:
-        group = draft_config(config).attention_groups[0]
-        return 2 * group.num_kv_heads * group.head_dim * dtype.itemsize
 
     @classmethod
     def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> Qwen3_5MTPDraft:
@@ -69,19 +71,17 @@ class Qwen3_5MTPDraft(BaseOP):
         draft.load_state_dict(loaded)
         if draft.config.moe_enabled:
             from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
+            from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
 
             # packed by the layer's own expert method, as the target's resident layers are
             moe = draft.layers.op_list[0].mlp.experts
-            banks = build_expert_banks(moe.quant_method, 1, iter_mtp_expert_pieces(model_path, device), device=device, resident=True)
+            pieces = iter_extra_layer_expert_pieces(model_path, "mtp.layers.0.mlp.experts", device)
+            banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
             attach_resident_banks([moe], banks)
         # not the root: it reaches the target's embed and head, which the target finalized already
         finalize_quant(draft.fc)
         finalize_quant(draft.layers)
         return draft
-
-    @property
-    def lm_head(self):
-        return self._lm_head
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self._embed_tokens.forward(input_ids)
@@ -98,3 +98,6 @@ class Qwen3_5MTPDraft(BaseOP):
             x, residual = layer.forward(x, residual)
         x, _ = self.norm.forward(x, residual)
         return x
+
+    def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden
