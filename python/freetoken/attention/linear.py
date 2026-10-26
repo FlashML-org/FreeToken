@@ -44,7 +44,9 @@ class FLAMetadata:
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
 
-def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
+def build_fla_metadata(
+    batch: "Batch", device: torch.device, *, include_track: bool = True
+) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
     stalling it.
@@ -78,7 +80,11 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track = _build_track_metadata(reqs, cu_host, device, pin)
+    track = (
+        _build_track_metadata(reqs, cu_host, device, pin)
+        if include_track
+        else dict(track_dst=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
+    )
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),

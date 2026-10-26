@@ -36,7 +36,7 @@ from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .mm import cut_image_spans, plan_mm_batch
-from .prefill import ChunkedReq, PrefillManager
+from .prefill import ChunkedReq, PrefillManager, _LAYER_MAJOR_MAX_EXTEND_TOKENS
 from .status import SchedulerStatusReporter
 from .table import TableManager
 
@@ -51,6 +51,18 @@ Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
+
+
+def _supports_layer_major_prefill(config: SchedulerConfig) -> bool:
+    model_config = config.model_config
+    return bool(
+        getattr(config, "prefill_layer_major", False)
+        and model_config.model_type == "qwen4_exp"
+        and config.tp_info.size == 1
+        and config.moe_strategy == "offload"
+        and getattr(model_config, "expert_quant", None) == "nvfp4"
+        and getattr(config, "ple_backend", None) == "pinned"
+    )
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
@@ -102,6 +114,12 @@ class Scheduler(SchedulerIOMixin):
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
         )
+        self.layer_major = _supports_layer_major_prefill(config)
+        if getattr(config, "prefill_layer_major", False) and not self.layer_major:
+            logger.warning_rank0(
+                "--prefill-layer-major requires Qwen3.8 text, TP=1, NVFP4 GPU offload, and the pinned PLE backend; using ordinary chunked prefill"
+            )
+        self.prefill_manager.layer_major = self.layer_major
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -892,6 +910,15 @@ class Scheduler(SchedulerIOMixin):
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
+        if (
+            self.layer_major
+            and batch.is_prefill
+            and len(batch.reqs) == 1
+            and batch.reqs[0].extend_len > self.prefill_budget
+            and batch.reqs[0].extend_len <= _LAYER_MAJOR_MAX_EXTEND_TOKENS
+            and getattr(batch.reqs[0], "mm_items", None) is None
+        ):
+            batch.layer_major = True
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
