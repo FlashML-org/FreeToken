@@ -40,15 +40,40 @@ def fused_experts_gguf(
     top_k = topk_ids.shape[1]
     qt = int(quant_type)
 
-    # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
-    gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
-    inter = act_fn(gate_up)
-    # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt, h, num_tokens * top_k)
-    out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
-        out.dtype
+    props = torch.cuda.get_device_properties(hidden_states.device)
+    shared_memory = int(getattr(props, "shared_memory_per_block_optin", 0))
+    if shared_memory <= 0:
+        shared_memory = int(props.shared_memory_per_block)
+    # ggml's expert-index helper stores one int32 per routed row in shared memory.
+    chunk_tokens = max(1, shared_memory // 4 // top_k)
+
+    def run_chunk(start: int, end: int) -> torch.Tensor:
+        chunk_ids = topk_ids[start:end]
+        chunk_weights = topk_weights[start:end]
+        chunk_size = end - start
+        gate_up = ggml_moe_a8_vec(
+            hidden_states[start:end], gate_up_q, chunk_ids, top_k, qt, n2, chunk_size
+        )
+        inter = act_fn(gate_up)
+        # The down projection indexes one expert per routed row, so its index table
+        # contains chunk_size * top_k entries.
+        out = ggml_moe_a8_vec(
+            inter, down_q, chunk_ids, 1, qt, h, chunk_size * top_k
+        )
+        out = out.reshape(chunk_size, top_k, h) * chunk_weights.reshape(
+            chunk_size, top_k, 1
+        ).to(out.dtype)
+        return out.sum(dim=1)
+
+    if num_tokens <= chunk_tokens:
+        return run_chunk(0, num_tokens)
+    return torch.cat(
+        [
+            run_chunk(start, min(start + chunk_tokens, num_tokens))
+            for start in range(0, num_tokens, chunk_tokens)
+        ],
+        dim=0,
     )
-    return out.sum(dim=1)
 
 
 def fused_experts_gguf_q4_0(

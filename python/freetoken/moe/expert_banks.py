@@ -302,10 +302,10 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         hb = alloc_layer_banks({
             "gate_up_packed": ((ram, 2 * I, H // 2), torch.uint8),
             "gate_up_scale": ((ram, 2 * I, H // 16), torch.float8_e4m3fn),
-            "gate_up_global": ((ram, 2 * I), torch.float16),
+            "gate_up_global": ((ram, 2 * I), torch.float32),
             "down_packed": ((ram, H, I // 2), torch.uint8),
             "down_scale": ((ram, H, I // 16), torch.float8_e4m3fn),
-            "down_global": ((ram, H), torch.float16),
+            "down_global": ((ram, H), torch.float32),
         }, L)
         banks = {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
         seen = torch.zeros(L, ram, dtype=torch.bool)

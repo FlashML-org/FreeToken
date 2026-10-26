@@ -23,6 +23,7 @@ from freetoken.utils import init_logger
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
+    _PLE_ST_DTYPE,
     _PLE_ST_DTYPES,
     _ple_table_files,
     _safetensors_header,

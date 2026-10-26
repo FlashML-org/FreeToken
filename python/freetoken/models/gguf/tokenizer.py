@@ -102,7 +102,6 @@ def load_gguf_tokenizer(model_path: str):
     from tokenizers.pre_tokenizers import ByteLevel
     from tokenizers import AddedToken
 
-    arch, converter_tok_dict, special = get_gguf_tokenizer(model_path)
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
     tok_dict: dict[str, Any] = {
@@ -112,9 +111,6 @@ def load_gguf_tokenizer(model_path: str):
     }
     tokens = tok_dict["tokens"]
 
-    # This repaired GGUF contains the 248044 base BPE entries but omits Qwen's
-    # tokenizer.json added_tokens. Their IDs are part of the model vocabulary and
-    # the chat template depends on them as atomic tokens.
     base_vocab_size = len(tokens)
     added_vocab = {
         token: base_vocab_size + index
@@ -124,9 +120,13 @@ def load_gguf_tokenizer(model_path: str):
     if added_vocab:
         tokens = tokens + [token for token, _ in sorted(added_vocab.items(), key=lambda item: item[1])]
 
+    # This repaired GGUF contains the 248044 base BPE entries but omits Qwen's
+    # tokenizer.json added_tokens. Their IDs are part of the model vocabulary and
+    # the chat template depends on them as atomic tokens.
     def tok_for(id_key: str, default: str) -> str:
         tid = meta.get(f"tokenizer.ggml.{id_key}")
-        return tokens[int(tid)] if tid is not None and int(tid) < len(tokens) else default
+        tid = int(tid) if tid is not None else -1
+        return tokens[tid] if 0 <= tid < len(tokens) else default
 
     unknown_token = tok_for("unknown_token_id", tokens[0] if tokens else "<unk>")
     # The hf_nvfp4 marker describes the weight layout, not the tokenizer family. Gemma4
@@ -136,6 +136,12 @@ def load_gguf_tokenizer(model_path: str):
     gemma_gpt2 = arch == "gemma4" and tok_dict.get("model") == "gpt2"
     pre = meta.get("tokenizer.ggml.pre") if tok_dict.get("model") == "gpt2" else None
     if hf_nvfp4:
+        special = {
+            "bos_token": tok_for("bos_token_id", None),
+            "eos_token": tok_for("eos_token_id", None),
+            "unk_token": tok_for("unknown_token_id", None),
+            "pad_token": tok_for("padding_token_id", None),
+        }
         # The embedded Qwen vocabulary is GPT-2 byte-level BPE. Treating it like a
         # SentencePiece vocabulary turns spaces into the fallback unknown token.
         vocab = {token: index for index, token in enumerate(tok_dict["tokens"])}
@@ -157,6 +163,8 @@ def load_gguf_tokenizer(model_path: str):
         # the visible fragment ``|im_end|>`` instead of terminating the assistant turn.
         fast.add_special_tokens([AddedToken(token, special=True) for token in _QWEN_ADDED_TOKENS])
     else:
+        arch, converter_tok_dict, special = get_gguf_tokenizer(model_path)
+        arch = gguf_architecture(model_path)
         if gemma_gpt2:
             # Gemma stores raw ▁ and newline pieces, so GPT-2 byte-encoding its
             # vocabulary makes the unencoded GGUF merge operands invalid.

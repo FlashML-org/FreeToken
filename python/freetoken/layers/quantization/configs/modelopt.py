@@ -63,6 +63,9 @@ class ModelOptConfig(QuantConfig):
         algo = self._module_algo(name)
         return None if algo is None else self._scheme_of(algo)
 
+    def is_ignored_name(self, name: str) -> bool:
+        return self.ignore(name)
+
     def _module_algo(self, name: str) -> str | None:
         if self.algo != "MIXED_PRECISION":
             return self.algo

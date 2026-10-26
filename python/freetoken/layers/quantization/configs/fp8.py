@@ -70,6 +70,9 @@ class Fp8BlockConfig(QuantConfig):
             return self.SCHEMES["EXPERT_MXFP4"]
         return self.block_scheme
 
+    def is_ignored_name(self, name: str) -> bool:
+        return not self.convert_tables(name) and (self.not_convert(name) or self.not_convert_substr(name))
+
     def layer_config(self, layer: Any, layer_kind: LayerKind, scheme: QuantScheme | None) -> LinearConfig | MoEConfig:
         cfg = super().layer_config(layer, layer_kind, scheme)
         if layer_kind is LayerKind.MOE and scheme is not None and scheme.kind is QuantKind.MXFP4:

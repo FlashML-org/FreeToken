@@ -48,8 +48,15 @@ class Qwen3_5DecoderLayer(BaseOP):
                 force_split_in_proj=config.ftw_split_gdn,
                 quant_config=config.quant,
                 prefix=f"{prefix}.linear_attn",
-                # llama.cpp stores every qwen35 ssm_out with tiled value-head columns
-                out_heads_tiled=config.quant is not None and config.quant.dialect == "gguf",
+                # Only llama.cpp's legacy blk.* layout tiles ssm_out value-head columns.
+                out_heads_tiled=(
+                    config.quant is not None
+                    and config.quant.dialect == "gguf"
+                    and any(
+                        name.startswith("blk.") and ".ssm_out.weight" in name
+                        for name in (config.gguf_tensor_types or {})
+                    )
+                ),
             )
         else:
             self.self_attn = Qwen3_5Attention(config, layer_id, prefix=f"{prefix}.self_attn")

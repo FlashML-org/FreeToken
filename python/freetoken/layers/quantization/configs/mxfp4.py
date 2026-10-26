@@ -27,3 +27,6 @@ class Mxfp4Config(QuantConfig):
         if not name.endswith(".experts") or self.not_convert(name):
             return None
         return self.SCHEME
+
+    def is_ignored_name(self, name: str) -> bool:
+        return self.not_convert(name)

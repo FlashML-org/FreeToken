@@ -67,14 +67,15 @@ have no resident path and stay on `offload`. Offload-only flags
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
 warning; pass `--moe-strategy offload` to use them.
 
-### Hosts that cap pinned memory (WSL)
+### Hosts that cap pinned memory (Windows and WSL)
 
-WSL caps CUDA pinned memory near half of RAM, so the expert banks of a large
-model may not all pin. With `--moe-cpu-layers auto`, FreeToken loads the banks
-first, then pins them layer by layer from the middle out until CUDA refuses one;
-the remaining head and tail layers are OS-locked instead (resident, but with no
-device address). After a refusal under WDDM (WSL and native Windows) it
-unpins about 3 GiB more (`FREETOKEN_PIN_PROBE_MARGIN_GB`).
+CUDA's host-pinning limit under WDDM (WSL and native Windows) can be lower than
+available system RAM, so the expert banks of a large model may not all pin.
+With `--moe-cpu-layers auto`, FreeToken loads the banks first, then pins them
+layer by layer from the middle out until CUDA refuses one; the remaining head
+and tail layers are OS-locked instead (resident, but with no device address).
+After a refusal under WDDM it unpins about 3 GiB more
+(`FREETOKEN_PIN_PROBE_MARGIN_GB`).
 The probe runs only where pinning is known to be capped (WDDM, or
 `FREETOKEN_SIMULATE_PIN_CAP_GB` for testing). FTW checkpoints, dummy weights
 and models the CPU executor cannot serve take the size estimate instead, as

@@ -1081,7 +1081,19 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
-        layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
+        layer_formats = []
+        for layer in by_id:
+            method = getattr(layer, "quant_method", None)
+            if method is None or method.kind is QuantKind.NONE:
+                layer_formats.append((cache.quant_format, {}))
+                continue
+            fmt, options = method.cpu_spec()
+            if fmt is None:
+                raise NotImplementedError(
+                    f"CPU MoE executor has no format for {type(method).__name__} "
+                    f"on layer {layer.layer_id}."
+                )
+            layer_formats.append((fmt, options))
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -1092,19 +1104,7 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # Native-format providers (GGUF/Qwen NVFP4) keep packed banks in the
-            # offload cache while their layer method may be QuantKind.NONE.
-            fmt=(
-                cache.quant_format
-                if sample.quant_method is None or sample.quant_method.kind is QuantKind.NONE
-                else sample.quant_method.cpu_format
-            ),
-            act_block=(
-                sample.quant_method.cfg.act_block
-                if sample.quant_method is not None
-                and getattr(sample.quant_method, "cfg", None) is not None
-                else None
-            ),
+            layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1678,6 +1678,13 @@ def _bank_bytes(config: EngineConfig, method=None, layer_methods=None) -> int | 
 
 def _pin_hint(reserved: int) -> str:
     if _pin_budget_bytes(reserved) is None:
+        from freetoken.moe.host_banks import pin_capped
+
+        if pin_capped():
+            return (
+                "CUDA's host-pinning limit can be lower than available system RAM; "
+                "try --moe-cpu-layers auto to OS-lock layers CUDA cannot pin"
+            )
         return "the expert banks need more page-locked host RAM than this host has; free host RAM or serve a smaller model"
     return (
         "pass --moe-cpu-layers auto to lock the layers over the pin budget for CPU decode, "

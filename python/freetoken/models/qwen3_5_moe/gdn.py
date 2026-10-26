@@ -32,6 +32,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_kernel_size, rms_norm_eps, layer_id, *, force_split_in_proj: bool = False,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
+        out_heads_tiled: bool = False,
     ):
         self.layer_id = layer_id
         self._out_heads_tiled = out_heads_tiled
@@ -54,10 +55,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._split_in_proj = force_split_in_proj
         if quant_config is not None:
             def has_scheme(name: str) -> bool:
-                return (
-                    quant_config.scheme_for(name) is not None
-                    or quant_config.scheme_for_name(name) is not None
-                )
+                return quant_config.scheme_for(name) is not None
 
             self._split_in_proj = (
                 has_scheme(f"{prefix}.in_proj_qkvz")

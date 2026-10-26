@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 LayerToBank = Callable[[int, object], int | None]
 DropPageCache = Callable[[str], None]
+_NVFP4_TENSOR_KINDS_PER_PROJECTION = 3
 
 
 @dataclass(frozen=True)
@@ -134,7 +135,12 @@ def iter_nvfp4_expert_pieces(
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
         wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
-    expected = _num_moe_layers(config) * (config.num_experts if skip_experts_from is None else skip_experts_from) * 9
+    tensors_per_expert = len(spec.proj_to_role) * _NVFP4_TENSOR_KINDS_PER_PROJECTION
+    expected = (
+        _num_moe_layers(config)
+        * (config.num_experts if skip_experts_from is None else skip_experts_from)
+        * tensors_per_expert
+    )
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 
@@ -157,7 +163,11 @@ def iter_nvfp4_expert_pieces(
         for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
             yield name, _ingest(spec, act, wanted[name][2], tensor)
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=per_expert)
+    return per_expert_pieces(
+        _parallel() if parallel else _serial(),
+        wanted.get,
+        tensors_per_expert=tensors_per_expert,
+    )
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

@@ -54,6 +54,9 @@ class CompressedTensorsConfig(QuantConfig):
                 return scheme
         return None
 
+    def is_ignored_name(self, name: str) -> bool:
+        return self.ignore(name)
+
     @classmethod
     def _scheme_of(cls, spec: dict[str, Any]) -> QuantScheme:
         w = spec.get("weights") or {}

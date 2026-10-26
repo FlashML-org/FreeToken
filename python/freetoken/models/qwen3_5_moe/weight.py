@@ -140,7 +140,7 @@ def iter_gguf_weights(
                 yield "lm_head.weight", _gguf_bf16(tensor).to(device)
             continue
         if raw == "model.language_model.norm.weight":
-            yield "model.norm.weight", _gguf_bf16(tensor).to(device) + 1.0
+            yield "model.norm.weight", _gguf_bf16(tensor).to(device)
             continue
         if raw.startswith("blk."):
             # Legacy GGML Qwen35MoE names are mapped to the model's HF-style tree.
@@ -288,12 +288,7 @@ def iter_gguf_weights(
             if name.endswith((".linear_attn.conv1d.weight", ".linear_attn.A_log", ".linear_attn.dt_bias", ".linear_attn.norm.weight")):
                 yield name, _gguf_gdn_state(tensor).to(device)
                 continue
-            if name.endswith((".input_layernorm.weight", ".post_attention_layernorm.weight", ".self_attn.q_norm.weight", ".self_attn.k_norm.weight")):
-                yield name, _gguf_bf16(tensor).to(device) + 1.0
-            elif name.endswith(".linear_attn.norm.weight"):
-                yield name, _gguf_bf16(tensor).to(device)
-            else:
-                yield name, _gguf_bf16(tensor).to(device)
+            yield name, _gguf_bf16(tensor).to(device)
             continue
 
         # Routers stay as dense BF16 modules in Qwen3.5 even when the GGUF stores
@@ -451,6 +446,8 @@ class _DenseReader:
             scheme = self.quant.scheme_for_name(name)
             if scheme is not None:
                 return scheme
+        if any(self.quant.is_ignored_name(name) for name in checkpoint_names):
+            return None
         # Multimodal Qwen checkpoints can store tensors below model.language_model
         # while ModelOpt metadata names the logical text module as model.layers.
         logical_name = module.removeprefix("model.language_model.")
@@ -465,10 +462,7 @@ class _DenseReader:
         if len(candidates) > 1:
             # GDN: quantized checkpoints split qkv|z from the bf16 b|a; same test as gdn.py
             def has_scheme(name: str) -> bool:
-                return (
-                    self.scheme(name) is not None
-                    or (self.quant is not None and self.quant.scheme_for_name(name) is not None)
-                )
+                return self.scheme(name) is not None
 
             split = any(
                 has_scheme(f"{parent}.{leaf}")

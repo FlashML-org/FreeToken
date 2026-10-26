@@ -43,7 +43,7 @@ _EXPERT_KEY_RE = (
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
-    key_pattern=_EXPERT_KEY_RE,
+    key_pattern=re.compile(_EXPERT_KEY_RE.format(kinds="weight|weight_scale|weight_scale_2")),
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.8-Flash-Next NVFP4 experts",
@@ -60,9 +60,6 @@ _NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
     global_reciprocal=True,
 )
-# Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
-_SCALE_SUFFIXES = (".weight_scale_2", ".weight_scale_inv", ".input_scale")
-
 # The n-gram table itself: too big for the dense state dict, loaded by load_ple_table.
 _PLE_TABLE_INFIX = ".ple.ple_embedding.ngram_embedding."
 _PLE_SHARD_RE = re.compile(
@@ -90,9 +87,20 @@ _ZERO_CENTERED_NORM_SUFFIXES = (
 # The top-level hyper_connection_mixer has no injection and never fuses.
 _PAD_TO = {"input_mix_weight_down_block_inject": 16}
 _HC_WITH_INJECT = (".attn_hyper_connection", ".mlp_hyper_connection")
-_KIND_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".weight")
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-_ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn}
+_LINEAR_LEAVES = frozenset({
+    "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+    "in_proj_qkvz", "in_proj_ba", "out_proj", "gate_proj", "up_proj", "down_proj", "gate",
+    "shared_expert_gate", "lm_head", "input_mix_weight_down", "block_inject_weight",
+    "input_mix_weight_up", "index_qk_proj",
+})
+_DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
+_QUANT_SCALE_SUFFIXES = frozenset({
+    "weight_scale", "weight_scale_inv", "weight_scale_2", "weight_global_scale",
+    "input_scale", "input_global_scale",
+})
+_ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
+_QUANT_DTYPES = (*_FP8_DTYPES, torch.uint8, torch.int8)
 
 
 def _rename(raw_name: str) -> str | None:
@@ -149,6 +157,8 @@ class _DenseReader:
             split = self.scheme(f"{parent}.in_proj_qkvz") is not None
             keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
             candidates = [c for c in candidates if c[0] in keep]
+            if not candidates:
+                raise ValueError(f"{module}: no merged projection for the {'split' if split else 'fused'} GDN layout")
         fused, idx = candidates[0]
         if fused in _PAD_TO and not parent.endswith(_HC_WITH_INJECT):
             return module, 0, 1
@@ -160,152 +170,109 @@ class _DenseReader:
         if module.rpartition(".")[2] not in _LINEAR_LEAVES:
             return None
         scheme = self.scheme(module)
-        if name.endswith(".weight_scale_inv") or name.endswith(".weight_scale"):
-            role = "weight_scale_inv" if name.endswith(".weight_scale_inv") else "weight_scale"
-            if scheme is None or not scheme.has(role):
-                raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
-            if role == "weight_scale" and tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-                raise ValueError(f"{name} has unsupported scale dtype {tensor.dtype}")
-            return
-        is_fp8 = tensor.dtype in _FP8_DTYPES
-        if scheme is None:
-            if is_fp8:
-                raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
-            return
-        expected = _ELEM_DTYPES.get(scheme.weight.elem)
-        if expected is not None and tensor.dtype is not expected:
-            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {scheme}")
-        rows, cols = (scheme.weight.group or (1, 1))
-        if rows > 1 and tensor.shape[0] % rows or cols > 1 and tensor.shape[1] % cols:
-            raise ValueError(f"{name}: {tuple(tensor.shape)} is not a multiple of the {rows}x{cols} scale block of {module}")
-
-    def check_unfused(self, name: str, tensor: torch.Tensor) -> None:
-        module, kind = _split_kind(name)
-        if kind == ".weight_scale_inv" or (kind == ".weight" and tensor.dtype in _FP8_DTYPES):
-            self.check(module, name, tensor)
-
-    def fuse(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]] | None:
-        """Buffer a part; return the merged ``[(name, tensor)]`` once its kind is complete, ``[]`` while incomplete, ``None`` if ``name`` is not a part."""
-        module, kind = _split_kind(name)
-        if not kind:
-            return None
-        parent, _, leaf = module.rpartition(".")
-        hit = self._target(parent, leaf)
-        if hit is None:
-            return None
-        fused, idx = hit
-        self.check(fused, name, tensor)
-        slots = self.buf.setdefault((fused, kind), {})
-        slots[idx] = tensor
-        parts = self.groups[fused.rpartition(".")[2]]
-        if len(slots) < len(parts):
+        if suffix in _DROPPED_SUFFIXES and (scheme is None or not scheme.has("input_scale")):
             return []
-        del self.buf[(fused, kind)]
-        rows = [slots[i] for i in range(len(parts))]
-        pad_to = _PAD_TO.get(fused.rpartition(".")[2], 0) if kind == ".weight" else 0
-        pad = (-sum(t.shape[0] for t in rows)) % pad_to if pad_to else 0
-        if pad:
-            rows.append(torch.zeros(pad, *rows[0].shape[1:], dtype=rows[0].dtype, device=rows[0].device))
-        return [(fused + kind, torch.cat(rows, dim=0))]
-
-def _load_maybe_quantized(reader: ShardReader, raw_name: str) -> torch.Tensor:
-    """Load checkpoint storage without dequantizing quantized modules.
-
-    Quantized layers own their dequantization/GEMM kernel and require the raw FP8 weight
-    together with its scale tensor. Dequantizing here turns a quantized model buffer into
-    BF16 and causes a state-dict mismatch during load.
-    """
-    tensor = reader.get_tensor(raw_name)
-    if raw_name.endswith(".weight_scale"):
-        return tensor.to(torch.float32).reshape(-1)
-    return tensor
-
-
-
-class _DenseFuser:
-    """Concatenates checkpoint projection parts into the model's merged buffers, per kind (weight / block scale).
-
-    The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout and validates each part against the scheme the model built its buffer from.
-    """
-
-    def __init__(self, quant, packed: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
-        self.quant = quant
-        self.groups = {fused: parts for fused, parts in packed if fused != "experts"}  # experts: bank reader
-        self.by_part: dict[str, list[tuple[str, int]]] = {}
-        for fused, parts in self.groups.items():
-            for idx, part in enumerate(parts):
-                self.by_part.setdefault(part, []).append((fused, idx))
-        self.buf: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
-
-    def scheme(self, module: str):
-        return None if self.quant is None else self.quant.scheme_for(module)
-
-    def _target(self, parent: str, leaf: str) -> tuple[str, int] | None:
-        candidates = self.by_part.get(leaf)
-        if not candidates:
-            return None
-        if len(candidates) > 1:
-            # GDN: quantized checkpoints split qkv|z from the bf16 b|a; same test as gdn.py
-            split = self.scheme(f"{parent}.in_proj_qkvz") is not None
-            keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
-            candidates = [c for c in candidates if c[0] in keep]
-            if not candidates:
-                raise ValueError(f"{parent}.{leaf}: no merged projection for the {'split' if split else 'fused'} GDN layout")
-        fused, idx = candidates[0]
-        if fused in _PAD_TO and not parent.endswith(_HC_WITH_INJECT):
-            return None
-        return f"{parent}.{fused}", idx
-
-    def check(self, module: str, name: str, tensor: torch.Tensor) -> None:
-        """``tensor`` (checkpoint key ``name``) must match the scheme the model built ``module`` from."""
-        scheme = self.scheme(module)
-        if name.endswith(".weight_scale_inv") or name.endswith(".weight_scale"):
-            role = "weight_scale_inv" if name.endswith(".weight_scale_inv") else "weight_scale"
-            if scheme is None or not scheme.has(role):
-                raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
-            if role == "weight_scale" and tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-                raise ValueError(f"{name} has unsupported scale dtype {tensor.dtype}")
-            return
-        is_fp8 = tensor.dtype in _FP8_DTYPES
         if scheme is None:
-            if tensor.dtype in _QUANT_DTYPES:
+            if suffix != "weight":
+                if suffix in _QUANT_SCALE_SUFFIXES:
+                    raise ValueError(f"{name}: {module} has no quantization scheme in the checkpoint config")
+                return None
+            role = "weight"
+            expected_roles = {"weight"}
+        else:
+            storage = self.quant.storage(scheme)
+            role = next((candidate for candidate, stored in storage.items() if suffix in stored.names), None)
+            if role is None:
+                if suffix == "weight":
+                    role = "weight"
+                elif suffix in _QUANT_SCALE_SUFFIXES:
+                    raise ValueError(f"{name}: {module} has no stored role for this scale in {scheme}")
+                else:
+                    return None
+            expected_roles = set(scheme.roles)
+
+        if role not in expected_roles:
+            raise ValueError(f"{name}: role {role!r} is not declared by {scheme}")
+        expected_dtype = _ELEM_DTYPES.get(scheme.weight.elem) if scheme is not None else None
+        if role == "weight":
+            if scheme is not None and expected_dtype is None:
+                raise ValueError(f"{name}: qwen4_exp has no dense reader for {scheme}")
+            if scheme is None and tensor.dtype in _QUANT_DTYPES:
                 raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
-            return
-        elem = _ELEM_DTYPES.get(scheme.weight.elem)
-        if elem is None:
-            raise ValueError(f"{name}: qwen4_exp has no dense reader for {scheme}")
-        if tensor.dtype is not elem:
-            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {scheme}")
-        rows, cols = tensor.shape[0], tensor.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
-        block_rows, block_cols = scheme.weight.group or (1, 1)
-        if block_rows > 1 and rows % block_rows or block_cols > 1 and cols % block_cols:
-            raise ValueError(f"{name}: {rows}x{cols} is not a multiple of the {block_rows}x{block_cols} scale block of {module}")
+            if expected_dtype is not None and tensor.dtype is not expected_dtype:
+                raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {scheme}")
+            if tensor.ndim < 2:
+                raise ValueError(f"{name} must have at least two dimensions, got {tuple(tensor.shape)}")
+            if scheme is not None:
+                rows = tensor.shape[0]
+                cols = tensor.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
+                block_rows, block_cols = scheme.weight.group or (1, 1)
+                if block_rows > 1 and rows % block_rows or block_cols > 1 and cols % block_cols:
+                    raise ValueError(f"{name}: {rows}x{cols} is not a multiple of the {block_rows}x{block_cols} scale block of {module}")
+
+        target, part_idx, part_count = self.target(module)
+        group_parts = self.groups.get(target.rpartition(".")[2], ())
+        if len(group_parts) != part_count:
+            group_parts = (module.rpartition(".")[2],)
+        parent = target.rpartition(".")[0]
+        part_modules = tuple(f"{parent}.{part_name}" if parent else part_name for part_name in group_parts)
+        expected_by_part = {
+            idx: set(part_scheme.roles) if (part_scheme := self.scheme(part_module)) is not None else {"weight"}
+            for idx, part_module in enumerate(part_modules)
+        }
+        if scheme != self.scheme(part_modules[0]):
+            raise ValueError(f"{name}: {module} uses {scheme}, but {target} has incompatible quantization")
+
+        state = self.pending.get(target)
+        if state is None:
+            state = (part_count, {}, expected_by_part, scheme)
+            self.pending[target] = state
+        count, received, expected, stored_scheme = state
+        if count != part_count or expected != expected_by_part or stored_scheme != scheme:
+            raise ValueError(f"{name}: incompatible quantization schemes among the parts of {target}")
+        part = received.setdefault(part_idx, {})
+        if role in part:
+            raise ValueError(f"{name}: duplicate {role} tensor for {target}")
+        part[role] = tensor
+
+        if any(set(received.get(idx, {})) != required for idx, required in expected.items()):
+            return []
+        del self.pending[target]
+        complete = [
+            self._finish(part_modules[idx], scheme, received[idx])
+            if scheme is not None
+            else received[idx]
+            for idx in range(count)
+        ]
+        return self._emit(target, complete, scheme)
 
     def _finish(self, module: str, scheme: QuantScheme, part: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Validate one complete part against ``scheme`` and put its scales in the layer's form."""
         storage = self.quant.storage(scheme)
-        part = {role: 1.0 / t.to(torch.float32) if storage[role].reciprocal else t for role, t in part.items()}
+        part = {role: 1.0 / tensor.to(torch.float32) if storage[role].reciprocal else tensor for role, tensor in part.items()}
         weight = part["weight"]
-        rows, cols = weight.shape[0], weight.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
+        rows = weight.shape[0]
+        cols = weight.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
         block_rows, block_cols = scheme.weight.group or (1, 1)
-        scale_role = "weight_scale_inv" if "weight_scale_inv" in part else "weight_scale"
+        scale_role = next((role for role in ("weight_scale_inv", "weight_scale") if role in part), None)
         out = dict(part)
-        if block_cols < 0:
-            try:
-                out[scale_role] = _per_row_scale(part[scale_role], rows)
-            except ValueError as exc:
-                raise ValueError(f"{module}.{scale_role}: {exc}") from None
-        else:
-            want = (rows // block_rows, cols // block_cols)
-            if tuple(part[scale_role].shape) != want:
-                raise ValueError(f"{module}: {scale_role} is {tuple(part[scale_role].shape)}, expected {want} for {scheme}")
-            if scheme.weight.scale == "e4m3" and part[scale_role].dtype is not torch.float8_e4m3fn:
-                raise ValueError(f"{module}: {scale_role} is {part[scale_role].dtype} but {scheme} stores e4m3 scales")
+        if scale_role is not None:
+            if block_cols < 0:
+                try:
+                    out[scale_role] = _per_row_scale(part[scale_role], rows)
+                except ValueError as exc:
+                    raise ValueError(f"{module}.{scale_role}: {exc}") from None
+            else:
+                expected_shape = (rows // block_rows, cols // block_cols)
+                if tuple(part[scale_role].shape) != expected_shape:
+                    raise ValueError(f"{module}: {scale_role} is {tuple(part[scale_role].shape)}, expected {expected_shape} for {scheme}")
+                if scheme.weight.scale == "e4m3" and part[scale_role].dtype is not torch.float8_e4m3fn:
+                    raise ValueError(f"{module}: {scale_role} is {part[scale_role].dtype} but {scheme} stores e4m3 scales")
         if "weight_global" in part:
-            g = part["weight_global"].reshape(-1).to(torch.float32)
-            if g.numel() != 1:
-                raise ValueError(f"{module}: weight_global has {g.numel()} elements, expected one per-tensor scale")
-            out["weight_global"] = g.expand(rows).contiguous()
+            global_scale = part["weight_global"].reshape(-1).to(torch.float32)
+            if global_scale.numel() != 1:
+                raise ValueError(f"{module}: weight_global has {global_scale.numel()} elements, expected one per-tensor scale")
+            out["weight_global"] = global_scale.expand(rows).contiguous()
         if "input_scale" in part:
             out["input_scale"] = part["input_scale"].reshape(()).to(torch.float32)
         return out
@@ -319,15 +286,24 @@ class _DenseFuser:
         for role in parts[0]:
             tensors = [part[role] for part in parts]
             if role == "input_scale":
-                # fused parts read the same activation, so one range covers them: max is exact then and safe if they drift
                 out.append((f"{target}.{role}", torch.stack(tensors).max()))
                 continue
-            pad = (-sum(t.shape[0] for t in tensors)) % pad_to if pad_to else 0
-            if pad:
-                tensors.append(torch.zeros(pad, *tensors[0].shape[1:], dtype=tensors[0].dtype, device=tensors[0].device))
+            padding = (-sum(tensor.shape[0] for tensor in tensors)) % pad_to if pad_to else 0
+            if padding:
+                tensors.append(torch.zeros(padding, *tensors[0].shape[1:], dtype=tensors[0].dtype, device=tensors[0].device))
             out.append((f"{target}.{role}", tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)))
         return out
 
+    def missing(self) -> list[str]:
+        lines = []
+        for target, (count, received, expected, _) in self.pending.items():
+            missing_roles = sorted(
+                set().union(*(expected[idx] - set(received[idx]) for idx in received))
+            )
+            if len(received) < count:
+                missing_roles.append(f"{count - len(received)} of {count} fused parts")
+            lines.append(f"{target}: missing {missing_roles}")
+        return lines
 
 def iter_weights(
     model_path: str,
@@ -351,7 +327,7 @@ def iter_weights(
 
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
-    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    dense_reader = _DenseReader(get_quant_config(), spec.packed_modules_mapping)
     reader = ShardReader(model_path, device)
     try:
         for file in tqdm(
@@ -365,18 +341,17 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
-                tensor = _load_maybe_quantized(reader, raw_name)
-                fused = fuser.fuse(name, tensor)
+                tensor = reader.get_tensor(raw_name)
+                fused = dense_reader.add(name, tensor)
                 if fused is None:
-                    fuser.check_unfused(name, tensor)
                     yield name, tensor
                 else:
                     yield from fused
     finally:
         reader.close()
 
-    if reader.pending:
-        lines = reader.missing()
+    if dense_reader.pending:
+        lines = dense_reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
 
@@ -409,7 +384,8 @@ class PleTable:
         return self.bank.tensor
 
 
-_PLE_ST_DTYPES = {"F8_E4M3": torch.float8_e4m3fn, "BF16": torch.bfloat16}
+_PLE_ST_DTYPE = "F8_E4M3"
+_PLE_ST_DTYPES = {_PLE_ST_DTYPE: torch.float8_e4m3fn, "BF16": torch.bfloat16}
 
 
 def _safetensors_header(path: str) -> tuple[dict, int]:
