@@ -105,7 +105,7 @@ class Glm5NextKDA(BaseOP):
         if fla is None:
             from freetoken.attention.linear import build_fla_metadata
 
-            fla = build_fla_metadata(batch, hidden_states.device)
+            fla = build_fla_metadata(batch, hidden_states.device, pool)
             batch.fla_metadata = fla
 
         proj = self.in_proj.forward(hidden_states)

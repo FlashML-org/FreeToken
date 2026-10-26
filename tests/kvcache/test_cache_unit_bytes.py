@@ -50,6 +50,13 @@ def test_kv_bytes_per_token_from_mha_buffer():
     assert ub["mamba_bytes_per_slot"] == 0
 
 
+def test_kv_bytes_per_token_counts_the_draft_kv():
+    eng = _mha_engine()
+    plain = compute_cache_unit_bytes(eng)["kv_bytes_per_token"]
+    eng.spec = SimpleNamespace(budget=lambda config: (1 << 20, 768))
+    assert compute_cache_unit_bytes(eng)["kv_bytes_per_token"] == plain + 768
+
+
 def test_kv_and_swa_bytes_per_token_from_hybrid_pools():
     # HybridSWAKVCache owns two pools: the full one denominates kv_bytes_per_token (over its
     # own layers), the window one swa_bytes_per_token (token-granular).

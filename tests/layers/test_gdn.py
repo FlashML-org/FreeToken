@@ -1,4 +1,4 @@
-"""The GatedDeltaNet layer against the pure-torch HF reference math (``layers/linear_attn/gdn_reference.py``): a ragged bs=3 prefill (up to 1000 tokens) and one decode step off the carried state, for both GQA head ratios and both output gates."""
+"""The GatedDeltaNet layer against the pure-torch HF reference math (``layers/linear_attn/gdn_reference.py``): a ragged bs=3 prefill (up to 1000 tokens), decode steps and a speculative verify off the carried state, for both GQA head ratios and both output gates."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ HIDDEN, HEAD_DIM, CONV_K, EPS = 256, 128, 4, 1e-6
 RTOL = ATOL = 2e-2
 # (num_k_heads, num_v_heads) per value:key head ratio; 3:1 is the Qwen3.8-Flash-Next shape.
 HEADS = {2: (8, 16), 3: (16, 48)}
+K = 3  # drafts per verify step
 
 
 def _bf(t: torch.Tensor) -> torch.Tensor:
@@ -78,6 +79,7 @@ def _ctx(monkeypatch, ratio: int, num_slots: int = 8) -> Context:
     )
     ctx = Context(page_size=64)
     ctx.linear_state_pool = LinearStatePool(group, num_slots, torch.bfloat16, DEV, tp_size=1)
+    ctx.linear_state_pool.attach_verify_scratch(num_slots, K + 1)
     monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
     return ctx
 
@@ -99,8 +101,8 @@ def _prefill(op, ctx: Context, lengths: list[int], seed: int):
     return hidden, reqs, out
 
 
-def _decode(op, ctx: Context, reqs, hidden: torch.Tensor) -> torch.Tensor:
-    batch = Batch(reqs=reqs, phase="decode")
+def _step(op, ctx: Context, reqs, hidden: torch.Tensor, phase: str = "decode", rows: int = 1) -> torch.Tensor:
+    batch = Batch(reqs=reqs, phase=phase, rows_per_req=rows)
     batch.padded_reqs = reqs
     with ctx.forward_batch(batch):
         return op.forward(hidden)
@@ -113,24 +115,38 @@ def _ref_out(ref, hidden: torch.Tensor) -> torch.Tensor:
 
 # 3:1 with sigmoid is Qwen3.8-Flash-Next; the sigmoid case also catches a layer that ignores output_gate (the default is silu)
 @pytest.mark.parametrize("ratio,output_gate", [(2, "silu"), (3, "sigmoid")])
-def test_ragged_prefill_then_decode(monkeypatch, ratio, output_gate):
-    """bs=3 ragged prefill, then one decode step per request off the carried conv + recurrent
-    state. The decode oracle is the whole (prefill + 1) sequence in one reference pass, so a
-    state that did not survive the prefill shows up immediately."""
+def test_prefill_decode_and_verify_match_reference(monkeypatch, ratio, output_gate):
+    """bs=3 ragged prefill, a decode step, a verify of K+1 rows committed at a different accept count per request, then another decode step.
+    Each step is checked against the reference over the request's whole sequence so far, so a state that did not survive a step, or a verify that wrote the live state, shows up in the next one."""
     op, ref = _make_layer(ratio, output_gate, seed=ratio)
     ctx = _ctx(monkeypatch, ratio)
     lengths = [128, 1000, 37]
-    hidden, reqs, out = _prefill(op, ctx, lengths, seed=13)
+    seqs, reqs, out = _prefill(op, ctx, lengths, seed=13)
 
     off = 0
-    for h, n in zip(hidden, lengths):
+    for h, n in zip(seqs, lengths):
         torch.testing.assert_close(
             out[off:off + n].float(), _ref_out(ref, h), rtol=RTOL, atol=ATOL
         )
         off += n
 
     nxt = torch.randn(len(lengths), HIDDEN, device=DEV, dtype=torch.bfloat16)
-    dec = _decode(op, ctx, reqs, nxt)
-    for i, h in enumerate(hidden):
-        full = _ref_out(ref, torch.cat([h, nxt[i:i + 1]], dim=0))
-        torch.testing.assert_close(dec[i].float(), full[-1], rtol=RTOL, atol=ATOL)
+    dec = _step(op, ctx, reqs, nxt)
+    seqs = [torch.cat([h, nxt[i:i + 1]]) for i, h in enumerate(seqs)]
+    for i, h in enumerate(seqs):
+        torch.testing.assert_close(dec[i].float(), _ref_out(ref, h)[-1], rtol=RTOL, atol=ATOL)
+
+    rows = torch.randn(len(lengths), K + 1, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    ver = _step(op, ctx, reqs, rows.flatten(0, 1), "verify", K + 1).view(len(lengths), K + 1, -1)
+    for i, h in enumerate(seqs):
+        want = _ref_out(ref, torch.cat([h, rows[i]]))[-(K + 1):]
+        torch.testing.assert_close(ver[i].float(), want, rtol=RTOL, atol=ATOL)
+    accepted = [1, 2, K + 1]
+    ctx.linear_state_pool.commit_verify([r.table_idx for r in reqs], accepted)
+    seqs = [torch.cat([h, rows[i, :n]]) for i, (h, n) in enumerate(zip(seqs, accepted))]
+
+    last = torch.randn(len(lengths), HIDDEN, device=DEV, dtype=torch.bfloat16)
+    dec = _step(op, ctx, reqs, last)
+    for i, h in enumerate(seqs):
+        want = _ref_out(ref, torch.cat([h, last[i:i + 1]]))[-1]
+        torch.testing.assert_close(dec[i].float(), want, rtol=RTOL, atol=ATOL)

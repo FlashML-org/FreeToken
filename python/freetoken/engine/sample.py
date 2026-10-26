@@ -123,3 +123,43 @@ class Sampler:
                     0, tokens[row : row + 1].long(), counts.new_ones(1)
                 )
             return tokens
+
+    def sample_verify(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor:
+        """One token per verify row as decode would sample it, ``drafts`` [bs, k] giving k+1 rows per request.
+
+        Row j of a request is penalized as if its drafts d1..dj were already committed; the penalty counts are not updated.
+        """
+        bs, k = drafts.shape
+        width = k + 1
+        if args.penalties:
+            logits = self._penalize_rows(logits, args, drafts)
+        if args.temperatures is None:
+            return torch.argmax(logits, dim=-1)
+
+        def rows(t: torch.Tensor | None) -> torch.Tensor | None:
+            return None if t is None else t.repeat_interleave(width)
+
+        tokens = sample_impl(logits.float(), rows(args.temperatures), rows(args.top_k), rows(args.top_p))
+        if args.greedy_mask is not None:
+            greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
+            tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
+        return tokens
+
+    def _penalize_rows(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor:
+        k = drafts.shape[1]
+        width = k + 1
+        logits = logits.float().clone()
+        # (row j, draft i) pairs with i < j: row j has seen drafts 0..j-1
+        pair_rows, pair_drafts = torch.tril_indices(width, k, offset=-1, device=logits.device)
+        earlier = torch.ones(k, k, dtype=torch.bool, device=logits.device).tril(-1)
+        for req_row, counts, presence, frequency in args.penalties:
+            block = logits[req_row * width : (req_row + 1) * width]
+            block -= frequency * counts + presence * (counts > 0)
+            if k == 0:
+                continue
+            d = drafts[req_row].long()
+            # presence applies once per token: only to a draft that is new to both the counts and the earlier drafts
+            first = ~((d.unsqueeze(1) == d.unsqueeze(0)) & earlier).any(dim=1)
+            extra = frequency + presence * ((counts[d] == 0) & first).float()
+            block.index_put_((pair_rows, d[pair_drafts]), -extra[pair_drafts], accumulate=True)
+        return logits

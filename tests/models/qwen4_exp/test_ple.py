@@ -370,14 +370,10 @@ def _state_pool(config, num_slots=8):
 
 def _track_batch(req, tokens, pool):
     """Prefill batch whose FLAMetadata carries the hybrid-radix track indices for ``req``."""
-    import freetoken.core as core
     from freetoken.attention.linear import build_fla_metadata
-    from freetoken.core import Context, set_global_ctx
 
-    core._GLOBAL_CTX = None  # test-only: build_fla_metadata reads the state pool off the ctx
-    set_global_ctx(Context(page_size=64, linear_state_pool=pool))
     batch = _fake_batch([req], decode=False, input_ids=tokens)
-    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"))
+    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"), pool)
     return batch
 
 

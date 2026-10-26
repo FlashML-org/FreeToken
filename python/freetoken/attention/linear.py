@@ -8,6 +8,7 @@ from freetoken.attention.base import AttentionSpec, BaseAttnBackend
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+    from freetoken.kvcache.linear_state_pool import LinearStatePool, LinearVerifyScratch
 
 
 @dataclass
@@ -34,6 +35,8 @@ class FLAMetadata:
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor | None = None
     fresh_state_indices: torch.Tensor | None = None
+    # verify only: the state pool's scratch the verify writes (row = batch row) and the commit replays
+    verify_scratch: "LinearVerifyScratch | None" = None
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
@@ -46,28 +49,34 @@ class FLAMetadata:
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
 
-def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
+def gdn_slot(req) -> int:
+    """The request's GDN state slot: its hybrid-radix live slot (decoupled from table_idx) when allocated, else table_idx (naive GDN keeps the old keying)."""
+    return req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+
+
+def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePool) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
     stalling it.
 
-    Decode is one token per request, so ``cu_seqlens`` is a plain ``arange(bs+1)``. Under
-    CUDA graph ``LinearAttnBackend`` copies this metadata into its persistent buffers
-    (stable addresses) before each replay.
+    Decode and verify run ``rows_per_req`` rows per request, so ``cu_seqlens`` is
+    ``arange(bs+1) * rows_per_req``. Under CUDA graph ``LinearAttnBackend`` copies this
+    metadata into its persistent buffers (stable addresses) before each replay.
     """
     reqs = batch.padded_reqs
     pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
 
-    # GDN state slot per request: the hybrid-radix live slot (decoupled from table_idx) when
-    # allocated, else table_idx (naive / force-naive GDN models keep the old keying).
-    def gdn_slot(r):
-        return r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx
-
-    if batch.is_decode:
+    if not batch.is_prefill:
+        # every request continues its live state
         bs = len(reqs)
-        cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
         idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
-        return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=idx_host.to(device, non_blocking=True))
+        metadata = FLAMetadata(
+            cu_seqlens=torch.arange(0, (bs + 1) * batch.rows_per_req, batch.rows_per_req, dtype=torch.int32, device=device),
+            cache_indices=idx_host.to(device, non_blocking=True),
+        )
+        if batch.phase == "verify":
+            metadata.verify_scratch = pool.verify_scratch
+        return metadata
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
     lens = [r.extend_len for r in reqs]
@@ -77,7 +86,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track = _build_track_metadata(reqs, cu_host, device, pin)
+    track = _build_track_metadata(reqs, cu_host, device, pin, pool.conv_states.shape[-1])
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),
@@ -90,7 +99,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     )
 
 
-def _build_track_metadata(reqs, cu_host, device, pin):
+def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
     """Hybrid-radix (extra_buffer): for each request that crosses a ×CHUNK boundary this
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
     ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
@@ -98,11 +107,9 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     empty = dict(track_dst=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
     if not any(r.mamba_ping_pong is not None for r in reqs):
         return empty
-    from freetoken.core import get_global_ctx
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
     from freetoken.kernel.fla.index import prepare_chunk_offsets
 
-    km1 = get_global_ctx().linear_state_pool.conv_states.shape[-1]  # conv_kernel_dim - 1
     assert km1 <= CHUNK_SIZE, (
         f"conv history {km1} exceeds CHUNK_SIZE {CHUNK_SIZE}: the snapshot window "
         "would reach before this forward's first token"
@@ -158,8 +165,9 @@ class LinearAttnBackend(BaseAttnBackend):
     The layers run their own kernels and read ``batch.fla_metadata``, so ``forward`` is never called.
     """
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, pool: LinearStatePool) -> None:
         self.device = device
+        self.pool = pool
         self.capture: FLACaptureData | None = None
         self.capture_bs: List[int] = []
 
@@ -176,7 +184,7 @@ class LinearAttnBackend(BaseAttnBackend):
         raise NotImplementedError("linear-attention layers run their own kernels")
 
     def prepare_metadata(self, batch: "Batch") -> None:
-        batch.fla_metadata = build_fla_metadata(batch, self.device)
+        batch.fla_metadata = build_fla_metadata(batch, self.device, self.pool)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -187,9 +195,10 @@ class LinearAttnBackend(BaseAttnBackend):
         assert (bs := batch.padded_size) in self.capture_bs and self.capture
         capture = self.capture
         # capture on the padding request's state slot, so the captured gather/scatter touches scratch; replay writes the real slots
-        dummy = batch.padded_reqs[0]
-        capture.cache_indices[:bs].fill_(dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx)
+        capture.cache_indices[:bs].fill_(gdn_slot(batch.padded_reqs[0]))
         batch.fla_metadata = FLAMetadata(cu_seqlens=capture.cu_seqlens[: bs + 1], cache_indices=capture.cache_indices[:bs])
+        if batch.phase == "verify":
+            batch.fla_metadata.verify_scratch = self.pool.verify_scratch
 
     def prepare_for_replay(self, batch: "Batch") -> None:
         metadata, bs = batch.fla_metadata, batch.padded_size

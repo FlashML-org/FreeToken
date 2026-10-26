@@ -103,11 +103,12 @@ class BaseKVCachePool(ABC):
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, extra_note: str = "", **targets,
+        extra_fixed_bytes: int = 0, extra_page_bytes: int = 0, extra_note: str = "", **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
-        The engine supplies the memory account (baseline/weights, the MoE terms, and any
-        sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
+        The engine supplies the memory account (baseline/weights, the MoE terms, any
+        sibling pool's fixed bytes at ITS target, e.g. the GDN state pool, and bytes that
+        scale with the page count, e.g. a speculative draft's KV); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.
 
         The base names no family-specific target: the engine forwards the whole request
@@ -129,7 +130,7 @@ class BaseKVCachePool(ABC):
             config.memory_ratio, baseline_free, weights_bytes,
             fixed_cache_size + extra_fixed_bytes,
         )
-        need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
+        need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page + extra_page_bytes)
         if need > budget:
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "

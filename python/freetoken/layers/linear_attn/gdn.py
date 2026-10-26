@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
-from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
+from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
 
@@ -109,6 +109,16 @@ class GatedDeltaNet(BaseOP):
         li = pool.local_index(self.layer_id)
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
+    def _conv_verify(self, conv_in: torch.Tensor, fla, pool) -> torch.Tensor:
+        """Causal conv over a verify batch's rows: rolls the live conv state as if every row were accepted and parks each row's window in ``fla.verify_scratch``."""
+        li = pool.local_index(self.layer_id)
+        total = conv_in.shape[0]
+        bs = fla.cu_seqlens.numel() - 1
+        # free views both ways: the conv reads any strides and writes token-major output
+        x = conv_in.reshape(bs, total // bs, -1).transpose(1, 2)
+        out = causal_conv1d_verify(x, pool.conv_states[li], self._conv_weight(), fla.cache_indices, fla.verify_scratch.conv_window[li])
+        return out.transpose(1, 2).reshape(total, -1)
+
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
                               h: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
@@ -137,7 +147,7 @@ class GatedDeltaNet(BaseOP):
         if fla is None:
             from freetoken.attention.linear import build_fla_metadata
 
-            fla = build_fla_metadata(batch, hidden_states.device)
+            fla = build_fla_metadata(batch, hidden_states.device, pool)
             batch.fla_metadata = fla
 
         if self._split_in_proj:
@@ -151,18 +161,22 @@ class GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if not batch.is_prefill:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
+            # A verify only reads the live state and stashes each row's inputs; LinearVerifyScratch.commit replays the accepted rows into it.
             from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
 
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
-            B = mixed.shape[0]
+            verify = batch.phase == "verify"
+            if verify:
+                mixed = self._conv_verify(conv_in, fla, pool)
+            else:
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
+            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
             core_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log, a=a, dt_bias=self.dt_bias,  # already fp32 (stored fp32)
                 softplus_beta=1.0, softplus_threshold=20.0,
@@ -170,7 +184,8 @@ class GatedDeltaNet(BaseOP):
                 initial_state_source=pool.recurrent_states[li],
                 initial_state_indices=fla.cache_indices,  # already int32 (built int32 by build_fla_metadata)
                 scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
-            )[0]  # [B, num_v, V]
+                disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
+            )[0]  # [total, num_v, V]
         else:
             from freetoken.kernel.fla import chunk_gated_delta_rule
 
