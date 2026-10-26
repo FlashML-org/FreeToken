@@ -1,5 +1,5 @@
 from .config import VisionConfig, parse_config, parse_vision_config
-from .gguf import iter_gguf_weights, parse_gguf_config, to_gguf
+from .gguf import gguf_mm_config, iter_gguf_weights, iter_mmproj_weights, parse_gguf_config, to_gguf
 from .model import MiniMaxM3ForCausalLM, MiniMaxM3ForConditionalGeneration
 from .vision import MiniMaxM3VisionModel
 from .weight import (
@@ -18,7 +18,9 @@ __all__ = [
     "parse_vision_config",
     "iter_vision_weights",
     "iter_weights",
+    "gguf_mm_config",
     "iter_gguf_weights",
+    "iter_mmproj_weights",
     "parse_gguf_config",
     "to_gguf",
 ]

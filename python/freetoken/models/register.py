@@ -225,13 +225,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "MiniMaxM3ForCausalLM",
         packed_modules_mapping=_MINIMAX_M3_PACKED,
     ),
-    # llama.cpp minimax-m3 GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp minimax-m3 GGUF: the same model classes with every tensor in its packed ggml type; a minimax_m3 mmproj adds the vision tower
     "MiniMaxM3GGUFForCausalLM": ModelSpec(
         "freetoken.models.minimax_m3",
-        "MiniMaxM3ForCausalLM",
+        "MiniMaxM3ForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_MINIMAX_M3_GGUF_PACKED,
+        mm_processor=_MINIMAX_M3_PROCESSOR,
+        encoders=_MINIMAX_M3_ENCODERS,
     ),
     "DeepseekV4ForCausalLM": ModelSpec(
         "freetoken.models.deepseek_v4",

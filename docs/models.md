@@ -129,6 +129,10 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   `deepseek4v` mmproj; the text-only 0731 release has no image token and refuses the
   mmproj. ggml-org's Vision-Exp text GGUF ships a chat template that renders no image
   placeholder; serve unsloth's release for image requests.
+- A MiniMax-M3 GGUF takes image input from a `minimax_m3` mmproj. MiniMax-M3.1-Flash ships its
+  own tower with other weights: pair each text GGUF with an mmproj of the same release (the other
+  one loads without an error, from `--mmproj` or the model folder). unsloth's MiniMax-M3 repo has
+  no mmproj; pass one from another MiniMax-M3 repo with `--mmproj`.
 - DeepSeek-V4.1-Flash serves text and images from the HF checkpoint as shipped (fp8 block-32
   dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
