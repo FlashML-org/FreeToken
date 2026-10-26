@@ -1,5 +1,5 @@
 from .config import VisionConfig, parse_config, parse_vision_config
-from .gguf import iter_gguf_weights, parse_gguf_config, to_gguf
+from .gguf import gguf_mm_config, iter_gguf_weights, parse_gguf_config, to_gguf
 from .model import (
     Qwen3VLForConditionalGeneration,
     Qwen3VLMoeForConditionalGeneration,
@@ -14,6 +14,7 @@ __all__ = [
     "Qwen3VLVisionModel",
     "VisionConfig",
     "deepstack_add",
+    "gguf_mm_config",
     "iter_gguf_weights",
     "iter_vision_weights",
     "iter_weights",
