@@ -48,18 +48,23 @@ foreach ($target in $targets) {
     )
 
     foreach ($extension in $extensions) {
-        $disabledPath = "$($extension.FullName).disabled"
+        $disabledName = "$($extension.Name).disabled"
+        $disabledPath = Join-Path $moduleDirectory $disabledName
         if (Test-Path -LiteralPath $disabledPath) {
-            Write-Warning "Already disabled; leaving unchanged: $target"
-            continue
+            $suffix = Get-Date -Format 'yyyyMMddTHHmmssfff'
+            $disabledName = "$($extension.Name).disabled.$suffix"
+            $disabledPath = Join-Path $moduleDirectory $disabledName
+            if (Test-Path -LiteralPath $disabledPath) {
+                throw "Refusing to overwrite an existing disabled extension: $disabledPath"
+            }
         }
 
         if ($Apply) {
-            Rename-Item -LiteralPath $extension.FullName -NewName "$($extension.Name).disabled"
+            Rename-Item -LiteralPath $extension.FullName -NewName $disabledName
             Write-Output "Disabled: $target"
         }
         else {
-            Write-Output "Would disable: $target"
+            Write-Output "Would disable: $target as $disabledName"
         }
     }
 }

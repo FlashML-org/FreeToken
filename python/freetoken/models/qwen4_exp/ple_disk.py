@@ -23,7 +23,6 @@ from freetoken.utils import init_logger
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
-    _PLE_ST_DTYPE,
     _PLE_ST_DTYPES,
     _ple_table_files,
     _safetensors_header,
@@ -52,7 +51,9 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
-    dtype: str
+    ggml_type: int | None = None
+    row_values: int | None = None
+    row_dtype: torch.dtype = torch.float8_e4m3fn
 
     @property
     def total_rows(self) -> int:
@@ -67,7 +68,7 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     paths: list[str] = []
     path_idx: dict[str, int] = {}
     shards: dict[int, tuple[int, int]] = {}
-    shard_dtype: str | None = None
+    shard_dtype: torch.dtype | None = None
     for path in _ple_table_files(folder):
         header, base = _safetensors_header(path)
         for key, meta in header.items():
@@ -80,13 +81,11 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            dtype = meta["dtype"]
-            if dtype not in (_PLE_ST_DTYPE, "BF16"):
+            dtype = _PLE_ST_DTYPES.get(meta["dtype"])
+            if dtype is None or shard_dtype not in (None, dtype):
                 raise ValueError(
-                    f"PLE shard {key} has dtype {dtype}, expected {_PLE_ST_DTYPE} or BF16"
+                    f"PLE shard {key} has dtype {meta['dtype']}, expected one of {sorted(_PLE_ST_DTYPES)} for every shard"
                 )
-            if shard_dtype is not None and dtype != shard_dtype:
-                raise ValueError(f"PLE shards have mixed dtypes: {shard_dtype} and {dtype}")
             shard_dtype = dtype
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
@@ -100,17 +99,16 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             shards[idx] = (path_idx[path], base + meta["data_offsets"][0])
     if sorted(shards) != list(range(len(shards))) or not shards:
         raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
-    if scale is None and shard_dtype != "BF16":
+    if scale is None and shard_dtype is torch.float8_e4m3fn:
         raise ValueError("PLE table has no weight_scale")
     order = [shards[i] for i in range(len(shards))]
     assert shard_dtype is not None
     if scale is None:
         scale = torch.tensor(1.0, dtype=torch.bfloat16)
-    itemsize = 1 if shard_dtype == _PLE_ST_DTYPE else 2
-    row_bytes = cols * itemsize
+    row_bytes = cols * shard_dtype.itemsize
     return PleRowSource(
         paths, [f for f, _ in order], [b for _, b in order], rows,
-        row_bytes, row_bytes, float(scale), shard_dtype,
+        row_bytes, row_bytes, float(scale), row_values=cols, row_dtype=shard_dtype,
     )
 
 
@@ -153,11 +151,11 @@ class DiskRowTable:
         from freetoken.layers.quantization.ggml_types import float_dtype
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes // (1 if source.dtype == _PLE_ST_DTYPE else 2)
+        self.head_dim = source.row_values or source.row_bytes
+        self._ggml_type = source.ggml_type
+        self._row_bytes = source.row_bytes
+        self._row_dtype = source.row_dtype if source.ggml_type is None else float_dtype(source.ggml_type)
         self.dtype = dtype
-        self._value_dtype = (
-            torch.float8_e4m3fn if source.dtype == _PLE_ST_DTYPE else torch.bfloat16
-        )
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
         self.eos_token_id = int(hash_constants["eos_token_id"])
@@ -183,7 +181,7 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * source.row_bytes
+        self._token_bytes = self.heads * self._row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -218,7 +216,7 @@ class DiskRowTable:
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
         self._worker = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-fill")
-            if self._wait_sync and torch.version.hip is not None else None
+            if self._wait_sync and (torch.version.hip is not None or os.name == "nt") else None
         )
         self._pending: Future | None = None
         self._failed = False
@@ -242,7 +240,7 @@ class DiskRowTable:
         def _complete() -> None:
             self._fill_decode(histories, bs)
 
-        # Like Engram, release HIP's WAIT independently of a queue-blocked graph launch.
+        # Release the WAIT independently of a queue-blocked graph launch.
         self._pending = self._worker.submit(_complete)
 
     def _await_pending(self) -> None:
@@ -370,7 +368,12 @@ class DiskRowTable:
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
         if not capturing:
             self._eager_read[self._eager_slot].record(stream)
-        values = dev[:nbytes].view(self._value_dtype).to(self.dtype)
+        if self._row_dtype is not None:
+            values = dev[:nbytes].view(self._row_dtype).to(self.dtype, copy=True)
+        else:
+            from freetoken.kernel import ggml
+
+            values = ggml.dequantize(dev[:nbytes].view(-1, self._row_bytes), self._ggml_type, self.head_dim, self.dtype)
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)
