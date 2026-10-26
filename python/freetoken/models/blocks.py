@@ -48,6 +48,21 @@ class SupportsMultimodal(Protocol):
         ...
 
 
+@runtime_checkable
+class FeatureSink(Protocol):
+    """Where a forward hands per-row hidden states to a draft model; set on ``batch.features``."""
+
+    wanted_layers: frozenset[int]
+
+    def final_hidden(self, x: torch.Tensor) -> None:
+        """Every row's hidden state before the LM head; the first call in a forward wins, so a model may call it before the head does."""
+        ...
+
+    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+        """A layer's output rows; called only for layers in ``wanted_layers``."""
+        ...
+
+
 def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
     """Token embeddings of the batch; on a chunk with multimodal rows, batch.mm_embeds' leading columns replace the rows batch.mm_rows."""
     if batch.mm_embeds is None:

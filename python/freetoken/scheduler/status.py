@@ -36,7 +36,9 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        generated: int | None = None,
     ) -> None:
+        """``generated``: tokens a decode step committed; None means one per request."""
         if batch.is_prefill:
             self._report_prefill(
                 batch,
@@ -47,7 +49,7 @@ class SchedulerStatusReporter:
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
             )
-        elif batch.is_decode:
+        else:
             self._report_decode(
                 batch,
                 running_reqs=running_reqs,
@@ -57,6 +59,7 @@ class SchedulerStatusReporter:
                 page_size=page_size,
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
+                generated=generated,
             )
 
     def _report_prefill(
@@ -103,9 +106,10 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        generated: int | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        self._decode_generated_tokens += len(batch.reqs) if generated is None else generated
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 

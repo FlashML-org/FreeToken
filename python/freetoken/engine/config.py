@@ -177,5 +177,10 @@ class EngineConfig:
         return self.max_seq_len
 
     @property
+    def decode_rows_per_req(self) -> int:
+        """Query rows each running request takes per decode step; every per-request decode allowance derives from it."""
+        return 1
+
+    @property
     def distributed_addr(self) -> str:
         return "tcp://127.0.0.1:2333"

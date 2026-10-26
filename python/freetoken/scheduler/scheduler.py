@@ -93,7 +93,8 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
-        self.decode_manager = DecodeManager(config.page_size)
+        token_headroom = config.decode_rows_per_req - 1
+        self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
         self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -101,6 +102,7 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
+            token_headroom=token_headroom,
         )
 
         # some alias for easy access
@@ -360,43 +362,9 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                # Overlap can advance device_len one token ahead of this host reply.
-                hit_length = req.input_ids.numel() >= req.max_device_len
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                    )
-                )
+                msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                reply.append(msg)
+                finished = msg.finished
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -443,6 +411,37 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _commit_tokens(self, req: Req, tokens: torch.Tensor) -> Tuple[DetokenizeMsg, int]:
+        """Append sampled tokens in order until one finishes the request; returns the reply and how many tokens were committed."""
+        params = req.sampling_params
+        committed: List[int] = []
+        finished, finish_reason, matched_stop = False, None, None
+        for j in range(tokens.numel()):
+            req.append_host(tokens[j : j + 1])
+            token = int(tokens[j].item())
+            committed.append(token)
+            # EOS / stop-string -> "stop", output budget exhausted -> "length";
+            # EOS and stop strings win over length.
+            # Overlap can advance device_len one token ahead of this host reply.
+            hit_length = req.input_ids.numel() >= req.max_device_len
+            hit_eos = not params.ignore_eos and token in self.eos_token_ids
+            matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            if hit_length or hit_eos or matched_stop is not None:
+                finished = True
+                finish_reason = "stop" if (hit_eos or matched_stop is not None) else "length"
+                break
+            if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
+                req.toolcall_anchor_len = req.input_ids.numel()
+        msg = DetokenizeMsg(
+            uid=req.uid,
+            next_tokens=committed,
+            finished=finished,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            stop_strs=params.stop_strs or None,
+        )
+        return msg, len(committed)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -841,7 +840,7 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
-        if batch.is_decode:
+        if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
@@ -866,7 +865,7 @@ class Scheduler(SchedulerIOMixin):
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         if self.engine.linear_state_pool is not None:
-            if batch.is_decode:
+            if not batch.is_prefill:
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
                 # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
                 # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
@@ -882,15 +881,15 @@ class Scheduler(SchedulerIOMixin):
                         slots, dtype=torch.int32, device="cpu", pin_memory=True
                     ).to(self.device, non_blocking=True)
                 else:
-                    batch.linear_table_idx = input_mapping[0].to(torch.int32)
+                    batch.linear_table_idx = input_mapping[0][:: batch.rows_per_req].to(torch.int32)
             # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
             batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+        if not batch.is_prefill:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)
+            batch.active_table_idx = input_mapping[0][:: batch.rows_per_req].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Tuple
 
 import torch
 
@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.blocks import FeatureSink
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 
@@ -95,6 +96,15 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def widen_pending(self, k: int) -> None:
+        """Extend the pending token at cached_len by k provisional draft tokens."""
+        self.device_len += k
+
+    def commit_pending(self, n: int) -> None:
+        """Make n tokens final and leave the last committed one pending at cached_len."""
+        self.cached_len += n
+        self.device_len = self.cached_len + 1
+
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
         m = n + next_token.numel()
@@ -116,9 +126,20 @@ class Req:
 
 
 @dataclass
+class VerifyInfo:
+    """A uniform extend of `steps` rows per request over read-only recurrent state."""
+
+    steps: int
+    gdn: Any = None
+    model_scratch: Any = None
+
+
+@dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    phase: Literal["prefill", "decode", "verify"]
+    # query rows per request: 1 on decode, steps on verify, None on prefill (ragged)
+    rows_per_req: int | None = None
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
@@ -160,6 +181,13 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # per-row hidden states a draft model reads from this forward; None when nothing reads them
+    features: "FeatureSink | None" = field(default=None, init=False)
+    verify: VerifyInfo | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.rows_per_req is None and self.phase == "decode":
+            self.rows_per_req = 1
 
     @property
     def is_prefill(self) -> bool:
@@ -200,11 +228,38 @@ class Context:
         return self._batch
 
     @contextmanager
-    def forward_batch(self, batch: Batch):
+    def override(
+        self,
+        *,
+        kv_cache: BaseKVCachePool | None = None,
+        attn_backend: BaseAttnBackend | None = None,
+        hide_target_state: bool = False,
+    ):
+        """Swap the KV pool and attention backend for a draft forward; hide_target_state also hides the target's GDN pool and MoE offload cache."""
+        swaps = {}
+        if kv_cache is not None:
+            swaps["kv_cache"] = kv_cache
+        if attn_backend is not None:
+            swaps["attn_backend"] = attn_backend
+        if hide_target_state:
+            swaps["linear_state_pool"] = None
+            swaps["moe_offload_cache"] = None
+        saved = {name: getattr(self, name) for name in swaps}
+        try:
+            for name, value in swaps.items():
+                setattr(self, name, value)
+            yield
+        finally:
+            for name, value in saved.items():
+                setattr(self, name, value)
+
+    @contextmanager
+    def forward_batch(self, batch: Batch, **override):
         assert self._batch is None, "Nested forward_batch is not allowed"
         try:
             self._batch = batch
-            yield
+            with self.override(**override):
+                yield
         finally:
             self._batch = None
 

@@ -139,8 +139,11 @@ class FlashInferBackend(BaseAttnBackend):
         # for cuda graph
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
+        self.graph_wrappers: Dict[
+            int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper | BatchPrefillWithPagedKVCacheWrapper
+        ] = {}
         self.capture: FICaptureData | None = None
+        self.capture_steps = 1
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
@@ -266,14 +269,15 @@ class FlashInferBackend(BaseAttnBackend):
         super().reset_capture()
         self.graph_wrappers = {}
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
+        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device, steps=steps)
         capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
+        self.capture_steps = steps
 
     @cached_property
     def use_tensor_cores(self) -> bool:
@@ -283,22 +287,41 @@ class FlashInferBackend(BaseAttnBackend):
         GQA = self.config.num_qo_heads // self.config.num_kv_heads
         return GQA >= 4
 
-    def prepare_for_capture(self, batch: Batch) -> None:
-        from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
+    def _make_graph_wrapper(
+        self, bs: int
+    ) -> CUDAGraphBatchDecodeWithPagedKVCacheWrapper | BatchPrefillWithPagedKVCacheWrapper:
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper, CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
+        capture = self.capture
+        assert capture is not None
+        if self.capture_steps > 1:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                backend="fa2",
+                use_cuda_graph=True,
+                qo_indptr_buf=capture.cu_seqlens_q[: bs + 1],
+                paged_kv_indptr_buf=capture.cu_seqlens_k[: bs + 1],
+                paged_kv_indices_buf=capture.indices,
+                paged_kv_last_page_len_buf=capture.one_tensor[:bs],
+            )
+        else:
+            wrapper = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                self.float_workspace_buffer,
+                kv_layout="NHD",
+                use_tensor_cores=self.use_tensor_cores,
+                indptr_buffer=capture.cu_seqlens_k[: bs + 1],
+                indices_buffer=capture.indices,
+                last_page_len_buffer=capture.one_tensor[:bs],
+            )
+            wrapper._backend = "fa2"
+        wrapper._int_workspace_buffer = self.int_workspace_buffer
+        return wrapper
+
+    def prepare_for_capture(self, batch: Batch) -> None:
         bs = batch.size
         assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
-        capture = self.capture
-        self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-            self.float_workspace_buffer,
-            kv_layout="NHD",
-            use_tensor_cores=self.use_tensor_cores,
-            indptr_buffer=capture.cu_seqlens_k[: bs + 1],
-            indices_buffer=capture.indices,
-            last_page_len_buffer=capture.one_tensor[:bs],
-        )
-        self.graph_wrappers[bs]._backend = "fa2"
-        self.graph_wrappers[bs]._int_workspace_buffer = self.int_workspace_buffer
+        self.graph_wrappers[bs] = self._make_graph_wrapper(bs)
         self.prepare_metadata(batch)
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)

@@ -94,8 +94,10 @@ class LLM(Scheduler):
                 continue
             assert isinstance(msg, DetokenizeMsg)
             status = self.status_map[msg.uid]
-            if not (msg.finished and msg.next_token in self.eos_token_ids):
-                status.output_ids.append(msg.next_token)
+            tokens = msg.next_tokens
+            if msg.finished and tokens and tokens[-1] in self.eos_token_ids:
+                tokens = tokens[:-1]
+            status.output_ids.extend(tokens)
 
     def generate(
         self,

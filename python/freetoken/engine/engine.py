@@ -111,6 +111,12 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
 
 
+def _seq_limits(config, num_tokens: int) -> tuple[int, int]:
+    """(longest request, page-table width). A decode step may widen a request by decode_rows_per_req - 1 provisional rows past its length, so requests get that much less and the table still covers the widened tail."""
+    limit = min(config.max_seq_len, num_tokens)
+    return limit - (getattr(config, "decode_rows_per_req", 1) - 1), _page_table_width(limit, config.page_size)
+
+
 def _required_attn_types(model_config) -> frozenset[AttnType]:
     """Backend-driving attention types of this model, from the group-spec walk
     (single source shared with the pool factory and the KV cost model). getattr
@@ -524,8 +530,7 @@ class Engine:
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
@@ -564,16 +569,16 @@ class Engine:
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
-            model=self.model,
+            forward=self.model.forward,
             attn_backend=self.attn_backend,
             cuda_graph_bs=config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            out_dtype=torch.float32,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1034,6 +1039,7 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
+        max_tokens *= config.decode_rows_per_req
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1098,8 +1104,7 @@ class Engine:
 
     def _refresh_seq_state(self, config) -> None:
         num_tokens = self.num_pages * config.page_size
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         if aligned_max_seq_len != self.page_table.shape[1]:
             # max_seq_len changed (e.g. KV grew past the startup token budget); the page table
             # columns must track it or new requests would index out of bounds. The scheduler
@@ -1244,7 +1249,7 @@ class Engine:
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        aligned_max_seq_len = self.page_table.shape[1]
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
@@ -1252,22 +1257,20 @@ class Engine:
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
-            model=self.model,
+            forward=self.model.forward,
             attn_backend=self.attn_backend,
             cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=free_min,
             max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            out_dtype=torch.float32,
         )
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
-        if batch.mm_gather_plan:
-            self._run_mm_encoder(batch)
+    def forward_logits(self, batch: Batch) -> torch.Tensor:
+        """The batch's logits from its captured graph, or eagerly when none fits."""
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -1275,6 +1278,13 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        return logits
+
+    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        assert torch.cuda.current_stream() == self.stream
+        if batch.mm_gather_plan:
+            self._run_mm_encoder(batch)
+        logits = self.forward_logits(batch)
 
         for req in batch.reqs:
             req.complete_one()

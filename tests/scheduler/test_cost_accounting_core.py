@@ -209,7 +209,7 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler._schedule_next_batch = lambda: None
     sent = []
     scheduler.send_result = lambda messages: sent.append(messages)
-    late_sample = DetokenizeMsg(uid=5, next_token=99, finished=False)
+    late_sample = DetokenizeMsg(uid=5, next_tokens=[99], finished=False)
     scheduler._process_last_data = lambda _data: scheduler.send_result([late_sample])
 
     Scheduler.normal_loop(scheduler)
