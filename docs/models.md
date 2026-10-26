@@ -129,6 +129,9 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   `deepseek4v` mmproj; the text-only 0731 release has no image token and refuses the
   mmproj. ggml-org's Vision-Exp text GGUF ships a chat template that renders no image
   placeholder; serve unsloth's release for image requests.
+- Muse-Glimmer serves images only, from the HF checkpoint and from a GGUF. Its
+  `muse-glimmer` mmproj also stores the patch embedding with the two temporal slabs
+  summed, which cannot be split back for video.
 - DeepSeek-V4.1-Flash serves text and images from the HF checkpoint as shipped (fp8 block-32
   dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on

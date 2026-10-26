@@ -372,13 +372,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_MUSE_GLIMMER_PROCESSOR,
         encoders=_MUSE_GLIMMER_ENCODERS,
     ),
-    # llama.cpp muse-glimmer GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp muse-glimmer GGUF: the same model classes with every tensor in its packed ggml type; a muse-glimmer mmproj adds the vision tower (images only)
     "MuseGlimmerGGUFForCausalLM": ModelSpec(
         "freetoken.models.muse_glimmer",
-        "MuseGlimmerForCausalLM",
+        "MuseGlimmerForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED,
+        mm_processor=_MUSE_GLIMMER_PROCESSOR,
+        encoders=_MUSE_GLIMMER_ENCODERS,
     ),
     "MistralForCausalLM": ModelSpec(
         "freetoken.models.mistral",
