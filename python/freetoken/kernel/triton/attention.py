@@ -1058,3 +1058,45 @@ def paged_attention(
         num_stages=2,
     )
     return o
+
+
+@triton.jit
+def _gather_kv_indices_kernel(
+    page_table,
+    rows,
+    indptr,
+    out,
+    pt_stride,
+    indptr_stride,
+    out_stride,
+    NUM_CHUNKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch_id = tl.program_id(1)
+    indptr_row = indptr + tl.program_id(0) * indptr_stride
+    start = tl.load(indptr_row + batch_id)
+    n = tl.load(indptr_row + batch_id + 1) - start
+    src = page_table + tl.load(rows + batch_id).to(tl.int64) * pt_stride
+    dst = out + tl.program_id(0).to(tl.int64) * out_stride + start
+    for off in range(tl.program_id(2) * BLOCK, n, NUM_CHUNKS * BLOCK):
+        cols = off + tl.arange(0, BLOCK)
+        mask = cols < n
+        tl.store(dst + cols, tl.load(src + cols, mask=mask), mask=mask)
+
+
+def gather_kv_indices(page_table: torch.Tensor, rows: torch.Tensor, indptr: torch.Tensor, out: torch.Tensor) -> None:
+    """Flat KV slot lists of several decode batches, built on the device: ``out[s, indptr[s, i] + j] = page_table[rows[i], j]`` for ``j < indptr[s, i + 1] - indptr[s, i]``."""
+    steps, batch = indptr.shape[0], indptr.shape[1] - 1
+    # a fixed grid keeps the launch graph-capturable; long rows loop over it
+    chunks = max(1, triton.cdiv(2 * _num_sms(page_table.device.index), steps * batch))
+    _gather_kv_indices_kernel[(steps, batch, chunks)](
+        page_table,
+        rows,
+        indptr,
+        out,
+        page_table.stride(0),
+        indptr.stride(0),
+        out.stride(0),
+        NUM_CHUNKS=chunks,
+        BLOCK=1024,
+    )

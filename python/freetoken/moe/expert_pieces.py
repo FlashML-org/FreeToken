@@ -8,6 +8,7 @@ their ``_scale`` / ``_global`` companions, or an already fused ``gate_up``). The
 
 from __future__ import annotations
 
+import re
 from typing import Callable, Collection, Iterable, Iterator
 
 import torch
@@ -169,10 +170,46 @@ def per_expert_pieces(
         raise ValueError(f"Incomplete expert tensors in checkpoint (layer, expert): {missing}")
 
 
+def iter_extra_layer_expert_pieces(model_path: str, prefix: str, device: torch.device) -> Iterator[Piece]:
+    """The routed experts stored under ``prefix``, one MoE layer outside the model's stack (an MTP head), as pieces of bank layer 0: stacked ``gate_up``/``down``, or ``gate``/``up``/``down`` per expert with ``_scale`` companions in a block-fp8 checkpoint."""
+    import safetensors
+
+    from freetoken.models.loader import iter_weight_files
+
+    per_expert_re = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.(gate|up|down)_proj\.(weight|weight_scale_inv)$")
+    stacked_re = re.compile(rf"^{re.escape(prefix)}\.(gate_up|down)_proj$")
+    names: dict[str, str] = {}
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            names.update((name, file) for name in f.keys() if per_expert_re.match(name) or stacked_re.match(name))
+    if not names:
+        raise ValueError(f"{model_path} has no routed experts under {prefix}")
+    stacked = {stacked_re.match(n)[1]: f for n, f in names.items() if stacked_re.match(n)}
+    if stacked:
+        piece = {}
+        for role, file in stacked.items():
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+                piece[role] = f.get_tensor(f"{prefix}.{role}_proj")
+        return iter([(0, 0, piece["down"].shape[0], piece)])
+
+    def locate(name: str) -> tuple[int, int, str]:
+        m = per_expert_re.match(name)
+        return 0, int(m[1]), m[2] + ("_scale" if m[3] == "weight_scale_inv" else "")
+
+    def tensors():
+        for file in dict.fromkeys(names.values()):
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+                yield from ((name, f.get_tensor(name)) for name, where in names.items() if where == file)
+
+    scaled = any(name.endswith("_scale_inv") for name in names)
+    return per_expert_pieces(tensors(), locate, tensors_per_expert=6 if scaled else 3)
+
+
 __all__ = [
     "Piece",
     "bank_layer_of",
     "iter_expert_pieces",
+    "iter_extra_layer_expert_pieces",
     "num_moe_layers",
     "packed_expert_source_info",
     "per_expert_pieces",

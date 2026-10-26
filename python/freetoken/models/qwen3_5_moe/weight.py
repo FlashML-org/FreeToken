@@ -271,6 +271,35 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
 
 
+# routed experts: expert_pieces.iter_extra_layer_expert_pieces
+_MTP_EXPERTS_PREFIX = "mtp.layers.0.mlp.experts."
+
+
+def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's."""
+    hf_config = cached_load_hf_config(model_path)
+    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]))
+    seen = False
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp.") or raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                    continue
+                seen = True
+                if raw_name.startswith(_MTP_EXPERTS_PREFIX):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                emitted = reader.add(raw_name, tensor)
+                if emitted is None:
+                    yield raw_name[len("mtp."):], tensor
+                else:
+                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+    if not seen:
+        raise ValueError(f"{model_path} has no mtp.* weights")
+    if reader.pending:
+        raise ValueError(f"{model_path}: incomplete MTP projections: {reader.missing()}")
+
+
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     for file in iter_weight_files(model_path):
@@ -398,6 +427,7 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 
 __all__ = [
+    "iter_mtp_weights",
     "iter_weights",
     "iter_weights_parallel",
     "iter_expert_pieces",
