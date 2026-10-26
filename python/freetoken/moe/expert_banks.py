@@ -8,7 +8,6 @@ banks from them (``build_expert_banks``). GGUF experts keep their packed ggml ro
 
 from __future__ import annotations
 
-import glob
 import math
 import os
 from dataclasses import dataclass, field
@@ -435,13 +434,12 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
         pass
     if avail is None:
         return True
-    try:  # resolve a hub id to its local cache dir (no-op for a local path) so glob sees the shards
-        from freetoken.utils.hf import download_hf_weight
+    try:  # the loader's index-first shard list also covers subdirectory layouts (a root glob does not)
+        from freetoken.models.loader import iter_weight_files
 
-        model_path = download_hf_weight(model_path)
+        sizes = [os.path.getsize(p) for p in iter_weight_files(model_path)]
     except Exception:
         return True
-    sizes = [os.path.getsize(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))]
     if not sizes:
         return True
     return avail > sum(sizes) + max(sizes)

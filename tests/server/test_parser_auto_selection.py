@@ -103,3 +103,8 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_flint_uses_optional_reasoning_and_xml_tool_calls():
+    assert _inferred("FlintForCausalLM") == ("glm47", "flint")
+    assert _inferred("FlintGGUFForCausalLM") == ("glm47", "flint")

@@ -50,6 +50,13 @@ def shard_tensor(
 
 def iter_weight_files(model_path: str) -> list[str]:
     model_folder = download_hf_weight(model_path)
+    # The index is authoritative: download_hf_weight only fetches the shards it names, and it
+    # covers subdirectory layouts (nvidia's FP4-Local releases ship tensors/model-*.safetensors).
+    index = os.path.join(model_folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index, encoding="utf-8") as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+        return [os.path.join(model_folder, shard) for shard in shards]
     files = glob.glob(f"{model_folder}/*.safetensors")
     return [f for f in files if not f.endswith("consolidated.safetensors")] or files
 

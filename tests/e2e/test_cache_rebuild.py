@@ -16,12 +16,14 @@ Gated behind ``needs_weights``:
   FREETOKEN_REBUILD_TEST_MODEL  small local model dir (falls back to FREETOKEN_TEST_MODEL)
   FREETOKEN_REBUILD_MIN_FREE_GIB  free-GPU-memory gate (default 20)
   FREETOKEN_REBUILD_BOOT_TIMEOUT  seconds to wait for "serving" (default 300)
+  FREETOKEN_REBUILD_EXTRA_ARGS    additional ft serve flags (e.g. offloaded MoE)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -92,7 +94,7 @@ def _wait_until_serving(base: str, proc: subprocess.Popen, deadline: float) -> N
 
 
 def _generate(base: str) -> str:
-    """A short non-thinking completion — the point is that the engine still runs, not what it says."""
+    """A short completion; reasoning models may spend the whole budget in their thought channel."""
     code, body = _post(
         base,
         "/v1/chat/completions",
@@ -105,7 +107,8 @@ def _generate(base: str) -> str:
         },
     )
     assert code == 200, body
-    return str(body["choices"][0]["message"]["content"])
+    message = body["choices"][0]["message"]
+    return message.get("content") or message.get("reasoning_content") or ""
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="cache rebuild e2e needs CUDA")
@@ -113,7 +116,7 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
     model_dir = _model_dir()
     if model_dir is None:
         pytest.skip("set FREETOKEN_REBUILD_TEST_MODEL to a small local model directory")
-    if not model_dir.is_dir():
+    if not model_dir.is_dir() and not model_dir.is_file():
         pytest.skip(f"model is not downloaded: {model_dir}")
 
     min_free = float(os.environ.get("FREETOKEN_REBUILD_MIN_FREE_GIB", "20"))
@@ -133,6 +136,7 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
             "--port", str(port),
             "--num-pages", str(BOOT_PAGES),
             "--enable-cache-report",
+            *shlex.split(os.environ.get("FREETOKEN_REBUILD_EXTRA_ARGS", "")),
         ],
         stdout=log,
         stderr=subprocess.STDOUT,

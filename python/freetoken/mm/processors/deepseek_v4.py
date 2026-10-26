@@ -103,6 +103,11 @@ class DSV4MMProcessor(MMProcessor):
         positions, delta = self.positions(len(out), items) or (None, 0)
         return MMResult(new_ids, items, positions, delta)
 
+    def _image_processor(self) -> None:
+        """None: this family's preprocessing is FreeToken-local (:func:`load_image`); no
+        transformers image-processor class exists to build from a preprocessor_config."""
+        return None
+
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         # The smallest block the tower can run: one 2x2 merge grid out of a 6x6 patch grid.
         r, p = self.vc.vision_downsample_ratio, self.vc.vision_patch_size
