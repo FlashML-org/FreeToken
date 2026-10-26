@@ -1375,6 +1375,9 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
+        spec_prefill = self.spec is not None and batch.is_prefill
+        if spec_prefill:
+            batch.features = self.spec.prefill_sink(batch)
         logits = self.forward_logits(batch)
 
         for req in batch.reqs:
@@ -1385,6 +1388,9 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if spec_prefill:
+            # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
+            self.spec.on_prefill(batch, next_tokens_gpu)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()

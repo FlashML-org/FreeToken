@@ -271,6 +271,63 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
 
 
+_MTP_EXPERT_RE = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(weight|weight_scale_inv)$")
+_MTP_STACKED_EXPERTS_RE = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.(gate_up|down)_proj$")
+
+
+def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's."""
+    hf_config = cached_load_hf_config(model_path)
+    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]))
+    seen = False
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp.") or raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                    continue
+                seen = True
+                if _MTP_EXPERT_RE.match(raw_name) or _MTP_STACKED_EXPERTS_RE.match(raw_name):
+                    continue
+                emitted = reader.add(raw_name, f.get_tensor(raw_name))
+                if emitted is None:
+                    yield raw_name[len("mtp."):], f.get_tensor(raw_name)
+                else:
+                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+    if not seen:
+        raise ValueError(f"{model_path} has no mtp.* weights")
+    if reader.pending:
+        raise ValueError(f"{model_path}: incomplete MTP projections: {reader.missing()}")
+
+
+def iter_mtp_expert_pieces(model_path: str, device: torch.device):
+    """The MTP layer's routed experts as expert pieces of bank layer 0: stacked ``gate_up``/``down``, or ``gate``/``up``/``down`` per expert with ``_scale`` companions in a block-fp8 checkpoint."""
+    from freetoken.moe.expert_pieces import per_expert_pieces
+
+    names: dict[str, str] = {}
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            names.update((name, file) for name in f.keys() if _MTP_EXPERT_RE.match(name) or _MTP_STACKED_EXPERTS_RE.match(name))
+    stacked = {_MTP_STACKED_EXPERTS_RE.match(n)[1]: f for n, f in names.items() if _MTP_STACKED_EXPERTS_RE.match(n)}
+    if stacked:
+        piece = {}
+        for role, file in stacked.items():
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+                piece[role] = f.get_tensor(f"mtp.layers.0.mlp.experts.{role}_proj")
+        return iter([(0, 0, piece["down"].shape[0], piece)])
+    scaled = any(name.endswith("_scale_inv") for name in names)
+
+    def locate(name: str) -> tuple[int, int, str]:
+        m = _MTP_EXPERT_RE.match(name)
+        return 0, int(m[1]), m[2] + ("_scale" if m[3] == "weight_scale_inv" else "")
+
+    def tensors():
+        for file in dict.fromkeys(names.values()):
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+                yield from ((name, f.get_tensor(name)) for name, where in names.items() if where == file)
+
+    return per_expert_pieces(tensors(), locate, tensors_per_expert=6 if scaled else 3)
+
+
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
     for file in iter_weight_files(model_path):
@@ -398,6 +455,8 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 
 __all__ = [
+    "iter_mtp_expert_pieces",
+    "iter_mtp_weights",
     "iter_weights",
     "iter_weights_parallel",
     "iter_expert_pieces",
