@@ -15,6 +15,8 @@ Public entry points:
   in place by ``initial_state_indices``, with optional in-kernel q/k l2norm.
 - ``fused_sigmoid_gating_delta_rule_update`` — single-token decode; gating + in-kernel
   l2norm + delta-rule update + per-slot state read/write, all in one kernel.
+- ``gdn_state_replay`` -- speculative commit: re-runs the accepted verify tokens from the
+  input stash the verify mode wrote, all layers in one launch.
 
 Provenance: https://github.com/sgl-project/sglang, ``python/sglang/srt/layers/attention/fla/``
 (NVIDIA path only; the ``is_intel`` XPU branch and the ``torch_release`` sglang import were
@@ -39,6 +41,7 @@ recurrence), ``fused_recurrent.py`` (pool-indexed decode kernel with in-kernel K
 from freetoken.kernel.fla.chunk import chunk_gated_delta_rule
 from freetoken.kernel.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
+    gdn_state_replay,
 )
 from freetoken.kernel.fla.kda import (
     chunk_kda_with_fused_gate,
@@ -50,6 +53,7 @@ from freetoken.kernel.fla.layernorm_gated import rms_norm_gated
 __all__ = [
     "chunk_gated_delta_rule",
     "fused_sigmoid_gating_delta_rule_update",
+    "gdn_state_replay",
     "chunk_kda_with_fused_gate",
     "fused_kda_gate",
     "fused_recurrent_kda",

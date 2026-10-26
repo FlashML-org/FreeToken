@@ -22,6 +22,8 @@ def causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,   # [batch+1] int32 prefix sums of per-request lengths
     cache_indices: torch.Tensor,    # [batch] int32 slot id per request
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
+    max_seq_len: int | None = None,   # host-known max per-request length; without it the
+                                      # triton fallback derives it via a device sync
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
     in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
@@ -33,7 +35,8 @@ def causal_conv1d_varlen(
         )
 
         return triton_causal_conv1d_varlen(
-            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state,
+            max_seq_len=max_seq_len,
         )
 
     from sgl_kernel import causal_conv1d_fwd
@@ -46,6 +49,26 @@ def causal_conv1d_varlen(
         has_initial_state, True, _PAD_SLOT_ID,
     )
     return x
+
+
+def causal_conv1d_verify(
+    x: torch.Tensor,                # [batch, conv_dim, seqlen] (any strides)
+    conv_state: torch.Tensor,       # [num_slots, conv_dim, kernel-1] (rolled in place)
+    weight: torch.Tensor,           # [conv_dim, kernel]
+    conv_state_indices: torch.Tensor,          # [batch] int32 slot id per request
+    intermediate_conv_window: torch.Tensor,    # [rows, steps, conv_dim, kernel-1]
+    intermediate_state_indices: torch.Tensor,  # [batch] int32 window row (<0 skips)
+) -> torch.Tensor:
+    """Speculative-verify conv (triton-only: sgl_kernel's update has no per-token
+    window stash). See the triton entrypoint for semantics."""
+    from freetoken.kernel.triton.causal_conv1d_triton import (
+        causal_conv1d_verify as triton_causal_conv1d_verify,
+    )
+
+    return triton_causal_conv1d_verify(
+        x, conv_state, weight, conv_state_indices,
+        intermediate_conv_window, intermediate_state_indices,
+    )
 
 
 def causal_conv1d_decode(

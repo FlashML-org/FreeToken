@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
+from freetoken.kernel.fla.verify import gdn_verify_mix
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
 
@@ -165,6 +166,9 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
+        elif batch.phase == "verify":
+            core_out = gdn_verify_mix(
+                self, conv_in, a, b, pool=pool, li=li, fla=fla, scratch=batch.verify.gdn, dtype=dtype)
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)

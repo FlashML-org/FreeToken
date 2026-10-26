@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
-from freetoken.core import Batch, Context, Req, set_global_ctx
+from freetoken.core import Batch, Context, Req, VerifyInfo, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
@@ -30,7 +30,7 @@ from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, r
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -190,6 +190,36 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         "No attention backend can serve attention types "
         f"{sorted(t.value for t in required)} on this machine."
     )
+
+
+def _spec_runner():
+    from freetoken.engine.spec_protocol import SPEC_RUNNER
+    from freetoken.models.register import _load_attr
+
+    return _load_attr(*SPEC_RUNNER.split(":"))
+
+
+def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
+    """Resolve k and check what every speculative method needs of the target; a method's own limits are its Proposer.validate."""
+    runner = _spec_runner()
+    if config.speculative_num_steps == 0:
+        override("speculative_num_steps", runner.default_k(config))
+    if windowed_kv:
+        raise ValueError(
+            "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
+            "their window frees would release slots a verify step still reads"
+        )
+    parts = [p.strip() for p in config.attention_backend.split(",")]
+    graph = attention_backend_info(parts[-1]).uniform_extend_graph
+    if graph == "host_plan" and len(parts) == 2 and attention_backend_info(parts[0]).uniform_extend_graph == "device":
+        # verify steps run on the decode part; a prefill part that captures on device serves them better
+        override("attention_backend", parts[0])
+    elif graph == "none":
+        raise ValueError(
+            f"speculative decoding needs a decode attention backend that captures multi-row graphs "
+            f"(fa, triton or fi), got {config.attention_backend!r}"
+        )
+    runner.validate(config)
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -453,6 +483,8 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        # draft weights load before any pool is sized, so every free-memory read below counts them
+        self.spec = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -505,6 +537,11 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        if self.spec is not None:
+            # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
+            spec_fixed, draft_page = self._spec_budget(config)
+            page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
+            available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -549,12 +586,9 @@ class Engine:
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
-        post_free_memory = self._sync_get_memory()[0]
-        logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
-
-        # ======================= Graph capture initialization ========================
+        # padded rows replay this request, so it carries one token per decode row
         self.dummy_req = Req(
-            input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            input_ids=torch.zeros(config.decode_rows_per_req, dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
             cached_len=0,
             output_len=1,
@@ -566,20 +600,23 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-        self.graph_runner = GraphRunner(
-            stream=self.stream,
-            device=self.device,
-            forward=self.model.forward,
-            attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=init_free_memory,
-            max_seq_len=aligned_max_seq_len,
-            dummy_req=self.dummy_req,
-            moe_offload_cache=self.moe_offload_cache,
-            mrope=config.model_config.model_is_mrope,
-            out_dtype=torch.float32,
+
+        # ======================= Verify state initialization ========================
+        rows = config.decode_rows_per_req
+        self.verify_scratch = (
+            self.linear_state_pool.verify_scratch(config.max_running_req, rows)
+            if rows > 1 and self.linear_state_pool is not None
+            else None
         )
+        self.model_verify_scratch = None
+        if self.spec is not None:
+            self.spec.attach(self)
+
+        post_free_memory = self._sync_get_memory()[0]
+        logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+
+        # ======================= Graph capture initialization ========================
+        self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -704,6 +741,9 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        spec_fixed, draft_page = self._spec_budget(config)
+        fixed_cache_size += spec_fixed
+        cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -1197,13 +1237,15 @@ class Engine:
             if num_mamba_slots is not None
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
+        spec_fixed, draft_page = self._spec_budget(config)
         self.kv_cache.validate_rebuild(
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
             extra_fixed_bytes=(
-                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
+                (state_pool_bytes(config, target_mamba) if target_mamba is not None else 0)
+                + spec_fixed + draft_page * (num_pages if num_pages is not None else self.num_pages)
             ),
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
@@ -1224,6 +1266,9 @@ class Engine:
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if self.spec is not None:
+            # the prefix cache indexes the draft KV through the target's slots, so it stays exactly when the target KV pool does
+            self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -1254,20 +1299,66 @@ class Engine:
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
-        self.graph_runner = GraphRunner(
+        if self.spec is not None:
+            self.spec.attach(self)
+        # reuse the startup-resolved bs set (see above)
+        self.graph_runner = self._make_graph_runner(prior_graph_bs, free_min, aligned_max_seq_len)
+
+    def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
+        """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
+        config = self.config
+        rows = config.decode_rows_per_req
+        verify = {}
+        if rows > 1:
+            # every decode step is a verify; the verify scratch has max_running_req rows
+            cuda_graph_bs = [
+                bs for bs in _determine_cuda_graph_bs(cuda_graph_bs, config.cuda_graph_max_bs, free_memory)
+                if bs <= config.max_running_req
+            ]
+            verify = dict(steps=rows, phase="verify", batch_hook=self._prepare_verify_batch)
+        runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             forward=self.model.forward,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=free_min,
-            max_seq_len=aligned_max_seq_len,
+            free_memory=free_memory,
+            max_seq_len=max_seq_len,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
             out_dtype=torch.float32,
+            **verify,
         )
+        if self.spec is not None:
+            self.spec.capture_graphs(runner.graph_bs_list, runner.graph_pool)
+        return runner
+
+    def _prepare_verify_batch(self, batch: Batch) -> None:
+        batch.verify = self.verify_info()
+        batch.features = self.spec.verify_sink(batch.padded_size * batch.rows_per_req)
+
+    def verify_info(self) -> VerifyInfo:
+        return VerifyInfo(steps=self.config.decode_rows_per_req, gdn=self.verify_scratch, model_scratch=self.model_verify_scratch)
+
+    def commit_verify(self, rows, reqs, slots, counts, out: torch.Tensor) -> None:
+        """Commit each verified request's first ``counts`` tokens (``out`` rows by table_idx) to the target's per-request state."""
+        if self.verify_scratch is not None:
+            self.linear_state_pool.commit_verify(self.verify_scratch, slots, counts, rows)
+        if self.model_verify_scratch is not None:
+            self.model_verify_scratch.commit(self.linear_state_pool, slots, counts, rows)
+        for req, n in zip(reqs, counts):
+            if req.output_token_counts is not None:
+                tokens = out[req.table_idx, :n]
+                req.output_token_counts.scatter_add_(0, tokens, req.output_token_counts.new_ones(n))
+
+    def _spec_budget(self, config) -> tuple[int, int]:
+        """(fixed bytes, draft KV bytes per page) speculative decoding adds next to the KV pool."""
+        if getattr(self, "spec", None) is None:
+            return 0, 0
+        fixed, per_token = self.spec.budget(config)
+        return fixed, per_token * config.page_size
 
     def forward_logits(self, batch: Batch) -> torch.Tensor:
         """The batch's logits from its captured graph, or eagerly when none fits."""
@@ -1910,6 +2001,8 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    if getattr(config, "speculative_algorithm", None) is not None:
+        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

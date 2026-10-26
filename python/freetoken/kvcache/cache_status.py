@@ -17,7 +17,7 @@ def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
     """Per-unit VRAM byte cost of each runtime cache, measured from the real allocated pool
     tensors so the desktop cache panel can show a true VRAM delta per slider step:
 
-      kv_bytes_per_token   -- total paged-KV bytes (across every attention layer) for one token
+      kv_bytes_per_token   -- total paged-KV bytes (across every attention layer) for one token, plus the speculative draft's KV on the same slot
       moe_bytes_per_expert -- bytes of one MoE expert-cache (offload bank) slot
       mamba_bytes_per_slot -- bytes of one SSM/GDN recurrent-state slot (all linear layers)
 
@@ -34,7 +34,10 @@ def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
         if pool is None:
             return 0, 0
         kv, swa = pool.unit_bytes()
-        return int(kv), int(swa)
+        # the draft KV pool grows with num_pages too, and the rebuild check counts it
+        spec = getattr(engine, "spec", None)
+        draft = spec.budget(engine.config)[1] if spec is not None else 0
+        return int(kv) + int(draft), int(swa)
 
     def _moe() -> int:
         banks = getattr(engine.moe_offload_cache, "bank_caches", None)
