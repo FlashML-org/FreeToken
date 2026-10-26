@@ -6,12 +6,15 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.layers.quantization import QuantKind, get_quant_config
 from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.models.loader import (
     MergeRule,
     ShardReader,
+    ct_nvfp4_fuse,
     drop_page_cache,
     iter_weight_files,
+    nvfp4_parts_ct,
 )
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -39,6 +42,15 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE (no dense prefix)
     desc="Gemma4 NVFP4 experts",
 )
+_NVFP4_EXPERT_KEY_TEMPLATE = (
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>{kinds})$"
+)
+_NVFP4_BANK_KINDS = {
+    "weight": "weight",
+    "weight_scale": "weight_scale",
+    "weight_global": "weight_scale_2",
+}
 _LAYER_INDEX_PATTERN = re.compile(r"layers\.(\d+)\.")
 _LAYER_FF_PREFIX_PATTERN = re.compile(r"^(model\.layers\.\d+)\.")
 _MERGE_RULES = {
@@ -63,6 +75,17 @@ _FEED_FORWARD_PREFIXES = (
 # The scales are consumed with their .weight.
 _NVFP4_DENSE_SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 _NVFP4_DENSE_MLP_RE = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)\.weight$")
+_CT_NVFP4_FUSIONS = {
+    ".feed_forward.shared_mlp.gate_up_proj": (
+        ".feed_forward.shared_mlp.gate_proj",
+        ".feed_forward.shared_mlp.up_proj",
+    ),
+}
+_CT_NVFP4_SCALE_SUFFIXES = (
+    ".weight_scale",
+    ".weight_global_scale",
+    ".input_global_scale",
+)
 
 
 def _nvfp4_dense_parts(reader: ShardReader, raw_base: str):
@@ -156,6 +179,10 @@ def iter_weights(
     include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     def rename_key(raw_name: str) -> str | None:
+        # Static KV quantizer metadata is not part of FreeToken's runtime KV
+        # cache state (same rule used by the generic compressed-tensors reader).
+        if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+            return None
         prefix = "model.language_model."
         if raw_name.startswith(prefix):
             return _rename_language_key(raw_name)
@@ -165,8 +192,11 @@ def iter_weights(
 
     def merge_info(key: str) -> tuple[str, MergeRule] | None:
         for suffix, rule in _MERGE_RULES.items():
-            if key.endswith(suffix + ".weight") or key.endswith(suffix):
-                return key.replace(suffix, rule.fused_suffix), rule
+            # Quantized tensors carry roles after the projection name, e.g.
+            # ``q_proj.weight_scale``.  Every role must follow the same fusion as
+            # its weight or the model asks for a fused tensor that was never emitted.
+            if key.endswith(suffix) or suffix + "." in key:
+                return key.replace(suffix, rule.fused_suffix, 1), rule
         return None
 
     config = parse_config(cached_load_hf_config(model_path))
@@ -200,8 +230,19 @@ def iter_weights(
                     if _NVFP4_EXPERT_RE.search(raw_name):
                         continue
 
-                    # NVFP4 dense-MLP scales are consumed with their .weight (below), never yielded.
-                    if raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES):
+                    # NVFP4 scales are consumed with their packed weight.  Do not
+                    # blanket-drop ``weight_scale``: FP8 attention projections use
+                    # that same suffix and must be fused q/k/v-wise.
+                    ct_scale_base = next(
+                        (raw_name[: -len(s)] for s in _CT_NVFP4_SCALE_SUFFIXES if raw_name.endswith(s)),
+                        None,
+                    )
+                    if ct_scale_base is not None and reader.has(ct_scale_base + ".weight_packed"):
+                        continue
+                    if (
+                        config.dense_quant == "nvfp4"
+                        and raw_name.endswith(_NVFP4_DENSE_SCALE_SUFFIXES)
+                    ):
                         continue
 
                     is_vision = name.startswith(("vision_tower.", "embed_vision.", "vision_embedder."))
@@ -213,6 +254,25 @@ def iter_weights(
                     if is_expert and not include_moe_experts:
                         continue
                     if not is_expert and not include_non_moe:
+                        continue
+
+                    # llm-compressor / compressed-tensors NVFP4.  The stored names
+                    # differ from ModelOpt but map to the same FreeToken buffers.
+                    if raw_name.endswith(".weight_packed"):
+                        raw_base = raw_name[: -len(".weight_packed")]
+                        base = name[: -len(".weight_packed")]
+                        parts = nvfp4_parts_ct(reader, raw_base)
+                        emitted = ct_nvfp4_fuse(base, parts, gateup_buf, _CT_NVFP4_FUSIONS)
+                        if emitted is None:
+                            w, s, g, a = parts
+                            emitted = [
+                                (base + ".weight", w),
+                                (base + ".weight_scale", s),
+                                (base + ".weight_global", g),
+                            ]
+                            if a is not None:
+                                emitted.append((base + ".input_scale", a))
+                        yield from emitted
                         continue
 
                     # Native W4A16 NVFP4 dense MLP: the .weight is FP4-packed and carries block + per-tensor scales.
@@ -230,6 +290,15 @@ def iter_weights(
                         continue
 
                     tensor = f.get_tensor(raw_name)
+                    # compressed-tensors stores FP8 per-channel scales as
+                    # ``[out_features, 1]`` (often bf16); FreeToken's FP8 linear
+                    # buffer is a flat fp32 vector.
+                    if (
+                        raw_name.endswith(".weight_scale")
+                        and tensor.ndim == 2
+                        and tensor.shape[1] == 1
+                    ):
+                        tensor = tensor.reshape(-1).to(torch.float32)
                     if is_vision or is_expert:
                         yield name, tensor
                         continue
@@ -296,7 +365,23 @@ def iter_weights_parallel(
 
 
 def nvfp4_expert_spec(model_path: str, config):
-    return _NVFP4_SOURCE_SPEC
+    quant = get_quant_config()
+    stored = quant.stored_tensors(QuantKind.NVFP4)
+    kind_map = {stored[role].name: kind for role, kind in _NVFP4_BANK_KINDS.items()}
+    # Preserve the original ModelOpt descriptor exactly; compressed-tensors uses
+    # weight_packed / weight_global_scale and reciprocal global scales.
+    if set(kind_map) == {"weight", "weight_scale", "weight_scale_2"}:
+        return _NVFP4_SOURCE_SPEC
+    return Nvfp4ExpertSourceSpec(
+        key_pattern=re.compile(
+            _NVFP4_EXPERT_KEY_TEMPLATE.format(kinds="|".join(map(re.escape, kind_map)))
+        ),
+        proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+        layer_to_bank=lambda layer, config: layer,
+        desc=f"Gemma4 NVFP4 experts ({quant.dialect})",
+        kind_map=kind_map,
+        global_reciprocal=stored["weight_global"].reciprocal,
+    )
 
 
 __all__ = [
