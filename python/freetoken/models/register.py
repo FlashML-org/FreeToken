@@ -173,13 +173,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_DENSE_PACKED + _STACKED_EXPERTS_PACKED,
     ),
-    # llama.cpp qwen3vl / qwen3vlmoe GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp qwen3vl / qwen3vlmoe GGUF: the same model classes with every tensor in
+    # its packed ggml type; a qwen3vl_merger mmproj adds the tower with its DeepStack mergers
     "Qwen3VLGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_vl",
         "Qwen3VLForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     "Qwen3VLMoeGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_vl",
@@ -187,6 +190,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     "MiniMaxM2ForCausalLM": ModelSpec(
         "freetoken.models.minimax_m2",
