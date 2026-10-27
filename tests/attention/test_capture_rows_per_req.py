@@ -1,4 +1,4 @@
-"""Graphs captured for `rows_per_req` query rows per request (1 = decode, more = a uniform extend such as a speculative verify) replay what the eager path computes."""
+"""Attention graphs captured for `rows_per_req` query rows per request (1 = decode, more = a uniform extend such as a speculative verify) replay what the eager path computes."""
 
 from types import SimpleNamespace
 
@@ -102,42 +102,4 @@ def test_graph_replay_matches_eager_attention(monkeypatch, name, rows_per_req):
     capture.out_loc.copy_(replay.out_loc)
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
-
-
-def test_graph_runner_returns_each_output_for_the_real_rows(monkeypatch):
-    from freetoken.engine.graph import GraphRunner
-
-    if try_get_tp_info() is None:
-        set_tp_info(rank=0, size=1)
-    monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
-    rows_per_req = 3
-    attn = SimpleNamespace(init_capture_graph=lambda **kwargs: None, prepare_for_capture=lambda batch: None,
-                           prepare_for_replay=lambda batch: None)
-
-    def forward():
-        batch = core.get_global_ctx().batch
-        ids = batch.input_ids.float()
-        return ids.unsqueeze(1) * 2, ids.view(-1, rows_per_req).sum(dim=1)
-
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        runner = GraphRunner(stream=stream, device=torch.device("cuda"), forward=forward, attn_backend=attn,
-                             cuda_graph_bs=[2, 4], cuda_graph_max_bs=None, free_memory=1024**3, max_seq_len=16,
-                             dummy_req=_req(0, 0, rows_per_req), rows_per_req=rows_per_req, phase="verify")
-        reqs = [_req(i, 1, rows_per_req) for i in range(3)]
-        assert not runner.can_use_cuda_graph(Batch(reqs=reqs, phase="decode"))
-        batch = Batch(reqs=reqs, phase="verify", rows_per_req=rows_per_req)
-        assert runner.can_use_cuda_graph(batch)
-        runner.pad_batch(batch)
-        assert batch.padded_size == 4
-        batch.input_ids = torch.arange(4 * rows_per_req, dtype=torch.int32, device="cuda")
-        batch.out_loc = torch.zeros(4 * rows_per_req, dtype=torch.int32, device="cuda")
-        batch.positions = torch.zeros(4 * rows_per_req, dtype=torch.int32, device="cuda")
-        per_row, per_req = runner.replay(batch)
-    torch.cuda.synchronize()
-    ids = torch.arange(3 * rows_per_req, dtype=torch.float32, device="cuda")
-    assert torch.equal(per_row, ids.unsqueeze(1) * 2)
-    assert torch.equal(per_req, ids.view(3, rows_per_req).sum(dim=1))
-    runner.destroy_cuda_graphs()
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)

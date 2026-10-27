@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Literal, Tuple
+from typing import TYPE_CHECKING, List, Literal, Tuple
 
 import torch
 
@@ -126,15 +126,6 @@ class Req:
 
 
 @dataclass
-class VerifyInfo:
-    """A uniform extend of `rows_per_req` rows per request over read-only recurrent state."""
-
-    rows_per_req: int
-    gdn: Any = None
-    model_scratch: Any = None
-
-
-@dataclass
 class Batch:
     reqs: List[Req]
     phase: Literal["prefill", "decode", "verify"]
@@ -183,11 +174,12 @@ class Batch:
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
     # per-row hidden states a draft model reads from this forward; None when nothing reads them
     features: "FeatureSink | None" = field(default=None, init=False)
-    verify: VerifyInfo | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.rows_per_req is None and self.phase == "decode":
             self.rows_per_req = 1
+        # without it, input_mapping[0][::None] would read every row as its own request
+        assert self.phase != "verify" or self.rows_per_req is not None, "a verify batch needs rows_per_req"
 
     @property
     def is_prefill(self) -> bool:

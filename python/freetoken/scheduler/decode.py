@@ -28,7 +28,8 @@ class DecodeManager:
 
     @property
     def inflight_tokens(self) -> int:
-        tokens_reserved = (self.page_size - 1 + self.token_headroom) * len(self.running_reqs)  # 1 page reserved
+        # each request's partly filled page, plus the provisional rows a decode step may add
+        tokens_reserved = (self.page_size - 1 + self.token_headroom) * len(self.running_reqs)
         return sum(req.remain_len for req in self.running_reqs) + tokens_reserved
 
     def schedule_next_batch(self) -> Batch | None:
