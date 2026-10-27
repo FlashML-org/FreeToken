@@ -59,8 +59,7 @@ class GraphCaptureBuffer:
         if self.mrope_positions is not None:
             batch.mrope_positions = self.mrope_positions[:, _rows]
         batch.linear_table_idx = self.table_idx[:bs]
-        # Decode GDN metadata reads the persistent cu_seqlens (constant arange * rows_per_req) and the
-        # persistent table_idx slot map, so the captured kernels see stable addresses.
+        # GDN metadata reads the persistent cu_seqlens (constant arange * rows_per_req) and table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
             cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[:bs]
         )
@@ -289,7 +288,7 @@ class GraphRunner:
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:
         # Drop the CUDAGraph objects (and the shared mempool they hold) AND the static
-        # GraphCaptureBuffer tensors (input/out_loc/positions/...) and output buffers ([max_bs, vocab] logits).
+        # GraphCaptureBuffer tensors (input/out_loc/positions/...) and the output buffers (_out).
         # Dropping the references is the load-bearing step; without it a runtime rebuild's
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
