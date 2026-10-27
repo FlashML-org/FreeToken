@@ -4,6 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken.message import TokenizeMsg, UserReply
@@ -354,6 +355,24 @@ def test_completion_rejects_token_id_prompts():
     body = json.loads(response.body)
     assert body["error"]["type"] == "invalid_request_error"
     assert "token-id prompt" in body["error"]["message"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("n", [0, 2])
+def test_completion_refuses_n_other_than_one(n, stream):
+    state = FakeState([UserReply(uid=42, incremental_output="hello", finished=True)])
+    response = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt="say hi", n=n, stream=stream),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["param"] == "n"
+    assert state.sent is None
 
 
 def test_completion_accepts_text_prompt():

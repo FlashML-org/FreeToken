@@ -396,6 +396,8 @@ async def handle_completion(
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
+    if req.n != 1:
+        return create_error_response("Only n=1 is supported", param="n")
     try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
