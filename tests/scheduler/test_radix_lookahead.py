@@ -17,11 +17,13 @@ def _pend(ids):
 
 
 def _publish(cm, table_idx, ids, *, finished=True, track=None):
-    """A request whose ids end with one sampled token past its committed cached_len, committed into the tree."""
+    """Admit ids at their prefix hit as prefill does, then commit them into the tree with the last id as the sampled token."""
     handle = cm.match_req(_pend(ids)).cuda_handle
-    req = Req(input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=table_idx, cached_len=0, output_len=0,
-              uid=table_idx, sampling_params=SamplingParams(), cache_handle=handle)
+    req = Req(input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=table_idx, cached_len=handle.cached_len,
+              output_len=0, uid=table_idx, sampling_params=SamplingParams(), cache_handle=handle)
     cm.lock(handle)
+    if handle.cached_len > 0:
+        cm.page_table[table_idx, : handle.cached_len].copy_(handle.get_matched_indices())
     req.device_len = len(ids) - 1
     cm.allocate_paged([req])
     req.cached_len = len(ids) - 1
@@ -66,7 +68,7 @@ def test_a_hit_takes_the_slot_before_the_fork_from_the_branch_it_follows(page_si
     assert lookahead_len == 11 // page_size * page_size
     # slot 7's draft KV depends on the token at 8, where b differs from a: it must be b's slot
     assert lookahead_slots[7] == b_row[7]
-    assert plain_slots[7] != b_row[7] or page_size > 1
+    assert plain_slots[7] != b_row[7]
 
 
 def test_the_prompt_end_key_uses_the_sampled_token():
