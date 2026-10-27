@@ -114,7 +114,7 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
 def _seq_limits(config, num_tokens: int) -> tuple[int, int]:
     """(longest request, page-table width). A decode step may widen a request by decode_rows_per_req - 1 provisional rows past its length, so requests get that much less and the table still covers the widened tail."""
     limit = min(config.max_seq_len, num_tokens)
-    return limit - (getattr(config, "decode_rows_per_req", 1) - 1), _page_table_width(limit, config.page_size)
+    return limit - (config.decode_rows_per_req - 1), _page_table_width(limit, config.page_size)
 
 
 def _required_attn_types(model_config) -> frozenset[AttnType]:

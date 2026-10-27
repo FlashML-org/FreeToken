@@ -227,7 +227,7 @@ def test_dsv4_refresh_seq_state_tracks_page_table_width():
 
     P, mrr = 128, 4
     config = SimpleNamespace(
-        max_seq_len=65536, page_size=P, max_running_req=mrr,
+        max_seq_len=65536, page_size=P, max_running_req=mrr, decode_rows_per_req=1,
         model_config=SimpleNamespace(dsv4_args=SimpleNamespace(window_size=P)),
     )
     # attach_page_table only re-points the pool's full_loc_map; the decode snapshot belongs to

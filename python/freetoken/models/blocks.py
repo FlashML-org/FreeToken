@@ -55,7 +55,7 @@ class FeatureSink(Protocol):
     wanted_layers: frozenset[int]
 
     def final_hidden(self, x: torch.Tensor) -> None:
-        """Every row's hidden state before the LM head; the first call in a forward wins, so a model may call it before the head does."""
+        """Every row's hidden state before the LM head; the LM head calls it once per forward."""
         ...
 
     def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:

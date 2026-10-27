@@ -59,7 +59,7 @@ class GraphCaptureBuffer:
         if self.mrope_positions is not None:
             batch.mrope_positions = self.mrope_positions[:, _rows]
         batch.linear_table_idx = self.table_idx[:bs]
-        # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
+        # Decode GDN metadata reads the persistent cu_seqlens (constant arange * rows_per_req) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
             cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[:bs]
@@ -128,11 +128,7 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
 
 
 class GraphRunner:
-    """CUDA graphs of ``forward`` over padded batches of ``rows_per_req`` rows per request, one graph per batch size.
-
-    ``forward`` returns one tensor or a tuple of tensors; each is copied into a buffer sized by the largest
-    captured batch, and ``replay`` returns the real requests' rows of each.
-    """
+    """CUDA graphs of ``forward`` over padded batches of ``rows_per_req`` rows per request, one graph per batch size; ``replay`` returns the real requests' rows of each output."""
 
     def __init__(
         self,
@@ -160,7 +156,7 @@ class GraphRunner:
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
         )
-        # the padded rows replay the dummy request, so it must carry one row per step
+        # the padded rows replay the dummy request, so it must carry rows_per_req rows
         assert rows_per_req == 1 or dummy_req.extend_len == rows_per_req, (rows_per_req, dummy_req.extend_len)
         self.forward = forward
         self.attn_backend = attn_backend
