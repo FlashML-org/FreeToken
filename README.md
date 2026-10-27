@@ -124,7 +124,9 @@ The fork is based on [FreeToken Engine 0.2.0](https://github.com/FlashML-org/Fre
 
 ### Windows site-library snapshots
 
-[`freetoken-0.2.0+g425dc7bf1-site-lib.zip`](./freetoken-0.2.0+g425dc7bf1-site-lib.zip) is a snapshot of the `freetoken` package from the Windows Desktop app venv at `%LOCALAPPDATA%\FreeToken\venv\Lib\site-packages`. It contains the Python package and active CPython 3.12 Windows native extensions, but not a full venv or third-party dependencies. Bytecode caches and disabled `.pyd.disabled` modules are excluded.
+[`freetoken-0.2.1+g2a75b3999-site-lib.zip`](./freetoken-0.2.1+g2a75b3999-site-lib.zip) is the current snapshot of the `freetoken` package from the Windows Desktop app venv at `%LOCALAPPDATA%\FreeToken\venv\Lib\site-packages`. It contains the Python package and active CPython 3.12 Windows native extensions, but not a full venv or third-party dependencies. Bytecode caches and disabled native-extension backups are excluded.
+
+[`freetoken-0.2.0+g425dc7bf1-site-lib.zip`](./freetoken-0.2.0+g425dc7bf1-site-lib.zip) is an older Engine 0.2 snapshot.
 
 [`freetoken-0.1.3+g52322e984-site-lib.zip`](./freetoken-0.1.3+g52322e984-site-lib.zip) is a historical snapshot, not the current Engine 0.2 package. Use it only when intentionally restoring that older version.
 
@@ -132,7 +134,7 @@ To restore the current snapshot, stop the FreeToken daemon and server, then extr
 
 ```powershell
 $sitePackages = Join-Path $env:LOCALAPPDATA 'FreeToken\venv\Lib\site-packages'
-Expand-Archive -LiteralPath .\freetoken-0.2.0+g425dc7bf1-site-lib.zip -DestinationPath $sitePackages -Force
+Expand-Archive -LiteralPath .\freetoken-0.2.1+g2a75b3999-site-lib.zip -DestinationPath $sitePackages -Force
 .\scripts\disable-stale-pyd.ps1 -SitePackages $sitePackages
 ```
 
