@@ -31,7 +31,7 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: int = 0):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -61,10 +61,7 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
-        # 1: position i is keyed by (t_i, t_{i+1}), so a hit also matches the token after the
-        # prefix -- a draft whose KV slot i depends on t_{i+1} (MTP) never reuses a slot written
-        # for a different next token. 0: plain token keys.
-        assert radix_lookahead in (0, 1), radix_lookahead
+        # radix_lookahead keys position i by (t_i, t_{i+1}), so a hit also matches the token after it and a draft whose KV slot i depends on t_{i+1} (MTP) never reuses a slot written for a different next token
         assert not (radix_lookahead and self.is_swa), "the SWA radix cache keeps token keys"
         self.radix_lookahead = radix_lookahead
 
@@ -397,7 +394,7 @@ class CacheManager:
             return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
         keys = self._keys(req.input_ids, L)
         if align_down(L, self.page_size) != L or len(keys) != L:
-            # page_size>1, or a bigram key short of the token after L: insert would attach a
+            # page_size>1, or a lookahead key short of the token after L: insert would attach a
             # state that encodes L tokens to a SHORTER node -- a future hit would COW-restore an
             # over-advanced state. Skip; the next boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
@@ -631,7 +628,7 @@ class CacheManager:
             self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
 
     def _keys(self, ids: torch.Tensor, n: int) -> torch.Tensor:
-        """Radix keys of the first ``n`` positions of ``ids``; fewer when a bigram key lacks the token after them."""
+        """Radix keys of the first ``n`` positions of ``ids``; with radix_lookahead, fewer when the token after them is not known yet."""
         if not self.radix_lookahead:
             return ids[:n]
         m = max(0, min(n, len(ids) - 1))
