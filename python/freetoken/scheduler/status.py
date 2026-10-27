@@ -18,6 +18,9 @@ class SchedulerStatusReporter:
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
+    # speculative steps since the last decode log: requests stepped and tokens they committed
+    _spec_req_steps: int = field(default=0, init=False)
+    _spec_tokens: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -110,6 +113,9 @@ class SchedulerStatusReporter:
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += len(batch.reqs) if generated is None else generated
+        if generated is not None:
+            self._spec_req_steps += len(batch.reqs)
+            self._spec_tokens += generated
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 
@@ -118,6 +124,8 @@ class SchedulerStatusReporter:
         self._last_decode_time = now
         gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
         self._decode_generated_tokens = 0
+        accept = f"accept len: {self._spec_tokens / self._spec_req_steps:.2f}, " if self._spec_req_steps else ""
+        self._spec_req_steps = self._spec_tokens = 0
         self.log(
             f"Decode batch, "
             f"#running-req: {running_reqs}, "
@@ -126,6 +134,7 @@ class SchedulerStatusReporter:
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
+            f"{accept}"
             f"#queue-req: {queue_reqs}"
         )
         if self.moe_stats is not None and (line := self.moe_stats()):
