@@ -210,6 +210,8 @@ def fused_experts_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
@@ -225,6 +227,7 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+    assert w1_bias is None or not apply_router_weight_on_input, "per-expert biases need the unweighted first GEMM"
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
@@ -285,6 +288,9 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
     )
+    if w1_bias is not None:
+        # gpt-oss: the expert's gate/up bias is added before the gated activation
+        intermediate_cache1 += w1_bias[curr_topk_ids]
     gated_act_and_mul(activation, intermediate_cache1.view(-1, N), intermediate_cache2, alpha=act_alpha, limit=act_limit)
     fused_moe_kernel_triton(
         intermediate_cache2,
@@ -305,6 +311,9 @@ def fused_experts_impl(
         intermediate_cache3,
         out_hidden_states[begin_token_idx:end_token_idx],
     )
+    if w2_bias is not None:
+        # the down bias is weighted like the expert's output: sum_k w_k * bias_k
+        out_hidden_states[begin_token_idx:end_token_idx] += (curr_topk_weights.unsqueeze(-1) * w2_bias[curr_topk_ids]).sum(1)
     return out_hidden_states
 
 
@@ -318,6 +327,8 @@ def fused_experts_decode_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel import fused_moe_decode_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
@@ -336,6 +347,7 @@ def fused_experts_decode_impl(
     assert w1.dtype == hidden_states.dtype and w2.dtype == hidden_states.dtype
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
+    assert w1_bias is None or not apply_router_weight_on_input, "per-expert biases need the unweighted first GEMM"
     M, _ = hidden_states.shape
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]
@@ -363,6 +375,8 @@ def fused_experts_decode_impl(
         compute_type=hidden_states.dtype,
     )
 
+    if w1_bias is not None:
+        intermediate_cache1 += w1_bias[topk_ids]
     intermediate_cache2 = torch.empty(
         (M * top_k, intermediate_size),
         device=hidden_states.device,
@@ -389,4 +403,6 @@ def fused_experts_decode_impl(
 
     out_hidden_states = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(intermediate_cache3, out_hidden_states)
+    if w2_bias is not None:
+        out_hidden_states += (topk_weights.unsqueeze(-1) * w2_bias[topk_ids]).sum(1)
     return out_hidden_states

@@ -451,6 +451,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "GptOssForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
     ),
+    # llama.cpp gpt-oss GGUF (gpt-oss-20b / 120b): the same model classes with every
+    # tensor in its packed ggml type
+    "GptOssGGUFForCausalLM": ModelSpec(
+        "freetoken.models.gpt_oss",
+        "GptOssForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+    ),
     "Glm4MoeForCausalLM": ModelSpec(
         "freetoken.models.glm4_moe",
         "Glm4MoeForCausalLM",
