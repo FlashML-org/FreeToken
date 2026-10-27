@@ -138,8 +138,8 @@ class TensorRTLLMBackend(BaseAttnBackend):
             page_table=new_page_table,
         )
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
-        if steps != 1:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
             raise NotImplementedError("trtllm captures decode graphs only")
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)

@@ -190,8 +190,8 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
             last_indices=last, table_rows=self._table_rows(batch), window_ar=self._window_ar
         )
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
-        if steps != 1:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
             raise NotImplementedError("dsv4_sparse captures decode graphs only")
         assert self.capture is None, "Capture already initialized."
         self.max_graph_bs = max(bs_list)

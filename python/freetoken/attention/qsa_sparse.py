@@ -489,8 +489,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
-        if steps != 1:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
             raise NotImplementedError("qsa_sparse captures decode graphs only")
         self.capture_bs = sorted(bs_list)
         max_bs = max(bs_list)

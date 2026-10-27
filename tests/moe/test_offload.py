@@ -475,7 +475,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
         events.append("graph_exit")
 
     class FakeAttnBackend:
-        def init_capture_graph(self, max_seq_len, bs_list, steps=1):
+        def init_capture_graph(self, max_seq_len, bs_list, rows_per_req=1):
             pass
 
         def prepare_for_capture(self, batch):

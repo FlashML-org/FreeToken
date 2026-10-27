@@ -127,9 +127,9 @@ class Req:
 
 @dataclass
 class VerifyInfo:
-    """A uniform extend of `steps` rows per request over read-only recurrent state."""
+    """A uniform extend of `rows_per_req` rows per request over read-only recurrent state."""
 
-    steps: int
+    rows_per_req: int
     gdn: Any = None
     model_scratch: Any = None
 
@@ -138,7 +138,7 @@ class VerifyInfo:
 class Batch:
     reqs: List[Req]
     phase: Literal["prefill", "decode", "verify"]
-    # query rows per request: 1 on decode, steps on verify, None on prefill (ragged)
+    # query rows per request: 1 on decode, more on verify, None on prefill (ragged)
     rows_per_req: int | None = None
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)

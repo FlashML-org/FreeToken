@@ -33,7 +33,7 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
-    # How the backend captures a graph of `steps` query rows per request: "device" keeps all metadata on device, "host_plan" plans on the host before each replay, "none" cannot.
+    # How the backend captures a graph of `rows_per_req` query rows per request: "device" keeps all metadata on device, "host_plan" plans on the host before each replay, "none" cannot.
     uniform_extend_graph: Literal["none", "host_plan", "device"] = "none"
 
 

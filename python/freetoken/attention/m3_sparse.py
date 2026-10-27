@@ -368,8 +368,8 @@ class M3SparseAttnBackend(BaseAttnBackend):
         return out
 
     # ----- CUDA graph (decode) ------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
-        if steps != 1:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
             raise NotImplementedError("m3_sparse captures decode graphs only")
         self.inner.init_capture_graph(max_seq_len, bs_list)
         self.capture_bs = sorted(bs_list)

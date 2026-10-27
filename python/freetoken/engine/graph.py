@@ -26,16 +26,16 @@ class GraphCaptureBuffer:
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
-    # [3, bs * steps] t/h/w rope positions; allocated only for mrope models (else None).
+    # [3, bs * rows_per_req] t/h/w rope positions; allocated only for mrope models (else None).
     mrope_positions: torch.Tensor | None
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
-    # GDN query indptr = arange(bs+1) * steps; a constant per captured bs, filled once.
+    # GDN query indptr = arange(bs+1) * rows_per_req; a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
-    steps: int = 1
+    rows_per_req: int = 1
 
     @classmethod
-    def init(cls, bs: int, device: torch.device, mrope: bool = False, steps: int = 1) -> GraphCaptureBuffer:
-        n = bs * steps
+    def init(cls, bs: int, device: torch.device, mrope: bool = False, rows_per_req: int = 1) -> GraphCaptureBuffer:
+        n = bs * rows_per_req
         return GraphCaptureBuffer(
             input_ids=torch.zeros(n, dtype=torch.int32, device=device),
             out_loc=torch.zeros(n, dtype=torch.int32, device=device),
@@ -44,15 +44,15 @@ class GraphCaptureBuffer:
                 torch.zeros(3, n, dtype=torch.int32, device=device) if mrope else None
             ),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
-            fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * steps,
-            steps=steps,
+            fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_per_req,
+            rows_per_req=rows_per_req,
         )
 
     def set_batch(self, batch: Batch) -> None:
         from freetoken.attention.linear import FLAMetadata
 
         bs = batch.padded_size
-        _rows = slice(bs * self.steps)
+        _rows = slice(bs * self.rows_per_req)
         batch.input_ids = self.input_ids[_rows]
         batch.out_loc = self.out_loc[_rows]
         batch.positions = self.positions[_rows]
@@ -66,7 +66,7 @@ class GraphCaptureBuffer:
         )
 
     def copy_from(self, batch: Batch) -> None:
-        _rows = slice(batch.padded_size * self.steps)
+        _rows = slice(batch.padded_size * self.rows_per_req)
         self.input_ids[_rows] = batch.input_ids
         if batch.out_loc is not None:
             self.out_loc[_rows] = batch.out_loc
@@ -128,7 +128,7 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
 
 
 class GraphRunner:
-    """CUDA graphs of ``forward`` over padded batches of ``steps`` rows per request, one graph per batch size.
+    """CUDA graphs of ``forward`` over padded batches of ``rows_per_req`` rows per request, one graph per batch size.
 
     ``forward`` returns one tensor or a tuple of tensors; each is copied into a buffer sized by the largest
     captured batch, and ``replay`` returns the real requests' rows of each.
@@ -148,7 +148,7 @@ class GraphRunner:
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
         *,
-        steps: int = 1,
+        rows_per_req: int = 1,
         phase: Literal["decode", "verify"] = "decode",
         ctx_override: Dict[str, Any] | None = None,
         batch_hook: Callable[[Batch], None] | None = None,
@@ -161,7 +161,7 @@ class GraphRunner:
             free_memory=free_memory,
         )
         # the padded rows replay the dummy request, so it must carry one row per step
-        assert steps == 1 or dummy_req.extend_len == steps, (steps, dummy_req.extend_len)
+        assert rows_per_req == 1 or dummy_req.extend_len == rows_per_req, (rows_per_req, dummy_req.extend_len)
         self.forward = forward
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
@@ -171,7 +171,7 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
-        self.steps = steps
+        self.rows_per_req = rows_per_req
         self.phase = phase
         self.ctx_override = ctx_override or {}
         self.batch_hook = batch_hook
@@ -208,7 +208,7 @@ class GraphRunner:
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
-        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, steps=self.steps)
+        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -218,7 +218,7 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, mrope=self.mrope, steps=self.steps)
+        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, mrope=self.mrope, rows_per_req=self.rows_per_req)
         self._reset_moe_offload_cache()
 
         pbar = tqdm(
@@ -233,7 +233,7 @@ class GraphRunner:
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase=self.phase, rows_per_req=self.steps)
+            batch = Batch(reqs=[self.dummy_req] * bs, phase=self.phase, rows_per_req=self.rows_per_req)
             batch.padded_reqs = batch.reqs
             if self.batch_hook is not None:
                 self.batch_hook(batch)
@@ -266,7 +266,7 @@ class GraphRunner:
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return (
             batch.phase == self.phase
-            and batch.rows_per_req == self.steps
+            and batch.rows_per_req == self.rows_per_req
             and batch.size <= self.max_graph_bs
         )
 

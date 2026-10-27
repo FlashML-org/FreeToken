@@ -143,7 +143,7 @@ class FlashInferBackend(BaseAttnBackend):
             int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper | BatchPrefillWithPagedKVCacheWrapper
         ] = {}
         self.capture: FICaptureData | None = None
-        self.capture_steps = 1
+        self.capture_rows_per_req = 1
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
@@ -269,15 +269,15 @@ class FlashInferBackend(BaseAttnBackend):
         super().reset_capture()
         self.graph_wrappers = {}
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device, steps=steps)
+        capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device, rows_per_req=rows_per_req)
         capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
-        self.capture_steps = steps
+        self.capture_rows_per_req = rows_per_req
 
     @cached_property
     def use_tensor_cores(self) -> bool:
@@ -294,7 +294,7 @@ class FlashInferBackend(BaseAttnBackend):
 
         capture = self.capture
         assert capture is not None
-        if self.capture_steps > 1:
+        if self.capture_rows_per_req > 1:
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 self.float_workspace_buffer,
                 kv_layout="NHD",

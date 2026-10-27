@@ -1,4 +1,4 @@
-"""Graphs captured for `steps` query rows per request (1 = decode, more = a uniform extend such as a speculative verify) replay what the eager path computes."""
+"""Graphs captured for `rows_per_req` query rows per request (1 = decode, more = a uniform extend such as a speculative verify) replay what the eager path computes."""
 
 from types import SimpleNamespace
 
@@ -55,36 +55,36 @@ def _context(monkeypatch) -> Context:
     return ctx
 
 
-def _batch(reqs, steps: int, ctx: Context) -> Batch:
-    batch = Batch(reqs=reqs, phase="decode" if steps == 1 else "verify", rows_per_req=steps)
+def _batch(reqs, rows_per_req: int, ctx: Context) -> Batch:
+    batch = Batch(reqs=reqs, phase="decode" if rows_per_req == 1 else "verify", rows_per_req=rows_per_req)
     batch.padded_reqs = reqs
     batch.positions = torch.cat([torch.arange(r.cached_len, r.device_len, dtype=torch.int32) for r in reqs]).cuda()
     batch.out_loc = torch.cat([ctx.page_table[r.table_idx, r.cached_len : r.device_len] for r in reqs])
     return batch
 
 
-def _req(table_idx: int, cached: int, steps: int) -> Req:
-    return Req(input_ids=torch.zeros(cached + steps, dtype=torch.int32), table_idx=table_idx, cached_len=cached,
+def _req(table_idx: int, cached: int, rows_per_req: int) -> Req:
+    return Req(input_ids=torch.zeros(cached + rows_per_req, dtype=torch.int32), table_idx=table_idx, cached_len=cached,
                output_len=1, uid=table_idx, sampling_params=None, cache_handle=None)
 
 
-@pytest.mark.parametrize("steps", [1, 4])
+@pytest.mark.parametrize("rows_per_req", [1, 4])
 @pytest.mark.parametrize("name", ["fa", "triton", "fi"])
-def test_graph_replay_matches_eager_attention(monkeypatch, name, steps):
+def test_graph_replay_matches_eager_attention(monkeypatch, name, rows_per_req):
     assert attention_backend_info(name).uniform_extend_graph != "none"
     ctx = _context(monkeypatch)
     backend = _backend(name)
-    rows = BS * steps
+    rows = BS * rows_per_req
     q = torch.randn(rows, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(rows, KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     v = torch.randn(rows, KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
 
-    eager = _batch([_req(i, CACHED[i], steps) for i in range(BS)], steps, ctx)
+    eager = _batch([_req(i, CACHED[i], rows_per_req) for i in range(BS)], rows_per_req, ctx)
     backend.prepare_metadata(eager)
     expected = backend.forward(q, k, v, 0, eager)
 
-    backend.init_capture_graph(max_seq_len=WIDTH, bs_list=[BS], steps=steps)
-    capture = _batch([_req(BS, 0, steps)] * BS, steps, ctx)
+    backend.init_capture_graph(max_seq_len=WIDTH, bs_list=[BS], rows_per_req=rows_per_req)
+    capture = _batch([_req(BS, 0, rows_per_req)] * BS, rows_per_req, ctx)
     backend.prepare_for_capture(capture)
     static_q, static_k, static_v = q.clone(), k.clone(), v.clone()
     stream = torch.cuda.Stream()
@@ -96,7 +96,7 @@ def test_graph_replay_matches_eager_attention(monkeypatch, name, steps):
             out = backend.forward(static_q, static_k, static_v, 0, capture)
     torch.cuda.current_stream().wait_stream(stream)
 
-    replay = _batch([_req(i, CACHED[i], steps) for i in range(BS)], steps, ctx)
+    replay = _batch([_req(i, CACHED[i], rows_per_req) for i in range(BS)], rows_per_req, ctx)
     backend.prepare_metadata(replay)
     backend.prepare_for_replay(replay)
     capture.out_loc.copy_(replay.out_loc)
@@ -111,33 +111,33 @@ def test_graph_runner_returns_each_output_for_the_real_rows(monkeypatch):
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
-    steps = 3
+    rows_per_req = 3
     attn = SimpleNamespace(init_capture_graph=lambda **kwargs: None, prepare_for_capture=lambda batch: None,
                            prepare_for_replay=lambda batch: None)
 
     def forward():
         batch = core.get_global_ctx().batch
         ids = batch.input_ids.float()
-        return ids.unsqueeze(1) * 2, ids.view(-1, steps).sum(dim=1)
+        return ids.unsqueeze(1) * 2, ids.view(-1, rows_per_req).sum(dim=1)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         runner = GraphRunner(stream=stream, device=torch.device("cuda"), forward=forward, attn_backend=attn,
                              cuda_graph_bs=[2, 4], cuda_graph_max_bs=None, free_memory=1024**3, max_seq_len=16,
-                             dummy_req=_req(0, 0, steps), steps=steps, phase="verify")
-        reqs = [_req(i, 1, steps) for i in range(3)]
+                             dummy_req=_req(0, 0, rows_per_req), rows_per_req=rows_per_req, phase="verify")
+        reqs = [_req(i, 1, rows_per_req) for i in range(3)]
         assert not runner.can_use_cuda_graph(Batch(reqs=reqs, phase="decode"))
-        batch = Batch(reqs=reqs, phase="verify", rows_per_req=steps)
+        batch = Batch(reqs=reqs, phase="verify", rows_per_req=rows_per_req)
         assert runner.can_use_cuda_graph(batch)
         runner.pad_batch(batch)
         assert batch.padded_size == 4
-        batch.input_ids = torch.arange(4 * steps, dtype=torch.int32, device="cuda")
-        batch.out_loc = torch.zeros(4 * steps, dtype=torch.int32, device="cuda")
-        batch.positions = torch.zeros(4 * steps, dtype=torch.int32, device="cuda")
+        batch.input_ids = torch.arange(4 * rows_per_req, dtype=torch.int32, device="cuda")
+        batch.out_loc = torch.zeros(4 * rows_per_req, dtype=torch.int32, device="cuda")
+        batch.positions = torch.zeros(4 * rows_per_req, dtype=torch.int32, device="cuda")
         per_row, per_req = runner.replay(batch)
     torch.cuda.synchronize()
-    ids = torch.arange(3 * steps, dtype=torch.float32, device="cuda")
+    ids = torch.arange(3 * rows_per_req, dtype=torch.float32, device="cuda")
     assert torch.equal(per_row, ids.unsqueeze(1) * 2)
-    assert torch.equal(per_req, ids.view(3, steps).sum(dim=1))
+    assert torch.equal(per_req, ids.view(3, rows_per_req).sum(dim=1))
     runner.destroy_cuda_graphs()
