@@ -12,7 +12,6 @@ if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.models.blocks import FeatureSink
-    from freetoken.moe.offload_cache import OffloadMoeCache
 
 
 @dataclass
@@ -207,7 +206,6 @@ class Context:
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
-    moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
@@ -227,7 +225,7 @@ class Context:
         attn_backend: BaseAttnBackend | None = None,
         hide_target_state: bool = False,
     ):
-        """Swap the KV pool and attention backend for a draft forward; hide_target_state also hides the target's GDN pool and MoE offload cache."""
+        """Swap the KV pool and attention backend for a draft forward; hide_target_state also hides the target's GDN pool."""
         swaps = {}
         if kv_cache is not None:
             swaps["kv_cache"] = kv_cache
@@ -235,7 +233,6 @@ class Context:
             swaps["attn_backend"] = attn_backend
         if hide_target_state:
             swaps["linear_state_pool"] = None
-            swaps["moe_offload_cache"] = None
         saved = {name: getattr(self, name) for name in swaps}
         try:
             for name, value in swaps.items():

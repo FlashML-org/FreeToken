@@ -908,7 +908,6 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
-        self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
 

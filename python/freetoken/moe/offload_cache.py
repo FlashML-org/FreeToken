@@ -690,7 +690,7 @@ class OffloadMoeCache:
         reloads banks. Tears down prefill-overlap buffers first (their views alias
         the old ``bank_caches``), frees the old GPU tensors, then reallocates. Slots
         cold-start after rebuild. Object identity is preserved so attached layers and
-        ``ctx.moe_offload_cache`` stay valid.
+        ``Engine.moe_offload_cache`` stay valid.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         sizes = [cache_size] if pool_sizes is None else list(pool_sizes)
