@@ -124,9 +124,15 @@ class Qwen4ExpModel(BaseOP):
         for layer in self.layers.op_list:
             hidden = layer.forward(hidden, batch)
         if meta is not None:
-            # single writer: the layers only read the context, so a second PLE layer's
-            # prefetch sees the un-rolled window
-            commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+            if getattr(batch, "phase", None) == "verify":
+                batch.verify.model_scratch.stash_ngram(meta)
+            else:
+                # single writer: the layers only read the context, so a second PLE layer's
+                # prefetch sees the un-rolled window
+                commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if (features := getattr(batch, "features", None)) is not None:
+            # a draft reads the residual streams before the final mix
+            features.final_hidden(hidden)
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
@@ -188,7 +194,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             disk_table = DiskRowTable(
                 resolve_row_source(engine_config.model_path),
                 constants,
-                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
+                max_graph_rows=max(256, (engine_config.cuda_graph_max_bs or 0) * engine_config.decode_rows_per_req),
                 max_extend_tokens=engine_config.max_extend_tokens,
             )
             self._ple_table = disk_table
@@ -208,9 +214,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         return table.bank.nbytes
 
+    def make_verify_scratch(self, max_rows: int, steps: int, device: torch.device, dtype: torch.dtype):
+        layers = self.model.ple_layers
+        if not layers:
+            return None
+        from .ple import PLEVerifyScratch
+
+        return PLEVerifyScratch(layers, max_rows, steps, device, dtype)
+
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        # the model hands its pre-mix streams to batch.features itself
+        return self.lm_head.forward(self.model.forward(batch.input_ids, batch), export_hidden=False)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

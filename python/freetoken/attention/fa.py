@@ -46,6 +46,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.capture: FACaptureData | None = None
+        self.capture_steps = 1
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
@@ -120,23 +121,26 @@ class FlashAttentionBackend(BaseAttnBackend):
             page_table=new_page_table,
         )
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FACaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device)
+        capture = FACaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device, steps=steps)
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
+        self.capture_steps = steps
 
     def prepare_for_capture(self, batch: Batch) -> None:
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
+        steps = self.capture_steps
+        capture.seq_lens[:bs].fill_(steps)
         metadata = FAMetadata(
             cu_seqlens_k=capture.cu_seqlens_k[: bs + 1],
             cu_seqlens_q=capture.cu_seqlens_q[: bs + 1],
             cache_seqlens=capture.seq_lens[:bs],
             max_seqlen_k=capture.page_table.size(1) * self.page_size,
-            max_seqlen_q=1,  # decode only
+            max_seqlen_q=steps,
             page_table=capture.page_table[:bs, :],
         )
         batch.attn_metadata = metadata
@@ -145,7 +149,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FAMetadata)
         assert self.capture is not None and bs in self.capture_bs
-        # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
+        # cu_seqlens_q is the constant arange * steps under a graph (i.e. no-op)
         table_len = metadata.page_table.size(1)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)

@@ -32,6 +32,8 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
+    # speculative method -> "module:Class" of the family's draft for it
+    spec_drafts: tuple[tuple[str, str], ...] = ()
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -40,6 +42,8 @@ _QWEN_VL_ROOTS = _LANGUAGE_MODEL_ROOT + (("visual", "model.visual"),)
 _QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
 # TODO: video once the processor samples frames; the tower already takes grid_thw with t > 1
 _QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_QWEN3_5_DRAFTS = (("mtp", "freetoken.models.qwen3_5_moe.mtp:Qwen3_5MTPDraft"),)
+_QWEN4_EXP_DRAFTS = (("mtp", "freetoken.models.qwen4_exp.mtp:Qwen4ExpMTPDraft"),)
 # Fused projections split back into their HF leaves so the quantization_config lookup sees the stored names.
 _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
@@ -288,6 +292,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # text-only Qwen3.5 releases: text_config is the top-level config and there is no tower
     "Qwen3_5MoeForCausalLM": ModelSpec(
@@ -295,14 +300,17 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoeForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     "Qwen3_5ForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5ForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # llama.cpp qwen35 / qwen35moe GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
+    # no MTP draft yet: the nextn blocks and mtp-*.gguf files need a loader of their own
     "Qwen3_5GGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5ForConditionalGeneration",
@@ -336,6 +344,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        spec_drafts=_QWEN4_EXP_DRAFTS,
     ),
     # llama.cpp qwen4exp GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Qwen4ExpGGUFForCausalLM": ModelSpec(
@@ -347,6 +356,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_QWEN4_EXP_GGUF_PACKED,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=_QWEN4_EXP_DRAFTS,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
@@ -359,6 +369,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); the windowed ViT under

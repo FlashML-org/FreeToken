@@ -48,6 +48,30 @@ class SupportsMultimodal(Protocol):
         ...
 
 
+@runtime_checkable
+class FeatureSink(Protocol):
+    """Where a forward hands per-row hidden states to a draft model; set on ``batch.features``."""
+
+    wanted_layers: frozenset[int]
+
+    def final_hidden(self, x: torch.Tensor) -> None:
+        """Every row's final hidden state, once per forward: the LM head's input, or what the model hands over itself before the head."""
+        ...
+
+    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+        """A layer's output rows; called only for layers in ``wanted_layers``."""
+        ...
+
+
+@runtime_checkable
+class SupportsVerifyScratch(Protocol):
+    """A model with per-request state outside the GDN pool: a verify forward leaves that state as it was and stages its windows in the scratch, which Engine.commit_verify commits."""
+
+    def make_verify_scratch(self, max_rows: int, steps: int, device: torch.device, dtype: torch.dtype):
+        """An object with ``commit(pool, slots, counts, rows)``, or None when this model instance keeps no such state."""
+        ...
+
+
 def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
     """Token embeddings of the batch; on a chunk with multimodal rows, batch.mm_embeds' leading columns replace the rows batch.mm_rows."""
     if batch.mm_embeds is None:

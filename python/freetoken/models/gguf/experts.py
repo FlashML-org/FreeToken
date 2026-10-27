@@ -48,6 +48,14 @@ def _device_bank(shape: tuple[int, ...], ggml_type: int, k: int, dtype: torch.dt
     return flat[: experts * rows].view(shape)
 
 
+def resident_expert_bank(info: GgufTensorInfo, device: torch.device) -> torch.Tensor:
+    """One stacked ``[E, rows, K]`` expert tensor as a resident device bank, in its packed ggml rows."""
+    rows = _expert_rows(info)
+    bank = _device_bank(tuple(rows.shape), info.ggml_type, info.ne[0], rows.dtype, device)
+    bank.copy_(rows)
+    return bank
+
+
 def _expert_scales(gate_up: list[GgufTensorInfo], down: GgufTensorInfo, experts: int) -> torch.Tensor:
     """[E, 4] fp32 (gate, up, down, 1) weight_scale_2 of one layer's experts."""
     gate, up = gate_up if len(gate_up) == 2 else (gate_up[0], gate_up[0])
@@ -128,4 +136,4 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
     return ExpertBanks("gguf_scaled" if scaled else "gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
 
 
-__all__ = ["load_gguf_expert_banks"]
+__all__ = ["load_gguf_expert_banks", "resident_expert_bank"]

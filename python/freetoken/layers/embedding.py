@@ -125,15 +125,21 @@ class ParallelLMHead(VocabParallelEmbedding):
         return {} if result is None else result
 
     @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, export_hidden: bool = True) -> torch.Tensor:
+        """``export_hidden=False``: the model hands its own final hidden to ``batch.features``."""
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
+        if export_hidden and (features := getattr(batch, "features", None)) is not None:
+            features.final_hidden(x)
         if batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
+        return self.logits(x)
 
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits of the rows of ``x``; reads no batch state."""
         if self.tied_embedding is not None:
             logits = self.tied_embedding.quant_method.logits(self.tied_embedding, x, self.bias)
         else:
@@ -143,7 +149,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        # keyed on rows, not batch size: a verify batch has several rows per request
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)

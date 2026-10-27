@@ -3,7 +3,10 @@ decode kernel. Borrowed verbatim (pure torch+triton, no sglang deps) from sglang
 ``python/sglang/srt/layers/attention/fla/fused_sigmoid_gating_recurrent.py``.
 Does gating(sigmoid+softplus) + optional in-kernel l2norm + delta-rule recurrent update +
 per-request state read/write-by-index in ONE kernel — no external gating or
-gather/scatter/clone glue."""
+gather/scatter/clone glue.
+
+FreeToken additions: the verify mode can stash each token's recurrence inputs (STASH_INPUTS), and
+``gdn_state_replay`` re-runs the accepted prefix from that stash to commit the live state."""
 from typing import Optional
 
 import torch
@@ -33,6 +36,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
+    stash_k,
+    stash_v,
+    stash_g,
+    stash_beta,
     # ================================================
     scale,
     T,
@@ -57,6 +64,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    STASH_INPUTS: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -100,7 +108,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:
             p_h0 = (
                 h0_source
@@ -126,8 +134,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
-    if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+    if CACHE_INTERMEDIATE_STATES or STASH_INPUTS:
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
+
+    if STASH_INPUTS:
+        tok0 = tl.maximum(cache_idx, 0) * cache_steps
+        ps_k = stash_k + (tok0 * H + i_h) * K + o_k
+        ps_v = stash_v + (tok0 * HV + i_hv) * V + o_v
+        ps_g = stash_g + tok0 * HV + i_hv
+        ps_beta = stash_beta + tok0 * HV + i_hv
+        stash_on = cache_idx >= 0
+        mask_sk = mask_k & stash_on & (i_v == 0) & (i_hv % (HV // H) == 0)
+        mask_sv = mask_v & stash_on
+        mask_sg = stash_on & (i_v == 0)
 
     step_idx = 0
     for _ in range(0, T):
@@ -192,6 +211,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         else:
             b_h *= tl.exp(b_g)
 
+        if STASH_INPUTS:
+            b_v_in = b_v
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
 
@@ -219,6 +240,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
+        # stored after the step's math: an earlier store stalls the in-order issue on its operands
+        if STASH_INPUTS:
+            tl.store(ps_k, b_k, mask=mask_sk)
+            tl.store(ps_v, b_v_in, mask=mask_sv)
+            tl.store(ps_g, b_g, mask=mask_sg)
+            tl.store(ps_beta, b_beta, mask=mask_sg)
+            ps_k += H * K
+            ps_v += HV * V
+            ps_g += HV
+            ps_beta += HV
+
         step_idx += 1
 
         # Update pointers for next timestep
@@ -232,7 +264,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
+            idx = tl.load(h0_indices + i_n).to(tl.int64)
             if idx >= 0:
                 p_h0 = (
                     h0_source
@@ -268,6 +300,7 @@ def fused_sigmoid_gating_delta_rule_update(
         int
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    input_stash: Optional[tuple] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -278,6 +311,10 @@ def fused_sigmoid_gating_delta_rule_update(
     - decode: standard single-step update with state write-back
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
+
+    ``input_stash`` = (k, v, g, beta) fp32 buffers of shape [rows, steps, H, K] / [rows, steps, HV, V] /
+    [rows, steps, HV] / [rows, steps, HV], keyed by ``intermediate_state_indices``: each token's l2-normed k,
+    raw v and gates, for ``gdn_state_replay``.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
@@ -322,6 +359,13 @@ def fused_sigmoid_gating_delta_rule_update(
         if intermediate_states_buffer is not None
         else 0
     )
+    stash_k = stash_v = stash_g = stash_beta = None
+    if input_stash is not None:
+        assert not is_kda and intermediate_state_indices is not None
+        stash_k, stash_v, stash_g, stash_beta = input_stash
+        assert all(t.dtype == torch.float32 and t.is_contiguous() for t in input_stash)
+        assert stash_k.shape[2:] == (H, K) and stash_v.shape[2:] == (HV, V)
+        cache_stride_steps = stash_k.shape[1]
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -343,6 +387,10 @@ def fused_sigmoid_gating_delta_rule_update(
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
+        stash_k=stash_k,
+        stash_v=stash_v,
+        stash_g=stash_g,
+        stash_beta=stash_beta,
         scale=scale,
         T=T,
         stride_a=stride_a,
@@ -365,8 +413,95 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        STASH_INPUTS=input_stash is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     o = o.squeeze(0)
     return o
+
+
+@triton.jit(do_not_specialize=["R"])
+def gdn_state_replay_kernel(
+    state,
+    stash_k,
+    stash_v,
+    stash_g,
+    stash_beta,
+    meta,
+    R,
+    ROWS: tl.constexpr,
+    STEPS: tl.constexpr,
+    SLOTS: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """One (layer, committed row, value head, V block) per program; the state update is the verify kernel's, op for op."""
+    i_v, i_x = tl.program_id(0), tl.program_id(1)
+    i_hv = i_x % HV
+    i_r = (i_x // HV) % R
+    i_l = i_x // (HV * R)
+    i_h = i_hv // (HV // H)
+    row = tl.load(meta + i_r).to(tl.int64)
+    slot = tl.load(meta + R + i_r).to(tl.int64)
+    n = tl.load(meta + 2 * R + i_r)
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    if slot >= 0:
+        p_h = state + ((i_l * SLOTS + slot) * HV + i_hv) * K * V + o_v[None, :] * K + o_k[:, None]
+        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+        b_h += tl.load(p_h, mask=mask_h, other=0).to(tl.float32)
+        tok = (i_l * ROWS + row) * STEPS
+        p_k = stash_k + (tok * H + i_h) * K + o_k
+        p_v = stash_v + (tok * HV + i_hv) * V + o_v
+        p_g = stash_g + tok * HV + i_hv
+        p_beta = stash_beta + tok * HV + i_hv
+        for _ in range(0, n):
+            b_k = tl.load(p_k, mask=mask_k, other=0)
+            b_v = tl.load(p_v, mask=mask_v, other=0)
+            b_g = tl.load(p_g)
+            b_beta = tl.load(p_beta)
+            b_h *= tl.exp(b_g)
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
+            b_v *= b_beta
+            b_h += b_k[:, None] * b_v[None, :]
+            p_k += H * K
+            p_v += HV * V
+            p_g += HV
+            p_beta += HV
+        tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
+
+
+def gdn_state_replay(
+    state: torch.Tensor,
+    input_stash: tuple,
+    meta: torch.Tensor,
+) -> None:
+    """Advance live GDN states in place over each committed row's first n stashed verify tokens, every layer in one launch.
+
+    ``state`` is the pool slab [L, slots, HV, K, V] fp32 ([V, K] raw inner layout, as the fused kernel addresses it);
+    ``input_stash`` holds [L, rows, steps, ...] buffers the verify filled; ``meta`` is int32 [3, R]: verify row, live
+    slot (-1 skips), token count. BV and num_warps match the verify launch so the state equals the verify's bit for bit.
+    """
+    stash_k, stash_v, stash_g, stash_beta = input_stash
+    L, slots, HV, K, V = state.shape
+    _, rows, steps, H, _ = stash_k.shape
+    R = meta.shape[1]
+    assert state.is_contiguous() and meta.dtype == torch.int32 and meta.is_contiguous()
+    if R == 0:
+        return
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    gdn_state_replay_kernel[(triton.cdiv(V, BV), L * R * HV)](
+        state, stash_k, stash_v, stash_g, stash_beta, meta, R,
+        ROWS=rows, STEPS=steps, SLOTS=slots, H=H, HV=HV, K=K, V=V, BK=BK, BV=BV,
+        num_warps=1, num_stages=3,
+    )

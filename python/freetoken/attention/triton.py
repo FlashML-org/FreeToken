@@ -32,15 +32,16 @@ class TritonCaptureData(BaseCaptureData):
         num_q_heads: int,
         max_head_dim: int,
         scratch_rows: int,
+        steps: int = 1,
         **kwargs,
     ):
         return cls(
             seq_lens=torch.ones((max_bs,), dtype=torch.int32, device=device),
-            positions=torch.zeros((max_bs,), dtype=torch.int32, device=device),
+            positions=torch.zeros((max_bs * steps,), dtype=torch.int32, device=device),
             cu_seqlens_k=torch.arange(0, max_bs + 1, dtype=torch.int32, device=device),
-            cu_seqlens_q=torch.arange(0, max_bs + 1, dtype=torch.int32, device=device),
+            cu_seqlens_q=torch.arange(0, max_bs + 1, dtype=torch.int32, device=device) * steps,
             page_table=torch.zeros((max_bs, max_seq_len), dtype=torch.int32, device=device),
-            q_to_req=torch.arange(max_bs, dtype=torch.int32, device=device),
+            q_to_req=torch.arange(max_bs, dtype=torch.int32, device=device).repeat_interleave(steps),
             attn_logits=torch.empty((scratch_rows * num_q_heads * max_head_dim,), dtype=torch.float32, device=device),
             attn_lse=torch.empty((scratch_rows * num_q_heads,), dtype=torch.float32, device=device),
             **kwargs,
@@ -71,6 +72,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
         self.capture: TritonCaptureData | None = None
+        self.capture_steps = 1
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
         self.prefill_tile_min_q = 128
@@ -253,7 +255,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             swa_indices=swa_indices,
         )
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         self.capture = TritonCaptureData.create(
@@ -263,7 +265,9 @@ class TritonAttentionBackend(BaseAttnBackend):
             num_q_heads=max(1, self.num_q_heads),
             max_head_dim=max(1, self.max_head_dim),
             scratch_rows=max(bs * self._split_cap(bs) for bs in bs_list),
+            steps=steps,
         )
+        self.capture_steps = steps
         if self._swa_capture_enabled():
             self.capture.swa_page_table = torch.zeros(
                 (max_bs, max_seq_len),
@@ -290,6 +294,10 @@ class TritonAttentionBackend(BaseAttnBackend):
         indices = self.capture.page_table.view(-1)
         self.capture.cu_seqlens_q[: bs + 1].copy_(metadata.cu_seqlens_q_gpu)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.indptr)
+        if not metadata.is_decode:
+            # the extend kernel reads prefix_lens; seq_lens is otherwise unused by this backend, so it holds them
+            self.capture.seq_lens[:bs].copy_(metadata.prefix_lens)
+            metadata.prefix_lens = self.capture.seq_lens[:bs]
         total = metadata.indices.numel()
         indices[:total].copy_(metadata.indices)
         if metadata.swa_indices is not None:
@@ -319,6 +327,24 @@ class TritonAttentionBackend(BaseAttnBackend):
         bs = batch.size
         assert bs in self.capture_bs and self.capture is not None
         capture = self.capture
+        steps = self.capture_steps
+        if steps > 1:
+            n = bs * steps
+            # placeholders for a fresh request (kv rows == query rows, no prefix); replay overwrites both
+            capture.cu_seqlens_k[: bs + 1].copy_(capture.cu_seqlens_q[: bs + 1])
+            capture.seq_lens[:bs].fill_(0)
+            batch.attn_metadata = TritonMetadata(
+                cu_seqlens_q_gpu=capture.cu_seqlens_q[: bs + 1],
+                indptr=capture.cu_seqlens_k[: bs + 1],
+                indices=capture.page_table.view(-1),
+                q_to_req=capture.q_to_req[:n],
+                q_positions=capture.positions[:n],
+                is_decode=False,
+                prefix_lens=capture.seq_lens[:bs],
+                max_q_len=steps,
+                swa_indices=self._capture_swa_indices(),
+            )
+            return
         attn_logits, attn_lse = self._capture_scratch(bs)
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=capture.cu_seqlens_q[: bs + 1],

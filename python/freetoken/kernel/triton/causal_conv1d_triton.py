@@ -252,6 +252,8 @@ def _causal_conv1d_update_kernel(
     bias_ptr,
     conv_state_ptr,
     conv_state_indices_ptr,
+    intermediate_conv_window_ptr,
+    intermediate_state_indices_ptr,
     o_ptr,
     batch: int,
     dim: tl.constexpr,
@@ -267,6 +269,10 @@ def _causal_conv1d_update_kernel(
     stride_conv_state_dim: tl.constexpr,
     stride_conv_state_tok: tl.constexpr,
     stride_state_indices: tl.constexpr,
+    stride_inter_seq: tl.constexpr,
+    stride_inter_step: tl.constexpr,
+    stride_inter_dim: tl.constexpr,
+    stride_inter_win: tl.constexpr,
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
@@ -277,6 +283,7 @@ def _causal_conv1d_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
+    SAVE_INTERMEDIATE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     idx_seq = tl.program_id(0)
@@ -294,6 +301,8 @@ def _causal_conv1d_update_kernel(
     if USE_PAD_SLOT:
         if conv_state_batch_coord == pad_slot_id:
             return
+    if SAVE_INTERMEDIATE:
+        inter_row = tl.load(intermediate_state_indices_ptr + idx_seq).to(tl.int64)
 
     # STEP 1: read prior conv_state window
     conv_states_base = (
@@ -403,6 +412,24 @@ def _causal_conv1d_update_kernel(
             col0 = col1
             col1 = col2
             col2 = matrix_x
+
+        if SAVE_INTERMEDIATE:
+            # Speculative verify: park the raw K-1 window ending at this token in
+            # intermediate_conv_window[row, t] (the drain scatters the accepted
+            # step's window back over the speculatively-rolled live state).
+            if inter_row >= 0:
+                win_base = (
+                    intermediate_conv_window_ptr
+                    + inter_row * stride_inter_seq
+                    + idx_token * stride_inter_step
+                    + idx_feats * stride_inter_dim
+                )
+                if KERNEL_WIDTH >= 2:
+                    tl.store(win_base + 0 * stride_inter_win, col0, mask=mask_w)
+                if KERNEL_WIDTH >= 3:
+                    tl.store(win_base + 1 * stride_inter_win, col1, mask=mask_w)
+                if KERNEL_WIDTH >= 4:
+                    tl.store(win_base + 2 * stride_inter_win, col2, mask=mask_w)
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
@@ -553,6 +580,8 @@ def causal_conv1d_decode(
         None,
         conv_state,
         conv_state_indices,
+        x,  # intermediate window/indices unused (SAVE_INTERMEDIATE=False)
+        x,
         out,
         batch,
         dim,
@@ -568,6 +597,10 @@ def causal_conv1d_decode(
         stride_istate_dim,
         stride_istate_token,
         stride_state_indices,
+        0,
+        0,
+        0,
+        0,
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
@@ -578,6 +611,7 @@ def causal_conv1d_decode(
         IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
+        SAVE_INTERMEDIATE=False,
         # Fixed via H100 sweep (36-config grid; BN128/w4 within noise of the winner
         # for bs 1..16, BN256 only +5% at bs32 -- a ~10us launch-bound kernel).
         BLOCK_N=128,
@@ -585,6 +619,90 @@ def causal_conv1d_decode(
         num_stages=2,
     )
     return out.squeeze(-1)
+
+
+def causal_conv1d_verify(
+    x: torch.Tensor,                # [batch, conv_dim, seqlen] (any strides)
+    conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)
+    weight: torch.Tensor,           # [conv_dim, kernel]
+    conv_state_indices: torch.Tensor,          # [batch] int32 slot id per request
+    intermediate_conv_window: torch.Tensor,    # [rows, steps>=seqlen, conv_dim, kernel-1]
+    intermediate_state_indices: torch.Tensor,  # [batch] int32 window row (<0 skips)
+    activation: Optional[str] = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+) -> torch.Tensor:
+    """Speculative-verify conv: the decode-family update run over seqlen (= k+1)
+    tokens per request. Rolls ``conv_state[idx]`` forward as if every token were
+    accepted (the drain corrects it by scattering the accepted step's window back)
+    and parks each token's raw K-1 window in ``intermediate_conv_window[row, t]``.
+    Returns silu(conv) [batch, conv_dim, seqlen], allocated token-major so
+    ``out.transpose(1, 2).reshape(total, conv_dim)`` is a free dense view."""
+    conv_state_indices = conv_state_indices.to(torch.int32)
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+
+    batch, dim, seqlen = x.shape
+    _, width = weight.shape
+    assert 2 <= width <= 4, f"causal_conv1d verify supports width 2..4, got {width}"
+    num_cache_lines = conv_state.size(0)
+    state_len = width - 1
+    assert intermediate_conv_window.shape[1] >= seqlen
+    assert intermediate_conv_window.shape[-1] == state_len
+    np2_statelen = triton.next_power_of_2(state_len)
+
+    out = torch.empty((batch, seqlen, dim), dtype=x.dtype, device=x.device).transpose(1, 2)
+    stride_w_dim, stride_w_width = weight.stride()
+    stride_x_seq, stride_x_dim, stride_x_token = x.stride()
+    stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
+    inter_strides = intermediate_conv_window.stride()
+
+    def grid(META):
+        return (batch, triton.cdiv(dim, META["BLOCK_N"]))
+
+    _causal_conv1d_update_kernel[grid](
+        x,
+        weight,
+        None,
+        conv_state,
+        conv_state_indices,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        out,
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        num_cache_lines,
+        stride_x_seq,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_istate_seq,
+        stride_istate_dim,
+        stride_istate_token,
+        conv_state_indices.stride(0),
+        inter_strides[0],
+        inter_strides[1],
+        inter_strides[2],
+        inter_strides[3],
+        stride_o_seq,
+        stride_o_dim,
+        stride_o_token,
+        pad_slot_id,
+        HAS_BIAS=False,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        IS_CONTINUOUS_BATCHING=True,
+        NP2_STATELEN=np2_statelen,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        SAVE_INTERMEDIATE=True,
+        BLOCK_N=128,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -677,5 +795,6 @@ __all__ = [
     "causal_conv1d_update",
     "causal_conv1d_varlen",
     "causal_conv1d_decode",
+    "causal_conv1d_verify",
     "PAD_SLOT_ID",
 ]

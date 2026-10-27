@@ -145,6 +145,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
+        self._capture_steps = 1
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -242,7 +243,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.block_table = self._graph["block_table"][:bs]
         md.seq_lens = self._graph["kvlen"][:bs]
         md.ring_slots = self._graph["table_idx"][:bs]
-        md.token_to_req = self._graph["token_to_req"][:bs]
+        md.token_to_req = self._graph["token_to_req"][: bs * self._capture_steps]
         md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
 
     def _snapshot_decode(self, md: QSASparseMetadata, batch: Batch) -> None:
@@ -489,13 +490,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], steps: int = 1) -> None:
         self.capture_bs = sorted(bs_list)
+        self._capture_steps = steps
         max_bs = max(bs_list)
+        rows = max_bs * steps
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         columns = pages * self.cmp_page_size
-        chunk = max(1, min(max_bs, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
+        chunk = max(1, min(rows, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
         topk_scratch = self._topk_scratch_width(columns)
 
         def empty(*shape: int, dtype: torch.dtype) -> torch.Tensor:
@@ -505,15 +508,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "block_table": torch.zeros((max_bs, pages), dtype=torch.int32, device=self.device),
             "kvlen": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "table_idx": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device),
+            "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device).repeat_interleave(steps),
+            "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device) * steps,
             "logits": empty(chunk, columns, dtype=torch.float32),
-            "visible": empty(max_bs, dtype=torch.int32),
-            "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
-            "indices": empty(max_bs, self.select_width, dtype=torch.int32),
-            "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
-            "first_pos": empty(max_bs, dtype=torch.int32),
-            "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
+            "visible": empty(rows, dtype=torch.int32),
+            "blocks": empty(rows, self.block_topk, dtype=torch.int32),
+            "indices": empty(rows, self.select_width, dtype=torch.int32),
+            "pooled": empty(rows, self.index_head_dim, dtype=self.dtype),
+            "first_pos": empty(rows, dtype=torch.int32),
+            "q_index": empty(rows, self.index_heads, self.index_head_dim, dtype=self.dtype),
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
@@ -531,7 +534,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def prepare_for_replay(self, batch: Batch) -> None:
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
-        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
+        assert batch.active_table_idx is not None, "graph batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
     def reset_capture(self) -> None:

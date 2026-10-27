@@ -475,7 +475,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
         events.append("graph_exit")
 
     class FakeAttnBackend:
-        def init_capture_graph(self, max_seq_len, bs_list):
+        def init_capture_graph(self, max_seq_len, bs_list, steps=1):
             pass
 
         def prepare_for_capture(self, batch):
@@ -511,13 +511,12 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     GraphRunner(
         stream=None,
         device=torch.device("cpu"),
-        model=FakeModel(),
+        forward=FakeModel().forward,
         attn_backend=FakeAttnBackend(),
         cuda_graph_bs=[1],
         cuda_graph_max_bs=None,
         free_memory=1024,
         max_seq_len=1,
-        vocab_size=3,
         dummy_req=dummy_req,
         moe_offload_cache=FakeOffloadCache(),
     )

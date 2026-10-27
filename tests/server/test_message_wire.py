@@ -106,7 +106,7 @@ def test_user_reply_token_deltas_round_trip():
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
     msg = DetokenizeMsg(
-        uid=3, next_token=42, finished=True,
+        uid=3, next_tokens=[42], finished=True,
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,

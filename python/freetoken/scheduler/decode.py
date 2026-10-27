@@ -9,6 +9,8 @@ from freetoken.core import Batch, Req
 @dataclass
 class DecodeManager:
     page_size: int
+    # slots a decode step may hold past each request's committed length (provisional rows)
+    token_headroom: int = 0
     running_reqs: Set[Req] = field(default_factory=set)
 
     def filter_reqs(self, reqs: Iterable[Req]) -> None:
@@ -26,7 +28,7 @@ class DecodeManager:
 
     @property
     def inflight_tokens(self) -> int:
-        tokens_reserved = (self.page_size - 1) * len(self.running_reqs)  # 1 page reserved
+        tokens_reserved = (self.page_size - 1 + self.token_headroom) * len(self.running_reqs)  # 1 page reserved
         return sum(req.remain_len for req in self.running_reqs) + tokens_reserved
 
     def schedule_next_batch(self) -> Batch | None:
