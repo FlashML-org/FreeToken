@@ -375,16 +375,23 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_with_cancellation(self, generator, request: Request, uid: int):
+    async def stream_with_cancellation(
+        self, generator, request: Request, uid: int | Callable[[], list[int]]
+    ):
+        """``uid`` may be a callable returning the uids to abort, for a stream (OpenAI ``n``)
+        whose requests are submitted after it starts."""
         try:
             async for chunk in generator:
                 # detect if the client has disconnected
                 if await request.is_disconnected():
-                    logger.info("Client disconnected for user %s", uid)
+                    logger.info(
+                        "Client disconnected for user %s", uid if isinstance(uid, int) else "(n > 1)"
+                    )
                     raise asyncio.CancelledError
                 yield chunk
         except asyncio.CancelledError:
-            asyncio.create_task(self.abort_user(uid))
+            for live_uid in uid() if callable(uid) else [uid]:
+                asyncio.create_task(self.abort_user(live_uid))
             raise
 
     async def abort_user(self, uid: int):
