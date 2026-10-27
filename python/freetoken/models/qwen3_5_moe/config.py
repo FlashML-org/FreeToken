@@ -127,7 +127,19 @@ def parse_gguf_config(hf_config: Any) -> ModelConfig:
             "vocab_size": int(_gguf_value(metadata, len(metadata.get("tokenizer.ggml.tokens", [])), "tokenizer.ggml.vocab_size", "vocab_size")),
             "partial_rotary_factor": 0.25,
             "layer_types": layer_types,
-            "rope_parameters": {"rope_theta": float(field("qwen35moe.rope.freq_base", "qwen3.rope.freq_base", "qwen3_5_moe.rope.freq_base", "qwen.rope.freq_base", "qwen3_moe.rope.freq_base", "10000000.0"))},
+            "rope_parameters": {
+                "rope_theta": float(field("qwen35moe.rope.freq_base", "qwen3.rope.freq_base", "qwen3_5_moe.rope.freq_base", "qwen.rope.freq_base", "qwen3_moe.rope.freq_base", "10000000.0")),
+                **(
+                    getattr(hf_config, "hf_fields", {}).get("text_config", {}).get("rope_parameters", {})
+                    if "qwen35moe.rope.dimension_sections" not in metadata
+                    else {}
+                ),
+                **(
+                    {"mrope_section": [int(s) for s in field("qwen35moe.rope.dimension_sections")][:3]}
+                    if "qwen35moe.rope.dimension_sections" in metadata
+                    else {}
+                ),
+            },
             "full_attention_interval": 4,
             "linear_num_key_heads": 16,
             "linear_num_value_heads": 32,
@@ -138,15 +150,21 @@ def parse_gguf_config(hf_config: Any) -> ModelConfig:
             and not (tensor_names is not None and "lm_head.weight" in tensor_names),
         },
     )
+    vision_config = getattr(hf_config, "vision_config", None)
     top = type(
         "_GGUFConfig",
         (),
         {
             "text_config": data,
             "model_type": "qwen3_5_moe",
-            "architectures": ["Qwen3_5MoeForCausalLM"],
-            "image_token_id": None,
-            "video_token_id": None,
+            "architectures": [
+                "Qwen3_5MoeForConditionalGeneration"
+                if vision_config is not None
+                else "Qwen3_5MoeForCausalLM"
+            ],
+            "image_token_id": getattr(hf_config, "image_token_id", None),
+            "video_token_id": getattr(hf_config, "video_token_id", None),
+            "vision_config": vision_config,
             "tie_word_embeddings": data.tie_word_embeddings,
             "num_experts": data.num_experts,
             "num_experts_per_tok": data.num_experts_per_tok,

@@ -119,6 +119,7 @@ The fork is based on [FreeToken Engine 0.2.0](https://github.com/FlashML-org/Fre
 - A Windows disk tier fetches Qwen3.8 NVFP4 expert rows from the original safetensors shards while keeping a configurable subset of experts in host RAM.
 - Qwen3.8 checkpoint loading fixes cover quantized dense-weight remapping/fusion, hyperconnection weights, FP8 GDN weights, BF16 vision weights, and PLE host-table loading.
 - Gemma 4 GGUF fixes cover Q8_0 tensor scales and tokenizer handling; additional repair tools help adapt local Gemma and Qwen GGUF files.
+- Qwen3.6 mixed BF16/NVFP4 GGUF loading handles HF-style tensor names and preserves the companion mmproj vision configuration.
 - Windows deployment fixes include a compatible Qwen4Exp PLE fallback, safer expert-bank residency, and guarded handling of stale native-extension modules.
 - NVFP4 and Q4_0 MoE paths and quantization-config handling have been extended for the checkpoints in [my model collection](#my-model-collection).
 

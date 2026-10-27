@@ -69,3 +69,12 @@ def test_gguf_eos_token_ids_accounts_for_existing_qwen_added_tokens(monkeypatch)
     monkeypatch.setattr(gguf_tokenizer, "gguf_architecture", lambda _: "qwen3_5_moe")
 
     assert gguf_tokenizer.gguf_eos_token_ids("model.gguf") == {0, 1, 3}
+
+
+def test_qwen_image_token_id_matches_reconstructed_vocabulary():
+    meta = {
+        "tokenizer.ggml.tokens": ["<|endoftext|>", "hello"],
+        "tokenizer.ggml.model": "gpt2",
+    }
+
+    assert gguf_tokenizer.qwen_added_token_id(meta, "<|image_pad|>") == 13

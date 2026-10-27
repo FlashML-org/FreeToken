@@ -63,6 +63,22 @@ def _add_bos(meta: dict) -> bool:
     return model == "llama" or (model == "gpt2" and meta.get("tokenizer.ggml.pre") in _BOS_PRE)
 
 
+def qwen_added_token_id(meta: dict[str, Any], token: str) -> int | None:
+    """Return a Qwen control token's ID, including tokens reconstructed after the GGUF vocabulary."""
+    tokens = meta.get("tokenizer.ggml.tokens", [])
+    if token in tokens:
+        return tokens.index(token)
+    if meta.get("tokenizer.ggml.model") != "gpt2":
+        return None
+    try:
+        index = _QWEN_ADDED_TOKENS.index(token)
+    except ValueError:
+        return None
+    return len(tokens) + sum(
+        added not in tokens for added in _QWEN_ADDED_TOKENS[:index]
+    )
+
+
 def _fix_added_tokens(fast, meta: dict):
     """Register the control and user-defined tokens that transformers skipped at their file ids, and drop added tokens past the file's vocabulary."""
     from tokenizers import Tokenizer

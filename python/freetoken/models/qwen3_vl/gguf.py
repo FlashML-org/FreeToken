@@ -7,6 +7,8 @@ llama.cpp splits the Conv3d patch embedding into one tensor per temporal slice (
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ import torch
 
 from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, load_gguf_metadata
+from freetoken.models.gguf.tokenizer import qwen_added_token_id
 from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
 
 from .config import parse_config
@@ -62,6 +65,46 @@ def _deepstack_taps(index: dict[str, GgufTensorInfo]) -> tuple[int, ...]:
     return tuple(sorted({int(m[1]) for n in index if (m := _DS_RE.match(n))}))
 
 
+def _matching_source_config(model_path: str, mmproj: Mmproj, text_md: dict[str, Any]) -> dict[str, Any]:
+    mm_md = load_gguf_metadata(mmproj.path)
+    basename = mm_md.get("general.basename") or mm_md.get("general.name")
+    key = "" if basename is None else re.sub(r"[^0-9a-z]", "", str(basename).lower())
+    if not model_path or not key:
+        raise ValueError(f"{mmproj.path}: cannot identify a matching local Qwen source config")
+
+    model_dir = os.path.dirname(os.path.abspath(model_path))
+    parent = os.path.dirname(model_dir)
+    candidates = []
+    for entry in os.scandir(parent):
+        if not entry.is_dir():
+            continue
+        name = re.sub(r"[^0-9a-z]", "", entry.name.lower())
+        config_path = os.path.join(entry.path, "config.json")
+        if name.startswith(key) and os.path.isfile(config_path):
+            candidates.append(config_path)
+    if len(candidates) != 1:
+        raise ValueError(
+            f"{mmproj.path}: expected one matching local source config for "
+            f"{basename!r} beside {model_dir}, found {len(candidates)}"
+        )
+
+    with open(candidates[0], encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    text_config = config.get("text_config", {})
+    expected_type = "qwen3_5" if text_md["general.architecture"] == "qwen35" else "qwen3_5_moe"
+    if (
+        not str(config.get("model_type", "")).startswith(expected_type)
+        or int(text_config.get("hidden_size", -1))
+        != int(text_md[f"{text_md['general.architecture']}.embedding_length"])
+    ):
+        raise ValueError(f"{candidates[0]}: source config does not match the GGUF architecture and hidden size")
+
+    image_token_id = qwen_added_token_id(text_md, _IMAGE_TOKEN)
+    if image_token_id is None or int(config.get("image_token_id", -1)) != image_token_id:
+        raise ValueError(f"{candidates[0]}: source config image token ID does not match the GGUF tokenizer")
+    return config
+
+
 def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, model_path: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
     """The HF config.json keys and the preprocessor_config.json of the tower in ``mmproj``, for the text GGUF whose metadata is ``text_md``."""
     if mmproj.projector != _PROJECTOR:
@@ -95,9 +138,28 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, 
     text_hidden = int(text_md[f"{arch}.embedding_length"])
     if int(kv("projection_dim")) != text_hidden:
         raise ValueError(f"mmproj {mmproj.path} projects to {int(kv('projection_dim'))} but the text model is {text_hidden} wide")
-    tokens = text_md["tokenizer.ggml.tokens"]
-    if _IMAGE_TOKEN not in tokens:
+    image_token_id = qwen_added_token_id(text_md, _IMAGE_TOKEN)
+    if image_token_id is None:
         raise ValueError(f"the text GGUF tokenizer has no {_IMAGE_TOKEN} token")
+    dimension_sections = text_md.get(f"{arch}.rope.dimension_sections")
+    if dimension_sections is not None:
+        rope_parameters = {
+            "mrope_section": [int(s) for s in dimension_sections][:3],
+            "mrope_interleaved": True,
+        }
+    else:
+        source_text = _matching_source_config(model_path, mmproj, text_md).get("text_config", {})
+        source_rope = source_text.get("rope_parameters", {})
+        sections = source_rope.get("mrope_section")
+        if not isinstance(sections, list) or len(sections) != 3:
+            raise ValueError(
+                f"{mmproj.path}: text GGUF lacks {arch}.rope.dimension_sections "
+                "and the matching source config has no three-axis mrope_section"
+            )
+        rope_parameters = {
+            "mrope_section": [int(s) for s in sections],
+            "mrope_interleaved": bool(source_rope.get("mrope_interleaved", True)),
+        }
     temporal = 2 if _PATCH[1] in index else 1
     vision_config = {
         "hidden_size": int(kv("embedding_length")),
@@ -115,10 +177,10 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, 
     }
     hf_fields = {
         "vision_config": vision_config,
-        "image_token_id": tokens.index(_IMAGE_TOKEN),
+        "image_token_id": image_token_id,
         "text_config": {
             "vocab_size": vocab_size,
-            "rope_parameters": {"mrope_section": [int(s) for s in text_md[f"{arch}.rope.dimension_sections"]][:3]},
+            "rope_parameters": rope_parameters,
         },
     }
     preprocessor = {
