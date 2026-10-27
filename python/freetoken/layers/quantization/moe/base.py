@@ -159,12 +159,12 @@ class MoEKernel(ABC):
         """Most GPU cache slots the kernel can address for ``cfg``; None for no limit."""
         return self.max_slots
 
-    def _common_reject(self, cfg: MoEConfig, *, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool) -> str | None:
+    def _common_reject(self, cfg: MoEConfig, *, tp_ok: bool, cpu_ok: bool, plain_silu_only: bool, bias_ok: bool = False) -> str | None:
         if not tp_ok and cfg.tp_size > 1:
             return "TP > 1 is not supported for this expert format"
         if not cpu_ok and cfg.decode_target != "gpu":
             return "has no CPU executor format; decode must run on the GPU"
-        if cfg.has_bias:
+        if cfg.has_bias and not bias_ok:
             return "kernel has no bias epilogue"
         if plain_silu_only and not cfg.plain_silu:
             return f"kernel is plain-silu only, experts use ({cfg.activation}, alpha={cfg.alpha}, beta={cfg.beta}, limit={cfg.limit})"
