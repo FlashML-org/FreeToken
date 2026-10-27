@@ -49,7 +49,18 @@ or NVFP4 Marlin/b12x (e.g. `--quant-backend moe.nvfp4=marlin` or
 ## CPU and hybrid MoE
 
 `--moe-strategy cpu`, `hybrid` and `--moe-cpu-layers` sync the GPU with the CPU
-expert pool through HIP stream memory operations. ROCm 10 records them into CUDA
-graphs itself; on ROCm 7.14, which does not, FreeToken adds the graph nodes
-explicitly. When the startup probe of that path fails, CUDA graph capture stops
-with an error; run those strategies with `--cuda-graph-max-bs 0`.
+expert pool through HIP stream memory operations. Before notifying the CPU,
+FreeToken records a system-release event after copying the expert inputs to
+host memory. The event is recorded as an external graph node so that every
+replay retains the publication point. This application workaround keeps Graph
+and memops enabled on unpatched runtimes; it does not require a custom HIP library.
+
+Native memop capture is detected at runtime. If it is unavailable, FreeToken
+adds explicit memop graph nodes. Before model capture, a numerical check
+compares distinct tasks and changing inputs against eager execution. ROCm
+decode graphs require BF16 inputs and a passing handshake and data check. When
+these checks reject the path, the engine logs a warning and disables decode
+graphs across TP ranks. Capture and runtime API errors still stop startup.
+
+After updating the native CPU MoE sources, rebuild the extension with
+`python setup.py build_ext --inplace` in the ROCm environment before serving.

@@ -5,6 +5,7 @@ every layer and batch size shares (one task is in flight at a time). ``decode`` 
 the whole CUDA-graph-capturable sequence on the current stream:
 
     D2H (hidden, topk_ids, topk_weights -> pinned IO rows [:bs])
+      -> publish (HIP external event before the memop doorbell)
       -> submit (doorbell naming (layer, bs), or a cudaLaunchHostFunc host node)
       -> sync   (wait for the CPU pool to finish)
       -> H2D (pinned expert output -> GPU)
@@ -342,12 +343,13 @@ class CpuMoeExecutor:
         self._kernel_io = False
         if self._flag_sync:
             self._ext.start_flag_coordinator(self._coord_core)
-            reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
-            if reason:
-                logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
-            else:
-                self._ext.enable_kernel_io()
-                self._kernel_io = True
+            if torch.version.hip is None:
+                reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
+                if reason:
+                    logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
+                else:
+                    self._ext.enable_kernel_io()
+                    self._kernel_io = True
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -365,13 +367,13 @@ class CpuMoeExecutor:
             self._watchdog.start()
 
         if torch.version.hip is not None:
-            # The flag probe alone misses stale shared IO in HIP graphs using memcpy + memops.
-            self._graph_capture_safe = self._flag_sync and self._kernel_io
+            # Check the event + memcpy + memop protocol, beyond the flag-only probe.
+            self._graph_capture_safe = self._flag_sync
             if self._graph_capture_safe:
-                reason = self._probe_kernel_graph_io()
+                reason = self._probe_graph_io()
                 if reason:
                     self._graph_capture_safe = False
-                    logger.warning_rank0(f"cpu-moe kernel IO graph probe failed ({reason}); using eager decode")
+                    logger.warning_rank0(f"cpu-moe graph IO probe failed ({reason}); using eager decode")
 
         fmt_label = "; ".join(f"{_format_label(name, opts)}: {n} layers" for (name, opts), n in layer_counts.items())
         logger.info_rank0(
@@ -381,16 +383,16 @@ class CpuMoeExecutor:
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "
             f"spin_wait={self.spin_wait} "
-            f"handshake={'kernel' if self._kernel_io else 'memop' if self._flag_sync else 'host-func'}"
+            f"handshake={'kernel' if self._kernel_io else 'event-memop' if self._flag_sync and torch.version.hip is not None else 'memop' if self._flag_sync else 'host-func'}"
         )
 
     def graph_capture_safe(self, dtype: torch.dtype) -> bool:
-        # Non-bf16 inputs still take the memcpy path, even when kernel IO is enabled.
+        # HIP graph IO is qualified for BF16 inputs.
         return self._graph_capture_safe and (
-            torch.version.hip is None or (self._kernel_io and dtype == torch.bfloat16)
+            torch.version.hip is None or dtype == torch.bfloat16
         )
 
-    def _probe_kernel_graph_io(self) -> str:
+    def _probe_graph_io(self) -> str:
         """Check distinct tasks sharing IO, including CPU-route skips, before engine capture."""
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -642,7 +644,7 @@ class CpuMoeExecutor:
         out = torch.empty_like(hidden_states)
         if self._flag_sync:
             # Front-end memops: reset done, then ring the doorbell with (layer, bs).
-            # No kernel launched; no host-func round trip.
+            # HIP records the input-publication event before these writes.
             self._ext.flag_signal(stream, layer_id, bs)
         else:
             self._ext.submit_with_cuda_stream(stream, layer_id, bs)

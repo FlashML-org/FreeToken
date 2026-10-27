@@ -313,3 +313,52 @@ def test_cpu_fp8_block_graph_distinct_layer_inputs(bs, accumulate):
                 torch.testing.assert_close(got, expected, rtol=0, atol=0)
             skipped = gpu_out[step] if accumulate else torch.zeros_like(gpu_out[step])
             torch.testing.assert_close(captured[step], skipped, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
+def test_cpu_fp8_block_event_graph_replay_and_recapture():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    L, E, H, I, top_k = 3, 8, 256, 128, 4
+    cache = _make_fp8_block_cache(L, E, H, I, seed=71)
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=3, device=torch.device("cuda"),
+    )
+    assert ex._flag_sync and not ex._kernel_io
+    assert ex.graph_capture_safe(torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Reuse the executor after destroying each graph, including a repeated task size.
+        for bs in (1, 3, 1):
+            hidden = torch.empty(L, bs, H, device="cuda", dtype=torch.bfloat16)
+            ids = torch.empty(L, bs, top_k, device="cuda", dtype=torch.int32)
+            weights = torch.empty(L, bs, top_k, device="cuda", dtype=torch.float32)
+
+            def inputs(step):
+                generator = torch.Generator().manual_seed(1700 + step)
+                hidden.copy_(torch.randn(hidden.shape, dtype=hidden.dtype, generator=generator))
+                routes = torch.randint(E, ids.shape, dtype=ids.dtype, generator=generator)
+                routes[step % L].fill_(-1)
+                ids.copy_(routes)
+                weights.copy_(torch.rand(weights.shape, generator=generator))
+
+            def forward():
+                return [ex.decode(layer, hidden[layer], weights[layer], ids[layer]) for layer in range(L)]
+
+            inputs(0)
+            # New tasks may allocate their publication event inside capture.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = forward()
+            for step in range(1, 11):
+                inputs(step)
+                graph.replay()
+                stream.synchronize()
+                references = forward()
+                stream.synchronize()
+                for actual, expected in zip(outputs, references):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            graph.reset()
+    ex.raise_if_unhealthy()
