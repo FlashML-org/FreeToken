@@ -101,13 +101,17 @@ class MTPProposer(Proposer):
     @classmethod
     def adjust_config(cls, config, override) -> None:
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
+        from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
 
         super().adjust_config(config, override)
         if "mtp" not in dict(config.model_spec.spec_drafts):
             raise ValueError(f"MTP is not supported for {config.hf_config.architectures[0]} yet")
+        path = config.speculative_draft_model_path or config.model_path
         # FTW keeps only what the target's iter_weights yields, which drops mtp.*
-        if is_ftw_checkpoint(config.speculative_draft_model_path or config.model_path):
+        if is_ftw_checkpoint(path):
             raise ValueError("MTP cannot load its draft from an FTW checkpoint yet")
+        if is_gguf_path(path) and not any(name.startswith("mtp.") for name in gguf_tensor_index(path)):
+            raise ValueError(f"{path} has no mtp.* tensors; pass a GGUF that carries them (a Strata MTP pack) with --speculative-draft-model-path")
 
     @classmethod
     def _draft_class(cls, config) -> type[MTPDraft]:
@@ -153,7 +157,7 @@ class MTPProposer(Proposer):
         if self.kv is None:
             self.kv = create_kvcache_pool(
                 model_config=cfg, num_pages=ctx.num_pages + 1, page_size=self.config.page_size, dtype=self.dtype,
-                device=ctx.device, num_req_slots=rows,
+                device=ctx.device, num_req_slots=rows, num_speculative_tokens=self.k,
             )
         width = self.draft.relay_width(self.config.model_config)
         self.relay = HiddenRelay(rows, width, self.dtype, ctx.device)
@@ -248,7 +252,7 @@ class MTPProposer(Proposer):
             ctx_override=dict(kv_cache=self.kv, attn_backend=self.extend_backend, hide_target_state=True),
             pool=pool,
         )
-        if self.k > 1:
+        if self.k > 1 and ChainGraphs.supports(self.chain_backend):
             self.chain_graphs = ChainGraphs(self, bs_list, self.extend_graphs.graph_pool)
 
     def propose(self, reqs: List[Req], rows: torch.Tensor) -> torch.Tensor:
@@ -294,6 +298,7 @@ class MTPProposer(Proposer):
         draft.positions = batch.positions
         draft.mrope_positions = batch.mrope_positions
         draft.out_loc = batch.out_loc
+        draft.active_table_idx = batch.active_table_idx
         self.picked_rows[:bs] = torch.arange(bs, device=self.device) * k1 + emitted
         self.extend_backend.prepare_metadata(draft)
         graphs = self.extend_graphs

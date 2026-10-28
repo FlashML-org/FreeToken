@@ -131,6 +131,9 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if (features := getattr(batch, "features", None)) is not None:
+            # a draft reads the residual streams before the final mix
+            features.final_hidden(hidden)
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
@@ -216,7 +219,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        # the model hands its pre-mix streams to batch.features itself
+        return self.lm_head.forward(self.model.forward(batch.input_ids, batch), export_hidden=False)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

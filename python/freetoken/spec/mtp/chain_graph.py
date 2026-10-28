@@ -1,4 +1,4 @@
-"""MTP chain steps as one CUDA graph per batch size: the k-1 draft decode steps on the triton backend, with each step's metadata built on the device."""
+"""MTP chain steps as one CUDA graph per batch size: the k-1 draft decode steps, with each step's metadata built on the device."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Dict, List
 
 import torch
 
-from freetoken.attention.triton import TritonMetadata
+from freetoken.attention.qsa_sparse import QSASparseAttnBackend, QSASparseMetadata
+from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
 from freetoken.core import Batch
 from freetoken.kernel.triton.attention import gather_kv_indices
 
@@ -16,13 +17,84 @@ if TYPE_CHECKING:
     from .proposer import MTPProposer
 
 
+class _TritonSteps:
+    """Each step's flat KV slot list, gathered from the page table in the graph."""
+
+    def __init__(self, ctx, steps: int, max_bs: int) -> None:
+        self.page_table = ctx.page_table
+        self.indptr = torch.zeros(steps, max_bs + 1, dtype=torch.int32, device=ctx.device)
+        self.indices = torch.zeros(steps, max_bs * ctx.page_table.shape[1], dtype=torch.int32, device=ctx.device)
+        self.arange = torch.arange(max_bs + 1, dtype=torch.int32, device=ctx.device)
+
+    def metadata(self, bs: int, step: int, positions: torch.Tensor) -> TritonMetadata:
+        return TritonMetadata(
+            cu_seqlens_q_gpu=self.arange[: bs + 1],
+            indptr=self.indptr[step, : bs + 1],
+            indices=self.indices[step],
+            q_to_req=self.arange[:bs],
+            q_positions=positions,
+            is_decode=True,
+            prefix_lens=positions,
+            max_q_len=1,
+        )
+
+    def stage(self, bs: int, rows: torch.Tensor, entry: torch.Tensor) -> None:
+        for step in range(self.indptr.shape[0]):
+            self.indptr[step, 1 : bs + 1] = torch.cumsum(entry + step + 1, 0)
+        gather_kv_indices(self.page_table, rows, self.indptr[:, : bs + 1], self.indices)
+
+
+class _QSASteps:
+    """The block table and ring slots of the rows, shared by the steps, and one KV length row per step."""
+
+    def __init__(self, backend: QSASparseAttnBackend, ctx, steps: int, bs_list: List[int]) -> None:
+        # static scratch for the sparse kernels, so the captured graphs keep their addresses
+        backend.init_capture_graph(ctx.page_table.shape[1], bs_list)
+        max_bs = max(bs_list)
+        self.page_table = ctx.page_table
+        self.page_size = backend.page_size
+        pages = -(-ctx.page_table.shape[1] // self.page_size)
+        self.block_table = torch.zeros(max_bs, pages, dtype=torch.int32, device=ctx.device)
+        self.slots = torch.zeros(max_bs, dtype=torch.int32, device=ctx.device)
+        self.kv_len = torch.zeros(steps, max_bs, dtype=torch.int32, device=ctx.device)
+        self.arange = torch.arange(max_bs + 1, dtype=torch.int32, device=ctx.device)
+        self.cpu = torch.zeros(max_bs + 1, dtype=torch.int32)
+
+    def metadata(self, bs: int, step: int, positions: torch.Tensor) -> QSASparseMetadata:
+        return QSASparseMetadata(
+            is_decode=True,
+            last_indices=self.arange[:bs],
+            qo_indptr_cpu=self.cpu[: bs + 1],
+            kv_len_cpu=self.cpu[:bs],
+            token_to_req=self.arange[:bs],
+            cu_seqlens=self.arange[: bs + 1],
+            seq_lens=self.kv_len[step, :bs],
+            ring_slots=self.slots[:bs],
+            block_table=self.block_table[:bs],
+        )
+
+    def stage(self, bs: int, rows: torch.Tensor, entry: torch.Tensor) -> None:
+        self.block_table[:bs] = self.page_table[rows, :: self.page_size] // self.page_size
+        self.slots[:bs] = rows
+        for step in range(self.kv_len.shape[0]):
+            self.kv_len[step, :bs] = entry + step + 1
+
+
 class ChainGraphs:
     """Replays ``MTPProposer.propose``: the inputs are each request's table row, entry position and mrope delta, everything else derives from them in the graph."""
+
+    @staticmethod
+    def supports(backend) -> bool:
+        return isinstance(backend, (TritonAttentionBackend, QSASparseAttnBackend))
 
     def __init__(self, proposer: MTPProposer, bs_list: List[int], pool) -> None:
         self.p = proposer
         ctx = proposer.ctx
         device, steps, max_bs = ctx.device, proposer.k - 1, max(bs_list)
+        backend = proposer.chain_backend
+        self.backend_steps = (
+            _QSASteps(backend, ctx, steps, bs_list) if isinstance(backend, QSASparseAttnBackend) else _TritonSteps(ctx, steps, max_bs)
+        )
         self.dummy_row = ctx.dummy_req.table_idx
         # rows: table row, entry position, mrope delta
         self.inputs = torch.zeros(3, max_bs, dtype=torch.int64, device=device)
@@ -30,9 +102,6 @@ class ChainGraphs:
         self.positions = torch.zeros(steps, max_bs, dtype=torch.int32, device=device)
         self.mrope = torch.zeros(steps, 3, max_bs, dtype=torch.int32, device=device) if proposer.mrope else None
         self.out_loc = torch.zeros(steps, max_bs, dtype=torch.int32, device=device)
-        self.indptr = torch.zeros(steps, max_bs + 1, dtype=torch.int32, device=device)
-        self.indices = torch.zeros(steps, max_bs * ctx.page_table.shape[1], dtype=torch.int32, device=device)
-        self.arange = torch.arange(max_bs + 1, dtype=torch.int32, device=device)
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         # the metadata of these batches holds the decode scratch the graphs read
         self._batches: Dict[int, List[Batch]] = {}
@@ -56,16 +125,7 @@ class ChainGraphs:
         if self.mrope is not None:
             batch.mrope_positions = self.mrope[step, :, :bs]
         batch.out_loc = self.out_loc[step, :bs]
-        batch.attn_metadata = TritonMetadata(
-            cu_seqlens_q_gpu=self.arange[: bs + 1],
-            indptr=self.indptr[step, : bs + 1],
-            indices=self.indices[step],
-            q_to_req=self.arange[:bs],
-            q_positions=self.positions[step, :bs],
-            is_decode=True,
-            prefix_lens=self.positions[step, :bs],
-            max_q_len=1,
-        )
+        batch.attn_metadata = self.backend_steps.metadata(bs, step, batch.positions)
         return batch
 
     def _run(self, bs: int, batches: List[Batch]) -> None:
@@ -79,8 +139,7 @@ class ChainGraphs:
             if self.mrope is not None:
                 self.mrope[step, :, :bs] = (pos + delta).unsqueeze(0)
             self.out_loc[step, :bs] = page_table[rows, pos]
-            self.indptr[step, 1 : bs + 1] = torch.cumsum(pos + 1, 0)
-        gather_kv_indices(page_table, rows, self.indptr[:, : bs + 1], self.indices)
+        self.backend_steps.stage(bs, rows, entry)
         token, hidden = p.relay.d1[rows], p.relay.hidden[rows]
         self.drafts[:bs, 0] = token
         for step, batch in enumerate(batches):

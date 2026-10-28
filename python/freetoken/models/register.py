@@ -43,6 +43,7 @@ _QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
 # TODO: video once the processor samples frames; the tower already takes grid_thw with t > 1
 _QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _QWEN3_5_DRAFTS = (("mtp", "freetoken.models.qwen3_5_moe.mtp:Qwen3_5MTPDraft"),)
+_QWEN4_EXP_DRAFTS = (("mtp", "freetoken.models.qwen4_exp.mtp:Qwen4ExpMTPDraft"),)
 # Fused projections split back into their HF leaves so the quantization_config lookup sees the stored names.
 _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
@@ -343,6 +344,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        spec_drafts=_QWEN4_EXP_DRAFTS,
     ),
     # llama.cpp qwen4exp GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Qwen4ExpGGUFForCausalLM": ModelSpec(
@@ -354,6 +356,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_QWEN4_EXP_GGUF_PACKED,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=_QWEN4_EXP_DRAFTS,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
