@@ -6,7 +6,6 @@ import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
@@ -864,28 +863,8 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_state_pool is not None:
-            if not batch.is_prefill:
-                # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
-                # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
-                # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
-                # req always carries one (= padding_slot), so that test is True even for naive
-                # and would collapse all real naive reqs onto the padding slot. Hybrid: build
-                # per padded req from Req.linear_slot_idx (dummy -> padding_slot). Naive: keep
-                # the old keying = input_mapping's table_idx column (already staged, no H2D).
-                if self.cache_manager.is_hybrid:
-                    pool = self.engine.linear_state_pool
-                    slots = [r.linear_slot_idx if r.linear_slot_idx is not None
-                             else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
-                else:
-                    batch.linear_table_idx = input_mapping[0][:: batch.rows_per_req].to(torch.int32)
-            # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
-            # built once here instead of rebuilt in each of the 30 GDN layers. For decode
-            # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
+        if self.engine.linear_backend is not None:
+            self.engine.linear_backend.prepare_metadata(batch)
         if not batch.is_prefill:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.

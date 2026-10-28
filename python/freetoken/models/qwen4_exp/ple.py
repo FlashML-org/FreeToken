@@ -319,10 +319,10 @@ def build_ple_metadata(
 
     The n-gram context is per-request device state (``ple_ngram_ctx`` [num_slots, ngram_size-1],
     rolled forward once per forward by ``commit_ngram_context``), so it never lags the sampled
-    token under overlap scheduling and follows the slot on COW/snapshot. A decode batch reads it
-    straight off the persistent ``linear_table_idx`` buffer, so the build is capture-safe and
-    sync-free. Reuses ``batch.fla_metadata`` (slots / indptr / fresh mask) when the scheduler
-    built it.
+    token under overlap scheduling and follows the slot on COW/snapshot. A decode batch takes its
+    slots straight off ``batch.fla_metadata.cache_indices`` (persistent under a graph), so the
+    build is capture-safe and sync-free. Reuses ``batch.fla_metadata`` (slots / indptr / fresh
+    mask) when the scheduler built it.
     """
     reqs = batch.padded_reqs
     ctx_len = args.ngram_size - 1
@@ -333,14 +333,13 @@ def build_ple_metadata(
         f"ple_ngram_ctx holds {context_pool.shape[-1]} ids, config wants {ctx_len}"
     )
     fla = getattr(batch, "fla_metadata", None)
-    slots_dev = getattr(batch, "linear_table_idx", None)
     # image rows hash as the placeholder token, never as the content pad ids
     input_ids = batch.input_ids
     if args.image_token_id is not None:
         input_ids = restore_placeholder(input_ids, args.image_token_id)
 
-    if batch.is_decode and slots_dev is not None:
-        slots = slots_dev.long()
+    if batch.is_decode and fla is not None:
+        slots = fla.cache_indices.long()
         bs = slots.numel()
         return PLEMetadata(
             input_ids=input_ids,

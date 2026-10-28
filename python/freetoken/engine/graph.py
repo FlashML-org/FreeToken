@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend
+    from freetoken.attention.linear import LinearAttnBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
 
 logger = init_logger(__name__)
@@ -28,9 +29,6 @@ class GraphCaptureBuffer:
     positions: torch.Tensor
     # [3, bs * rows_per_req] t/h/w rope positions; allocated only for mrope models (else None).
     mrope_positions: torch.Tensor | None
-    table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
-    # GDN query indptr = arange(bs+1) * rows_per_req; a constant per captured bs, filled once.
-    fla_cu_seqlens: torch.Tensor
     rows_per_req: int = 1
 
     @classmethod
@@ -43,14 +41,10 @@ class GraphCaptureBuffer:
             mrope_positions=(
                 torch.zeros(3, n, dtype=torch.int32, device=device) if mrope else None
             ),
-            table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
-            fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * rows_per_req,
             rows_per_req=rows_per_req,
         )
 
     def set_batch(self, batch: Batch) -> None:
-        from freetoken.attention.linear import FLAMetadata
-
         bs = batch.padded_size
         _rows = slice(bs * self.rows_per_req)
         batch.input_ids = self.input_ids[_rows]
@@ -58,11 +52,6 @@ class GraphCaptureBuffer:
         batch.positions = self.positions[_rows]
         if self.mrope_positions is not None:
             batch.mrope_positions = self.mrope_positions[:, _rows]
-        batch.linear_table_idx = self.table_idx[:bs]
-        # GDN metadata reads the persistent cu_seqlens (constant arange * rows_per_req) and table_idx slot map, so the captured kernels see stable addresses.
-        batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[:bs]
-        )
 
     def copy_from(self, batch: Batch) -> None:
         _rows = slice(batch.padded_size * self.rows_per_req)
@@ -72,8 +61,6 @@ class GraphCaptureBuffer:
         self.positions[_rows] = batch.positions
         if self.mrope_positions is not None:
             self.mrope_positions[:, _rows] = batch.mrope_positions
-        if batch.linear_table_idx is not None:
-            self.table_idx[: batch.padded_size] = batch.linear_table_idx
 
 
 def _determine_cuda_graph_bs(
@@ -149,6 +136,7 @@ class GraphRunner:
         batch_hook: Callable[[Batch], None] | None = None,
         pool: Any = None,
         out_dtype: torch.dtype | None = None,
+        linear_backend: LinearAttnBackend | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -159,6 +147,7 @@ class GraphRunner:
         assert rows_per_req == 1 or dummy_req.extend_len == rows_per_req, (rows_per_req, dummy_req.extend_len)
         self.forward = forward
         self.attn_backend = attn_backend
+        self.linear_backend = linear_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
@@ -204,6 +193,8 @@ class GraphRunner:
             return logger.info_rank0("CUDA graph is disabled.")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
+        if self.linear_backend is not None:
+            self.linear_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -234,13 +225,8 @@ class GraphRunner:
                 self.batch_hook(batch)
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
-            # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
-            # touches scratch (real slot indices are written by copy_from on replay). Hybrid-
-            # radix decouples the GDN slot from table_idx -> use the GDN padding slot.
-            dummy_slot = (self.dummy_req.linear_slot_idx
-                          if self.dummy_req.linear_slot_idx is not None
-                          else self.dummy_req.table_idx)
-            self.buffer.table_idx[:bs].fill_(dummy_slot)
+            if self.linear_backend is not None:
+                self.linear_backend.prepare_for_capture(batch)
             with get_global_ctx().forward_batch(batch, **self.ctx_override):
                 self._store_output(bs, self.forward())
                 # Keep the offload cache warmed for capture. Resetting here forces
@@ -271,6 +257,8 @@ class GraphRunner:
         padded = batch.padded_size
         g = self.graph_map[padded]
         self.attn_backend.prepare_for_replay(batch)
+        if self.linear_backend is not None:
+            self.linear_backend.prepare_for_replay(batch)
         g.replay()
         outs = tuple(
             buf[: rows // padded * batch.size] for buf, rows in zip(self._out, self._out_rows[padded], strict=True)

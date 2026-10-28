@@ -136,10 +136,6 @@ class Batch:
     # [3, n] t/h/w rope positions on mrope models; positions keeps its sequence-index meaning for token_pool / page_table
     mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
-    # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
-    # decode to gather/scatter recurrent+conv state without host-side loops (so the
-    # decode step is CUDA-graph capturable). Set by the scheduler / graph buffer.
-    linear_table_idx: torch.Tensor | None = field(default=None, init=False)
     # Per-forward GatedDeltaNet metadata (cu_seqlens / cache_indices / continuation
     # flags), built once and shared by all GDN layers. Lazily built by the GDN op if
     # the scheduler/graph didn't set it.

@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import torch
 
+from freetoken.attention.linear import FLAMetadata
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.ple import (
@@ -561,8 +562,9 @@ def _fake_batch(reqs, *, decode, input_ids, positions=None, table_idx=None, devi
         is_prefill=not decode,
         input_ids=torch.tensor(input_ids, dtype=torch.int64, device=device),
         positions=None if positions is None else torch.tensor(positions, dtype=torch.int32, device=device),
-        linear_table_idx=(
-            None if table_idx is None else torch.tensor(table_idx, dtype=torch.int32, device=device)
+        fla_metadata=None if table_idx is None else FLAMetadata(
+            cu_seqlens=torch.arange(len(table_idx) + 1, dtype=torch.int32, device=device),
+            cache_indices=torch.tensor(table_idx, dtype=torch.int32, device=device),
         ),
     )
 
@@ -648,7 +650,8 @@ def test_decode_graph_replay_matches_eager():
     batch = SimpleNamespace(
         padded_reqs=[None] * bs, is_decode=True, is_prefill=False,
         input_ids=torch.randint(0, VOCAB, (bs,), device="cuda", dtype=torch.int32),
-        positions=positions, linear_table_idx=slots,
+        positions=positions,
+        fla_metadata=FLAMetadata(cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device="cuda"), cache_indices=slots),
     )
     R = torch.randn(bs, args.ple_state_width, device="cuda", dtype=torch.bfloat16)
     states0 = torch.randn(bs + 1, args.ple_state_width, args.ple_conv_state_len,
