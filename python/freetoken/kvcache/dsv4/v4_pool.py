@@ -279,6 +279,16 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                 f"{mem_GB(need)} > budget {mem_GB(budget)}; old cache kept, still serving"
             )
 
+    @classmethod
+    def rebuild_footprint(cls, config, num_pages: int, num_swa_pages: int | None) -> int:
+        # The DSV4 kv_cost does not take num_swa_pages, so price the family with the same
+        # byte model validate_rebuild uses (num_pages is USABLE; +1 for the dummy page).
+        from .v4_cost_model import _dsv4_pool_sizes, dsv4_pool_bytes
+
+        dsv4_args = config.model_config.dsv4_args
+        sizes = _dsv4_pool_sizes(config, num_pages + 1, num_swa_pages=num_swa_pages)
+        return dsv4_pool_bytes(sizes, dsv4_args, config.max_running_req + 1)
+
     def rebuild_from_config(
         self, config, num_pages: int, *, num_swa_pages: int | None = None
     ) -> None:
