@@ -277,7 +277,8 @@ void zero_inactive_routes(TensorView ids, TensorView out, ggml_type otype, cudaS
 
 // out[T, k, N]: row (t, j) multiplies x[t, j or 0] by expert ids[t, j] of W[E, N, K]; the matrix kernel runs a flat grid over the tiles that hold routes
 // scale[ids[t, j]] multiplies row (t, j); only the vector kernel takes it
-void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out, Optional<TensorView> scale) {
+// inactive: ids may hold negative (inactive) routes, which the matrix kernel then skips and zeroes; the vector kernel always does
+void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out, Optional<TensorView> scale, bool inactive) {
     RuntimeCheck(w.ndim() == 3, "mul_mat_id takes w[E, N, row_bytes]");
     RuntimeCheck(is_dtype(ids.dtype(), kDLInt, 32) && ids.ndim() == 2 && ids.IsContiguous(), "ids must be a contiguous int32 [T, k] tensor");
     const DeviceGuard guard(x.device());
@@ -317,8 +318,10 @@ void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, 
         }
         ggml_cuda_mul_mat_vec_q(ctx, &src0, &src1, &tids, &dst, scale.has_value() ? &fusion : nullptr);
     } else {
-        ggml_cuda_mul_mat_q(ctx, &src0, &src1, &tids, &dst, 0);
-        zero_inactive_routes(ids, out, otype, stream);
+        ggml_cuda_mul_mat_q(ctx, &src0, &src1, &tids, &dst, 0, inactive);
+        if (inactive) {
+            zero_inactive_routes(ids, out, otype, stream);
+        }
     }
 }
 

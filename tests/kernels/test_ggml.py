@@ -77,7 +77,7 @@ def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive):
     ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
     if inactive:  # hybrid decode hands the GPU the CPU's routes as id -1: zero rows, no expert read
         ids[::2, 0] = -1
-    actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids)
+    actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids, inactive=inactive)
     xs = x.cpu().float() if per_route_x else x.cpu().float().unsqueeze(1).expand(-1, 2, -1)
     expected = torch.einsum("tjk, tjok -> tjo", xs, ref[ids.cpu().long().clamp_min(0)])
     expected[ids.cpu() < 0] = 0

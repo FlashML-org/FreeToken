@@ -104,6 +104,7 @@ class GgmlMoEKernel(MoEKernel):
             return self._apply_float(layer, x, topk_weights, topk_ids, view, gate_up_type, is_prefill=is_prefill)
         assert not layer.apply_router_weight_on_input, "GGUF experts apply the router weights on the output"
         ids = topk_ids.to(torch.int32)
+        inactive = not is_prefill and cfg.decode_target == "hybrid"  # only hybrid decode hands over -1 routes
         gate_up = view.tensors["gate_up"]
         # a float half runs on the bf16 fused MoE's grouped GEMM, with its config for this layer's shape
         config = None
@@ -115,7 +116,7 @@ class GgmlMoEKernel(MoEKernel):
 
         def mul_mat_id(w: torch.Tensor, ggml_type: int, a: torch.Tensor) -> torch.Tensor:
             if is_quantized(ggml_type):
-                return ggml.mul_mat_id(w, ggml_type, a, ids)
+                return ggml.mul_mat_id(w, ggml_type, a, ids, inactive=inactive)
             # the bf16 kernels read every route's slot: an inactive one reads slot 0 and gets weight 0
             return float_mul_mat_id(w, a, ids.clamp_min(0), topk_weights, config)
 
@@ -137,7 +138,7 @@ class GgmlMoEKernel(MoEKernel):
             gated_act_and_mul(layer.activation, h.view(-1, two_i), inter.view(-1, two_i // 2), alpha=float(layer.alpha), limit=limit_or_inf(layer))
             del h  # free the gate_up output before the down GEMM allocates its own
         if down_scales is not None and x.shape[0] <= ggml.mmvq_max_tokens(down_type):
-            y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids, scale=down_scales[:, 2])
+            y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids, scale=down_scales[:, 2], inactive=inactive)
         else:
             y = mul_mat_id(view.tensors["down"], down_type, inter)
             if down_scales is not None:

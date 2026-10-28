@@ -153,7 +153,7 @@
 -    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
 -    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
 +        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-+        int64_t ncols_max) {
++        int64_t ncols_max, bool inactive_ids) {
 +    // FreeToken: bf16 and fp16 activations are quantized directly, except for the native fp4 paths; dst is fp32, bf16 or fp16
 +    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16 || src1->type == GGML_TYPE_F16);
 +    GGML_ASSERT(        dst->type  == GGML_TYPE_F32 || dst->type  == GGML_TYPE_BF16 || dst->type  == GGML_TYPE_F16);
@@ -202,16 +202,18 @@
              } else {
                  quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-@@ -284,6 +296,8 @@
+@@ -284,6 +296,10 @@
      ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
      ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
      ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
-+    // FreeToken: inactive routes (negative ids) get no compact row, so their ids_src1 entries stay -1
-+    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
++    // FreeToken: inactive routes (negative ids, only with inactive_ids) get no compact row, so their ids_src1 entries stay -1
++    if (inactive_ids) {
++        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
++    }
  
      // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
      // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
-@@ -299,6 +313,17 @@
+@@ -299,6 +315,17 @@
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -229,7 +231,7 @@
      const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
      ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
      ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-@@ -325,9 +350,21 @@
+@@ -325,9 +352,21 @@
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
              }
@@ -251,7 +253,7 @@
          } else {
              quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
-@@ -347,7 +384,7 @@
+@@ -347,7 +386,7 @@
          ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
          ne02, ne02, s02, s12, s2,
          ne03, ne13, s03, s13, s3,
@@ -598,7 +600,7 @@
  void ggml_cuda_mul_mat_q(
 -        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 +        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-+        int64_t ncols_max = -1);
++        int64_t ncols_max = -1, bool inactive_ids = false);
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 --- a/ggml/src/ggml-cuda/mmvq.cu
