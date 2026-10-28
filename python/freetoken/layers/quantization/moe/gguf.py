@@ -53,7 +53,7 @@ def float_mul_mat_id(w: torch.Tensor, x: torch.Tensor, ids: torch.Tensor, topk_w
 
     t, top_k = ids.shape
     per_route = x.dim() == 3
-    # f16 experts take f16 activations, as llama.cpp's f16 path does
+    # the float banks run bf16, so the activations cast to the banks' dtype
     a = x.reshape(-1, x.shape[-1]).to(w.dtype).contiguous()
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if config is None:
@@ -125,7 +125,8 @@ class GgmlMoEKernel(MoEKernel):
                 return ggml.mul_mat_id(w, ggml_type, a, ids)
             return float_mul_mat_id(w, a, ids, topk_weights, config)
 
-        # llama.cpp's build_moe_ffn: each NVFP4 GEMM result times the expert's weight_scale_2, gate and up before the glu, down before the routing weight
+        # llama.cpp's build_moe_ffn: each NVFP4 GEMM result times the expert's weight_scale_2 (before
+        # its bias), gate and up before the glu, down before the routing weight
         scales = view.tensors.get("global")
         gate_up_scales = scales if scales is not None and gate_up_type == NVFP4 else None
         down_scales = scales if scales is not None and down_type == NVFP4 else None
@@ -140,11 +141,11 @@ class GgmlMoEKernel(MoEKernel):
             inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu, *gu)
         else:
             h = mul_mat_id(gate_up, gate_up_type, x)
-            if gate_up_bias is not None:
-                h.add_(gate_up_bias[ids])
             t, k, two_i = h.shape
             if gate_up_scales is not None:
                 h.view(t, k, 2, two_i // 2).mul_(gate_up_scales[ids, :2].unsqueeze(-1))
+            if gate_up_bias is not None:
+                h.add_(gate_up_bias[ids])
             inter = torch.empty(t, k, two_i // 2, dtype=h.dtype, device=h.device)
             gated_act_and_mul(layer.activation, h.view(-1, two_i), inter.view(-1, two_i // 2), alpha=float(layer.alpha), limit=limit_or_inf(layer))
             del h  # free the gate_up output before the down GEMM allocates its own

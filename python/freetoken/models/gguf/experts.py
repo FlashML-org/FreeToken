@@ -116,6 +116,9 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             if scaled:
                 banks["global"].copy_(_expert_scales(parts, down, experts))
             if biased:
+                missing = [f"{blk}.ffn_{p}_exps.bias" for p in ("gate", "up", "down") if f"{blk}.ffn_{p}_exps.bias" not in index]
+                if missing:
+                    raise NotImplementedError(f"{model_path}: {', '.join(missing)}: the per-expert biases ship on every layer of a gpt-oss file")
                 # gpt-oss per-expert biases: gate|up as one [E, 2I] row block, down as [E, H]
                 gate_b, up_b, down_b = (
                     float_tensor(index[f"{blk}.ffn_{p}_exps.bias"]).to(torch.bfloat16) for p in ("gate", "up", "down")
