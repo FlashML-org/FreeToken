@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
+from typing import Any, ClassVar, Dict, List, Literal, Protocol, Tuple, TypeAlias
 
 from freetoken.attention.base import AttnType
 
@@ -242,6 +242,29 @@ def _full_group_attn_type(group: FullAttentionGroupConfig) -> AttnType:
     return AttnType.MLA
 
 
+class SlotVerify(Protocol):
+    """How a speculative verify step stages and commits one slot state; the state's owner supplies it and the pool only calls it.
+
+    The pool builds one per engine as ``cls(spec, max_bs, rows_per_req, device, dtype)``, ``dtype`` being the state's own, and keeps it across ``rebuild``.
+    A verify forward reads the live state only and writes what the commit needs into this handler's scratch; the owner gets it back with ``pool.verify_handler(spec.name)``.
+    Scratch row = verify-batch row, never a pool slot.
+    The scratch is single-buffered, which is safe because speculative decoding forces the normal loop.
+    A handler reads only its own scratch and writes only its own state, so the handlers commit in any order.
+    """
+
+    @staticmethod
+    def nbytes(spec: SlotStateSpec, max_bs: int, rows_per_req: int, dtype) -> int:
+        """Scratch bytes, from the spec alone, before any pool exists."""
+        ...
+
+    def commit(self, pool, slots, counts) -> None:
+        """Roll live slot ``slots[i]`` to where it stands after the first ``counts[i]`` rows of verify request i; int64 device tensors, one entry per request.
+
+        Reads the scratch without consuming it and may run more than once per step; reads the state through ``pool.slot_state`` on every call, since ``rebuild`` replaces it.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class SlotStateSpec:
     """One extra per-request tensor riding the LinearStatePool slots.
@@ -256,6 +279,8 @@ class SlotStateSpec:
     layer_ids: Tuple[int, ...] = ()
     dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
     fill_value: float = 0.0
+    # None: speculative decoding cannot serve a model carrying this state
+    verify: type[SlotVerify] | None = None
 
 
 @dataclass(frozen=True)

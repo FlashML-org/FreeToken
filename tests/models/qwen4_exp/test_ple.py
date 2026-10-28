@@ -30,7 +30,7 @@ from freetoken.models.qwen4_exp.ple import (
     short_conv_reference,
 )
 
-from .common import EOS, VOCAB, hash_constants, requires_cuda, toy_hf_config
+from .common import EOS, VOCAB, fresh_ctx, hash_constants, requires_cuda, toy_hf_config
 
 _HF_REF_PYTHON = os.environ.get("FREETOKEN_QWEN4_HF_PYTHON", "")
 _HF_REF_SCRIPT = Path(__file__).with_name("ple_hf_ref.py")
@@ -621,6 +621,66 @@ def test_context_matches_the_token_history_across_chunks_and_decode():
         commit_ngram_context(meta, None, ctxp)
         history.append(tok)
         cached += 1
+
+
+@requires_cuda
+@pytest.mark.parametrize("accepted", [(1, 4), (2, 1), (4, 3)])
+def test_verify_commit_matches_stepwise_decode(accepted):
+    """A verify forward over k+1 rows per request leaves the PLE state as it was; committing n rows leaves the conv history and n-gram context of n decode steps, and every row's conv output is its decode step's, bitwise."""
+    from freetoken.attention.linear import FLAMetadata
+    from freetoken.core import Batch, Req, SamplingParams
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.qwen4_exp.config import PLE_CONV_STATE, PLE_NGRAM_STATE
+
+    torch.manual_seed(19)
+    config = _config()
+    args = config.qwen4_args
+    device = torch.device("cuda")
+    layer = _make_layer(config, device="cuda")
+    pool = LinearStatePool(config.linear_attention_group(), 6, torch.float32, device, tp_size=1, slot_states=config.slot_states)
+    fresh_ctx(linear_state_pool=pool)
+    rows, slots = 4, [3, 1]
+    bs = len(slots)
+    conv = pool.slot_state(PLE_CONV_STATE, layer.layer_id)
+    context = pool.slot_state(PLE_NGRAM_STATE)
+    conv.copy_(torch.randn_like(conv))
+    context.copy_(torch.randint(8, VOCAB, context.shape, device=device, dtype=context.dtype))
+    conv0, context0 = conv.clone(), context.clone()
+    tokens = torch.tensor([[11, EOS, 12, 13], [14, 15, 16, EOS]], dtype=torch.int32, device=device)
+    x = torch.randn(bs, rows, args.ple_state_width, device=device)
+    slot_ids = torch.tensor(slots, dtype=torch.int32, device=device)
+
+    def batch(phase, input_ids, extend):
+        reqs = [Req(input_ids=torch.zeros(8 + extend, dtype=torch.int32), table_idx=slot, cached_len=8, output_len=8,
+                    uid=i, sampling_params=SamplingParams(), cache_handle=None) for i, slot in enumerate(slots)]
+        b = Batch(reqs=reqs, phase=phase, rows_per_req=extend)
+        b.padded_reqs, b.input_ids = reqs, input_ids
+        b.fla_metadata = FLAMetadata(
+            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device) * extend, cache_indices=slot_ids)
+        return b
+
+    want, after = [], []
+    for t in range(rows):
+        meta = build_ple_metadata(batch("decode", tokens[:, t].contiguous(), 1), args, device)
+        want.append(layer._short_conv(x[:, t].contiguous(), meta, conv))
+        commit_ngram_context(meta, None)
+        after.append((conv.clone(), context.clone()))
+    conv.copy_(conv0)
+    context.copy_(context0)
+
+    pool.attach_verify_scratch(bs, rows)
+    meta = build_ple_metadata(batch("verify", tokens.view(-1), rows), args, device)
+    got = layer._short_conv(x.view(bs * rows, -1), meta, conv)
+    pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
+    assert torch.equal(conv, conv0) and torch.equal(context, context0)
+    assert torch.equal(got.view(bs, rows, -1), torch.stack(want, dim=1))
+
+    pool.commit_verify(slots, list(accepted))
+    for slot, n in zip(slots, accepted):
+        assert torch.equal(conv[slot], after[n - 1][0][slot]), f"conv history of slot {slot} after {n} rows"
+        assert torch.equal(context[slot], after[n - 1][1][slot]), f"n-gram context of slot {slot} after {n} rows"
+    others = [s for s in range(conv.shape[0]) if s not in slots]
+    assert torch.equal(conv[others], conv0[others]) and torch.equal(context[others], context0[others])
 
 
 # --------------------------------------------------------------------------------------
