@@ -25,6 +25,15 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    """Embed token ids and replace multimodal placeholder rows when present."""
+    if batch.mm_embeds is None:
+        return embed_tokens.forward(input_ids)
+    x = embed_tokens.forward(input_ids.clamp(max=embed_tokens.num_embeddings - 1))
+    x.index_copy_(0, batch.mm_rows, batch.mm_embeds[:, : x.shape[1]].to(x.dtype))
+    return x
+
+
 class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
     def forward(self) -> torch.Tensor: ...

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from freetoken.engine.engine import Engine
 from freetoken.engine.engine import _parse_cpu_layers_spec as parse
 from freetoken.engine.engine import _resolve_cpu_layers as resolve
 
@@ -59,6 +60,39 @@ def test_resolve_backend_dispatch():
     assert resolve(_cfg("offload", None), L) == frozenset()
     # non-offload backend ignores the spec (validation lives in _adjust_config)
     assert resolve(_cfg("fused", "8"), L) == frozenset()
+
+
+def test_residency_split_returns_decode_target_and_lock_plan():
+    engine = Engine.__new__(Engine)
+    engine._host_tables_bytes = 0
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(decode_target="gpu"),
+        moe_strategy="offload",
+        moe_prefill_overlap=True,
+    )
+
+    result = engine._residency_split(config, frozenset({2}), None, capped=True)
+
+    assert result == ("gpu", True)
+    assert config.moe_prefill_overlap is False
+
+
+def test_engine_moe_pool_helpers_preserve_per_layout_pool_constraints():
+    engine = Engine.__new__(Engine)
+    engine.config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=8, num_experts_per_tok=2)
+    )
+    engine._moe_pool_groups = [[0, 1], [2]]
+    engine._moe_layer_slot_bytes = [10, 10, 30]
+    engine._moe_slot_limit = 12
+
+    pools = engine._moe_pools(batch=3)
+
+    assert [(pool.layers, pool.min_num_slots, pool.max_num_slots) for pool in pools] == [
+        ((0, 1), 6, 12),
+        ((2,), 6, 8),
+    ]
+    assert engine._moe_pool_bytes([10, 7]) == 310
 
 
 if __name__ == "__main__":

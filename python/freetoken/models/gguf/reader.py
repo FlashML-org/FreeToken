@@ -13,9 +13,12 @@ import os
 import re
 import struct
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
 
 
 def is_gguf_path(model_path: str) -> bool:
@@ -35,6 +38,8 @@ FTW_METADATA_GGUF = "source_metadata.gguf"
 # Records whether the source carried an untied "output.weight" head (the tensor table
 # is stripped from metadata-only gguf files, so the fact travels as a KV).
 OUTPUT_WEIGHT_PRESENT_KV = "freetoken.output_weight_present"
+GGUF_FORMAT_KV = "freetoken.gguf_format"
+GGML_NVFP4 = 40
 
 
 def gguf_config_source(model_path: str) -> str | None:
@@ -155,6 +160,29 @@ class GgufTensorInfo:
         reader = _reader(self.path)
         return reader.data[self.offset : self.offset + self.nbytes]
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Tensor shape in torch order."""
+        return tuple(reversed(self.ne))
+
+    @property
+    def rows(self) -> int:
+        """Number of packed rows, including leading tensor dimensions."""
+        return int(np.prod(self.shape[:-1]))
+
+    @property
+    def row_bytes(self) -> int:
+        """Packed byte width of one row."""
+        from .dequant import row_bytes
+
+        return row_bytes(self.shape[-1], self.ggml_type)
+
+    def packed(self) -> torch.Tensor:
+        """Packed ggml rows as a CPU uint8 tensor."""
+        from .tensors import packed_rows
+
+        return packed_rows(self)
+
 
 @functools.cache
 def gguf_tensor_index(model_path: str) -> dict[str, GgufTensorInfo]:
@@ -166,6 +194,11 @@ def gguf_tensor_index(model_path: str) -> dict[str, GgufTensorInfo]:
                 t.name, path, int(t.data_offset), int(t.n_bytes), int(t.tensor_type), tuple(int(x) for x in t.shape), model_path
             )
     return index
+
+
+def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensorInfo]:
+    """Iterate over GGUF tensors with packed-row access."""
+    return iter(gguf_tensor_index(model_path).values())
 
 
 def gguf_architecture(model_path: str) -> str:
@@ -183,11 +216,14 @@ __all__ = [
     "is_gguf_path",
     "FTW_METADATA_GGUF",
     "OUTPUT_WEIGHT_PRESENT_KV",
+    "GGUF_FORMAT_KV",
+    "GGML_NVFP4",
     "gguf_config_source",
     "write_metadata_gguf",
     "GgufTensorInfo",
     "gguf_split_paths",
     "gguf_tensor_index",
+    "iter_gguf_tensors",
     "load_gguf_metadata",
     "gguf_architecture",
     "gguf_tensor_names",

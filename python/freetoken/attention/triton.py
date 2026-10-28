@@ -134,16 +134,22 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, TritonMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        spec = attn_spec or AttentionSpec()
+        cache_layer_id = (
+            spec.kv_cache_layer_id
+            if spec.kv_cache_layer_id is not None
+            else layer_id
+        )
+        if cache_layer_id == layer_id:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        k_raw = self.kvcache.k_cache(layer_id)
-        v_raw = self.kvcache.v_cache(layer_id)
+        k_raw = self.kvcache.k_cache(cache_layer_id)
+        v_raw = self.kvcache.v_cache(cache_layer_id)
         kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
         assert head_dim == q.shape[-1]
         k_cache = k_raw.view(-1, kv_heads, head_dim)
         v_cache = v_raw.view(-1, kv_heads, head_dim)
 
-        spec = attn_spec or AttentionSpec()
         block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:

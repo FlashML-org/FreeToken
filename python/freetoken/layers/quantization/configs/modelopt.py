@@ -20,6 +20,7 @@ class ModelOptConfig(QuantConfig):
         "NVFP4": nvfp4_scheme(input_scale=True),
         "W4A16_NVFP4": nvfp4_scheme(input_scale=False),
         "FP8": fp8_tensor_scheme("fp32", input_scale=True),
+        "FP8_NO_INPUT": fp8_tensor_scheme("fp32", input_scale=False),
         "FP8_PER_CHANNEL_PER_TOKEN": fp8_tensor_scheme("fp32", per_row=True),
         "FP8_PB_WO": fp8_block_scheme("fp32"),
         "MXFP8": mxfp8_scheme(),
@@ -41,7 +42,9 @@ class ModelOptConfig(QuantConfig):
         super().__init__(name_map, unquantized)
         self.algo = str(q.get("quant_algo") or "").upper()
         # Inferact exports carry this key; false says the FP8 and NVFP4 layers store no input_scale, and an explicit value wins over the config_groups rule below
-        self.with_input_scale = q.get("with_input_scale")
+        # Older ModelOpt weight-only exports omit this key and store no activation
+        # scales; treat the missing value as W4A16/FP8-without-input-scale.
+        self.with_input_scale = q.get("with_input_scale", False)
         groups = q.get("config_groups")
         # an export with no activation quantizer can still say NVFP4; every config group then has input_activations null (vLLM applies the same rule)
         if self.with_input_scale is None and self.algo == "NVFP4" and isinstance(groups, dict) and groups and all(isinstance(g, dict) and g.get("input_activations") is None for g in groups.values()):
@@ -60,6 +63,9 @@ class ModelOptConfig(QuantConfig):
         algo = self._module_algo(name)
         return None if algo is None else self._scheme_of(algo)
 
+    def is_ignored_name(self, name: str) -> bool:
+        return self.ignore(name)
+
     def _module_algo(self, name: str) -> str | None:
         if self.algo != "MIXED_PRECISION":
             return self.algo
@@ -75,6 +81,10 @@ class ModelOptConfig(QuantConfig):
                 return fp8_tensor_scheme("fp32")  # ModelOpt has no algo name for fp8 without an activation scale
             if algo == "NVFP4":
                 algo = "W4A16_NVFP4"
+        if algo in ("NVFP4", "W4A16_NVFP4") and self.with_input_scale is not True:
+            return self.SCHEMES["W4A16_NVFP4"]
+        if algo == "FP8" and self.with_input_scale is not True:
+            return self.SCHEMES["FP8_NO_INPUT"]
         try:
             return self.SCHEMES[algo]
         except KeyError:

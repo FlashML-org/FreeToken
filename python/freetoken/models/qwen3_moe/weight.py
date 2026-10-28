@@ -16,7 +16,7 @@ from freetoken.models.loader import (
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
-from .config import parse_config
+from .config import parse_config, parse_gguf_config
 
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 _MERGE_RULES = {
@@ -35,7 +35,8 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    config = parse_config(cached_load_hf_config(model_path))
+    hf_config = cached_load_hf_config(model_path)
+    config = parse_gguf_config(hf_config) if hasattr(hf_config, "metadata") else parse_config(hf_config)
     tp_info = get_tp_info()
 
     def sharded_tensors() -> Iterator[tuple[str, torch.Tensor]]:
@@ -93,7 +94,8 @@ def iter_weights_parallel(
     )
     from freetoken.models.weight import iter_expert_tensors_parallel
 
-    config = parse_config(cached_load_hf_config(model_path))
+    hf_config = cached_load_hf_config(model_path)
+    config = parse_gguf_config(hf_config) if hasattr(hf_config, "metadata") else parse_config(hf_config)
     tp_info = get_tp_info()
 
     def _is_expert(raw_name: str) -> bool:

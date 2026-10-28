@@ -15,14 +15,31 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
-from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
+from freetoken.layers import (
+    OffloadMoELayer,
+    VocabParallelEmbedding,
+    iter_moe_layers,
+    iter_ops,
+    set_rope_device,
+)
+from freetoken.layers.quantization import (
+    LayerKind,
+    QuantBackend,
+    QuantKind,
+    finalize_quant,
+    set_quant_backend,
+)
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
-from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
+from freetoken.moe.expert_banks import (
+    attach_resident_banks,
+    is_mixed,
+    load_expert_banks,
+    pin_probe_enabled,
+)
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
@@ -723,9 +740,10 @@ class Engine:
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
-        from freetoken.moe.expert_banks import is_mixed
-
-        method = shared_offload_method(self.model)
+        method = shared_offload_method(
+            self.model,
+            include_unquantized=_include_unquantized_offload_method(config.model_config),
+        )
         num_moe_layers = config.model_config.num_moe_layers
         # experts of several formats: one method per MoE layer, one slot pool per format
         layer_methods = offload_layer_methods(self.model)
@@ -765,6 +783,21 @@ class Engine:
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
+        disk_tier = None
+        if config.moe_disk_tier == "on":
+            if getattr(config.model_config, "model_type", "") != "qwen4_exp":
+                raise ValueError("--moe-disk-tier currently supports native qwen4_exp NVFP4 only")
+            if not 0 < config.expert_ram_experts < config.model_config.num_experts:
+                raise ValueError(
+                    f"--expert-ram-experts must be in (0, {config.model_config.num_experts})"
+                )
+            if decode_target != "gpu" or config.moe_prefill_overlap:
+                raise ValueError("--moe-disk-tier requires GPU offload and prefill overlap disabled")
+            if config.cuda_graph_max_bs != 0:
+                raise ValueError("--moe-disk-tier requires --cuda-graph-max-bs 0")
+            from freetoken.moe.disk_tier import DiskTierSpec
+
+            disk_tier = DiskTierSpec(config.expert_ram_experts)
         # read before the expert load, so a bad profile fails in seconds
         expert_counts = resolve_profile(
             config.moe_cache_split, config.model_path,
@@ -777,9 +810,12 @@ class Engine:
                     config.model_config,
                     method=method,
                     device=self.device,
+                    dtype=self.dtype,
                     dummy=config.use_dummy_weight,
                     parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
+                    disk_tier=disk_tier,
                     layer_methods=layer_methods,
                 )
         except PinFailed as exc:
@@ -890,12 +926,17 @@ class Engine:
             max_slots=max_slots,
             pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
             pool_sizes=pool_sizes,
+            disk_ram_experts=None if disk_tier is None else config.expert_ram_experts,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         if locked_fetch:
             cache.locked_hybrid = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
+        if banks.disk_index is not None:
+            cache.attach_disk_tier(
+                banks.disk_index, banks.disk_ram_experts, workers=config.disk_fetch_workers
+            )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
@@ -910,6 +951,21 @@ class Engine:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self.moe_offload_cache = cache
         return cache
+
+    def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
+        return sum(
+            size * self._moe_layer_slot_bytes[layers[0]]
+            for layers, size in zip(self._moe_pool_groups, pool_sizes)
+        )
+
+    def _moe_pools(self, batch: int) -> list:
+        """Return slot pools sized to hold the routed experts of ``batch`` decode tokens."""
+        model_config = self.config.model_config
+        num_experts = model_config.num_experts
+        min_num_slots = min(num_experts, model_config.num_experts_per_tok * batch)
+        return make_pools(
+            self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit
+        )
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
@@ -947,16 +1003,6 @@ class Engine:
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         return decode_target, split_residency
-
-    def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
-        return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
-
-    def _moe_pools(self, batch: int) -> list:
-        """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
-        model_config = self.config.model_config
-        num_experts = model_config.num_experts
-        min_num_slots = min(num_experts, model_config.num_experts_per_tok * batch)
-        return make_pools(self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit)
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.
@@ -1041,7 +1087,19 @@ class Engine:
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
         max_tokens *= config.decode_rows_per_req
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
-        layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
+        layer_formats = []
+        for layer in by_id:
+            method = getattr(layer, "quant_method", None)
+            if method is None or method.kind is QuantKind.NONE:
+                layer_formats.append((cache.quant_format, {}))
+                continue
+            fmt, options = method.cpu_spec()
+            if fmt is None:
+                raise NotImplementedError(
+                    f"CPU MoE executor has no format for {type(method).__name__} "
+                    f"on layer {layer.layer_id}."
+                )
+            layer_formats.append((fmt, options))
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -1399,6 +1457,11 @@ def _fused_resident_ok(model_config) -> bool:
     """Whether the resident ('fused') MoE path can hold this model's experts; DeepSeek-V4 experts stay offload."""
     if getattr(model_config, "expert_quant", "none") not in _RESIDENT_EXPERT_QUANTS:
         return False
+    if (
+        getattr(model_config, "model_type", "") == "qwen4_exp"
+        and getattr(model_config, "expert_quant", "none") == "none"
+    ):
+        return False
     return getattr(model_config, "moe_weight_format", None) in (None, "bf16", "mxfp4")
 
 
@@ -1625,6 +1688,13 @@ def _bank_bytes(config: EngineConfig, method=None, layer_methods=None) -> int | 
 
 def _pin_hint(reserved: int) -> str:
     if _pin_budget_bytes(reserved) is None:
+        from freetoken.moe.host_banks import pin_capped
+
+        if pin_capped():
+            return (
+                "CUDA's host-pinning limit can be lower than available system RAM; "
+                "try --moe-cpu-layers auto to OS-lock layers CUDA cannot pin"
+            )
         return "the expert banks need more page-locked host RAM than this host has; free host RAM or serve a smaller model"
     return (
         "pass --moe-cpu-layers auto to lock the layers over the pin budget for CPU decode, "
@@ -1718,30 +1788,62 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     return QuantBackend(quant_backend.items + (((LayerKind.MOE, kind), kernel),))
 
 
-def offload_layer_methods(model) -> list | None:
-    """The expert method of each offload MoE layer of ``model``, by MoE-layer id; None for models whose MoE layers carry none (GGUF)."""
-    layers = [l for l in iter_offload_moe_layers(model) if getattr(l, "quant_method", None) is not None]
-    if not layers:
-        return None
-    layers.sort(key=lambda layer: layer.layer_id)
-    assert [layer.layer_id for layer in layers] == list(range(len(layers))), [layer.layer_id for layer in layers]
-    return [layer.quant_method for layer in layers]
-
-
-def shared_offload_method(model):
-    """The expert method the offload MoE layers of ``model`` use, or None for models whose MoE layers carry none (GGUF).
-
-    With experts of several formats (a checkpoint that keeps some layers unquantized) this is the format of the most
-    layers; the cache then takes every layer's method (``offload_layer_methods``) and keeps one slot pool per format."""
-    from freetoken.moe.expert_banks import method_groups
-
+def shared_offload_method(model, *, include_unquantized: bool = False):
+    """Return the most common offload method, or None for native-format experts."""
     methods = offload_layer_methods(model)
     if methods is None:
         return None
+    methods = [
+        method for method in methods
+        if method.kind is not QuantKind.NONE
+    ]
+    if not methods and include_unquantized:
+        methods = [
+            layer.quant_method
+            for layer in iter_offload_moe_layers(model)
+            if getattr(layer, "quant_method", None) is not None
+        ]
+    if not methods:
+        return None
+    from freetoken.moe.expert_banks import method_groups
+
     groups = method_groups(methods)
-    found = ", ".join(f"{m.kind} via {m.kernel.name}" + (f" on {len(ids)} layers" if len(groups) > 1 else "") for m, ids in groups)
+    found = ", ".join(
+        f"{method.kind} via {method.kernel.name}"
+        + (f" on {len(layer_ids)} layers" if len(groups) > 1 else "")
+        for method, layer_ids in groups
+    )
     logger.info_rank0(f"MoE experts: {found}")
     return groups[0][0]
+
+
+def offload_layer_methods(model) -> list | None:
+    """Return the expert method of each offload MoE layer, ordered by layer id."""
+    layers = [
+        layer
+        for layer in iter_offload_moe_layers(model)
+        if getattr(layer, "quant_method", None) is not None
+    ]
+    if not layers:
+        return None
+    layers.sort(key=lambda layer: layer.layer_id)
+    assert [layer.layer_id for layer in layers] == list(range(len(layers))), [
+        layer.layer_id for layer in layers
+    ]
+    return [layer.quant_method for layer in layers]
+
+
+def _include_unquantized_offload_method(model_config) -> bool:
+    return (
+        model_config.model_type != "qwen4_exp"
+        and model_config.expert_quant == "none"
+        and model_config.moe_weight_format is None
+    )
+
+
+def offload_expert_method(config: EngineConfig):
+    """Return the most common offload method from a meta-device model build."""
+    return offload_expert_methods(config)[0]
 
 
 def _slot_limit(layer_methods) -> int | None:
@@ -1775,25 +1877,23 @@ def _meta_model(config: EngineConfig, decode_target: str):
 
 
 def offload_expert_methods(config: EngineConfig) -> tuple:
-    """``(method, layer_methods)`` of ``config``'s model, from a meta-device build: the most common expert method and,
-    for experts of several formats, one per MoE layer (else None).
-
-    For tools that load expert banks without an engine (the FTW converter); they pack for GPU decode."""
+    """Return the common expert method and per-layer methods from a meta-device model build."""
     from freetoken.moe.expert_banks import is_mixed
 
     model = _meta_model(config, "gpu")
     layer_methods = offload_layer_methods(model)
-    return shared_offload_method(model), (layer_methods if is_mixed(layer_methods) else None)
+    return (
+        shared_offload_method(
+            model,
+            include_unquantized=_include_unquantized_offload_method(config.model_config),
+        ),
+        layer_methods if is_mixed(layer_methods) else None,
+    )
 
 
 def meta_offload_layer_methods(config: EngineConfig, decode_target: str) -> list | None:
-    """The expert method of each offload MoE layer of ``config``'s model, from a meta-device build for ``decode_target``; see ``offload_layer_methods``."""
+    """Return per-layer expert methods from a meta-device model built for ``decode_target``."""
     return offload_layer_methods(_meta_model(config, decode_target))
-
-
-def offload_expert_method(config: EngineConfig):
-    """The (most common) offload expert method of ``config``'s model; see ``offload_expert_methods``."""
-    return offload_expert_methods(config)[0]
 
 
 def _adjust_config(config: EngineConfig):

@@ -16,6 +16,7 @@ from safetensors.torch import save_file
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
+from freetoken.models.qwen4_exp import weight as qwen4_weight
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseReader,
@@ -577,6 +578,21 @@ def test_expert_spec_reads_the_llm_compressor_names(checkpoint_fp8_channel):
     kinds = {spec.kind_map[spec.key_pattern.match(f"{base}.{k}")["kind"]] for k in ("weight_packed", "weight_scale", "weight_global_scale")}
     assert kinds == {"weight", "weight_scale", "weight_scale_2"}
     assert spec.global_reciprocal
+
+
+def test_modelopt_expert_spec_compiles_its_key_pattern(monkeypatch):
+    monkeypatch.setattr(
+        qwen4_weight,
+        "cached_load_hf_config",
+        lambda _: SimpleNamespace(quantization_config={"quant_method": "modelopt"}),
+    )
+    spec = nvfp4_expert_spec("model", None)
+    base = "model.language_model.layers.0.mlp.experts.1.gate_proj"
+
+    assert {
+        spec.key_pattern.match(f"{base}.{kind}")["kind"]
+        for kind in ("weight", "weight_scale", "weight_scale_2")
+    } == {"weight", "weight_scale", "weight_scale_2"}
 
 
 def _assert_fused_per_kind(loaded, raw, fused: str, parts: list[str]) -> None:

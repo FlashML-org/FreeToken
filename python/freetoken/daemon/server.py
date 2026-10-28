@@ -24,6 +24,15 @@ DEFAULT_PORT = 1900  # distinct from the serve default (1919)
 DEFAULT_SERVE_PORT = 1919
 
 
+def _manager_serve_api_key(manager) -> str | None:
+    get_api_key = getattr(manager, "serve_api_key", None)
+    if callable(get_api_key):
+        return get_api_key()
+    from freetoken.launch import API_KEY_ENV
+
+    return os.environ.get(API_KEY_ENV)
+
+
 def _default_state_dir() -> str:
     env = os.environ.get("FREETOKEN_DAEMON_DIR")
     if env:
@@ -133,7 +142,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
     ring = LogRing(capacity=args.log_capacity)
     store = ServeStateStore(os.path.join(state_dir, "serve.json"))
     # read at call time: the running serve's key, from the manager created below
-    probe = ServeProbe(api_key=lambda: manager.serve_api_key())
+    probe = ServeProbe(api_key=lambda: _manager_serve_api_key(manager))
 
     def tailer_factory(child):
         log_path = getattr(child, "log_path", None)

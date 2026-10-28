@@ -51,7 +51,6 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
-    # packed ggml rows (a GGUF table) of ``row_values`` values each; None for float rows of ``row_dtype``
     ggml_type: int | None = None
     row_values: int | None = None
     row_dtype: torch.dtype = torch.float8_e4m3fn
@@ -69,6 +68,7 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     paths: list[str] = []
     path_idx: dict[str, int] = {}
     shards: dict[int, tuple[int, int]] = {}
+    shard_dtype: torch.dtype | None = None
     for path in _ple_table_files(folder):
         header, base = _safetensors_header(path)
         for key, meta in header.items():
@@ -81,10 +81,12 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            shard_dtype = _PLE_ST_DTYPES.get(meta["dtype"])
-            if shard_dtype is None or dtype not in (None, shard_dtype):
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected one of {sorted(_PLE_ST_DTYPES)} for every shard")
-            dtype = shard_dtype
+            dtype = _PLE_ST_DTYPES.get(meta["dtype"])
+            if dtype is None or shard_dtype not in (None, dtype):
+                raise ValueError(
+                    f"PLE shard {key} has dtype {meta['dtype']}, expected one of {sorted(_PLE_ST_DTYPES)} for every shard"
+                )
+            shard_dtype = dtype
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
             rows, cols = meta["shape"]
@@ -97,14 +99,17 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             shards[idx] = (path_idx[path], base + meta["data_offsets"][0])
     if sorted(shards) != list(range(len(shards))) or not shards:
         raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
-    if scale is None:
-        if dtype is torch.float8_e4m3fn:
-            raise ValueError("PLE table has no weight_scale")
-        scale = torch.tensor(1.0)
+    if scale is None and shard_dtype is torch.float8_e4m3fn:
+        raise ValueError("PLE table has no weight_scale")
     order = [shards[i] for i in range(len(shards))]
-    row_bytes = cols * dtype.itemsize
-    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, row_bytes, row_bytes, float(scale),
-                        row_values=cols, row_dtype=dtype)
+    assert shard_dtype is not None
+    if scale is None:
+        scale = torch.tensor(1.0, dtype=torch.bfloat16)
+    row_bytes = cols * shard_dtype.itemsize
+    return PleRowSource(
+        paths, [f for f, _ in order], [b for _, b in order], rows,
+        row_bytes, row_bytes, float(scale), row_values=cols, row_dtype=shard_dtype,
+    )
 
 
 def source_from_gguf(model_path: str) -> PleRowSource:
@@ -149,7 +154,6 @@ class DiskRowTable:
         self.head_dim = source.row_values or source.row_bytes
         self._ggml_type = source.ggml_type
         self._row_bytes = source.row_bytes
-        # float rows (fp8, or F32 / F16 / BF16 in a GGUF) are only cast; quantized ggml rows go through ggml
         self._row_dtype = source.row_dtype if source.ggml_type is None else float_dtype(source.ggml_type)
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
@@ -212,7 +216,7 @@ class DiskRowTable:
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
         self._worker = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="ple-fill")
-            if self._wait_sync and torch.version.hip is not None else None
+            if self._wait_sync and (torch.version.hip is not None or os.name == "nt") else None
         )
         self._pending: Future | None = None
         self._failed = False
@@ -236,7 +240,7 @@ class DiskRowTable:
         def _complete() -> None:
             self._fill_decode(histories, bs)
 
-        # Like Engram, release HIP's WAIT independently of a queue-blocked graph launch.
+        # Release the WAIT independently of a queue-blocked graph launch.
         self._pending = self._worker.submit(_complete)
 
     def _await_pending(self) -> None:
@@ -365,7 +369,6 @@ class DiskRowTable:
         if not capturing:
             self._eager_read[self._eager_slot].record(stream)
         if self._row_dtype is not None:
-            # copy=True: rows already in self.dtype must not alias the staging buffer the next fill reuses
             values = dev[:nbytes].view(self._row_dtype).to(self.dtype, copy=True)
         else:
             from freetoken.kernel import ggml

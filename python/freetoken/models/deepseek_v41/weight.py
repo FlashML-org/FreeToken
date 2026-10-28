@@ -61,7 +61,7 @@ class _ShardReader:
 
 
 def weight_map(model_path: str) -> dict:
-    with open(os.path.join(model_path, "model.safetensors.index.json")) as f:
+    with open(os.path.join(model_path, "model.safetensors.index.json"), encoding="utf-8") as f:
         return json.load(f)["weight_map"]
 
 

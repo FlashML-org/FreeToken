@@ -66,6 +66,17 @@ _ACT_IDS = {
     "swiglu_clamp": 4,
 }
 
+# Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
+_WFMT_IDS = {
+    "bf16": 0,
+    "nvfp4": 1,
+    "mxfp4_triton": 2,
+    "ds_fp4": 3,
+    "q4_0": 4,
+    "q8_0": 5,
+    "fp8_block": 6,
+}
+
 
 def compiled_extension_supports(activation: str) -> bool:
     """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
@@ -159,7 +170,8 @@ def _format_label(name: str, opts: tuple) -> str:
 
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
-    (the formats ``_cpu_moe.weight_formats()`` lists — see ``_resolve_banks``)."""
+    (bf16, nvfp4, mxfp4_triton, ds_fp4, q4_0, q8_0, or fp8_block — see
+    ``_WFMT_IDS`` / ``_resolve_banks``)."""
 
     def __init__(
         self,
@@ -432,12 +444,17 @@ class CpuMoeExecutor:
                 raise NotImplementedError(
                     f"bf16 CPU MoE requires bf16 banks, got {gate_up[rep].dtype}/{down[rep].dtype}"
                 )
-            H = int(gate_up[rep].shape[2])
-            I = int(gate_up[rep].shape[1] // 2)
-            assert gate_up[rep].shape[1] == 2 * I
-            assert tuple(down[rep].shape[1:]) == (H, I), (down[rep].shape, H, I)
-            banks = self._tables(gate_up=gate_up, down=down)
-            return banks, {}, (H, I)
+            H = int(gate_up[0].shape[2])
+            I = int(gate_up[0].shape[1] // 2)
+            assert gate_up[0].shape[1] == 2 * I
+            assert tuple(down[0].shape[1:]) == (H, I), (down[0].shape, H, I)
+            return self._tables(gate_up=gate_up, down=down), {}, (H, I)
+
+        if fmt == "q4_0":
+            return self._resolve_packed_gguf_banks(banks, block_bytes=18, fmt="q4_0")
+
+        if fmt == "q8_0":
+            return self._resolve_packed_gguf_banks(banks, block_bytes=34, fmt="q8_0")
 
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks, rep)
@@ -471,19 +488,21 @@ class CpuMoeExecutor:
         ``scaled`` adds global [E, 4] fp32, each expert's (gate, up, down, 1) NVFP4 weight_scale_2."""
         from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes, type_name
 
+    def _resolve_packed_gguf_banks(
+        self, banks: dict, *, block_bytes: int, fmt: str
+    ) -> tuple[dict, dict, tuple[int, int]]:
+        """Resolve native GGUF Q4_0/Q8_0 row-major packed expert banks."""
         gate_up, down = banks["gate_up"], banks["down"]
-        H, I = int(down[rep].shape[1]), int(gate_up[rep].shape[1] // 2)
-        for role, t, ggml_type, k in (("gate_up", gate_up[rep], gate_up_type, H), ("down", down[rep], down_type, I)):
-            dtype = float_dtype(ggml_type) if float_dtype(ggml_type) is not None else torch.uint8
-            if t.dtype != dtype or t.shape[-1] * t.element_size() != row_bytes(ggml_type, k):
-                raise ValueError(f"MoE layer {rep} {role} bank {tuple(t.shape)} {t.dtype} is not {type_name(ggml_type)} rows of {k} values")
-        types = {"gate_up_type": gate_up_type, "down_type": down_type}
-        if not scaled:
-            return self._tables(gate_up=gate_up, down=down), types, (H, I)
-        scales = banks["global"]
-        if scales[rep].dtype != torch.float32 or tuple(scales[rep].shape) != (gate_up[rep].shape[0], 4) or not scales[rep].is_contiguous():
-            raise ValueError(f"MoE layer {rep} global bank {tuple(scales[rep].shape)} {scales[rep].dtype} is not contiguous [experts, 4] fp32")
-        return self._tables(gate_up=gate_up, down=down, **{"global": scales}), types, (H, I)
+        assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
+            gate_up[0].dtype, down[0].dtype,
+        )
+        I = int(gate_up[0].shape[1] // 2)
+        H = int(down[0].shape[1])
+        assert gate_up[0].shape[1] == 2 * I
+        assert H % 32 == 0 and I % 32 == 0, (H, I)
+        assert int(gate_up[0].shape[2]) == (H // 32) * block_bytes, (fmt, gate_up[0].shape, H)
+        assert int(down[0].shape[2]) == (I // 32) * block_bytes, (fmt, down[0].shape, I)
+        return self._tables(gate_up=gate_up, down=down), {}, (H, I)
 
     def _resolve_mxfp4_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
         """gpt-oss mxfp4 ``mxfp4_triton`` schema: transposed split-K blocks/scales

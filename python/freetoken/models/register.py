@@ -128,11 +128,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3",
         "Qwen3ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
+        parse_config="parse_gguf_config",
     ),
     "Qwen3MoeForCausalLM": ModelSpec(
         "freetoken.models.qwen3_moe",
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        parse_config="parse_gguf_config",
     ),
     # llama.cpp qwen2 / qwen3 / qwen3moe GGUF: the same model classes with every tensor in its packed ggml type
     "Qwen2GGUFForCausalLM": ModelSpec(
@@ -295,12 +297,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoeForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        parse_config="parse_gguf_config",
     ),
     "Qwen3_5ForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5ForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        parse_config="parse_gguf_config",
     ),
     # llama.cpp qwen35 / qwen35moe GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Qwen3_5GGUFForCausalLM": ModelSpec(
@@ -522,19 +526,19 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
 
 
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming.
+    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
+    from freetoken.layers.quantization import NameMap, QuantConfig
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
-    A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
-    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig
-
-    name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
-    if spec.parse_config == "parse_gguf_config":
-        to_gguf = _load_attr(spec.module, "to_gguf")
-        from freetoken.models.gguf.reader import gguf_tensor_index
-
-        types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
-        return GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
-    return QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+    # FTW stores dense tensors after the family loader has materialized them (usually
+    # BF16); only routed expert banks retain their native quantized representation.
+    if spec.parse_config == "parse_gguf_config" or is_ftw_checkpoint(model_path):
+        return None
+    return QuantConfig.from_hf(
+        hf_config,
+        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
+        unquantized=spec.unquantized_modules,
+    )
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

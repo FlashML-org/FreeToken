@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Iterator
+from typing import Any, Iterator, TYPE_CHECKING
 
 import torch
 
@@ -73,6 +73,11 @@ def _check_supported(shim: GgufConfigShim) -> None:
 
 
 def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
+    if shim.is_hf_nvfp4:
+        from .config import parse_gguf_config as parse_hf_nvfp4_config
+
+        return parse_hf_nvfp4_config(shim)
+
     md = shim.metadata
     arch = shim.model_type
 
@@ -91,6 +96,30 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         interval = int(kv("full_attention_interval"))
         layer_types = ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(num_layers)]
     moe = arch == "qwen35moe"
+    vision_config = getattr(shim, "vision_config", None)
+    rope_parameters: dict[str, Any] = {
+        "rope_type": "default",
+        "rope_theta": float(kv("rope.freq_base")),
+        "partial_rotary_factor": int(kv("rope.dimension_count")) / head_dim,
+    }
+    dimension_sections = md.get(f"{arch}.rope.dimension_sections")
+    if dimension_sections is not None:
+        rope_parameters["mrope_section"] = [int(s) for s in dimension_sections][:3]
+        rope_parameters["mrope_interleaved"] = True
+    else:
+        source_text = shim.hf_fields.get("text_config", {})
+        source_rope = source_text.get("rope_parameters", {})
+        sections = source_rope.get("mrope_section")
+        if sections is not None:
+            rope_parameters["mrope_section"] = [int(s) for s in sections][:3]
+            rope_parameters["mrope_interleaved"] = bool(
+                source_rope.get("mrope_interleaved", True)
+            )
+        elif vision_config is not None:
+            raise ValueError(
+                f"{shim.model_path}: GGUF metadata is missing "
+                f"{arch}.rope.dimension_sections, required for vision input"
+            )
     text = SimpleNamespace(
         hidden_act="silu",
         hidden_size=int(kv("embedding_length")),
@@ -99,13 +128,7 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         num_attention_heads=int(kv("attention.head_count")),
         num_key_value_heads=int(kv("attention.head_count_kv")),
         head_dim=head_dim,
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": float(kv("rope.freq_base")),
-            "partial_rotary_factor": int(kv("rope.dimension_count")) / head_dim,
-            "mrope_section": [int(s) for s in kv("rope.dimension_sections")][:3],
-            "mrope_interleaved": True,
-        },
+        rope_parameters=rope_parameters,
         max_position_embeddings=int(kv("context_length")),
         rms_norm_eps=float(kv("attention.layer_norm_rms_epsilon")),
         vocab_size=int(shim.vocab_size),
@@ -125,7 +148,7 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         text_config=text,
         model_type="qwen3_5_moe" if moe else "qwen3_5",
         architectures=list(shim.architectures),
-        vision_config=getattr(shim, "vision_config", None),
+        vision_config=vision_config,
         image_token_id=getattr(shim, "image_token_id", None),
     )
     config = parse_config(hf_like)
@@ -157,7 +180,25 @@ def iter_gguf_weights(
         return
     from freetoken.utils import cached_load_hf_config
 
-    config = parse_gguf_config(cached_load_hf_config(model_path))
+    shim = cached_load_hf_config(model_path)
+    if shim.is_hf_nvfp4:
+        config = parse_gguf_config(shim)
+        vision = include_vision and config.is_multimodal
+        log_mmproj(model_path, vision)
+        from .weight import iter_gguf_weights as iter_hf_nvfp4_gguf_weights
+
+        yield from iter_hf_nvfp4_gguf_weights(
+            model_path,
+            device,
+            include_moe_experts=include_moe_experts,
+            include_non_moe=True,
+            include_vision=include_vision,
+        )
+        if vision:
+            yield from iter_mmproj_weights(find_mmproj(model_path))
+        return
+
+    config = parse_gguf_config(shim)
     vision = include_vision and config.is_multimodal
     log_mmproj(model_path, vision)
     index = gguf_tensor_index(model_path)

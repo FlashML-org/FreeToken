@@ -5,10 +5,30 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.kernel.triton.gemma4_fused import gemma_dual_rmsnorm_residual_scalar
 from freetoken.layers import BaseOP, GemmaRMSNorm, LinearReplicated, make_moe_layer
-from freetoken.models.blocks import GatedMLP
+from freetoken.models.blocks import GatedMLP, gelu_tanh_and_mul
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+class _Nvfp4GatedMLP(BaseOP):
+    def __init__(self, config: ModelConfig):
+        from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
+
+        self.gate_up_proj = Nvfp4DenseColMerged(
+            config.hidden_size,
+            [config.intermediate_size, config.intermediate_size],
+            has_bias=False,
+        )
+        self.act_fn = gelu_tanh_and_mul
+        self.down_proj = Nvfp4DenseLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            has_bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj.forward(self.act_fn(self.gate_up_proj.forward(x)))
 
 
 class Gemma4Router(BaseOP):
@@ -16,7 +36,15 @@ class Gemma4Router(BaseOP):
 
     def __init__(self, config: ModelConfig):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, with_scale=False)
-        self.proj = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        if (
+            getattr(config, "moe_weight_format", None) == "nvfp4"
+            and not getattr(config, "gguf_router_bf16", False)
+        ):
+            from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseLinear
+
+            self.proj = Nvfp4DenseLinear(config.hidden_size, config.num_experts, has_bias=False)
+        else:
+            self.proj = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.scale = torch.empty(config.hidden_size)
         self.per_expert_scale = torch.empty(config.num_experts)
         self._scalar_root = config.hidden_size ** -0.5
@@ -40,7 +68,12 @@ class Gemma4MLP(BaseOP):
     """Gemma 4 feed-forward sandwich: shared MLP plus routed MoE branch."""
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
-        self.shared_mlp = GatedMLP(config, quant_config=config.quant, prefix=f"{prefix}.shared_mlp")
+        self.shared_mlp = (
+            _Nvfp4GatedMLP(config)
+            if getattr(config, "moe_weight_format", None) == "nvfp4"
+            and not getattr(config, "gguf_dense_bf16", False)
+            else GatedMLP(config)
+        )
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
@@ -58,7 +91,9 @@ class Gemma4MLP(BaseOP):
         self.post_feedforward_layernorm_2 = GemmaRMSNorm(hidden_size, eps=eps)
         self.layer_scalar = torch.empty(1)
 
-    def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pre_ff: torch.Tensor, x: torch.Tensor, *, apply_layer_scalar: bool = True
+    ) -> torch.Tensor:
         residual = x
         shared = self.shared_mlp.forward(pre_ff)
 
@@ -68,6 +103,11 @@ class Gemma4MLP(BaseOP):
         # keep the router's output intact.
         routed = self.experts.routed_forward(routed_in, topk_weights, topk_ids.clone())
 
+        layer_scalar = (
+            self.layer_scalar
+            if apply_layer_scalar
+            else torch.ones_like(self.layer_scalar)
+        )
         return gemma_dual_rmsnorm_residual_scalar(
             shared,
             self.post_feedforward_layernorm_1.weight,
@@ -75,7 +115,7 @@ class Gemma4MLP(BaseOP):
             self.post_feedforward_layernorm_2.weight,
             self.post_feedforward_layernorm.weight,
             residual,
-            self.layer_scalar,
+            layer_scalar,
             self.post_feedforward_layernorm_1.eps,
             self.post_feedforward_layernorm_2.eps,
             self.post_feedforward_layernorm.eps,
@@ -99,10 +139,13 @@ class Gemma4DenseMLP(BaseOP):
         )
         self.layer_scalar = torch.empty(1)
 
-    def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pre_ff: torch.Tensor, x: torch.Tensor, *, apply_layer_scalar: bool = True
+    ) -> torch.Tensor:
         h = self.shared_mlp.forward(pre_ff)
         h = self.post_feedforward_layernorm.forward(h)
-        return (x + h) * self.layer_scalar
+        output = x + h
+        return output * self.layer_scalar if apply_layer_scalar else output
 
 
 __all__ = [

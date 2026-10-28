@@ -44,7 +44,7 @@ CompileFlags:
         logger.warning(".clangd file already exists, nothing done.")
         logger.warning(f"suggested content: {clangd_content}")
     else:
-        with open(".clangd", "w") as f:
+        with open(".clangd", "w", encoding="utf-8") as f:
             f.write(clangd_content)
         logger.info(".clangd file generated.")
 

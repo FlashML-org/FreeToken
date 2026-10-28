@@ -126,7 +126,7 @@ def resolve_profile(spec: str, model_path: str, num_layers: int, num_experts: in
 
 def load_profile(path: str | Path, num_layers: int, num_experts: int, model_path: str = "") -> torch.Tensor:
     """Per-layer expert use ``[num_layers, num_experts]`` from a profile, each row scaled to sum to 1."""
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     model = str(data.get("model", ""))
     if model and model_path and not any(n.lower().startswith(model.lower()) for n in _model_names(model_path)):
         logger.warning_rank0(f"MoE pool profile {path} was taken on {model!r}, not on {model_path}")

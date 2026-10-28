@@ -14,6 +14,7 @@ __all__ = [
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "parse_config",
+    "parse_gguf_config",
     "iter_vision_weights",
     "iter_weights",
     "iter_weights_parallel",
@@ -21,6 +22,5 @@ __all__ = [
     "nvfp4_expert_spec",
     "gguf_mm_config",
     "iter_gguf_weights",
-    "parse_gguf_config",
     "to_gguf",
 ]

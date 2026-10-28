@@ -71,11 +71,33 @@ class QuantConfig(ABC):
     def scheme_for_name(self, name: str) -> QuantScheme | None:
         """Scheme of one module by its checkpoint name; None means unquantized."""
 
+    def is_ignored_name(self, name: str) -> bool:
+        """Whether the checkpoint explicitly excludes this name from quantization."""
+        return False
+
     def scheme_for(self, prefix: str) -> QuantScheme | None:
         if prefix in self._schemes:
             return self._schemes[prefix]
         names = self.name_map.to_checkpoint(prefix)
         schemes = {None if self.unquantized(n) else self.scheme_for_name(n) for n in names}
+        # Some multimodal wrappers name the text modules as model.layers in the quantization
+        # metadata even when the checkpoint-root mapping looks below model.language_model.
+        if (
+            all(scheme is None for scheme in schemes)
+            and prefix not in names
+            and not any(self.is_ignored_name(name) for name in names)
+        ):
+            logical_names = tuple(
+                name.replace("model.language_model.", "model.", 1)
+                for name in names
+            )
+            if logical_names != names:
+                # The mapped checkpoint root is authoritative when it has no scheme
+                # (for example, a BF16 vision tower in a globally quantized checkpoint).
+                schemes = {
+                    None if self.unquantized(name) else self.scheme_for_name(name)
+                    for name in logical_names
+                }
         if len(schemes) != 1:
             raise ValueError(f"fused module {prefix!r} mixes quantization schemes across {names}: {schemes}")
         scheme = schemes.pop()

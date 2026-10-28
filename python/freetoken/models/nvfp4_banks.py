@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 LayerToBank = Callable[[int, object], int | None]
 DropPageCache = Callable[[str], None]
+_NVFP4_TENSOR_KINDS_PER_PROJECTION = 3
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,7 @@ def iter_nvfp4_expert_pieces(
     chunk: int = 8 << 20,
     drop_page_cache: DropPageCache | None = None,
     primary: bool = True,
+    skip_experts_from: int | None = None,
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
@@ -121,6 +123,8 @@ def iter_nvfp4_expert_pieces(
         match = spec.key_pattern.match(name)
         if match is None:
             continue
+        if skip_experts_from is not None and int(match.group("expert")) >= skip_experts_from:
+            continue
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None or (keep is not None and bank_layer not in keep):
             continue
@@ -131,20 +135,14 @@ def iter_nvfp4_expert_pieces(
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
         wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
-        if kind == "weight" and act is not None:
-            act_name = name[: match.start("kind")] + act.name
-            if act_name in weight_map:
-                wanted[act_name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + "_input")
-    experts = (_num_moe_layers(config) if keep is None else len(keep)) * config.num_experts
-    acts = [name for name, (_, _, role) in wanted.items() if role.endswith("_input")]
-    # a partial set serves no W4A4 kernel; the pieces then carry none
-    if len(acts) != experts * 3:
-        for name in acts:
-            del wanted[name]
-        acts = []
-    per_expert = 12 if acts else 9
-    if len(wanted) != experts * per_expert:
-        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {experts * per_expert}")
+    tensors_per_expert = len(spec.proj_to_role) * _NVFP4_TENSOR_KINDS_PER_PROJECTION
+    expected = (
+        _num_moe_layers(config)
+        * (config.num_experts if skip_experts_from is None else skip_experts_from)
+        * tensors_per_expert
+    )
+    if len(wanted) != expected:
+        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)
@@ -165,7 +163,11 @@ def iter_nvfp4_expert_pieces(
         for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
             yield name, _ingest(spec, act, wanted[name][2], tensor)
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=per_expert)
+    return per_expert_pieces(
+        _parallel() if parallel else _serial(),
+        wanted.get,
+        tensors_per_expert=tensors_per_expert,
+    )
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

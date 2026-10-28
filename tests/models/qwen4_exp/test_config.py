@@ -110,17 +110,39 @@ def test_moe_dims():
     assert cfg.moe_enabled
 
 
-@pytest.mark.parametrize(
-    "quantization_config, expert_quant",
-    [
-        pytest.param(RADIXARK_NVFP4, "nvfp4", id="RadixArk/Qwen3.8-Flash-Next-NVFP4"),
-        pytest.param(NVIDIA_NVFP4, "nvfp4", id="nvidia/Qwen3.8-Flash-Next-NVFP4"),
-        pytest.param(QWEN_FP8, "fp8_block", id="Qwen/Qwen3.8-Flash-Next-FP8"),
-        pytest.param(None, "none", id="Qwen/Qwen3.8-Flash-Next"),
-    ],
-)
-def test_released_checkpoints_expert_quant(quantization_config, expert_quant):
-    assert parse_config(_hf_config(quantization_config)).expert_quant == expert_quant
+def test_mixed_precision_quantized_layers_detect_nvfp4_experts():
+    hf = _hf_config()
+    hf.quantization_config = {
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.language_model.layers.*.mlp.experts.*": {"quant_algo": "NVFP4"},
+            "model.language_model.layers.*.self_attn.*": {"quant_algo": "FP8"},
+        },
+    }
+
+    cfg = parse_config(hf)
+
+    assert cfg.expert_quant == "nvfp4"
+    assert cfg.attn_quant == cfg.dense_quant == cfg.lm_head_quant == "none"
+
+
+def test_mixed_precision_sequence_specs_detect_nvfp4_experts():
+    hf = _hf_config()
+    hf.quantization_config = {
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": [
+            "model.language_model.layers.*.mlp.experts.*: NVFP4",
+            "model.language_model.layers.*.self_attn.*: FP8",
+        ],
+    }
+
+    assert parse_config(hf).expert_quant == "nvfp4"
+
+
+def test_unquantized_config_parses():
+    hf = _hf_config()
+    hf.quantization_config = None
+    assert parse_config(hf).expert_quant == "none"
 
 
 def test_qwen4_args_payload():
@@ -215,6 +237,45 @@ def test_released_checkpoints_keep_the_dense_projections_bf16(quantization_confi
     quant = _quant(_hf_config(quantization_config), tmp_path)
     for prefix in DENSE_PREFIXES + BF16_PREFIXES:
         assert quant.scheme_for(prefix) is None, prefix
+
+
+def test_vision_quantization_follows_checkpoint_metadata(tmp_path):
+    hf = _hf_config(RADIXARK_NVFP4)
+    quant = _quant(hf, tmp_path)
+    assert quant.scheme_for("visual.blocks.0.attn.qkv") is None
+
+    hf.quantization_config = {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.visual.blocks.0.attn.qkv": {"quant_algo": "NVFP4"},
+        },
+    }
+    scheme = _quant(hf, tmp_path).scheme_for("visual.blocks.0.attn.qkv")
+    assert scheme is not None and str(scheme.kind) == "nvfp4"
+
+
+def test_qwen4_vision_tower_receives_model_quant_config(monkeypatch):
+    from freetoken.models.qwen4_exp import model as qwen4_model
+
+    captured = {}
+
+    def capture_vision(_vision_config, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(qwen4_model.Qwen4ExpForCausalLM, "__init__", lambda self, _config: None)
+    monkeypatch.setattr(qwen4_model, "Qwen3VLVisionModel", capture_vision)
+    config = SimpleNamespace(
+        is_multimodal=True,
+        vision_config=SimpleNamespace(deepstack_visual_indexes=()),
+        quant=object(),
+    )
+
+    model = qwen4_model.Qwen4ExpForConditionalGeneration(config)
+
+    assert captured["quant_config"] is config.quant
+    assert captured["prefix"] == "visual"
 
 
 # Qwen3.8-Flash-Next model card, "Processing Ultra-Long Texts": the 1M-token override.

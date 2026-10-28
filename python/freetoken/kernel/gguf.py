@@ -1,0 +1,203 @@
+"""Compatibility wrappers for operations on packed GGUF weights.
+
+Dequantization, matrix multiplication and vector-routed MoE use the shared ggml
+CUDA module, keeping weights in their native packed layout until kernel execution.
+"""
+
+from __future__ import annotations
+
+import functools
+import glob
+import os
+import pathlib
+import shutil
+
+import torch
+
+_CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
+
+
+def _host_compiler() -> str | None:
+    """A host compiler nvcc + libtorch headers accept.
+
+    The system default gcc can be too new for the torch headers (gcc 16 hard-errors),
+    and on this toolchain even nvcc+gcc-13 trips a non-conformant ``typename
+    decltype`` in ``List_inl.h`` once ``torch::Tensor`` is instantiated -- but nvcc
+    with ``clang++`` as host compiles it cleanly. So prefer clang++, then fall back
+    to an older gcc. Override with ``FREETOKEN_GGUF_HOST_CXX``.
+    """
+    override = os.environ.get("FREETOKEN_GGUF_HOST_CXX")
+    if override:
+        return override
+    if os.name == "nt":
+        candidates = glob.glob(
+            r"C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+        ) + glob.glob(
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+        )
+        if candidates:
+            return sorted(candidates)[-1]
+    for cxx in ("clang++", "g++-13", "g++-14", "g++-15"):
+        if shutil.which(cxx):
+            return cxx
+    return None
+
+
+def _c_compiler_for(cxx: str) -> str:
+    base = os.path.basename(cxx)
+    if "clang" in base:
+        return shutil.which("clang") or "clang"
+    cc = base.replace("g++", "gcc")
+    return shutil.which(cc) or cc
+
+
+def _short_windows_path(path: pathlib.Path) -> str:
+    if os.name != "nt":
+        return str(path)
+    import ctypes
+
+    get_short = ctypes.windll.kernel32.GetShortPathNameW
+    buf = ctypes.create_unicode_buffer(32768)
+    length = get_short(str(path), buf, len(buf))
+    return buf.value if length else str(path)
+
+
+def _force_windows_msvc_toolchain(cxx_path: str) -> None:
+    if os.name != "nt" or not cxx_path.lower().endswith("cl.exe"):
+        return
+    cl = pathlib.Path(cxx_path)
+    vc_tools = cl.parents[3]  # ...\VC\Tools\MSVC\14.x.x\
+    vc_root = cl.parents[6]  # ...\VC\
+    host_bin = cl.parent      # ...\Hostx64\x64
+    lib_dir = vc_tools / "lib" / "x64"
+    include_dir = vc_tools / "include"
+    os.environ["PATH"] = str(host_bin) + os.pathsep + os.environ.get("PATH", "")
+    os.environ["LIB"] = str(lib_dir) + os.pathsep + os.environ.get("LIB", "")
+    os.environ["INCLUDE"] = str(include_dir) + os.pathsep + os.environ.get("INCLUDE", "")
+    os.environ["VCToolsInstallDir"] = str(vc_tools) + os.pathsep
+    os.environ["VCINSTALLDIR"] = str(vc_root) + os.pathsep
+
+
+@functools.cache
+def _module():
+    from torch.utils.cpp_extension import load
+
+    extra_cuda_cflags = [
+        "-std=c++20", "-Xcompiler", "/std:c++20", "-allow-unsupported-compiler",
+        "-O3", "--expt-relaxed-constexpr",
+    ]
+    host_cxx = _host_compiler()
+    if host_cxx is not None:
+        # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
+        # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
+        # default (CXX unset -> g++) can be a gcc too new for the torch headers.
+        cxx_path = shutil.which(host_cxx) or host_cxx
+        extra_cuda_cflags += ["-ccbin", cxx_path]
+        if os.name == "nt" and cxx_path.lower().endswith("cl.exe"):
+            _force_windows_msvc_toolchain(cxx_path)
+            msvc_include = _short_windows_path(pathlib.Path(cxx_path).parents[3] / "include")
+            extra_cuda_cflags += [f"-Xcompiler=/I{msvc_include}"]
+        os.environ["CXX"] = cxx_path
+        os.environ["CC"] = _c_compiler_for(cxx_path)
+
+    # gguf_kernel.cu carries its own PYBIND11_MODULE (appended at the end), so a
+    # plain `load` of the single source compiles + binds the ggml_* ops.
+    return load(
+        name="freetoken_gguf_kernels",
+        sources=[str(_CSRC / "gguf_kernel.cu")],
+        extra_include_paths=[str(_CSRC)],
+        extra_cuda_cflags=extra_cuda_cflags,
+        verbose=True,
+    )
+
+
+# ---- thin typed wrappers (signatures mirror sgl_kernel.quantization.gguf) ----
+
+
+def ggml_dequantize(
+    weight: torch.Tensor, quant_type: int, m: int, n: int, dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Dequantize a packed GGUF weight ``[m, row_bytes]`` to a dense ``[m, n]`` tensor."""
+    from .ggml import dequantize
+
+    if weight.shape[0] != m:
+        raise ValueError(f"expected {m} GGUF rows, got {weight.shape[0]}")
+    output_dtype = dtype if dtype is not None else torch.bfloat16
+    return dequantize(weight, quant_type, n, output_dtype)
+
+
+def ggml_mul_mat_vec_a8(
+    weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+) -> torch.Tensor:
+    """MMVQ: small-batch GEMV with on-the-fly dequant. ``row`` = output features."""
+    from .ggml import mul_mat
+
+    if weight.shape[0] != row:
+        raise ValueError(f"expected {row} GGUF output rows, got {weight.shape[0]}")
+    return mul_mat(weight, quant_type, x)
+
+
+def ggml_mul_mat_a8(
+    weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+) -> torch.Tensor:
+    """MMQ: large-batch quantized matmul. ``row`` = output features."""
+    from .ggml import mul_mat
+
+    if weight.shape[0] != row:
+        raise ValueError(f"expected {row} GGUF output rows, got {weight.shape[0]}")
+    return mul_mat(weight, quant_type, x)
+
+
+def ggml_moe_a8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    quant_type: int,
+    row: int,
+    top_k: int,
+    tokens: int,
+) -> torch.Tensor:
+    """MMQ grouped expert matmul over stacked experts ``weight[E, row, *]``."""
+    return _module().ggml_moe_a8(
+        x, weight, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        quant_type, row, top_k, tokens,
+    )
+
+
+def ggml_moe_a8_vec(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    quant_type: int,
+    row: int,
+    tokens: int,
+) -> torch.Tensor:
+    """MMVQ grouped expert GEMV over stacked experts ``weight[E, row, *]``."""
+    from .ggml import mul_mat_id
+
+    if x.shape[0] != tokens:
+        raise ValueError(f"expected {tokens} input tokens, got {x.shape[0]}")
+    if weight.shape[1] != row:
+        raise ValueError(f"expected {row} GGUF output rows per expert, got {weight.shape[1]}")
+    if top_k < 1 or topk_ids.numel() < tokens * top_k:
+        raise ValueError("topk_ids does not contain the requested token routes")
+    ids = topk_ids.reshape(-1)[: tokens * top_k].reshape(tokens, top_k).to(torch.int32)
+    output = mul_mat_id(weight, quant_type, x, ids)
+    return output.reshape(tokens * top_k, row)
+
+
+def ggml_moe_get_block_size(quant_type: int) -> int:
+    return _module().ggml_moe_get_block_size(quant_type)
+
+
+__all__ = [
+    "ggml_dequantize",
+    "ggml_mul_mat_vec_a8",
+    "ggml_mul_mat_a8",
+    "ggml_moe_a8",
+    "ggml_moe_a8_vec",
+    "ggml_moe_get_block_size",
+]

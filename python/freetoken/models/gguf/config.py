@@ -15,7 +15,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .mmproj import Mmproj, find_mmproj, warn_inline_vision
-from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
+from .reader import (
+    GGML_NVFP4,
+    GGUF_FORMAT_KV,
+    gguf_architecture,
+    load_gguf_metadata,
+    gguf_tensor_names,
+)
 
 # GGUF ``general.architecture`` -> FreeToken registry key (a GGUF-specific spec that
 # reuses the model classes but a GGUF parse_config / iter_weights).
@@ -39,6 +45,9 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "qwen3vl": "Qwen3VLGGUFForCausalLM",
     "qwen3vlmoe": "Qwen3VLMoeGGUFForCausalLM",
     "qwen4exp": "Qwen4ExpGGUFForCausalLM",
+    "qwen3_moe": "Qwen3MoeGGUFForCausalLM",
+    "qwen3_5_moe": "Qwen3_5MoeGGUFForCausalLM",
+    "qwen3_5": "Qwen3_5MoeGGUFForCausalLM",
 }
 # (GGUF architecture, mmproj projector) -> registry key, for text GGUFs whose release is told apart only by its mmproj
 GGUF_MMPROJ_TO_REGISTRY: dict[tuple[str, str], str] = {
@@ -64,6 +73,20 @@ class GgufConfigShim:
 
         # __dict__ lookup: copy.copy probes attributes before the fields exist
         return getattr(RawConfigShim(self.__dict__.get("hf_fields") or {}), name)
+
+    @property
+    def is_hf_nvfp4(self) -> bool:
+        from .reader import _reader
+
+        if self.metadata.get(GGUF_FORMAT_KV) == "hf_nvfp4":
+            return True
+        return (
+            (
+                "model.language_model.embed_tokens.weight" in gguf_tensor_names(self.model_path)
+                or "token_embd.weight" in gguf_tensor_names(self.model_path)
+            )
+            and any(int(t.tensor_type) == GGML_NVFP4 for t in _reader(self.model_path).tensors)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Minimal HF-config-like dict for trunk code that introspects the config
@@ -111,13 +134,15 @@ def mm_fields(model_path: str, mmproj: Mmproj) -> tuple[dict[str, Any], dict[str
 
 def build_gguf_shim(model_path: str) -> GgufConfigShim:
     arch = gguf_architecture(model_path)
+    names = gguf_tensor_names(model_path)
+    if arch == "qwen3" and any(".linear_attn." in name for name in names):
+        arch = "qwen3_5_moe"
     registry_key = GGUF_ARCH_TO_REGISTRY.get(arch)
     if registry_key is None:
         raise ValueError(
             f"GGUF architecture {arch!r} is not supported "
             f"(known: {sorted(GGUF_ARCH_TO_REGISTRY)})"
         )
-    names = gguf_tensor_names(model_path)
     warn_inline_vision(model_path, names)
     metadata = load_gguf_metadata(model_path)
     if names:

@@ -142,10 +142,12 @@ def fetch_plan(share: float, layers: list[int], layer_rows) -> dict[int, tuple[i
 
 
 def _smt_siblings(cpus: list[int]) -> list[int]:
+    if os.name == "nt":
+        return []
     out = []
     for cpu in cpus:
         try:
-            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list", encoding="utf-8") as f:
                 text = f.read().strip()
         except OSError:
             continue
@@ -168,6 +170,8 @@ def _copy_cpus(executor, count: int) -> list[int]:
     from freetoken.moe.cpu_executor import physical_core_cpus
 
     busy = set(executor.core_ids) | {getattr(executor, "_coord_core", -1)}
+    if os.name == "nt":
+        busy.add(0)
     cpus = [c for c in dict.fromkeys(_smt_siblings(executor.core_ids)) if c not in busy]
     cpus = cpus or [c for c in physical_core_cpus() if c not in busy]
     return cpus[:count]

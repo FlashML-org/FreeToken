@@ -18,12 +18,13 @@ from freetoken.layers.quantization import QuantKind
 from freetoken.utils import init_logger
 
 from .host_banks import HostBank
-from .offload_cache import _BANK_BYTES_PER_EXPERT, placeholder_bank
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS, placeholder_bank
 
 logger = init_logger(__name__)
 
 # the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+_PARALLEL_CHUNK = 8 << 20
 
 
 @dataclass(frozen=True)
@@ -47,14 +48,12 @@ class ExpertBanks:
     kind: QuantKind | None = None
     kernel: str | None = None
     layout: dict | None = None
-    # per-layer quant tag (e.g. the gate_up and down GGUF types), for layers whose banks match in dtype and row shape but not in quant; None = one quant
     layer_tags: list | None = None
-    # per bank, per layer: bytes past an expert matrix's last row that the kernel reads and that must read as zeros (ggml MMQ); None = no such reads
-    row_tail_bytes: dict[str, list[int]] | None = None
-    # per-layer quant_format of experts in several formats (``quant_format``/``kind``/``kernel`` then name the most common one); None = every layer is ``quant_format``
     layer_formats: list[str] | None = None
-    # the residency plan holding DEFERRED layers' banks, for host_banks.probe_pin; None when nothing was deferred
+    row_tail_bytes: dict[str, list[int]] | None = None
     deferred_plan: object | None = None
+    disk_index: object | None = None
+    disk_ram_experts: int | None = None
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -214,29 +213,197 @@ def merge_expert_banks(parts: list[ExpertBanks], layer_methods, num_experts: int
     )
 
 
-def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for q4_0: GGUF is a single packed file "
+            "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
+            "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
+        )
+    from freetoken.models.weight import load_q4_0_moe_expert_sources
+    from freetoken.models.gguf.dequant import GGML_Q4_0
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes
+
+    sink = None if dummy else layer_sink
+    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    return ExpertBanks(
+        "q4_0",
+        {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]},
+        streamed=sink is not None,
+        row_tail_bytes={
+            "gate_up": [mmq_tail_bytes(GGML_Q4_0, model_config.hidden_size)] * model_config.num_layers,
+            "down": [mmq_tail_bytes(GGML_Q4_0, model_config.moe_intermediate_size)] * model_config.num_layers,
+        },
+    )
+
+
+def _q8_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError("parallel reader not implemented for q8_0 GGUF experts")
+    from freetoken.models.weight import load_q8_0_moe_expert_sources
+    from freetoken.models.gguf.dequant import GGML_Q8_0
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes
+
+    sink = None if dummy else layer_sink
+    sources = load_q8_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    return ExpertBanks(
+        "q8_0",
+        {name: sources[name] for name in _BANK_SCHEMAS["q8_0"]},
+        streamed=sink is not None,
+        row_tail_bytes={
+            "gate_up": [mmq_tail_bytes(GGML_Q8_0, model_config.hidden_size)] * model_config.num_layers,
+            "down": [mmq_tail_bytes(GGML_Q8_0, model_config.moe_intermediate_size)] * model_config.num_layers,
+        },
+    )
+
+
+def _q4_k_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    from freetoken.kernel.gguf import ggml_dequantize
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
+
+    E, H, I, L = model_config.num_experts, model_config.hidden_size, model_config.moe_intermediate_size, model_config.num_layers
+    hb = alloc_layer_banks({"gate_up": ((E, 2 * I, H), torch.bfloat16), "down": ((E, H, I), torch.bfloat16)}, L)
+    banks = {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
+    tensors = {t.name: t for t in iter_gguf_tensors(model_path)}
+    for layer in range(L):
+        gate = tensors[f"blk.{layer}.ffn_gate_exps.weight"]
+        up = tensors[f"blk.{layer}.ffn_up_exps.weight"]
+        down = tensors[f"blk.{layer}.ffn_down_exps.weight"]
+
+        def dequant(tensor):
+            packed = tensor.packed().to(device="cuda", dtype=torch.uint8)
+            rows, cols = tensor.rows, int(tensor.shape[-1])
+            return ggml_dequantize(packed, tensor.ggml_type, rows, cols, torch.bfloat16).reshape(-1, cols).cpu()
+
+        banks["gate_up"][layer].copy_(torch.cat((dequant(gate).reshape(E, I, H), dequant(up).reshape(E, I, H)), dim=1))
+        banks["down"][layer].copy_(dequant(down).reshape(E, H, I))
+    if layer_sink is None and torch.cuda.is_available():
+        pin_banks(hb)
+    return ExpertBanks("bf16", banks, streamed=layer_sink is not None and not dummy)
+
+
+def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, disk_tier=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for nvfp4 GGUF: use the GGUF-native reader"
+        )
+    if getattr(model_config, "model_type", "") in ("qwen3_5_moe", "qwen4_exp") and os.path.isdir(model_path):
+        from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+        if getattr(model_config, "model_type", "") == "qwen4_exp":
+            from freetoken.models.qwen4_exp.weight import nvfp4_expert_spec
+        else:
+            from freetoken.models.qwen3_5_moe.weight import nvfp4_expert_spec
+        from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
+
+        E, H, I, L = model_config.num_experts, model_config.hidden_size, model_config.moe_intermediate_size, model_config.num_moe_layers
+        ram = E if disk_tier is None else disk_tier.ram_experts
+        hb = alloc_layer_banks({
+            "gate_up_packed": ((ram, 2 * I, H // 2), torch.uint8),
+            "gate_up_scale": ((ram, 2 * I, H // 16), torch.float8_e4m3fn),
+            "gate_up_global": ((ram, 2 * I), torch.float32),
+            "down_packed": ((ram, H, I // 2), torch.uint8),
+            "down_scale": ((ram, H, I // 16), torch.float8_e4m3fn),
+            "down_global": ((ram, H), torch.float32),
+        }, L)
+        banks = {name: [bank.tensor for bank in layers] for name, layers in hb.items()}
+        seen = torch.zeros(L, ram, dtype=torch.bool)
+        pieces = iter_nvfp4_expert_pieces(
+            model_path, model_config, nvfp4_expert_spec(model_path, model_config),
+            parallel=False, workers=workers, chunk=chunk,
+            skip_experts_from=None if disk_tier is None else ram,
+        )
+        def global_rows(value: torch.Tensor, rows: int) -> torch.Tensor:
+            value = value.reshape(value.shape[0], -1)
+            if value.shape[1] == 1:
+                return value.expand(-1, rows)
+            if value.shape[1] != rows:
+                raise ValueError(f"NVFP4 global scale has {value.shape[1]} rows, expected 1 or {rows}")
+            return value
+
+        for layer, e0, e1, piece in pieces:
+            banks["gate_up_packed"][layer][e0:e1].copy_(torch.cat((piece["gate"], piece["up"]), dim=1))
+            banks["gate_up_scale"][layer][e0:e1].copy_(torch.cat((piece["gate_scale"], piece["up_scale"]), dim=1))
+            banks["gate_up_global"][layer][e0:e1].copy_(torch.cat((global_rows(piece["gate_global"], I), global_rows(piece["up_global"], I)), dim=1))
+            banks["down_packed"][layer][e0:e1].copy_(piece["down"])
+            banks["down_scale"][layer][e0:e1].copy_(piece["down_scale"])
+            banks["down_global"][layer][e0:e1].copy_(global_rows(piece["down_global"], H))
+            seen[layer, e0:e1] = True
+        if not bool(seen.all()):
+            raise ValueError(f"Qwen NVFP4 expert banks were not filled: {(~seen).nonzero().tolist()[:4]}")
+        pin_banks(hb)
+        disk_index = None
+        if disk_tier is not None:
+            from freetoken.moe.disk_tier import Nvfp4DiskIndex
+            disk_index = Nvfp4DiskIndex(model_path, model_config, nvfp4_expert_spec(model_path, model_config))
+        return ExpertBanks("nvfp4", banks, streamed=False, disk_index=disk_index,
+                           disk_ram_experts=ram)
+    elif getattr(model_config, "model_type", "") == "qwen3_5_moe":
+        from freetoken.models.qwen3_5_moe.weight import load_nvfp4_expert_sources
+    else:
+        from freetoken.models.gemma4.gguf import load_nvfp4_expert_sources
+
+    sources = load_nvfp4_expert_sources(
+        model_path, model_config, layer_sink=None if dummy else layer_sink
+    )
+    return ExpertBanks(
+        "nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
+        streamed=layer_sink is not None and not dummy,
+    )
+
+
+def _compressed_tensors_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for Gemma compressed-tensors expert banks"
+        )
+    from freetoken.models.gemma4.weight import _load_ct_fp8_expert_banks
+
+    return _load_ct_fp8_expert_banks(model_path, model_config, layer_sink=layer_sink)
+
+
+# expert formats that still load through their own provider (GGUF)
+_PROVIDERS = {
+    "q4_0": _q4_0_banks,
+    "q8_0": _q8_0_banks,
+    "q4_k": _q4_k_banks,
+    "nvfp4": _nvfp4_banks,
+    "compressed-tensors": _compressed_tensors_banks,
+}
+
+
+def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, disk_tier=None) -> ExpertBanks:
+    expert_quant = model_config.expert_quant
+    # Qwen4Exp's dense modules may be unquantized while routed experts remain native
+    # NVFP4; both ordinary offload and disk tier use the format-specific source reader.
+    if getattr(model_config, "model_type", "") == "qwen4_exp" and getattr(model_config, "expert_quant", "none") == "none":
+        expert_quant = "nvfp4"
+    if expert_quant not in _PROVIDERS:
+        raise ValueError(
+            f"{expert_quant!r} experts load through their MoE quant method; "
+            f"only {sorted(_PROVIDERS)} still have a format provider"
+        )
+    kwargs = dict(
+        parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
+        layer_sink=layer_sink,
+    )
+    if disk_tier is not None:
+        kwargs["disk_tier"] = disk_tier
+    return _PROVIDERS[expert_quant](
+        model_path, model_config, device, dtype, dummy, **kwargs
+    )
+
+
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
-    assert len(layer_methods) == num_layers, (len(layer_methods), num_layers)
-    groups = method_groups(layer_methods)
-    # resolve every format's reader before any bank exists, so a missing parallel reader falls back to serial with nothing allocated
-    readers = [
-        None if dummy else iter_expert_pieces(
-            model_path, model_config, method.kind, layers=layers, parallel=parallel, workers=workers, chunk=chunk
-        )
-        for method, layers in groups
-    ]
-    parts = []
-    for (method, layers), pieces in zip(groups, readers):
-        parts.append(build_expert_banks(
-            method, num_layers, pieces, device=device, layer_sink=layer_sink, dummy=dummy, layers=layers,
-        ))
-        logger.info_rank0(f"expert banks: {method.kind} / {method.kernel.name} on {len(layers)} of {num_layers} MoE layers")
-    return merge_expert_banks(parts, layer_methods, model_config.num_experts)
-
-
-_PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
+    if dummy:
+        return build_expert_banks(method, num_layers, None, device=device, dummy=True)
+    pieces = iter_expert_pieces(
+        model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
+    )
+    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
 
 
 def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, resident=False) -> ExpertBanks:
@@ -329,12 +496,15 @@ def load_expert_banks(
     *,
     method=None,
     device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
     dummy: bool = False,
     parallel: bool | None = None,
     workers: int = 8,
     chunk: int = _PARALLEL_CHUNK,
+    decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    disk_tier=None,
     resident: bool = False,
     layer_methods: list | None = None,
 ) -> ExpertBanks:
@@ -374,17 +544,20 @@ def load_expert_banks(
         raise ValueError("experts of several formats are served from the offload slot cache only (no resident experts, no --moe-cpu-layers)")
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
-    if model_path and is_ftw_checkpoint(model_path) and not dummy:
-        if resident:
-            banks = load_ftw_banks_to_device(model_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
-        else:
-            banks = load_ftw_banks(
-                model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-                layer_residency=layer_residency,
-            )
-        if banks is not None:
-            logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
-            return banks
+    if model_path and is_ftw_checkpoint(model_path):
+        if disk_tier is not None:
+            raise ValueError("--moe-disk-tier requires the original safetensors checkpoint, not an FTW checkpoint")
+        if not dummy:
+            if resident:
+                banks = load_ftw_banks_to_device(model_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
+            else:
+                banks = load_ftw_banks(
+                    model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+                    layer_residency=layer_residency,
+                )
+            if banks is not None:
+                logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+                return banks
 
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(
@@ -417,16 +590,31 @@ def load_expert_banks(
     from freetoken.moe.host_banks import requested_residency
 
     def _build(par: bool) -> ExpertBanks:
-        if mixed:
-            return _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, par, workers, chunk, layer_sink)
-        if method is not None and method.kind is QuantKind.GGUF:
-            from freetoken.models.gguf.experts import load_gguf_expert_banks
-
-            # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
-            return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=model_config.first_k_dense_replace, dummy=dummy, device=device if resident else None)
-        if method is None:
-            raise ValueError("the experts of a raw checkpoint are packed by the offload layers' MoE quant method; pass method=")
-        return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)
+        # compressed-tensors experts (e.g. Gemma) have no quant pieces; they load entirely through
+        # the legacy provider path (_compressed_tensors_banks -> _load_ct_fp8_expert_banks),
+        # even if method is set to UnquantizedMoEMethod.
+        expert_quant = getattr(model_config, "expert_quant", "none")
+        # Native NVFP4 checkpoints may use the unquantized MoE method for the
+        # layer modules while their routed experts still require the native
+        # NVFP4 bank provider. Do not send those banks through the BF16 piece
+        # reader, which has no stacked experts for a quantized checkpoint.
+        qwen4_native_nvfp4 = (
+            getattr(model_config, "model_type", "") == "qwen4_exp"
+            and expert_quant == "none"
+        )
+        if resident or (
+            disk_tier is None
+            and method is not None
+            and not qwen4_native_nvfp4
+            and expert_quant != "compressed-tensors"
+            and (expert_quant == "none" or method.kind is not QuantKind.NONE)
+        ):
+            assert method is not None
+            return _method_expert_banks(
+                model_path, model_config, method, device, dummy, par, workers, chunk,
+                layer_sink, resident,
+            )
+        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink, disk_tier)
 
     with requested_residency(layer_residency) as residency_plan:
         try:

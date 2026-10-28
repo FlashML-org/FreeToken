@@ -8,7 +8,7 @@ import torch
 import os
 
 from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
-from freetoken.engine.engine import _pin_budget_bytes
+from freetoken.engine.engine import _pin_budget_bytes, _pin_hint
 
 
 def test_moe_priority_fills_experts_up_to_total():
@@ -521,6 +521,16 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_pin_hint_explains_wddm_limit(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+    monkeypatch.setattr("freetoken.moe.host_banks.pin_capped", lambda: True)
+
+    hint = _pin_hint(reserved=0)
+
+    assert "lower than available system RAM" in hint
+    assert "--moe-cpu-layers auto" in hint
 
 
 def test_moe_slot_pool_split(tmp_path):

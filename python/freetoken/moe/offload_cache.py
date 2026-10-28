@@ -46,10 +46,12 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # Half the host/cache footprint of bf16; the grouped GEMM (kernel/triton/fp8_blockscale_moe)
     # reads the routed fp8 rows directly and dequantizes in the K-loop (no bf16 materialization).
     "fp8_block": ("gate_up", "gate_up_scale", "down", "down_scale"),
-    # GGUF experts in their own ggml type per layer: gate_up [L*E, 2I, row_bytes] (gate rows, then up rows), down [L*E, H, row_bytes]; float experts keep their dtype
-    "gguf": ("gate_up", "down"),
-    # GGUF experts whose NVFP4 tensors carry per-expert scales: global [L*E, 4] fp32 (gate, up, down, 1) weight_scale_2
-    "gguf_scaled": ("gate_up", "down", "global"),
+    # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
+    # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
+    "q4_0": ("gate_up", "down"),
+    "q8_0": ("gate_up", "down"),
+    # native GGUF Q4_K experts use the same two packed bank roles with 144-byte rows.
+    "q4_k": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp32 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -94,7 +96,9 @@ _BANK_BYTES_PER_EXPERT = {
         (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
-    "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 4) + H * (I // 2 + I // 16 + 4),
+    "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    "q8_0": lambda H, I: 2 * I * (H // 32) * 34 + H * (I // 32) * 34,
+    "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
 }
@@ -161,12 +165,12 @@ class OffloadMoeCache:
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
-    # Per-layer kernel layouts for experts of several formats (replaces ``layout``). The banks are the union of their roles;
-    # a layer whose kernel reads no such role carries a zero-byte [num_experts, 0] uint8 placeholder (see placeholder_bank).
+    # Per-layer kernel layouts for experts served by different formats.
     layer_layouts: list[dict] | None = None
-    # Each layer belongs to one pool: a contiguous slot range with its own LRU scope; pool p owns slots [sum(pool_sizes[:p]), +pool_sizes[p]). Slot ids in slot_for_id are local to the pool. None = one pool for all layers.
+    # Slot-cache partition: each MoE layer maps to a pool, with one capacity per pool.
     pool_of_layer: list[int] | None = None
     pool_sizes: list[int] | None = None
+    disk_ram_experts: int | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
@@ -344,13 +348,13 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
-        self._slice_pools()
+        self.disk_tier = None
 
     def _pool_layout(self, pool: int) -> int:
         return self.layer_layout[self.pool_of_layer.index(pool)]
 
     def _bank_rows(self, k: int, layout: int, offset: int, nrows: int) -> torch.Tensor:
-        """``nrows`` rows of bank ``k`` in ``layout``, starting ``offset`` bytes into the bank cache."""
+        """Return rows from one bank layout at a byte offset in its slot cache."""
         cache = self.banks[k][1]
         row = self._row_bytes[layout][k]
         if not self._raw_banks:
@@ -360,13 +364,19 @@ class OffloadMoeCache:
         return cache[offset : offset + nrows * row].view(dtype).view(nrows, *shape)
 
     def _bank_bytes(self, k: int, pool_sizes: list[int]) -> int:
-        """Bytes of raw bank ``k``: each pool's slots and pad, plus the largest pad, so two staging buffers fit wherever two layers of slots do."""
+        """Return one raw bank's storage, including pool and staging padding."""
         layouts = [self._pool_layout(p) for p in range(len(pool_sizes))]
-        slots = sum(s * self._row_bytes[g][k] + self._pad_bytes[g][k] for g, s in zip(layouts, pool_sizes))
+        slots = sum(
+            size * self._row_bytes[layout][k] + self._pad_bytes[layout][k]
+            for layout, size in zip(layouts, pool_sizes)
+        )
         return slots + max(pads[k] for pads in self._pad_bytes)
 
     def _stage_fits(self, buffers: int) -> bool:
-        return all(c.numel() * c.element_size() >= buffers * s for (_, c), s in zip(self.banks, self._stage_bytes))
+        return all(
+            cache.numel() * cache.element_size() >= buffers * stage
+            for (_, cache), stage in zip(self.banks, self._stage_bytes)
+        )
 
     def _slice_pools(self) -> None:
         E = self.num_experts
@@ -376,83 +386,118 @@ class OffloadMoeCache:
         self.pool_bases = bases
         spans = list(zip(bases, self.pool_sizes))
 
-        def cut(t: torch.Tensor, b: int, s: int) -> torch.Tensor:
-            return t if s == t.shape[0] else t[b : b + s]
+        def cut(t: torch.Tensor, base: int, size: int) -> torch.Tensor:
+            return t if size == t.shape[0] else t[base : base + size]
 
-        self._pool_id_of_slot = [cut(self.id_of_slot, b, s) for b, s in spans]
-        self._pool_usage = [cut(self.usage, b, s) for b, s in spans]
-        # rows[k][p]: bytes of one slot of pool p in bank k; before the banks exist, one unit per slot with a stage of E
+        self._pool_id_of_slot = [cut(self.id_of_slot, base, size) for base, size in spans]
+        self._pool_usage = [cut(self.usage, base, size) for base, size in spans]
         if self.banks:
-            rows = [[self._row_bytes[self._pool_layout(p)][k] for p in range(len(spans))] for k in range(len(self.banks))]
-            pads = [[self._pad_bytes[self._pool_layout(p)][k] for p in range(len(spans))] for k in range(len(self.banks))]
+            rows = [
+                [self._row_bytes[self._pool_layout(pool)][k] for pool in range(len(spans))]
+                for k in range(len(self.banks))
+            ]
+            pads = [
+                [self._pad_bytes[self._pool_layout(pool)][k] for pool in range(len(spans))]
+                for k in range(len(self.banks))
+            ]
             stage = self._stage_bytes
         else:
             rows, pads, stage = [[1] * len(spans)], [[0] * len(spans)], [E]
         offsets = []
         for row, pad in zip(rows, pads):
             offsets.append([0])
-            for s, r, d in zip(self.pool_sizes[:-1], row, pad):
-                offsets[-1].append(offsets[-1][-1] + s * r + d)
+            for size, row_bytes, pad_bytes in zip(self.pool_sizes[:-1], row, pad):
+                offsets[-1].append(offsets[-1][-1] + size * row_bytes + pad_bytes)
         self._pool_offsets = offsets
-        # local slots below this index overlap the prefill staging area in some bank; a pool's zero-byte rows (a role its kernel does not read) overlap nothing
         self._pool_stable_from = [
-            max((min(max(-(-(2 * stage[k] - offsets[k][p]) // rows[k][p]), 0), s) for k in range(len(rows)) if rows[k][p]), default=0)
-            for p, s in enumerate(self.pool_sizes)
+            max(
+                (
+                    min(max(-(-(2 * stage[k] - offsets[k][pool]) // rows[k][pool]), 0), size)
+                    for k in range(len(rows))
+                    if rows[k][pool]
+                ),
+                default=0,
+            )
+            for pool, size in enumerate(self.pool_sizes)
         ]
         self._inval = []
-        for b in range(2):
+        for buffer_id in range(2):
             mask = torch.zeros(self.cache_size, dtype=torch.bool)
             for k in range(len(rows)):
-                lo, hi = b * stage[k], (b + 1) * stage[k]
-                for p, (base, s) in enumerate(spans):
-                    if not rows[k][p]:
+                lo, hi = buffer_id * stage[k], (buffer_id + 1) * stage[k]
+                for pool, (base, size) in enumerate(spans):
+                    row_bytes = rows[k][pool]
+                    if not row_bytes:
                         continue
-                    first = max((lo - offsets[k][p]) // rows[k][p], 0)
-                    end = min(-(-(hi - offsets[k][p]) // rows[k][p]), s)
+                    first = max((lo - offsets[k][pool]) // row_bytes, 0)
+                    end = min(-(-(hi - offsets[k][pool]) // row_bytes), size)
                     mask[base + first : base + max(first, end)] = True
-            idx = mask.nonzero().flatten()
-            if idx.numel() == 0 or int(idx[-1] - idx[0]) + 1 == idx.numel():
-                self._inval.append(slice(int(idx[0]), int(idx[-1]) + 1) if idx.numel() else slice(0, 0))
+            indices = mask.nonzero().flatten()
+            if indices.numel() == 0 or int(indices[-1] - indices[0]) + 1 == indices.numel():
+                self._inval.append(
+                    slice(int(indices[0]), int(indices[-1]) + 1) if indices.numel() else slice(0, 0)
+                )
             else:
-                self._inval.append(idx.to(self.device))
+                self._inval.append(indices.to(self.device))
         self._stage_dirty = [False, False]
         if not self.banks:
             self._pool_bank_views, self._stage_views, self._stage_tails = [], [], []
             return
         self._pool_bank_views = [
-            tuple(self._bank_rows(k, self._pool_layout(p), offsets[k][p], s) for k in range(len(self.banks)))
-            for p, s in enumerate(self.pool_sizes)
+            tuple(self._bank_rows(k, self._pool_layout(pool), offsets[k][pool], size) for k in range(len(self.banks)))
+            for pool, size in enumerate(self.pool_sizes)
         ]
         self._stage_views = [
             [
-                tuple(self._bank_rows(k, g, b * stage[k], E) for k in range(len(self.banks))) if self._stage_fits(b + 1) else None
-                for b in range(2)
+                tuple(self._bank_rows(k, layout, buffer_id * stage[k], E) for k in range(len(self.banks)))
+                if self._stage_fits(buffer_id + 1) else None
+                for buffer_id in range(2)
             ]
-            for g in range(len(self.layouts))
+            for layout in range(len(self.layouts))
         ]
         self._stage_tails = [
-            [[self.banks[k][1][b * stage[k] + E * row[k] :][: pad[k]] for k in range(len(self.banks)) if pad[k] and self._stage_fits(b + 1)] for b in range(2)]
+            [
+                [
+                    self.banks[k][1][buffer_id * stage[k] + E * row[k] :][: pad[k]]
+                    for k in range(len(self.banks))
+                    if pad[k] and self._stage_fits(buffer_id + 1)
+                ]
+                for buffer_id in range(2)
+            ]
             for row, pad in zip(self._row_bytes, self._pad_bytes)
         ]
 
     def stage_views(self, layer_id: int, buffer_id: int) -> tuple[torch.Tensor, ...]:
-        """Per-bank ``[num_experts, ...]`` views of prefill staging buffer ``buffer_id`` in ``layer_id``'s layout; row == expert id."""
+        """Return prefill staging views for a layer's bank layout."""
         views = self._stage_views[self.layer_layout[layer_id]][buffer_id]
         assert views is not None, f"the slot cache is too small for staging buffer {buffer_id}"
         return views
 
     def pool_state(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(id_of_slot, usage)`` views of the pool that serves ``layer_id``."""
-        p = self.pool_of_layer[layer_id]
-        return self._pool_id_of_slot[p], self._pool_usage[p]
+        """Return the slot-id and usage views for a layer's pool."""
+        pool = self.pool_of_layer[layer_id]
+        return self._pool_id_of_slot[pool], self._pool_usage[pool]
 
     def pool_slots(self, layer_id: int) -> int:
         return self.pool_sizes[self.pool_of_layer[layer_id]]
 
     def pool_bank_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
-        """Per-bank slot views of the pool that serves ``layer_id``, indexed by its local slot ids."""
+        """Return cache-bank views indexed by the layer's local pool slots."""
         assert self.banks, "set_bank_sources must register the banks first"
         return self._pool_bank_views[self.pool_of_layer[layer_id]]
+
+    def _alloc_banks(self) -> None:
+        for k, name in enumerate(self.bank_schema):
+            if self._raw_banks:
+                self.bank_caches[name] = torch.zeros(
+                    self._bank_bytes(k, self.pool_sizes), dtype=torch.uint8, device=self.device
+                )
+            else:
+                dtype, shape = self.layouts[0][k]
+                self.bank_caches[name] = torch.zeros(
+                    (self.cache_size, *shape), dtype=dtype, device=self.device
+                )
+        self.banks = [(self.bank_sources[name], self.bank_caches[name]) for name in self.bank_schema]
 
     def set_bank_sources(
         self,
@@ -510,20 +555,32 @@ class OffloadMoeCache:
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
+            head = per_layer[0]
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
-                assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                spec = self.layout[name] if self.layout is not None else None
+                expected_rows = self.num_experts if self.disk_ram_experts is None else self.disk_ram_experts
+                if source.size(0) != expected_rows:
+                    raise ValueError((name, layer_id, source.shape))
+                spec = self.layout.get(name) if self.layout is not None else None
                 if self.layer_layouts is not None:
                     spec = self.layer_layouts[layer_id].get(name)
-                    if spec is None and source.numel() != 0:
-                        raise ValueError(f"layer {layer_id}'s expert kernel reads no {name!r} bank, so it takes a zero-byte placeholder")
+                    if spec is None:
+                        if source.numel() != 0:
+                            raise ValueError(
+                                f"layer {layer_id}'s expert kernel reads no {name!r} bank, "
+                                "so it takes a zero-byte placeholder"
+                            )
+                        continue
                 if spec is not None:
-                    if tuple(source.shape[1:]) != tuple(spec.shape) or source.dtype != spec.dtype:
-                        raise ValueError(
-                            f"bank {name!r} rows are {tuple(source.shape[1:])} {source.dtype} but the expert kernel's layout "
-                            f"wants {tuple(spec.shape)} {spec.dtype}; the banks were packed for another kernel"
-                        )
+                    expected_shape, expected_dtype = spec.shape, spec.dtype
+                else:
+                    expected_shape, expected_dtype = head.shape[1:], head.dtype
+                if tuple(source.shape[1:]) != tuple(expected_shape) or source.dtype != expected_dtype:
+                    raise ValueError(
+                        f"bank {name!r} rows for layer {layer_id} are "
+                        f"{tuple(source.shape[1:])} {source.dtype}, expected "
+                        f"{tuple(expected_shape)} {expected_dtype}"
+                    )
             self.bank_sources[name] = list(per_layer)
         keys = bank_layouts(sources, layer_tags)
         unique = list(dict.fromkeys(keys))
@@ -559,14 +616,18 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
-    def _alloc_banks(self) -> None:
-        for k, name in enumerate(self.bank_schema):
-            if self._raw_banks:
-                self.bank_caches[name] = torch.zeros(self._bank_bytes(k, self.pool_sizes), dtype=torch.uint8, device=self.device)
-            else:
-                dtype, shape = self.layouts[0][k]
-                self.bank_caches[name] = torch.zeros((self.cache_size, *shape), dtype=dtype, device=self.device)
-        self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+    @property
+    def disk_tier_enabled(self) -> bool:
+        return self.disk_tier is not None
+
+    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
+        from freetoken.moe.disk_tier import DiskTier
+
+        if self.disk_ram_experts != ram_experts:
+            raise ValueError("disk-tier source prefix does not match the cache configuration")
+        if ram_experts >= self.num_experts:
+            raise ValueError("disk tier requires fewer RAM experts than the model has")
+        self.disk_tier = DiskTier(index, self, ram_experts, workers)
 
     def _build_copy_plan(self) -> None:
         self._build_fused_copy_plan()
@@ -1254,6 +1315,27 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.disk_tier is not None:
+            if self._pending_whole_layer:
+                for expert in range(self.num_experts):
+                    if expert < self.disk_tier.ram_experts:
+                        for sources, cache in self.banks:
+                            cache[expert].copy_(sources[layer_id][expert])
+                    else:
+                        self.disk_tier.fetch(layer_id, expert, expert)
+                return
+            count = int(self.num_indices.item())
+            slots = self.evict_slots[:count].cpu().tolist()
+            experts = self.src_indices[:count].cpu().tolist()
+            for slot, expert in zip(slots, experts):
+                expert = int(expert)
+                slot = int(slot)
+                if expert < self.disk_tier.ram_experts:
+                    for sources, cache in self.banks:
+                        cache[slot].copy_(sources[layer_id][expert])
+                else:
+                    self.disk_tier.fetch(layer_id, expert, slot)
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 if layer_id in self.locked_hybrid:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, List, Mapping
@@ -65,6 +67,9 @@ class EngineConfig:
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
+    moe_disk_tier: str = "off"
+    expert_ram_experts: int = 0
+    disk_fetch_workers: int = 8
     # Hybrid CPU/GPU decode (--moe-strategy offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
@@ -140,10 +145,16 @@ class EngineConfig:
     @cached_property
     def active_encoders(self) -> tuple[EncoderSpec, ...]:
         """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        ftw_visual = None
+        if os.path.isfile(os.path.join(self.model_path, "freetoken_weight.json")):
+            with open(os.path.join(self.model_path, "freetoken_weight.json"), encoding="utf-8") as f:
+                names = {entry["name"] for entry in json.load(f).get("tensors", ())}
+            ftw_visual = any(name.startswith("visual.") for name in names)
         return tuple(
             e
             for e in self.model_spec.encoders
             if getattr(self.hf_config, e.config_key, None) is not None
+            and (ftw_visual is not False or e.kind != "vision")
             and e.kind not in self.mm.disabled_encoders
         )
 
@@ -157,9 +168,16 @@ class EngineConfig:
         # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
         hf_config = copy.copy(self.hf_config)
         built = {e.config_key for e in self.active_encoders}
-        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
-            if key not in built and getattr(hf_config, key, None) is not None:
-                setattr(hf_config, key, None)
+        disabled = {
+            key
+            for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}
+            if key not in built and hasattr(hf_config, key)
+        }
+        # ``dataclasses.replace`` rebuilds Transformer config objects and drops dynamic
+        # attributes such as ``quantization_config``. Mutate the shallow copy through the
+        # dataclass escape hatch instead, preserving the checkpoint's quant metadata.
+        for key in disabled:
+            object.__setattr__(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)

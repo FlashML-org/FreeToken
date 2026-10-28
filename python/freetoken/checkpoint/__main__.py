@@ -10,7 +10,13 @@ fast path (auto-detected).
 from __future__ import annotations
 
 import argparse
+import os
 import time
+
+# The converter only ever READS expert banks on the CPU; registering them steals the
+# WDDM ~50%-of-RAM pin quota and outright OOMs on models whose banks exceed it.
+# setdefault so an explicit caller override still wins.
+os.environ.setdefault("FREETOKEN_SKIP_BANK_PIN", "1")
 
 import torch
 

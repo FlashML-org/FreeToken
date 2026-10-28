@@ -19,3 +19,15 @@ def test_registered_model_specs_resolve_required_package_exports():
         assert callable(getattr(module, spec.model_cls)), arch
         assert callable(getattr(module, spec.parse_config)), arch
         assert callable(getattr(module, spec.iter_weights)), arch
+
+
+def test_gguf_qwen_architectures_are_registered():
+    from freetoken.models.gguf.config import GGUF_ARCH_TO_REGISTRY
+
+    assert GGUF_ARCH_TO_REGISTRY["qwen3"] == "Qwen3ForCausalLM"
+    assert GGUF_ARCH_TO_REGISTRY["qwen3_moe"] == "Qwen3MoeForCausalLM"
+    assert GGUF_ARCH_TO_REGISTRY["qwen3_5_moe"] == "Qwen3_5MoeForCausalLM"
+
+    for module_name in ("freetoken.models.qwen3", "freetoken.models.qwen3_moe", "freetoken.models.qwen3_5_moe"):
+        module = importlib.import_module(module_name)
+        assert callable(module.parse_gguf_config)

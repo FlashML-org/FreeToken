@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+from ctypes import wintypes
 import math
 import mmap
 import os
@@ -190,13 +191,24 @@ class HostBank:
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        # mmap.madvise is unavailable on Windows; releasing the mapping is handled
+        # by normal object lifetime, so page dropping is only an optional optimization.
+        madvise = getattr(self._buf, "madvise", None)
+        if madvise is not None and hasattr(mmap, "MADV_DONTNEED"):
+            try:
+                madvise(mmap.MADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but with no device address, so the GPU cannot gather its rows.
 
         Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
         if self._locked or self._pinned:  # cudaHostRegister already page-locks
+            return
+        if os.name == "nt":
+            # Windows WDDM does not provide a useful process-wide equivalent of mlock for
+            # multi-hundred-MB expert banks; pageable CPU fallback is supported here.
             return
         global _os_lock_failed
         if _os_lock_failed:
@@ -216,6 +228,15 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 
 def _os_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        kernel32.VirtualLock.restype = wintypes.BOOL
+        if not kernel32.VirtualLock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)):
+            err = ctypes.get_last_error()
+            raise OSError(err, f"VirtualLock({nbytes / 2**30:.1f} GiB) failed")
+        _os_locked_total += nbytes
+        return
     import resource
 
     # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
@@ -243,6 +264,16 @@ def _os_lock(addr: int, nbytes: int) -> None:
 def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
     """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``."""
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
+
+
+def alloc_layer_banks(
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]], num_layers: int
+) -> dict[str, list[HostBank]]:
+    """Allocate independent lazy host banks for each layer and bank role."""
+    return {
+        name: [HostBank(shape, dtype) for _ in range(num_layers)]
+        for name, (shape, dtype) in specs.items()
+    }
 
 
 class _ResidencyPlan:
@@ -571,6 +602,7 @@ __all__ = [
     "LayerCompletionTracker",
     "PinPipeline",
     "alloc_banks",
+    "alloc_layer_banks",
     "born_pinned_default",
     "pin_banks",
     "read_file_into",

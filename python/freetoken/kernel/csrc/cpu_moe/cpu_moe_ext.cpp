@@ -7,8 +7,14 @@
 // The GPU rings a doorbell to submit and waits on it to sync (GpuSync, gpu_sync.h), so the
 // whole decode step stays in one CUDA graph; cudaLaunchHostFunc nodes are the fallback.
 //
-// Weight formats live in kernels/, one file each behind the MoeFormat interface (format.h).
-// Compute is FP32-accumulate; the intermediate is stored bf16 to match the GPU decode path.
+// One task is in flight at a time (per MoE layer): submit() wakes the pool,
+// sync() blocks the host-func thread until the pool drains. The heavy GEMV runs
+// on the persistent worker threads, not the host-func thread.
+//
+// Weight formats: bf16, NVFP4, MXFP4, ds_fp4, Q4_0, Q8_0 and block-FP8 expert
+// banks (see WFmt and the per-format bank schemas). Compute is FP32-accumulate;
+// the intermediate is stored bf16 to match the GPU decode path. ISA is chosen
+// once at construction (AVX-512-BF16 dpbf16 -> AVX-512F widening -> AVX2+FMA -> scalar).
 
 #include <algorithm>
 #include <atomic>
@@ -76,14 +82,177 @@ const std::pair<const char*, std::unique_ptr<MoeFormat> (*)(const MoeParams&, co
     {"gguf_scaled", make_gguf_scaled_format},
 };
 
-std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams& p, const FormatArgs& a) {
-  for (const auto& [n, make] : kFormats)
-    if (name == n) return make(p, a);
-  throw std::invalid_argument("unknown CPU MoE weight format " + name);
+// Output-row tiling. Small enough to give every worker independent work even at
+// batch size 1; large enough to amortize the atomic work-grab.
+//
+// Bandwidth notes (Sapphire Rapids 8480+, 13 cores): the two passes already read
+// every expert weight byte exactly once per token (each output row block is owned
+// by one worker), and x stays hot in L1 across a (token,expert)'s rows -- so the
+// kernel is single-read bandwidth-optimal at bs=1 (~205 GB/s vs ~55 GB/s PCIe).
+// One worker per *physical* core, pinned, is the sweet spot; SMT oversubscription
+// thrashes the spin-barrier. Deferred (not worth it here / for this workload):
+//   - AMX-bf16: a GEMM tile engine; decode is M=1 GEMV so tiles sit idle. It would
+//     only pay off in a grouped/batched (dedup) path.
+//   - expert dedup for bs>1: read each distinct expert once and GEMM its tokens.
+//     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
+//   - NUMA: a single node is assumed. Multi-socket machines would split each
+//     expert's K dimension per node (banks are already per-row contiguous).
+constexpr int IBLK = 32;
+constexpr int HBLK = 32;
+
+// -------------------------------- Q4_0 (W4A8) --------------------------------
+// Native GGUF Q4_0 experts (gemma4 GGUF): per-32 block = fp16 scale d + 16 packed
+// bytes; byte j holds element j in its low nibble and j+16 in its high nibble, so a
+// block's storage order is [lo0..lo15, hi0..hi15] and w = (nibble - 8) * d. Matches
+// the reference dequant (models/gguf/dequant.py) and the packed banks the GPU offload
+// path streams.
+//
+// llama.cpp ggml_vec_dot_q4_0_q8_0: W4A8. The activation is pre-quantized to Q8_0
+// (per-32-block int8 ``aq`` + fp32 scale ``asb``); each block unpacks its 16 bytes to
+// 32 int8 weights in [-8,7] (bytes_from_nibbles_32: low nibbles -> elems 0..15, high
+// -> 16..31) and runs an integer block dot -- VPDPBUSD (AVX-VNNI) or VPMADDUBSW+VPMADDWD
+// (AVX2) with the ggml sign trick |w|*(sign(w)*a)=w*a, or a scalar int loop -- then
+// scales the block sum by wd*xd in fp32. No fp weight dequant / shuffle chain. The GPU
+// offload path (ggml_moe_a8_vec / MMVQ) is also W4A8, so cpu and hybrid stay close.
+using q4dot_fn = float (*)(const uint8_t*, const int8_t*, const float*, int);
+using q8dot_fn = float (*)(const uint8_t*, const bf16_t*, int);
+
+// Native GGUF Q8_0 experts: per-32 block = fp16 scale d + 32 signed int8 values,
+// with w = d * q. The CPU path keeps activations in bf16 and accumulates in fp32.
+float q8_0_dot_bf16_scalar(const uint8_t* w, const bf16_t* x, int K) {
+  float acc = 0.0f;
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 34;
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const int8_t* q = reinterpret_cast<const int8_t*>(blk + 2);
+    float block = 0.0f;
+    for (int j = 0; j < 32; ++j)
+      block += static_cast<float>(q[j]) * bf16_to_f32(x[(size_t)b * 32 + j]);
+    acc += fp16_to_f32(dh) * block;
+  }
+  return acc;
 }
 
-// One format instance as cpu_executor.py passes it: name, bank tables by role, integer options.
-using FormatSpec = std::tuple<std::string, std::map<std::string, uint64_t>, std::map<std::string, int64_t>>;
+float q4_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    const uint8_t* q = blk + 2;  // 16 nibble bytes
+    const int8_t* a = aq + (size_t)b * 32;
+    int isum = 0;
+    for (int j = 0; j < 16; ++j) {
+      isum += ((int)(q[j] & 0x0F) - 8) * (int)a[j];       // elem j
+      isum += ((int)(q[j] >> 4) - 8) * (int)a[16 + j];    // elem 16+j
+    }
+    acc += fp16_to_f32(dh) * asb[b] * (float)isum;
+  }
+  return acc;
+}
+
+#if CPU_MOE_X86
+// fp16 block scale -> fp32 via HW F16C (single value in lane 0).
+__attribute__((target("f16c")))
+static inline float q4_scale(uint16_t h) {
+  return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
+}
+
+// Unpack one Q4_0 block's 16 bytes -> 32 int8 weights in [-8,7] (elems 0..15 = low
+// nibbles, 16..31 = high nibbles). ``eight`` = _mm256_set1_epi8(8).
+__attribute__((target("avx2")))
+static inline __m256i q4_unpack32(const uint8_t* blk, __m128i mask, __m256i eight) {
+  const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+  const __m128i lo = _mm_and_si128(qb, mask);
+  const __m128i hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+  return _mm256_sub_epi8(_mm256_set_m128i(hi, lo), eight);
+}
+
+// AVX2 W4A8 (llama.cpp non-VNNI mul_sum_i8_pairs): integer block dot via VPMADDUBSW +
+// VPMADDWD (sign trick), scaled by wd*xd. |aw*sa| pair sums <= 8*127*2 < 32767 -> no
+// int16 saturation. This is the fast path on AVX2 CPUs without AVX-VNNI (and the
+// avx512-tier fallback, since the block dot is 256-bit either way).
+__attribute__((target("avx2,fma,f16c")))
+float q4_0_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m128i mask = _mm_set1_epi8(0x0F);
+  const __m256i eight = _mm256_set1_epi8(8);
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    __m256i wq = q4_unpack32(blk, mask, eight);
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 32));
+    __m256i aw = _mm256_sign_epi8(wq, wq);              // |wq|          (unsigned operand)
+    __m256i sa = _mm256_sign_epi8(a, wq);               // sign(wq) * a  (signed operand)
+    __m256i d32 = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sa), ones16);  // 8 int32
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32), _mm256_set1_ps(q4_scale(dh) * asb[b]), accF);
+  }
+  return hsum256(accF);
+}
+
+// AVX-VNNI W4A8: one VPDPBUSD per block (the fast path on modern CPUs).
+__attribute__((target("avx2,avxvnni,fma,f16c")))
+float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m128i mask = _mm_set1_epi8(0x0F);
+  const __m256i eight = _mm256_set1_epi8(8);
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 18;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    __m256i wq = q4_unpack32(blk, mask, eight);
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 32));
+    __m256i aw = _mm256_sign_epi8(wq, wq);   // |wq|            (unsigned operand)
+    __m256i sa = _mm256_sign_epi8(a, wq);    // sign(wq) * a    (signed operand)
+    __m256i di = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), aw, sa);
+    // All 32 elems of the block share wd*xd; distribute over di's 8 partial sums and
+    // reduce at the end (equivalent to scale * block_total).
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(di), _mm256_set1_ps(q4_scale(dh) * asb[b]), accF);
+  }
+  return hsum256(accF);
+}
+#endif  // CPU_MOE_X86
+
+// All tiers are W4A8 (int8 activations pre-quantized to Q8_0). AVX-VNNI is orthogonal to
+// the ISA tier (gated by cpu_has_avxvnni() / FREETOKEN_CPU_MOE_NO_VNNI), so it wins when
+// present; otherwise the 256-bit VPMADDUBSW kernel covers both the avx2 and avx512 tiers.
+q4dot_fn select_q4dot() {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  if (cpu_has_avxvnni()) return q4_0_dot_i8_vnni;
+  if (t >= ISA_AVX2) return q4_0_dot_i8_avx2;
+#endif
+  (void)t;
+  return q4_0_dot_i8_scalar;
+}
+
+enum WFmt {
+  WF_BF16 = 0,
+  WF_NVFP4 = 1,
+  WF_MXFP4 = 2,
+  WF_DSFP4 = 3,
+  WF_Q4_0 = 4,
+  WF_Q8_0 = 5,
+  WF_FP8_BLOCK = 6,
+};
+
+// Each ctor pointer arg is the address of a CPU int64 array of length
+// num_layers (one base address per layer, built by cpu_executor.py's
+// _make_table), not a single flat bank. tbl_at resolves
+// tbl[layer_id] once per task/pass; a null table (bank unused by this fmt, ptr
+// arg 0) resolves to nullptr without dereferencing.
+inline const void* tbl_at(const uint64_t* tbl, int layer_id) {
+  return tbl ? reinterpret_cast<const void*>(tbl[layer_id]) : nullptr;
+}
 
 struct CpuMoeExecutor {
   // A host-function callback gets one pointer, so it carries the executor with the task.
@@ -108,7 +277,65 @@ struct CpuMoeExecutor {
 
   // Worker pool.
   int num_threads;
-  std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
+  int num_layers, num_experts, top_k;
+  int H, I;
+  int act, apply_on_input;
+  int fmt;                // WFmt
+  bool needs_di = false;  // pre-deinterleave activations to fp32 (nvfp4/ds_fp4/fp8_block)
+  // Per-layer pointer tables (one base address per layer, see tbl_at). gate_up_tbl
+  // doubles as the bf16 gate_up table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up
+  // table (down_tbl likewise for down); which reinterpretation applies is picked by
+  // fmt at each resolve site (see gemm1_dot/gemm2_dot/do_pass1_mxfp4/do_pass1_dsfp4).
+  const uint64_t* gate_up_tbl;   // bf16: [E,2I,H] rows; else: packed e2m1/mxfp4-blocks
+  const uint64_t* down_tbl;      // bf16: [E,H,I] rows; else: packed e2m1/mxfp4-blocks
+  const uint64_t* gu_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,2I,*] block scales
+  const uint64_t* gu_global_tbl; // nvfp4: [E,2I] fp16 row globals
+  const uint64_t* dn_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,H,*] block scales
+  const uint64_t* dn_global_tbl; // nvfp4: [E,H] fp16 row globals
+  const uint64_t* gu_bias_tbl;   // mxfp4: [E,2I] bf16 biases
+  const uint64_t* dn_bias_tbl;   // mxfp4: [E,H] bf16 biases
+  float swiglu_alpha;
+  float swiglu_limit;          // +inf == no clamp
+  dot_fn dot;
+  nvdot_fn nvdot;
+  nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
+  bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
+  bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
+  dsdot_fn dsdot;
+  mxgemv_fn mxgemv;
+  q4dot_fn q4dot;
+  q8dot_fn q8dot;
+  bool use_q8 = false;          // q8_0: W8A16 with bf16 activations
+  fp8_block_dot_fn fp8_block_dot;
+  // fp8_block: bf16 scale per 128x128 weight block. These are the scale tensor's
+  // trailing strides, including any padding used by the host bank layout.
+  int fp8_block_gu_scale_row = 0, fp8_block_dn_scale_row = 0;
+  // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
+  // (same reference grid), so submit() must not repeat it on the host-callback
+  // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
+  // PATH (~0.3ms/layer at H=4096, every worker and the GPU waiting on it); moving
+  // it to a captured GPU elementwise kernel removes it while keeping the official
+  bool input_prequant = false;
+  // ds_fp4 activation round-trip block (the checkpoint's fp8 block); set via set_act_block.
+  int act_block = 128;
+  // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
+  int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
+  int q8_gu_row_bytes = 0, q8_dn_row_bytes = 0;
+  float e2m1_lut[16];
+  float e4m3_lut[256];
+  float e8m0_lut[256];         // mxfp4 block scale: 2^(s-127), s clamped to [0,254]
+  const char* isa;
+
+  std::vector<bf16_t> g_scratch;   // [max_tokens * top_k * I] intermediate
+  std::vector<bf16_t> xq_scratch;  // [max_tokens * H] ds_fp4 fp8-roundtripped input
+  // nvfp4/ds_fp4/fp8_block activations pre-deinterleaved to fp32 (even/odd K) for the row-major dot.
+  std::vector<float> xe_scratch, xo_scratch;  // [max_tokens * H/2]   (input)
+  std::vector<float> ge_scratch, go_scratch;  // [max_tokens*top_k*I/2] (intermediate)
+  // AVX-VNNI W4A8: per-16-block int8 activations [even(8),odd(8)] + per-block scale.
+  std::vector<int8_t> xi8_scratch, gi8_scratch;  // [max_tokens*H], [max_tokens*top_k*I]
+  std::vector<float> xas_scratch, gas_scratch;   // [max_tokens*H/16], [..*top_k*I/16]
+  std::string isa_str;
+
   std::vector<std::thread> workers;
   std::mutex task_mtx;
   std::condition_variable task_cv;
@@ -163,19 +390,185 @@ struct CpuMoeExecutor {
         io_y(reinterpret_cast<bf16_t*>(y_ptr)),
         num_threads(num_threads_ > 0 ? num_threads_ : 1),
         core_ids(std::move(core_ids_)) {
-    if (params.top_k > kMaxTopK) throw std::invalid_argument("CPU MoE supports top_k <= " + std::to_string(kMaxTopK));
-    for (auto& [name, banks, options] : formats)
-      fmts.push_back(make_format(name, params, FormatArgs{name, std::move(banks), std::move(options)}));
-    if (static_cast<int>(layer_formats.size()) != num_layers)
-      throw std::invalid_argument("CPU MoE needs the format of every layer");
-    for (const int f : layer_formats)
-      if (f < 0 || f >= static_cast<int>(fmts.size())) throw std::out_of_range("CPU MoE layer format index out of range");
-    layer_fmt = std::move(layer_formats);
-    n_iblk = (params.I + kRowBlock - 1) / kRowBlock;
-    n_hblk = (params.H + kRowBlock - 1) / kRowBlock;
-    g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
+    DotChoice c = select_dot();
+    dot = c.fn;
+    nvdot = select_nvdot();
+    dsdot = select_dsdot();
+    mxgemv = select_mxgemv();
+    q4dot = select_q4dot();
+    q8dot = q8_0_dot_bf16_scalar;
+    fp8_block_dot = select_fp8_block_dot();
+    if (weight_format == WF_Q4_0) {
+      if (H % 32 != 0 || I % 32 != 0)
+        throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
+      q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
+      q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
+    }
+    if (weight_format == WF_Q8_0) {
+      if (H % 32 != 0 || I % 32 != 0)
+        throw std::runtime_error("Q8_0 CPU MoE requires H and I to be multiples of 32");
+      q8_gu_row_bytes = (H / 32) * 34;  // K = H (gate_up rows)
+      q8_dn_row_bytes = (I / 32) * 34;  // K = I (down rows)
+    }
+    isa = c.name;
+    // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
+    // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
+    // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
+    nvi8dot = select_nvi8dot();
+    use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
+    use_q4a8 = (weight_format == WF_Q4_0);
+    use_q8 = (weight_format == WF_Q8_0);
+    const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
+    const char* q8tag = use_q8 ? "+q8_0-w8a16" : "";
+    const char* vnni_tag =
+        cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
+    isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag + q8tag;
+    isa = isa_str.c_str();
+    for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
+    for (int i = 0; i < 256; ++i) e4m3_lut[i] = e4m3_decode((uint8_t)i);
+    // e8m0 (mxfp4 block scale) = 2^(s-127); the GPU GEMV clamps s to [0,254].
+    for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
+    g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+    // Row-major fp4 (nvfp4/ds_fp4) and fp8_block pre-deinterleave activations to fp32 even/odd.
+    needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4 || fmt == WF_FP8_BLOCK);
+    if (needs_di) {
+      if (fmt == WF_DSFP4) xq_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
+      xe_scratch.assign(static_cast<size_t>(max_tokens) * (H / 2), 0);
+      xo_scratch.assign(static_cast<size_t>(max_tokens) * (H / 2), 0);
+      ge_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 2), 0);
+      go_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 2), 0);
+      if (use_vnni) {
+        xi8_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
+        xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 16), 0);
+        gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+        gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 16), 0);
+      }
+    }
+    // q4_0 W4A8: per-32-block Q8_0 activations (int8 + fp32 scale) for input + intermediate.
+    if (use_q4a8) {
+      xi8_scratch.assign(static_cast<size_t>(max_tokens) * H, 0);
+      xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 32), 0);
+      gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+      gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
+    }
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
+  }
+
+  // Quantize a bf16 activation row to Q8_0 (llama.cpp): per-32-block symmetric int8 in
+  // natural order + one fp32 scale (amax/127) per block. Done once per token/route,
+  // amortized over every output row that the q4_0 W4A8 GEMV reads. K % 32 == 0.
+  void quant_q8_0(const bf16_t* x, int K, int8_t* aq, float* asb) {
+    const int nb = K / 32;
+    for (int b = 0; b < nb; ++b) {
+      const bf16_t* xb = x + (size_t)b * 32;
+      float xf[32], amax = 0.0f;
+      for (int j = 0; j < 32; ++j) {
+        xf[j] = bf16_to_f32(xb[j]);
+        amax = std::max(amax, std::fabs(xf[j]));
+      }
+      const float d = amax > 0.0f ? amax / 127.0f : 1.0f;
+      asb[b] = d;
+      const float inv = amax > 0.0f ? 1.0f / d : 0.0f;
+      int8_t* o = aq + (size_t)b * 32;
+      for (int j = 0; j < 32; ++j)
+        o[j] = (int8_t)std::max(-127, std::min(127, (int)std::lround(xf[j] * inv)));
+    }
+  }
+
+  // Quantize the pre-deinterleaved fp32 even/odd activations to per-16-block int8 in the
+  // [even(8),odd(8)] layout the VNNI dot expects. Done once per token/route (amortized over
+  // every output row), so a scalar pass is fine relative to the GEMV.
+  void quant_i8_pg16(const float* xe, const float* xo, int K, int8_t* asi8, float* asb) {
+    const int nb = K / 16;
+    for (int b = 0; b < nb; ++b) {
+      const float* xeb = xe + (size_t)b * 8;
+      const float* xob = xo + (size_t)b * 8;
+      float amax = 0.0f;
+      for (int j = 0; j < 8; ++j)
+        amax = std::max(amax, std::max(std::fabs(xeb[j]), std::fabs(xob[j])));
+      const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+      asb[b] = s;
+      const float inv = 1.0f / s;
+      int8_t* ae = asi8 + (size_t)b * 16;
+      for (int j = 0; j < 8; ++j) {
+        int qe = (int)std::lround(xeb[j] * inv), qo = (int)std::lround(xob[j] * inv);
+        ae[j] = (int8_t)std::max(-127, std::min(127, qe));
+        ae[8 + j] = (int8_t)std::max(-127, std::min(127, qo));
+      }
+    }
+  }
+
+  // gate_up output row `row` (in [0, 2I)) dotted with activation over K = H. ``e`` is
+  // the layer-local expert row (0..num_experts); the layer bases (already resolved
+  // once per task/pass by the caller via tbl_at) pick the layer's own tensors.
+  // bf16 uses the interleaved bf16 row; nvfp4 uses the pre-split fp32 even/odd halves
+  // (or, with AVX-VNNI, the per-16-block int8 activations).
+  // fp8_block uses the halves for whole 128-blocks and the bf16 row for a ragged tail.
+  inline float gemm1_dot(const bf16_t* gate_up_l, const uint8_t* gu_packed_l,
+                         const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
+                         const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
+                         const float* xas) {
+    if (fmt == WF_BF16) {
+      const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
+      return dot(w, x, H);
+    }
+    if (fmt == WF_Q4_0) {
+      const uint8_t* w =
+          gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q4_gu_row_bytes;
+      return q4dot(w, xi8, xas, H);  // W4A8: int8 activations (Q8_0), scale in xas
+    }
+    if (fmt == WF_Q8_0) {
+      const uint8_t* w =
+          gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)q8_gu_row_bytes;
+      return q8dot(w, x, H);
+    }
+    if (fmt == WF_FP8_BLOCK) {
+      const uint8_t* w = gu_packed_l + ((size_t)e * (2 * I) + row) * (size_t)H;
+      const bf16_t* sc = reinterpret_cast<const bf16_t*>(gu_scale_l) +
+                         ((size_t)e * ((2 * I + FP8_BLK - 1) / FP8_BLK) + row / FP8_BLK) *
+                             (size_t)fp8_block_gu_scale_row;
+      return fp8_block_dot(w, xe, xo, x, sc, H, e4m3_lut);
+    }
+    const size_t r = (size_t)e * (2 * I) + row;
+    if (use_vnni)
+      return nvi8dot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
+                     fp16_to_f32(gu_global_l[r]), xi8, H, e4m3_lut, xas);
+    return nvdot(gu_packed_l + r * (size_t)(H / 2), gu_scale_l + r * (size_t)(H / 16),
+                 fp16_to_f32(gu_global_l[r]), xe, xo, H, e2m1_lut, e4m3_lut);
+  }
+
+  // down output row `row` (in [0, H)) dotted with the intermediate over K = I. Same
+  // layer-local-base convention as gemm1_dot.
+  inline float gemm2_dot(const bf16_t* down_l, const uint8_t* dn_packed_l,
+                         const uint8_t* dn_scale_l, const uint16_t* dn_global_l, int e, int row,
+                         const bf16_t* g, const float* ge, const float* go, const int8_t* gi8,
+                         const float* gas) {
+    if (fmt == WF_BF16) {
+      const bf16_t* w = down_l + ((size_t)e * H + row) * I;
+      return dot(w, g, I);
+    }
+    if (fmt == WF_Q4_0) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
+      return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+    }
+    if (fmt == WF_Q8_0) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q8_dn_row_bytes;
+      return q8dot(w, g, I);
+    }
+    if (fmt == WF_FP8_BLOCK) {
+      const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)I;
+      const bf16_t* sc = reinterpret_cast<const bf16_t*>(dn_scale_l) +
+                         ((size_t)e * ((H + FP8_BLK - 1) / FP8_BLK) + row / FP8_BLK) *
+                             (size_t)fp8_block_dn_scale_row;
+      return fp8_block_dot(w, ge, go, g, sc, I, e4m3_lut);
+    }
+    const size_t r = (size_t)e * H + row;
+    if (use_vnni)
+      return nvi8dot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
+                     fp16_to_f32(dn_global_l[r]), gi8, I, e4m3_lut, gas);
+    return nvdot(dn_packed_l + r * (size_t)(I / 2), dn_scale_l + r * (size_t)(I / 16),
+                 fp16_to_f32(dn_global_l[r]), ge, go, I, e2m1_lut, e4m3_lut);
   }
 
   void pin_self(int tid) {

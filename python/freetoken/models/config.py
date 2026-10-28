@@ -16,12 +16,25 @@ def detect_expert_quant(hf_config: Any) -> str:
     RedHatAI/GLM-5.3-Flash-NVFP4), else the lowercased algo string (``"none"`` when
     unquantized). Models with mixed-precision configs (e.g. qwen3_5_moe) need their
     own detector."""
-    quant = getattr(hf_config, "quantization_config", None)
+    if isinstance(hf_config, dict):
+        quant = hf_config.get("quantization_config")
+    else:
+        quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return "none"
     get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
     algo = get("quant_algo") or get("quant_method")
+    groups = get("config_groups") or {}
+    groups = [g or {} for g in (groups.values() if isinstance(groups, dict) else [])]
     if algo is None:
+        expert_targets = [
+            str(t).lower()
+            for g in groups
+            for t in (g.get("targets") or [])
+            if isinstance(t, str)
+        ]
+        if any("gemma4textexperts" in t or "experts" in t for t in expert_targets):
+            return "compressed-tensors"
         return "none"
     if "fp4" in str(algo).lower():
         return "nvfp4"
@@ -31,8 +44,6 @@ def detect_expert_quant(hf_config: Any) -> str:
         return "nvfp4"
     # llm-compressor writes "mixed-precision" at the top when the groups differ (GLM-5.3-Flash: nvfp4 routed experts, fp8 MTP experts); the real format then sits in each group
     if fmt == "mixed-precision":
-        groups = get("config_groups") or {}
-        groups = [g or {} for g in (groups.values() if isinstance(groups, dict) else [])]
         # groups that target the experts decide; only a generic ["Linear"] group falls back to all of them
         expert_groups = [g for g in groups if any("experts" in str(t) for t in (g.get("targets") or []))]
         for g in expert_groups or groups:
@@ -52,7 +63,10 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
     ["Linear"]`` are NVFP4 except the per-module ``ignore`` list. A 4-bit float scheme
     with a DIFFERENT geometry (MXFP4: group_size 32, real since LLM Compressor 0.9)
     raises instead of routing into the NVFP4 loader and dying in a shape assert."""
-    quant = getattr(hf_config, "quantization_config", None)
+    if isinstance(hf_config, dict):
+        quant = hf_config.get("quantization_config")
+    else:
+        quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return False
     get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
@@ -327,6 +341,23 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    gguf_model_path: str | None = None
+    # Gemma 4 per-layer input embeddings (PLE); zero for models without PLE.
+    per_layer_input_dim: int = 0
+    per_layer_input_vocab_size: int | None = None
+    gguf_per_layer_embedding_type: int | None = None
+    # For Gemma 4 shared-KV models, source layer per decoder layer; None means local KV.
+    shared_kv_source_layers: Tuple[int | None, ...] = ()
+    # Raw GGUF block_count, which may include trailing NextN/MTP blocks excluded from the
+    # decoder stack used for ordinary text generation.
+    gguf_block_count: int | None = None
+    gguf_tensor_types: dict[str, int] | None = None
+    gguf_embedding_bf16: bool = False
+    gguf_embedding_type: int | None = None
+    gguf_router_bf16: bool = False
+    gguf_dense_bf16: bool = False
+    ftw_split_gdn: bool = False
+    ftw_lm_head_nvfp4: bool = False
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,

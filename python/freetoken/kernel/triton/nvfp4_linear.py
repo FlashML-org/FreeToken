@@ -40,6 +40,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.layers import BaseOP
+from freetoken.layers.base import _concat_prefix
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_kernel_view,
     e4m3_native_cx,
@@ -808,6 +810,75 @@ def nvfp4_dense_linear_t(
     return _linear_impl(
         x, weight_t.t(), scale_t.t(), weight_global, bias, x.dtype, transposed=True
     )
+
+
+class Nvfp4DenseLinear(BaseOP):
+    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
+        assert in_features % 16 == 0, f"NVFP4 in_features must be %16, got {in_features}"
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.empty(out_features, in_features // 2, dtype=torch.uint8)
+        self.weight_scale = torch.empty(out_features, in_features // 16, dtype=FP8)
+        self.weight_global = torch.empty(out_features, dtype=torch.float16)
+        self.bias = torch.empty(out_features) if has_bias else None
+        self._transposed = False
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        weight = state_dict.pop(_concat_prefix(prefix, "weight"))
+        scale = state_dict.pop(_concat_prefix(prefix, "weight_scale"))
+        assert weight.shape == self.weight.shape and weight.dtype == torch.uint8
+        assert scale.shape == self.weight_scale.shape
+        self.weight, self.weight_scale = nvfp4_transpose_resident(weight, scale)
+        self.weight_global = state_dict.pop(_concat_prefix(prefix, "weight_global"))
+        if self.bias is not None:
+            self.bias = state_dict.pop(_concat_prefix(prefix, "bias"))
+        self._transposed = True
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._transposed:
+            return nvfp4_dense_linear_t(
+                x, self.weight, self.weight_scale, self.weight_global, self.bias
+            )
+        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global, self.bias)
+
+
+class Nvfp4DenseColMerged(Nvfp4DenseLinear):
+    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
+        self.output_sizes = list(output_sizes)
+        super().__init__(in_features, sum(output_sizes), has_bias)
+
+
+class Nvfp4LMHead(BaseOP):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        assert embedding_dim % 16 == 0
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight = torch.empty(num_embeddings, embedding_dim // 2, dtype=torch.uint8)
+        self.weight_scale = torch.empty(num_embeddings, embedding_dim // 16, dtype=FP8)
+        self.weight_global = torch.empty(num_embeddings, dtype=torch.float16)
+        self._transposed = False
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        weight = state_dict.pop(_concat_prefix(prefix, "weight"))
+        scale = state_dict.pop(_concat_prefix(prefix, "weight_scale"))
+        assert weight.shape == self.weight.shape and weight.dtype == torch.uint8
+        self.weight, self.weight_scale = nvfp4_transpose_resident(weight, scale)
+        self.weight_global = state_dict.pop(_concat_prefix(prefix, "weight_global"))
+        self._transposed = True
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            x = x[batch.attn_metadata.get_last_indices(batch.size)].contiguous()
+        if self._transposed:
+            return nvfp4_dense_linear_t(x, self.weight, self.weight_scale, self.weight_global)
+        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)
 
 
 __all__ = [

@@ -10,6 +10,7 @@ import contextlib
 import os
 
 import torch
+from tqdm import tqdm
 
 from freetoken.layers.quantization import QuantKind
 from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_scales, mmq_tail_bytes, pad_rows, type_name
@@ -74,7 +75,13 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
     with PinPipeline() if device is None else contextlib.nullcontext() as pins:
-        for layer in range(num_layers):
+        from freetoken.distributed import get_tp_info
+
+        for layer in tqdm(
+            range(num_layers),
+            desc="Loading GGUF expert banks",
+            disable=not get_tp_info().is_primary(),
+        ):
             blk = f"blk.{first_layer + layer}"
             down = index[f"{blk}.ffn_down_exps.weight"]
             if f"{blk}.ffn_gate_up_exps.weight" in index:

@@ -10,7 +10,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 
 
 from .base import BaseOP
-from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
+from .quantization import ExpertView, LayerKind, QuantConfig, QuantKind, quant_method_for
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -86,7 +86,12 @@ class MoELayer(BaseOP):
             self.quant_method.create_weights(self)
 
     def finalize(self) -> None:
-        self.quant_method.finalize(self)
+        if (
+            self.quant_method is not None
+            and self.quant_method.kind is not QuantKind.NONE
+            and not cache.disk_tier_enabled
+        ):
+            self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
@@ -411,15 +416,84 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
     ) -> torch.Tensor:
-        from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
+        if (
+            self.quant_method is not None
+            and self.quant_method.kind is not QuantKind.NONE
+            and not cache.disk_tier_enabled
+        ):
+            from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
-        view = ExpertView(
-            {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-            slots=None if n is not None else topk_ids, n=n, alphas=alphas,
-        )
-        return self.quant_method.apply(
-            hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
-        )
+            view = ExpertView(
+                {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
+                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+            )
+            return self.quant_method.apply(
+                hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
+            )
+        fmt = cache.quant_format
+        if fmt == "q4_0":
+            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
+            # streamed packed banks; topk_ids already index the cache slots / layer.
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+
+            gate_up, down = views
+            return fused_experts_gguf_q4_0(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
+        if fmt == "q8_0":
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q8_0
+
+            gate_up, down = views
+            return fused_experts_gguf_q8_0(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
+        if fmt == "q4_k":
+            # Native GGUF Q4_K experts share the same packed bank layout as Q4_0 and
+            # are decoded by the same grouped GEMV kernel; only the quant type changes.
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_k
+
+            gate_up, down = views
+            return fused_experts_gguf_q4_k(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+            )
+        if fmt == "nvfp4":
+            from freetoken.moe.fused_nvfp4 import (
+                fused_experts_decode_nvfp4_marlin,
+                fused_experts_nvfp4,
+            )
+
+            if is_prefill:
+                return fused_experts_nvfp4(
+                    hidden_states,
+                    *views,
+                    topk_weights,
+                    topk_ids,
+                    self.num_experts,
+                    self.activation,
+                    self.apply_router_weight_on_input,
+                )
+            return fused_experts_decode_nvfp4_marlin(
+                hidden_states,
+                *views,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                self.apply_router_weight_on_input,
+            )
+        if fmt == "bf16":
+            from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
+
+            gate_up, down = views
+            if is_prefill:
+                return fused_experts_impl(
+                    hidden_states, gate_up, down, topk_weights, topk_ids,
+                    self.activation, self.apply_router_weight_on_input, self.num_experts,
+                )
+            return fused_experts_decode_impl(
+                hidden_states, gate_up, down, topk_weights, topk_ids,
+                self.activation, self.apply_router_weight_on_input,
+            )
+        raise AssertionError(f"offload experts without a quant method only serve q4_0/nvfp4 banks, got {fmt!r}")
 
 
 def iter_moe_layers(model) -> Iterator[MoELayer]:
