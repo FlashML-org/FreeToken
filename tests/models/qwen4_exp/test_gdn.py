@@ -105,9 +105,6 @@ def _prefill(op, ctx: Context, lengths: list[int], seed: int):
 def _decode(op, ctx: Context, reqs, hidden: torch.Tensor) -> torch.Tensor:
     batch = Batch(reqs=reqs, phase="decode")
     batch.padded_reqs = reqs
-    batch.linear_table_idx = torch.tensor(
-        [r.table_idx for r in reqs], dtype=torch.int32, device=DEV
-    )
     with ctx.forward_batch(batch):
         return op.forward(hidden)
 

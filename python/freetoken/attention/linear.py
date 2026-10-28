@@ -21,7 +21,8 @@ class FLAMetadata:
     Fields:
       cu_seqlens          query indptr; decode = arange(bs+1) (1 token/req), prefill =
                           cumsum of extend_len. int32 on device.
-      cache_indices       per-request recurrent/conv state slot (= Req.table_idx). int32.
+      cache_indices       per-request recurrent/conv state slot (Req.linear_slot_idx, else
+                          Req.table_idx). int32.
       has_initial_state   prefill only: whether each request continues a cached prefix
                           (cached_len > 0). None for decode (state always present).
       fresh_state_indices prefill only: the state-pool slots whose sequence is fresh
@@ -50,11 +51,9 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
     stalling it.
 
-    Decode is one token per request, so ``cu_seqlens`` is a plain ``arange(bs+1)`` and
-    ``cache_indices`` is ``batch.linear_table_idx`` (already int32) -- reused as-is. Under
-    CUDA graph the decode ``FLAMetadata`` is instead built by
-    ``LinearAttnBackend.prepare_for_capture`` against its persistent buffers (stable addresses);
-    this builder serves the eager path and direct-op test callers.
+    Decode is one token per request, so ``cu_seqlens`` is a plain ``arange(bs+1)``. Under
+    CUDA graph ``LinearAttnBackend`` copies this metadata into its persistent buffers
+    (stable addresses) before each replay.
     """
     reqs = batch.padded_reqs
     pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
@@ -67,9 +66,8 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     if batch.is_decode:
         bs = len(reqs)
         cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
-        # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
-        assert batch.linear_table_idx is not None
-        return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
+        idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
+        return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=idx_host.to(device, non_blocking=True))
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
     lens = [r.extend_len for r in reqs]
@@ -157,7 +155,7 @@ class FLACaptureData:
 class LinearAttnBackend(BaseAttnBackend):
     """Metadata of the linear-attention layers (GatedDeltaNet, KDA), next to the attention backend: ``FLAMetadata`` per forward, ``FLACaptureData`` for CUDA graphs.
 
-    The layers run their own kernels and read ``batch.fla_metadata`` (qwen4_exp PLE also reads ``batch.linear_table_idx``), so ``forward`` is never called.
+    The layers run their own kernels and read ``batch.fla_metadata``, so ``forward`` is never called.
     """
 
     def __init__(self, device: torch.device) -> None:
@@ -191,7 +189,6 @@ class LinearAttnBackend(BaseAttnBackend):
         # capture on the padding request's state slot, so the captured gather/scatter touches scratch; replay writes the real slots
         dummy = batch.padded_reqs[0]
         capture.cache_indices[:bs].fill_(dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx)
-        batch.linear_table_idx = capture.cache_indices[:bs]
         batch.fla_metadata = FLAMetadata(cu_seqlens=capture.cu_seqlens[: bs + 1], cache_indices=capture.cache_indices[:bs])
 
     def prepare_for_replay(self, batch: "Batch") -> None:

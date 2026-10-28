@@ -566,7 +566,8 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         # padded/dummy rows index the GDN padding slot (0) so gather/scatter hits scratch.
-        if self.linear_state_pool is not None:
+        # Naive GDN keys state by table_idx, where slot 0 is a live request and the dummy's own row is the scratch.
+        if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
         self.graph_runner = GraphRunner(
