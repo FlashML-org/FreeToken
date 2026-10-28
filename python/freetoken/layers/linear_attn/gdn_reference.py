@@ -1,10 +1,11 @@
 """Pure-torch Gated DeltaNet reference (text-only, no cache).
 
-Correctness oracle for the kernel-backed GDN op (``gdn.Qwen3_5GatedDeltaNet``).
-The recurrence and forward are transcribed from
-``transformers.models.qwen3_5_moe.modeling_qwen3_5_moe`` (``torch_recurrent_gated_delta_rule``
-and ``Qwen3_5MoeGatedDeltaNet.forward`` no-cache path) and were validated against the
-HF module bit-for-bit when ported.
+Correctness oracle for the kernel-backed GDN op (``freetoken.layers.linear_attn.GatedDeltaNet``).
+The delta rule and the forward are transcribed from
+``transformers.models.qwen4_exp.modeling_qwen4_exp`` (``torch_recurrent_gated_delta_rule``
+and ``Qwen4ExpTextGatedDeltaNet.forward`` no-cache path).
+Qwen3.8-Flash-Next gates the output norm with ``config.output_gate_type`` (sigmoid) where
+Qwen3.5 hardcodes silu; the conv keeps ``config.hidden_act`` (silu).
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+_GATE_ACTS = {"silu": F.silu, "swish": F.silu, "sigmoid": torch.sigmoid}
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -65,26 +68,27 @@ def recurrent_gated_delta_rule(
 
 
 class _RMSNormGated(nn.Module):
-    """RMSNorm of x followed by a silu(z) gate (norm_before_gate=True).
+    """RMSNorm of x followed by an ``activation(z)`` gate (norm_before_gate=True).
 
-    Mirrors ``Qwen3_5MoeRMSNormGated`` over head_v_dim groups.
+    Mirrors ``Qwen4ExpTextRMSNormGated`` over head_v_dim groups.
     """
 
-    def __init__(self, dim: int, eps: float):
+    def __init__(self, dim: int, eps: float, activation: str = "silu"):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.act = _GATE_ACTS[activation]
 
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         x = x * self.weight.float()
-        x = x * F.silu(z.float())
+        x = x * self.act(z.float())
         return x.to(in_dtype)
 
 
-class Qwen3_5GatedDeltaNetReference(nn.Module):
+class GatedDeltaNetReference(nn.Module):
     """Pure-torch Gated DeltaNet (text-only, no cache)."""
 
     def __init__(
@@ -97,10 +101,13 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         conv_kernel_size: int,
         rms_norm_eps: float,
         hidden_act: str = "silu",
+        output_gate: str = "silu",
     ):
         super().__init__()
         if hidden_act != "silu":
-            raise ValueError(f"GDN reference only supports silu activation, got {hidden_act!r}")
+            raise ValueError(f"GDN reference only supports silu conv activation, got {hidden_act!r}")
+        if output_gate not in _GATE_ACTS:
+            raise ValueError(f"unsupported GDN output gate {output_gate!r}")
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
@@ -120,12 +127,12 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         )
         self.dt_bias = nn.Parameter(torch.zeros(num_v_heads))
         self.A_log = nn.Parameter(torch.zeros(num_v_heads))
-        self.norm = _RMSNormGated(head_v_dim, eps=rms_norm_eps)
+        self.norm = _RMSNormGated(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
     @torch.no_grad()
     def load_from_hf(self, hf_gdn) -> None:
-        """Copy weights from a transformers ``Qwen3_5MoeGatedDeltaNet``."""
+        """Copy weights from a transformers ``Qwen4ExpTextGatedDeltaNet``."""
         self.in_proj_qkv.weight.copy_(hf_gdn.in_proj_qkv.weight)
         self.in_proj_z.weight.copy_(hf_gdn.in_proj_z.weight)
         self.in_proj_b.weight.copy_(hf_gdn.in_proj_b.weight)
@@ -173,4 +180,7 @@ class Qwen3_5GatedDeltaNetReference(nn.Module):
         return self.out_proj(core)
 
 
-__all__ = ["Qwen3_5GatedDeltaNetReference", "recurrent_gated_delta_rule"]
+__all__ = [
+    "GatedDeltaNetReference",
+    "recurrent_gated_delta_rule",
+]

@@ -38,7 +38,7 @@ class FLAMetadata:
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
     # recurrent + conv state into a donatable pool slot, written on the forward stream by the
-    # GDN op (see Qwen3_5GatedDeltaNet._write_track_snapshot). Built by the scheduler in P2;
+    # GDN op (see GatedDeltaNet._write_track_snapshot). Built by the scheduler in P2;
     # left None by build_fla_metadata so the existing path is unchanged.
     track_dst: torch.Tensor | None = None        # [nt] int64 dst pool slot per tracked req
     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)

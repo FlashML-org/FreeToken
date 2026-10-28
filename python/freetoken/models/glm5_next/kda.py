@@ -11,7 +11,7 @@ State lives in ``ctx.linear_state_pool`` exactly like GDN: the conv state is the
 merged q|k|v stream (width 3*H*D == the pool's ``2*K*dk + V*dv``) and the
 recurrent state is one [D, D] matrix per head, stored in the KERNEL's [V, K]
 layout (coincides with the pool's [K, V] declaration because D_k == D_v; same
-convention as GDN, see qwen3_5_moe/gdn.py).
+convention as GDN, see layers/linear_attn/gdn.py).
 
 Kernels: ``fused_recurrent_kda`` decodes with in-kernel gate/beta/l2norm and
 per-slot state read/write (slot 0 is its NULL sentinel == the pool's padding
@@ -84,7 +84,7 @@ class Glm5NextKDA(BaseOP):
     def _write_track_snapshot(self, pool, li, conv_in, h, fla) -> None:
         """Hybrid-radix: snapshot recurrent + conv state at the chunk-aligned track
         boundary into a donatable pool slot (same contract as GDN, see
-        qwen3_5_moe/gdn.py). h rows are the kernel's per-chunk [V, K] states --
+        layers/linear_attn/gdn.py). h rows are the kernel's per-chunk [V, K] states --
         a direct copy into the pool's [K, V] slots (D_k == D_v)."""
         rec = pool.recurrent_states[li]
         rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
