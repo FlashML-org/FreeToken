@@ -2,12 +2,15 @@ import pytest
 import torch
 
 
-def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
+def _activation_and_mul(gate_up: torch.Tensor, activation: str, alpha: float = 1.0, limit: float = float("inf")) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":
         return torch.nn.functional.silu(gate) * up
     if activation == "gelu":
         return torch.nn.functional.gelu(gate) * up
+    if activation == "swigluoai":
+        gate = gate.clamp(max=limit)
+        return gate / (1.0 + torch.exp(-alpha * gate)) * (up.clamp(-limit, limit) + 1.0)
     raise AssertionError(f"unsupported test activation {activation}")
 
 
@@ -19,6 +22,10 @@ def _reference_fused_experts_decode(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    act_alpha: float = 1.0,
+    act_limit: float = float("inf"),
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     output = torch.zeros_like(hidden_states, dtype=torch.float32)
     hidden_fp32 = hidden_states.float()
@@ -29,10 +36,14 @@ def _reference_fused_experts_decode(
             expert_id = int(topk_ids[token_idx, route_idx])
             route_weight = topk_weights[token_idx, route_idx].float()
             gate_up = torch.matmul(w1_fp32[expert_id], hidden_fp32[token_idx])
+            if w1_bias is not None:
+                gate_up = gate_up + w1_bias[expert_id].float()
             if apply_router_weight_on_input:
                 gate_up = gate_up * route_weight
-            activated = _activation_and_mul(gate_up, activation)
+            activated = _activation_and_mul(gate_up, activation, alpha=act_alpha, limit=act_limit)
             contribution = torch.matmul(w2_fp32[expert_id], activated)
+            if w2_bias is not None:
+                contribution = contribution + w2_bias[expert_id].float()
             if not apply_router_weight_on_input:
                 contribution = contribution * route_weight
             output[token_idx] += contribution
@@ -154,6 +165,75 @@ def test_fused_experts_decode_matches_grouped_impl(dtype, apply_router_weight_on
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("impl_name", ["decode", "grouped"])
+def test_fused_experts_with_per_expert_biases_match_reference(impl_name):
+    """gpt-oss's expert banks carry per-expert biases: w1 before the gated activation, w2 before the routing weight."""
+    from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
+
+    device = torch.device("cuda")
+    batch_size = 4
+    num_experts = 37
+    hidden_size = 32
+    intermediate_size = 24
+    top_k = 4
+    torch.manual_seed(104)
+
+    hidden_states = 0.25 * torch.randn(batch_size, hidden_size, device=device, dtype=torch.bfloat16)
+    gate_up = torch.randn(
+        num_experts,
+        intermediate_size * 2,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    ) * 0.25
+    down = torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device=device,
+        dtype=torch.bfloat16,
+    ) * 0.25
+    w1_bias = 0.5 * torch.randn(num_experts, intermediate_size * 2, device=device, dtype=torch.bfloat16)
+    w2_bias = 0.5 * torch.randn(num_experts, hidden_size, device=device, dtype=torch.bfloat16)
+    weights = torch.rand(batch_size, top_k, device=device, dtype=torch.float32)
+    topk_weights = weights / weights.sum(dim=-1, keepdim=True)
+    topk_ids = torch.tensor(
+        [[31, 4, 18, 0], [29, 7, 35, 12], [6, 21, 1, 33], [16, 3, 28, 9]],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    impl = fused_experts_decode_impl if impl_name == "decode" else fused_experts_impl
+    output = impl(
+        hidden_states.clone(),
+        gate_up,
+        down,
+        topk_weights,
+        topk_ids,
+        activation="swigluoai",
+        act_alpha=1.702,
+        act_limit=7.0,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+    )
+    expected = _reference_fused_experts_decode(
+        hidden_states,
+        gate_up,
+        down,
+        topk_weights,
+        topk_ids,
+        activation="swigluoai",
+        act_alpha=1.702,
+        act_limit=7.0,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=5e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

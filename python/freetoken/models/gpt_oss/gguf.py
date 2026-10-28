@@ -2,7 +2,7 @@
 
 The converter (conversion/gpt_oss.py) writes the attention projections fused as ``attn_qkv`` (``--fuse-qkv``; separate ``attn_q``/``attn_k``/``attn_v`` without), the attention sinks as ``attn_sinks.weight``, and a per-expert bias for each of gate / up / down - the only GGUF family whose experts carry biases, so they load as two dense tensors the ggml kernel adds around the gated activation. The MXFP4 releases (ggml-org) repack the routed experts into ggml MXFP4, scales ahead of the blocks in llama.cpp's nibble order, which the ggml kernels read as packed rows.
 
-The GGUF carries no per-layer attention types: every gpt-oss release alternates ``sliding_attention``/``full_attention`` from layer 0 (the HF configs' ``layer_types``), which is what this loader derives from ``attention.sliding_window``. The swiglu's alpha (1.702) and limit (7) are family constants llama.cpp also hardcodes; the GGUF stores neither.
+The GGUF carries no per-layer attention types in any release: llama.cpp derives the alternating ``sliding_attention``/``full_attention`` layout from ``attention.sliding_window`` (its ``pattern`` KV, which no release writes, is honored when present), and so does this loader. The swiglu's alpha (1.702) and limit (7) are family constants llama.cpp also hardcodes; the GGUF stores neither.
 """
 
 from __future__ import annotations
@@ -66,9 +66,24 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
     arch = shim.model_type  # the GGUF architecture: gpt-oss
 
     def kv(key: str):
-        return md[f"{arch}.{key}"]
+        if (name := f"{arch}.{key}") not in md:
+            raise KeyError(f"missing GGUF metadata key {name}")
+        return md[name]
 
     check_scales(shim.model_path)
+    # llama.cpp treats the attention-output, router and per-expert biases as required tensors
+    # (openai-moe.cpp); without this check a GGUF that lost them would serve silently bias-free
+    missing = [
+        f"blk.0.{name}.bias"
+        for name in ("attn_output", "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")
+        if f"blk.0.{name}.bias" not in index
+    ]
+    if "blk.0.attn_qkv.bias" not in index and "blk.0.attn_q.bias" not in index:
+        missing.append("blk.0.attn_{qkv|q,k,v}.bias")
+    if missing:
+        raise NotImplementedError(
+            f"{shim.model_path}: {', '.join(missing)}: every gpt-oss release ships these (reconvert with a current llama.cpp)"
+        )
     scaling = md.get(f"{arch}.rope.scaling.type", "none")
     if scaling == "yarn":
         # every release's rope_scaling; the betas default to llama.cpp's when a file omits them
@@ -84,6 +99,20 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
     else:
         raise NotImplementedError(f"{shim.model_path}: rope scaling {scaling!r} is not supported")
     num_layers = int(kv("block_count"))
+    # llama.cpp's load_swa_pattern (openai-moe.cpp, default 2): the per-layer pattern array
+    # verbatim, else the scalar's il % p < p - 1 layout, layer 0 sliding
+    pattern = md.get(f"{arch}.attention.sliding_window.pattern")
+    if pattern is None:
+        layer_types = ["sliding_attention" if i % 2 < 1 else "full_attention" for i in range(num_layers)]
+    elif isinstance(pattern, list):
+        if len(pattern) != num_layers:
+            raise NotImplementedError(
+                f"{shim.model_path}: attention.sliding_window.pattern has {len(pattern)} entries for {num_layers} layers"
+            )
+        layer_types = ["sliding_attention" if bool(p) else "full_attention" for p in pattern]
+    else:
+        p = int(pattern)
+        layer_types = ["sliding_attention" if p == 0 or i % p < p - 1 else "full_attention" for i in range(num_layers)]
     return SimpleNamespace(
         model_type="gpt_oss",
         architectures=list(shim.architectures),
@@ -102,10 +131,9 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
         intermediate_size=int(kv("expert_feed_forward_length")),
         num_local_experts=int(kv("expert_count")),
         num_experts_per_tok=int(kv("expert_used_count")),
-        # the GGUF has no per-layer KV: every release alternates sliding/full from layer 0
-        layer_types=["sliding_attention" if i % 2 == 0 else "full_attention" for i in range(num_layers)],
+        layer_types=layer_types,
         sliding_window=int(kv("attention.sliding_window")),
-        attention_bias="blk.0.attn_output.bias" in index,
+        attention_bias=True,
         swiglu_limit=_ACT_LIMIT,
         hidden_act_alpha=_ACT_ALPHA,
     )
