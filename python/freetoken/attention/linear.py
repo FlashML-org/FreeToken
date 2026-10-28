@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
 
@@ -51,9 +51,9 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
 
     Decode is one token per request, so ``cu_seqlens`` is a plain ``arange(bs+1)`` and
     ``cache_indices`` is ``batch.linear_table_idx`` (already int32) -- reused as-is. Under
-    CUDA graph the decode ``FLAMetadata`` is instead built directly in
-    ``GraphCaptureBuffer.set_batch`` against the persistent buffers (stable addresses); this
-    builder serves the eager scheduler path and direct-op test callers.
+    CUDA graph the decode ``FLAMetadata`` is instead built by
+    ``LinearAttnBackend.prepare_for_capture`` against its persistent buffers (stable addresses);
+    this builder serves the eager path and direct-op test callers.
     """
     reqs = batch.padded_reqs
     pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
@@ -137,4 +137,39 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     )
 
 
-__all__ = ["FLAMetadata", "build_fla_metadata"]
+class LinearAttnBackend:
+    """Metadata of the linear-attention layers (GatedDeltaNet, KDA), next to the attention backend: built once per forward, plus the static buffers their CUDA graphs read.
+
+    The layers run their own kernels and read ``batch.fla_metadata`` (qwen4_exp PLE also reads ``batch.linear_table_idx``); the hooks are named after ``BaseAttnBackend``'s, without ``forward``.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.cu_seqlens: torch.Tensor | None = None
+        self.cache_indices: torch.Tensor | None = None
+
+    def prepare_metadata(self, batch: "Batch") -> None:
+        batch.fla_metadata = build_fla_metadata(batch, self.device)
+
+    def init_capture_graph(self, bs_list: List[int], rows_per_req: int = 1) -> None:
+        max_bs = max(bs_list)
+        # a graph's query indptr is the constant arange(bs+1) * rows_per_req
+        self.cu_seqlens = torch.arange(max_bs + 1, dtype=torch.int32, device=self.device) * rows_per_req
+        self.cache_indices = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
+
+    def prepare_for_capture(self, batch: "Batch") -> None:
+        bs = batch.padded_size
+        # capture on the padding request's state slot, so the captured gather/scatter touches scratch; replay writes the real slots
+        dummy = batch.padded_reqs[0]
+        self.cache_indices[:bs].fill_(dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx)
+        batch.linear_table_idx = self.cache_indices[:bs]
+        batch.fla_metadata = FLAMetadata(cu_seqlens=self.cu_seqlens[: bs + 1], cache_indices=self.cache_indices[:bs])
+
+    def prepare_for_replay(self, batch: "Batch") -> None:
+        self.cache_indices[: batch.padded_size] = batch.linear_table_idx
+
+    def reset_capture(self) -> None:
+        self.cu_seqlens = self.cache_indices = None
+
+
+__all__ = ["FLAMetadata", "LinearAttnBackend", "build_fla_metadata"]

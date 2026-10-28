@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
+from freetoken.attention.linear import LinearAttnBackend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
@@ -546,6 +547,7 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        self.linear_backend = LinearAttnBackend(self.device) if self.linear_state_pool is not None else None
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -580,6 +582,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
             out_dtype=torch.float32,
+            linear_backend=self.linear_backend,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1223,6 +1226,8 @@ class Engine:
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
+        if self.linear_backend is not None:
+            self.linear_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
@@ -1267,6 +1272,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
             out_dtype=torch.float32,
+            linear_backend=self.linear_backend,
         )
 
     def forward_logits(self, batch: Batch) -> torch.Tensor:
