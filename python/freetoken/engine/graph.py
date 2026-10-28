@@ -194,7 +194,7 @@ class GraphRunner:
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
         if self.linear_backend is not None:
-            self.linear_backend.init_capture_graph(self.graph_bs_list, rows_per_req=self.rows_per_req)
+            self.linear_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list, rows_per_req=self.rows_per_req)
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()

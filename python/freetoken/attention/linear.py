@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
+from freetoken.attention.base import AttentionSpec, BaseAttnBackend
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -137,39 +138,67 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     )
 
 
-class LinearAttnBackend:
-    """Metadata of the linear-attention layers (GatedDeltaNet, KDA), next to the attention backend: built once per forward, plus the static buffers their CUDA graphs read.
+@dataclass
+class FLACaptureData:
+    """The static buffers the linear-attention layers' CUDA graphs read, sized for the largest captured batch."""
 
-    The layers run their own kernels and read ``batch.fla_metadata`` (qwen4_exp PLE also reads ``batch.linear_table_idx``); the hooks are named after ``BaseAttnBackend``'s, without ``forward``.
+    cu_seqlens: torch.Tensor
+    cache_indices: torch.Tensor
+
+    @classmethod
+    def create(cls, max_bs: int, device: torch.device, rows_per_req: int = 1) -> FLACaptureData:
+        return cls(
+            # constant under a graph: every request has exactly `rows_per_req` query rows
+            cu_seqlens=torch.arange(max_bs + 1, dtype=torch.int32, device=device) * rows_per_req,
+            cache_indices=torch.zeros(max_bs, dtype=torch.int32, device=device),
+        )
+
+
+class LinearAttnBackend(BaseAttnBackend):
+    """Metadata of the linear-attention layers (GatedDeltaNet, KDA), next to the attention backend: ``FLAMetadata`` per forward, ``FLACaptureData`` for CUDA graphs.
+
+    The layers run their own kernels and read ``batch.fla_metadata`` (qwen4_exp PLE also reads ``batch.linear_table_idx``), so ``forward`` is never called.
     """
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
-        self.cu_seqlens: torch.Tensor | None = None
-        self.cache_indices: torch.Tensor | None = None
+        self.capture: FLACaptureData | None = None
+        self.capture_bs: List[int] = []
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: "Batch",
+        attn_spec: AttentionSpec | None = None,
+    ) -> torch.Tensor:
+        # the GDN and KDA layers call their fla kernels themselves on batch.fla_metadata
+        raise NotImplementedError("linear-attention layers run their own kernels")
 
     def prepare_metadata(self, batch: "Batch") -> None:
         batch.fla_metadata = build_fla_metadata(batch, self.device)
 
-    def init_capture_graph(self, bs_list: List[int], rows_per_req: int = 1) -> None:
-        max_bs = max(bs_list)
-        # a graph's query indptr is the constant arange(bs+1) * rows_per_req
-        self.cu_seqlens = torch.arange(max_bs + 1, dtype=torch.int32, device=self.device) * rows_per_req
-        self.cache_indices = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        assert self.capture is None, "Capture already initialized."
+        self.capture = FLACaptureData.create(max(bs_list), self.device, rows_per_req=rows_per_req)
+        self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: "Batch") -> None:
-        bs = batch.padded_size
+        assert (bs := batch.padded_size) in self.capture_bs and self.capture
+        capture = self.capture
         # capture on the padding request's state slot, so the captured gather/scatter touches scratch; replay writes the real slots
         dummy = batch.padded_reqs[0]
-        self.cache_indices[:bs].fill_(dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx)
-        batch.linear_table_idx = self.cache_indices[:bs]
-        batch.fla_metadata = FLAMetadata(cu_seqlens=self.cu_seqlens[: bs + 1], cache_indices=self.cache_indices[:bs])
+        capture.cache_indices[:bs].fill_(dummy.linear_slot_idx if dummy.linear_slot_idx is not None else dummy.table_idx)
+        batch.linear_table_idx = capture.cache_indices[:bs]
+        batch.fla_metadata = FLAMetadata(cu_seqlens=capture.cu_seqlens[: bs + 1], cache_indices=capture.cache_indices[:bs])
 
     def prepare_for_replay(self, batch: "Batch") -> None:
-        self.cache_indices[: batch.padded_size] = batch.linear_table_idx
+        metadata, bs = batch.fla_metadata, batch.padded_size
+        assert self.capture is not None and bs in self.capture_bs
+        # cu_seqlens is the constant arange * rows_per_req under a graph (i.e. no-op)
+        self.capture.cache_indices[:bs].copy_(metadata.cache_indices)
 
-    def reset_capture(self) -> None:
-        self.cu_seqlens = self.cache_indices = None
 
-
-__all__ = ["FLAMetadata", "LinearAttnBackend", "build_fla_metadata"]
+__all__ = ["FLACaptureData", "FLAMetadata", "LinearAttnBackend", "build_fla_metadata"]
