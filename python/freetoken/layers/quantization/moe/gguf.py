@@ -36,8 +36,9 @@ def expert_types(cfg: MoEConfig) -> tuple[int, int]:
 
 
 def _bank_spec(ggml_type: int, rows: int, k: int) -> BankSpec:
+    # F16 / F32 expert banks are loaded and run as bf16, the fused MoE's dtype
     dtype = float_dtype(ggml_type)
-    return BankSpec((rows, k), dtype) if dtype is not None else BankSpec((rows, row_bytes(ggml_type, k)), torch.uint8)
+    return BankSpec((rows, k), torch.bfloat16) if dtype is not None else BankSpec((rows, row_bytes(ggml_type, k)), torch.uint8)
 
 
 _DECODE_CONFIG = {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "num_warps": 8}
@@ -52,7 +53,7 @@ def float_mul_mat_id(w: torch.Tensor, x: torch.Tensor, ids: torch.Tensor, topk_w
 
     t, top_k = ids.shape
     per_route = x.dim() == 3
-    # f16 experts take f16 activations, as llama.cpp's f16 path does
+    # the float banks run bf16, so the activations cast to the banks' dtype
     a = x.reshape(-1, x.shape[-1]).to(w.dtype).contiguous()
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if config is None:
@@ -75,7 +76,9 @@ class GgmlMoEKernel(MoEKernel):
             reason = gated_epilogue_reason(cfg)
             if reason:
                 return f"float GGUF experts run on the bf16 fused MoE: {reason}"
-        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        if cfg.has_bias and cfg.decode_target != "gpu":
+            return "gpt-oss per-expert biases have no CPU executor format; decode must run on the GPU"
+        return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False, bias_ok=True)
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)
@@ -84,6 +87,11 @@ class GgmlMoEKernel(MoEKernel):
         if cfg.scheme.weight.scale is not None:
             # each expert's NVFP4 weight_scale_2 as (gate, up, down, 1): a 16-byte row, which the slot cache's copies need
             banks["global"] = BankSpec((4,), torch.float32)
+        if cfg.has_bias:
+            # gpt-oss per-expert biases: bank rows so they follow the expert through the slot cache (decode)
+            # and the expert-ordered prefill / resident views, as llama.cpp's build_moe_ffn applies them
+            banks["gate_up_bias"] = BankSpec((2 * i,), torch.bfloat16)
+            banks["down_bias"] = BankSpec((h,), torch.bfloat16)
         return banks
 
     def pack(self, pieces, cfg: MoEConfig, out):
@@ -117,13 +125,18 @@ class GgmlMoEKernel(MoEKernel):
                 return ggml.mul_mat_id(w, ggml_type, a, ids)
             return float_mul_mat_id(w, a, ids, topk_weights, config)
 
-        # llama.cpp's build_moe_ffn: each NVFP4 GEMM result times the expert's weight_scale_2, gate and up before the glu, down before the routing weight
+        # llama.cpp's build_moe_ffn: each NVFP4 GEMM result times the expert's weight_scale_2 (before
+        # its bias), gate and up before the glu, down before the routing weight
         scales = view.tensors.get("global")
         gate_up_scales = scales if scales is not None and gate_up_type == NVFP4 else None
         down_scales = scales if scales is not None and down_type == NVFP4 else None
+        # the per-expert biases (gpt-oss) add around the gated activation, as in llama.cpp's build_moe_ffn;
+        # the view indexes them by slot id on the decode path and by expert id on prefill / resident
+        gate_up_bias = view.tensors.get("gate_up_bias")
+        down_bias = view.tensors.get("down_bias")
         glu = fused_glu(layer)
         small = x.shape[0] <= min(ggml.mmvq_max_tokens(t) for t in (gate_up_type, down_type) if is_quantized(t))
-        if glu is not None and small and is_quantized(gate_up_type):
+        if glu is not None and small and is_quantized(gate_up_type) and gate_up_bias is None:
             gu = (None, None) if gate_up_scales is None else (gate_up_scales[:, 0], gate_up_scales[:, 1])
             inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu, *gu)
         else:
@@ -131,6 +144,8 @@ class GgmlMoEKernel(MoEKernel):
             t, k, two_i = h.shape
             if gate_up_scales is not None:
                 h.view(t, k, 2, two_i // 2).mul_(gate_up_scales[ids, :2].unsqueeze(-1))
+            if gate_up_bias is not None:
+                h.add_(gate_up_bias[ids])
             inter = torch.empty(t, k, two_i // 2, dtype=h.dtype, device=h.device)
             gated_act_and_mul(layer.activation, h.view(-1, two_i), inter.view(-1, two_i // 2), alpha=float(layer.alpha), limit=limit_or_inf(layer))
             del h  # free the gate_up output before the down GEMM allocates its own
@@ -140,18 +155,24 @@ class GgmlMoEKernel(MoEKernel):
             y = mul_mat_id(view.tensors["down"], down_type, inter)
             if down_scales is not None:
                 topk_weights = topk_weights * down_scales[ids, 2]
+        if down_bias is not None:
+            y.add_(down_bias[ids])
         return ggml.moe_weighted_sum(y, topk_weights)
 
     @staticmethod
     def _apply_float(layer, x, topk_weights, topk_ids, view: ExpertView, ggml_type: int, *, is_prefill: bool):
-        """Float experts: their banks in their own dtype, through the bf16 fused MoE (the unquantized kernel's path)."""
+        """Float experts: their bf16 banks through the bf16 fused MoE (the unquantized kernel's path)."""
         from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
 
         gate_up, down = view.tensors["gate_up"], view.tensors["down"]
         if gate_up.dtype != x.dtype:
             raise NotImplementedError(f"GGUF {type_name(ggml_type)} experts need {gate_up.dtype} activations, got {x.dtype}")
         impl = fused_experts_impl if is_prefill or is_resident(layer) else fused_experts_decode_impl
-        return impl(x, gate_up, down, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, float(layer.alpha), limit_or_inf(layer))
+        return impl(
+            x, gate_up, down, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input,
+            float(layer.alpha), limit_or_inf(layer),
+            w1_bias=view.tensors.get("gate_up_bias"), w2_bias=view.tensors.get("down_bias"),
+        )
 
 
 @register_method(QuantKind.GGUF, LayerKind.MOE)
@@ -159,9 +180,12 @@ class GGUFMoEMethod(MoEMethod):
     candidates = (GgmlMoEKernel,)
 
     def cpu_spec(self) -> tuple[str | None, dict[str, int]]:
+        if self.cfg.has_bias:
+            raise NotImplementedError("GGUF experts with per-expert biases (gpt-oss) do not run on the cpu executor")
         gate_up, down = expert_types(self.cfg)
-        # BF16 experts keep the executor's bf16 kernels, which use AVX512-BF16 where the CPU has it; ggml-cpu is built for AVX2 only
-        if float_dtype(gate_up) is torch.bfloat16 and float_dtype(down) is torch.bfloat16:
+        # every float type (BF16 / F16 / F32) loads and runs as bf16 banks: the executor's bf16
+        # kernels, which use AVX512-BF16 where the CPU has it (ggml-cpu is built for AVX2 only)
+        if float_dtype(gate_up) is not None and float_dtype(down) is not None:
             return "bf16", {}
         # an NVFP4 layer of a file with weight scales reads the layout's global bank too
         scaled = self.cfg.scheme.weight.scale is not None and NVFP4 in (gate_up, down)

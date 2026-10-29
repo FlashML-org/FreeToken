@@ -1,8 +1,9 @@
 """Routed-expert banks straight from a GGUF's ``blk.N.ffn_{gate,up,down}_exps`` tensors, in their packed ggml rows: pinned host banks for the offload cache, or device banks for resident experts.
 
-Each layer keeps its own ggml types, so each layer gets its own bank shapes: ``gate_up`` [E, 2I, row_bytes] (expert e's gate rows, then its up rows) and ``down`` [E, H, row_bytes]; float experts keep their dtype ([E, 2I, H] and [E, H, I]).
+Each layer keeps its own ggml types, so each layer gets its own bank shapes: ``gate_up`` [E, 2I, row_bytes] (expert e's gate rows, then its up rows) and ``down`` [E, H, row_bytes]; float experts (BF16 / F16 / F32) load and run bf16 ([E, 2I, H] and [E, H, I]).
 A GGUF that stores ``ffn_gate_up_exps`` (gemma4) already holds the gate_up rows in that order.
-When NVFP4 experts carry per-expert ``.scale`` tensors, every layer also gets ``global`` [E, 4] fp32: the (gate, up, down, 1) weight_scale_2, 1 where a tensor has none."""
+When NVFP4 experts carry per-expert ``.scale`` tensors, every layer also gets ``global`` [E, 4] fp32: the (gate, up, down, 1) weight_scale_2, 1 where a tensor has none.
+gpt-oss files carry per-expert gate / up / down biases; every layer then also gets ``gate_up_bias`` [E, 2I] and ``down_bias`` [E, H] bf16 rows, so the bias follows the expert through the slot cache like its weights do."""
 
 from __future__ import annotations
 
@@ -16,17 +17,17 @@ from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_sca
 from freetoken.utils import init_logger
 
 from .reader import GgufTensorInfo, gguf_tensor_index
-from .tensors import weight_scale
+from .tensors import float_tensor, weight_scale
 
 logger = init_logger(__name__)
 
 
 def _expert_rows(info: GgufTensorInfo) -> torch.Tensor:
-    """[E, rows, row_bytes] packed ggml rows, or [E, rows, K] for a float tensor."""
+    """[E, rows, row_bytes] packed ggml rows, or [E, rows, K] bf16 for an F16 / BF16 / F32 tensor (the fused MoE runs bf16)."""
     k, rows, experts = info.ne
     raw = torch.from_numpy(info.data()).view(experts, rows, info.nbytes // (experts * rows))
     dtype = float_dtype(info.ggml_type)
-    return raw if dtype is None else raw.view(dtype)
+    return raw if dtype is None else raw.view(dtype).to(torch.bfloat16)
 
 
 def _drop_page_cache(info: GgufTensorInfo) -> None:
@@ -69,7 +70,10 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
 
     index = gguf_tensor_index(model_path)
     scaled = has_expert_scales({name: info.ggml_type for name, info in index.items()})
+    # gpt-oss: a bias tensor per expert and role; other families ship none
+    biased = f"blk.{first_layer}.ffn_gate_exps.bias" in index
     roles = ("gate_up", "down", "global") if scaled else ("gate_up", "down")
+    roles += ("gate_up_bias", "down_bias") if biased else ()
     sources: dict[str, list[torch.Tensor]] = {role: [] for role in roles}
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
@@ -90,6 +94,9 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             tails["down"].append(mmq_tail_bytes(down.ggml_type, down.ne[0]))
             if scaled:
                 tails["global"].append(0)
+            if biased:
+                tails["gate_up_bias"].append(0)
+                tails["down_bias"].append(0)
             rows = [_expert_rows(info) for info in parts]
             d = _expert_rows(down)
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
@@ -108,9 +115,30 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                     banks["global"] = torch.empty(experts, 4, dtype=torch.float32, device=device)
             if scaled:
                 banks["global"].copy_(_expert_scales(parts, down, experts))
+            if biased:
+                missing = [f"{blk}.ffn_{p}_exps.bias" for p in ("gate", "up", "down") if f"{blk}.ffn_{p}_exps.bias" not in index]
+                if missing:
+                    raise NotImplementedError(f"{model_path}: {', '.join(missing)}: the per-expert biases ship on every layer of a gpt-oss file")
+                # gpt-oss per-expert biases: gate|up as one [E, 2I] row block, down as [E, H]
+                gate_b, up_b, down_b = (
+                    float_tensor(index[f"{blk}.ffn_{p}_exps.bias"]).to(torch.bfloat16) for p in ("gate", "up", "down")
+                )
+                gate_up_bias, down_bias = torch.cat([gate_b, up_b], dim=1), down_b
+                for role, rows_bias in (("gate_up_bias", gate_up_bias), ("down_bias", down_bias)):
+                    if rows_bias.shape[0] != experts:
+                        raise NotImplementedError(f"{blk}.{role}: {tuple(rows_bias.shape)} for {experts} experts")
+                    if device is None:
+                        host[role] = HostBank(tuple(rows_bias.shape), torch.bfloat16)
+                        banks[role] = host[role].tensor
+                    else:
+                        banks[role] = torch.empty_like(rows_bias, device=device)
+                    banks[role].copy_(rows_bias)
             if dummy:
                 banks["gate_up"].zero_()
                 banks["down"].zero_()
+                if biased:
+                    banks["gate_up_bias"].zero_()
+                    banks["down_bias"].zero_()
             else:
                 start = 0
                 for r in rows:

@@ -23,6 +23,7 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "flint": "FlintGGUFForCausalLM",
     "deepseek4": "DeepseekV4GGUFForCausalLM",
     "gemma4": "Gemma4GGUFForCausalLM",
+    "gpt-oss": "GptOssGGUFForCausalLM",
     "glm4moe": "Glm4MoeGGUFForCausalLM",
     # glm5-next: the llama.cpp spelling; glm5next: unsloth's first release
     "glm5-next": "Glm5NextGGUFForCausalLM",
