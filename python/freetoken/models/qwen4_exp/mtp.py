@@ -119,6 +119,7 @@ def draft_config(config: ModelConfig) -> ModelConfig:
 
 class Qwen4ExpMTPDraft(BaseOP):
     attention_backend = "qsa_sparse"
+    reads_gguf_pack = True
     draft_config = staticmethod(draft_config)
 
     @staticmethod

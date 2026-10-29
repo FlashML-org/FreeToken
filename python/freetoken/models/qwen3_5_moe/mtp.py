@@ -39,6 +39,7 @@ class Qwen3_5MTPDraft(BaseOP):
 
     # the draft MTPProposer picks from the target's backends
     attention_backend = None
+    reads_gguf_pack = False
     draft_config = staticmethod(draft_config)
 
     @staticmethod

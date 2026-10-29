@@ -179,9 +179,16 @@ def iter_extra_layer_expert_pieces(model_path: str, prefix: str, device: torch.d
     per_expert_re = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.(gate|up|down)_proj\.(weight|weight_scale_inv)$")
     stacked_re = re.compile(rf"^{re.escape(prefix)}\.(gate_up|down)_proj$")
     names: dict[str, str] = {}
+    unknown: list[str] = []
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-            names.update((name, file) for name in f.keys() if per_expert_re.match(name) or stacked_re.match(name))
+            for name in f.keys():
+                if per_expert_re.match(name) or stacked_re.match(name):
+                    names[name] = file
+                elif name.startswith(prefix + "."):
+                    unknown.append(name)
+    if unknown:
+        raise ValueError(f"{model_path}: the experts under {prefix} use a format this reader does not support, e.g. {sorted(unknown)[:3]}")
     if not names:
         raise ValueError(f"{model_path} has no routed experts under {prefix}")
     stacked = {stacked_re.match(n)[1]: f for n, f in names.items() if stacked_re.match(n)}
