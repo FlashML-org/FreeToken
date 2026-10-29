@@ -921,6 +921,7 @@ def parse_args(
 
     parser.add_argument(
         "--speculative-algorithm",
+        "--spec-algo",
         type=str,
         default=ServerArgs.speculative_algorithm,
         help="Speculative decoding with this draft method. Off by default.",
@@ -928,6 +929,7 @@ def parse_args(
 
     parser.add_argument(
         "--speculative-num-steps",
+        "--spec-num-steps",
         type=int,
         default=ServerArgs.speculative_num_steps,
         help="Draft tokens per decode step (k); 0 takes the method's default.",
@@ -935,6 +937,7 @@ def parse_args(
 
     parser.add_argument(
         "--speculative-draft-model-path",
+        "--spec-draft-model",
         type=str,
         default=ServerArgs.speculative_draft_model_path,
         help="Draft weights; by default they come from the target checkpoint.",
