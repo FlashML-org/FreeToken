@@ -333,8 +333,6 @@ class MTPProposer(Proposer):
 
     def on_prefill(self, batch: Batch, next_tokens_gpu: torch.Tensor) -> None:
         """Draft the chunk's positions: row p pairs token p+1 with the target hidden at p; a final chunk adds the sampled token's row and relays it."""
-        from freetoken.scheduler.prefill import ChunkedReq
-
         sink, self._prefill_sink = self._prefill_sink, None
         hidden = sink.hidden
         # image rows take the embeddings the target used
@@ -349,7 +347,7 @@ class MTPProposer(Proposer):
             state = self._prefill_state.get(row)
             # a continuation chunk resumes where the last one stopped; a first chunk starts at its prefix hit, whose draft KV the tree already holds
             frontier = state[1] if state is not None and state[0] == req.uid else s
-            final = not isinstance(req, ChunkedReq)
+            final = e == req.prompt_len
             end = e if final else e - 1
             if frontier < end:
                 # draft row p embeds the token at p+1
