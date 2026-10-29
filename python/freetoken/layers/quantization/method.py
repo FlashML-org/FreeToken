@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from abc import ABC
 from typing import Any, ClassVar, Sequence
 
@@ -55,7 +57,13 @@ class QuantMethod(ABC):
     def __init__(self, cfg: Any, requested: str = "auto"):
         self.cfg = cfg
         self.requested = requested
-        self.kernel = select_kernel(self.candidates, requested, cfg)
+        candidates = self.candidates
+
+        if os.environ.get("FREETOKEN_USE_ARK", "0") == "1":
+            from freetoken.kernel.ark import candidate_kernels
+
+            candidates = candidate_kernels(self, candidates)
+        self.kernel = select_kernel(candidates, requested, cfg)
 
     @property
     def scheme(self):

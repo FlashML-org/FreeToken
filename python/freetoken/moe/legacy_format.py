@@ -29,6 +29,7 @@ def legacy_bank_names(quant_format: str) -> dict[str, str]:
 LEGACY_FORMAT = {
     (QuantKind.NONE, "fused"): "bf16",
     (QuantKind.FP8_BLOCK, "triton"): "fp8_block",
+    (QuantKind.FP8_BLOCK, "ark_r9700"): "fp8_block",
     (QuantKind.NVFP4, "triton"): "nvfp4",
     # same banks as triton, plus the resident input scales; a "nvfp4" file reads back as triton
     (QuantKind.NVFP4, "w4a4"): "nvfp4",
@@ -48,3 +49,8 @@ def legacy_format_for(kind: QuantKind, kernel: str) -> str:
 
 def kind_kernel_for(legacy_format: str) -> tuple[QuantKind, str]:
     return _KIND_KERNEL[legacy_format]
+
+
+def bank_kernel_compatible(kind: QuantKind, stored: str, selected: str) -> bool:
+    """ARK inherits the block-FP8 Triton layout; other kernels keep strict identity."""
+    return stored == selected or (kind is QuantKind.FP8_BLOCK and stored == "triton" and selected == "ark_r9700")
