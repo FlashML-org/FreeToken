@@ -74,7 +74,7 @@ class GatedDeltaNet(BaseOP):
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
-        # per-call .float() upcast in the decode wrapper. The weight loader exempts
+        # per-call .float() upcast before the decode kernel. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
@@ -168,7 +168,7 @@ class GatedDeltaNet(BaseOP):
                 softplus_beta=1.0, softplus_threshold=20.0,
                 q=q, k=k, v=v, b=b,
                 initial_state_source=pool.recurrent_states[li],
-                initial_state_indices=fla.cache_indices,  # already int32 (built int32 in the scheduler)
+                initial_state_indices=fla.cache_indices,  # already int32 (built int32 by build_fla_metadata)
                 scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
             )[0]  # [B, num_v, V]
         else:

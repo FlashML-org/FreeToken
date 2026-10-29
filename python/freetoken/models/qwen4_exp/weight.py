@@ -137,7 +137,7 @@ class _DenseReader:
         if not candidates:
             return module, 0, 1
         if len(candidates) > 1:
-            # GDN: quantized checkpoints split qkv|z from b|a; same test as gdn.py
+            # GDN: quantized checkpoints split qkv|z from b|a; same test as layers/linear_attn/gdn.py
             split = self.scheme(f"{parent}.in_proj_qkvz") is not None
             keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
             candidates = [c for c in candidates if c[0] in keep]

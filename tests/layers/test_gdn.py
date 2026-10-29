@@ -38,7 +38,7 @@ def _state_dict(ref) -> dict[str, torch.Tensor]:
     }
 
 
-def _make_layer(ratio: int, output_gate: str = "sigmoid", seed: int = 0):
+def _make_layer(ratio: int, output_gate: str, seed: int = 0):
     """fp32 reference + bf16 kernel op over one set of weights. The op is built on meta under
     the serving dtype, the way the engine builds a model, so load_state_dict's dtype check bites."""
     from freetoken.distributed import set_tp_info, try_get_tp_info
@@ -66,7 +66,7 @@ def _make_layer(ratio: int, output_gate: str = "sigmoid", seed: int = 0):
     return op, ref
 
 
-def _ctx(ratio: int, num_slots: int = 8) -> Context:
+def _ctx(monkeypatch, ratio: int, num_slots: int = 8) -> Context:
     import freetoken.core as core
     from freetoken.kvcache.linear_state_pool import LinearStatePool
 
@@ -76,10 +76,9 @@ def _ctx(ratio: int, num_slots: int = 8) -> Context:
         key_head_dim=HEAD_DIM, value_head_dim=HEAD_DIM, conv_kernel_dim=CONV_K,
         output_gate="sigmoid",
     )
-    core._GLOBAL_CTX = None
     ctx = Context(page_size=64)
     ctx.linear_state_pool = LinearStatePool(group, num_slots, torch.bfloat16, DEV, tp_size=1)
-    core.set_global_ctx(ctx)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
     return ctx
 
 
@@ -112,14 +111,14 @@ def _ref_out(ref, hidden: torch.Tensor) -> torch.Tensor:
     return ref(hidden.float().unsqueeze(0))[0]
 
 
-# 3:1 with sigmoid is Qwen3.8-Flash-Next; the silu case catches a gate that ignores the config
+# 3:1 with sigmoid is Qwen3.8-Flash-Next; the sigmoid case also catches a layer that ignores output_gate (the default is silu)
 @pytest.mark.parametrize("ratio,output_gate", [(2, "silu"), (3, "sigmoid")])
-def test_ragged_prefill_then_decode(ratio, output_gate):
+def test_ragged_prefill_then_decode(monkeypatch, ratio, output_gate):
     """bs=3 ragged prefill, then one decode step per request off the carried conv + recurrent
     state. The decode oracle is the whole (prefill + 1) sequence in one reference pass, so a
     state that did not survive the prefill shows up immediately."""
     op, ref = _make_layer(ratio, output_gate, seed=ratio)
-    ctx = _ctx(ratio)
+    ctx = _ctx(monkeypatch, ratio)
     lengths = [128, 1000, 37]
     hidden, reqs, out = _prefill(op, ctx, lengths, seed=13)
 
