@@ -38,6 +38,29 @@ def _nvfp4_weights(shape, seed=765):
     return storage, reference
 
 
+def _iq1_m_weights(shape, exact_sums, seed=1729):
+    """Random IQ1_M blocks over every grid index, shift bit and 3-bit scale, padded for MMQ.
+
+    Super-scales are random fp16 in [0.005, 0.02], every bit of which the loader decodes. With ``exact_sums`` they are
+    m / 1024 (m in 5..20) instead: every product with ``_activation`` is then a multiple of 2^-19 and the sums are exact
+    in fp32, so the kernel and the reference round a bf16 / fp16 result alike.
+    """
+    rng = np.random.default_rng(seed)
+    *lead, rows, k = shape
+    blocks = (*lead, rows, k // 256)
+    qs = rng.integers(0, 256, (*blocks, 32), dtype=np.uint8)
+    qh = rng.integers(0, 256, (*blocks, 16), dtype=np.uint8)
+    d = rng.integers(5, 21, blocks) / 1024 if exact_sums else rng.uniform(0.005, 0.02, blocks)
+    d = d.astype(np.float16).view(np.uint16)
+    # the super-scale's four nibbles sit in the top nibble of the four uint16 scale words
+    scales = rng.integers(0, 1 << 12, (*blocks, 4), dtype=np.uint16) | (((d[..., None] >> (4 * np.arange(4, dtype=np.uint16))) & 0xF) << 12)
+    packed = np.concatenate([qs, qh, scales.astype("<u2").view(np.uint8)], axis=-1).reshape(*lead, rows, -1)
+    reference = torch.from_numpy(quants.dequantize(packed, QType.IQ1_M))
+    storage = torch.zeros(*lead, rows + 1, packed.shape[-1], dtype=torch.uint8, device="cuda")
+    storage[..., :-1, :].copy_(torch.from_numpy(packed))
+    return storage[..., :-1, :], reference
+
+
 def _activation(shape, dtype, seed=19):
     rng = np.random.default_rng(seed)
     half = rng.integers(-127, 128, (*shape[:-1], shape[-1] // 32, 16))
@@ -82,6 +105,22 @@ def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive):
     expected = torch.einsum("tjk, tjok -> tjo", xs, ref[ids.cpu().long().clamp_min(0)])
     expected[ids.cpu() < 0] = 0
     torch.testing.assert_close(actual.cpu(), expected.to(dtype), atol=2e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("batch", [1, 17, 300])
+def test_iq1_m_matrix_and_moe_routes_match_cpu(dtype, batch):
+    # llama.cpp has no IQ1_M MMQ: above the vector kernel's batch this runs FreeToken's IQ1_M tile loader
+    exact_sums = dtype != torch.float32
+    w, ref = _iq1_m_weights((64, 512), exact_sums)
+    x = _activation((batch, 512), dtype)
+    actual = ggml.mul_mat(w, int(QType.IQ1_M), x)
+    torch.testing.assert_close(actual.cpu(), F.linear(x.cpu().float(), ref).to(dtype), atol=2e-4, rtol=1e-3)
+    w, ref = _iq1_m_weights((4, 64, 512), exact_sums)
+    ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
+    actual = ggml.mul_mat_id(w, int(QType.IQ1_M), x, ids)
+    expected = torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.cpu().long()]).to(dtype)
+    torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

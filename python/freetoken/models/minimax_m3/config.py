@@ -37,6 +37,11 @@ from freetoken.models.config import (
 
 from .args import load_args
 
+# the config names only the image token; the reference processor reads these two from the tokenizer's fixed added tokens
+IMAGE_START_ID = 200029  # ]<]start of image[>[
+IMAGE_END_ID = 200030  # ]<]end of image[>[
+
+
 def _text_config(hf_config: Any) -> Any:
     return getattr(hf_config, "text_config", None) or hf_config
 
@@ -233,4 +238,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["VisionConfig", "parse_config", "parse_vision_config"]
+__all__ = ["IMAGE_END_ID", "IMAGE_START_ID", "VisionConfig", "parse_config", "parse_vision_config"]

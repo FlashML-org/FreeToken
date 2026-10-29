@@ -60,6 +60,7 @@ def _setup():
         finished_reqs=set(),
         eos_token_ids=set(),
         toolcall_anchor_id=None,
+        spec=None,
         config=SimpleNamespace(page_size=1),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
         send_result=sent.extend,
@@ -72,6 +73,7 @@ def _setup():
         _last_data=None,
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
+    stub._commit_tokens = lambda req, tokens: Scheduler._commit_tokens(stub, req, tokens)
     return pool, cm, tm, dm, pm, sent, stub
 
 

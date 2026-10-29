@@ -11,10 +11,7 @@ from freetoken.message import MMItem
 from freetoken.mm import mm_pad_value
 from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.processor import MMProcessor, PromptReplacement, content_hash
-
-# the config names only the image token; the reference processor reads these two from the tokenizer's fixed added tokens
-IMAGE_START_ID = 200029  # ]<]start of image[>[
-IMAGE_END_ID = 200030  # ]<]end of image[>[
+from freetoken.models.minimax_m3.config import IMAGE_END_ID, IMAGE_START_ID
 
 
 def _compression(vc: Any, key: str) -> int:

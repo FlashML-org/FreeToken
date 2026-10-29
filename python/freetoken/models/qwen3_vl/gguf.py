@@ -1,8 +1,8 @@
 """Qwen3-VL GGUFs: the text trunks of llama.cpp ``qwen3vl`` / ``qwen3vlmoe`` files, and the Qwen VL vision tower from a ``qwen3vl_merger`` mmproj (the HF config keys, the image processor config, and the tower weights).
 
-The text trunk runs without its vision side: no tower and plain rope instead of interleaved mrope. llama.cpp's IMROPE keeps the standard full-spectrum theta (ggml.h: the dim index is not reset per section), so equal (t, h, w) text positions reduce to NeoX rope and q/k carry no permute, like the ``qwen3`` / ``qwen3moe`` GGUFs. The routed experts stack as ``ffn_*_exps`` because the converter splits HF's packed ``gate_up_proj`` / ``down_proj`` experts (conversion/qwen3vl.py).
+Without an mmproj the text trunk runs without its vision side: no tower and plain rope instead of interleaved mrope. llama.cpp's IMROPE keeps the standard full-spectrum theta (ggml.h: the dim index is not reset per section), so equal (t, h, w) text positions reduce to NeoX rope and q/k carry no permute, like the ``qwen3`` / ``qwen3moe`` GGUFs. The routed experts stack as ``ffn_*_exps`` because the converter splits HF's packed ``gate_up_proj`` / ``down_proj`` experts (conversion/qwen3vl.py).
 
-llama.cpp splits the Conv3d patch embedding into one tensor per temporal slice (``v.patch_embd.weight`` and ``.weight.1``); everything else is stored in HF layout.
+llama.cpp splits the Conv3d patch embedding into one tensor per temporal slice (``v.patch_embd.weight`` and ``.weight.1``); everything else is stored in HF layout. A Qwen3-VL mmproj also carries one DeepStack merger per tapped block as ``v.deepstack.{block}.{norm,fc1,fc2}``; the merger index is the tap's rank, as the converter writes it (conversion/qwen3vl.py maps ``deepstack_merger_list.{k}`` through ``deepstack_visual_indexes[k]``).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Any, TYPE_CHECKING, Iterator
 
 import torch
 
-from freetoken.models.gguf.mmproj import Mmproj, mmproj_tensor
+from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, load_gguf_metadata
 from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix
 
@@ -53,6 +53,13 @@ _BLOCK = {
 }
 _BLOCK_RE = re.compile(r"^v\.blk\.(\d+)\.(\w+)\.(weight|bias)$")
 _PATCH = ("v.patch_embd.weight", "v.patch_embd.weight.1")
+_DS_RE = re.compile(r"^v\.deepstack\.(\d+)\.(norm|fc1|fc2)\.(weight|bias)$")
+_DS_LEAF = {"norm": "norm", "fc1": "linear_fc1", "fc2": "linear_fc2"}
+
+
+def _deepstack_taps(index: dict[str, GgufTensorInfo]) -> tuple[int, ...]:
+    """The ViT blocks a DeepStack merger taps, ascending; ``deepstack_visual_indexes`` and the merger order both follow it."""
+    return tuple(sorted({int(m[1]) for n in index if (m := _DS_RE.match(n))}))
 
 
 def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, model_path: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
@@ -60,13 +67,31 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, 
     if mmproj.projector != _PROJECTOR:
         raise ValueError(f"mmproj {mmproj.path} is a {mmproj.projector!r} tower; Qwen VL needs {_PROJECTOR!r}")
     md, index = load_gguf_metadata(mmproj.path), gguf_tensor_index(mmproj.path)
-    if any(md.get("clip.vision.is_deepstack_layers") or []):
+    arch = text_md["general.architecture"]
+    taps = _deepstack_taps(index)
+    if taps and arch not in ("qwen3vl", "qwen3vlmoe"):
         raise ValueError(f"mmproj {mmproj.path} is a Qwen3-VL tower with DeepStack layers; Qwen3.5 and later read none")
+    declared = [i for i, on in enumerate(md.get("clip.vision.is_deepstack_layers") or []) if on]
+    if declared and tuple(declared) != taps:
+        raise ValueError(f"mmproj {mmproj.path} declares DeepStack layers {declared} but carries tensors for blocks {list(taps)}")
+    text_n = text_md.get(f"{arch}.n_deepstack_layers")
+    if text_n is not None and int(text_n) != len(taps):
+        raise ValueError(f"mmproj {mmproj.path} taps {len(taps)} DeepStack layers; the text GGUF declares {int(text_n)}")
+    if taps:
+        if max(taps) >= int(md["clip.vision.block_count"]):
+            raise ValueError(f"mmproj {mmproj.path} taps DeepStack mergers at blocks {list(taps)} past its {int(md['clip.vision.block_count'])} tower blocks")
+        missing = [
+            f"v.deepstack.{i}.{leaf}"
+            for i in taps
+            for leaf in ("norm.weight", "norm.bias", "fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias")
+            if f"v.deepstack.{i}.{leaf}" not in index
+        ]
+        if missing:
+            raise ValueError(f"mmproj {mmproj.path} carries incomplete DeepStack mergers (no {missing[0]})")
 
     def kv(key: str):
         return md[f"clip.vision.{key}"]
 
-    arch = text_md["general.architecture"]
     text_hidden = int(text_md[f"{arch}.embedding_length"])
     if int(kv("projection_dim")) != text_hidden:
         raise ValueError(f"mmproj {mmproj.path} projects to {int(kv('projection_dim'))} but the text model is {text_hidden} wide")
@@ -86,7 +111,7 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, 
         "out_hidden_size": text_hidden,
         # ggml order [kw, kh, in, out]
         "in_channels": int(index[_PATCH[0]].ne[2]),
-        "deepstack_visual_indexes": [],
+        "deepstack_visual_indexes": list(taps),
     }
     hf_fields = {
         "vision_config": vision_config,
@@ -108,22 +133,26 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, 
     return hf_fields, preprocessor
 
 
-def _name(gguf_name: str) -> str:
+def _name(gguf_name: str, taps: tuple[int, ...]) -> str:
     if gguf_name in _TOP:
         return _TOP[gguf_name]
+    if m := _DS_RE.match(gguf_name):
+        # gguf_mm_config refuses a tap past the tower depth or an incomplete merger before any weight loads
+        return f"deepstack_merger_list.{taps.index(int(m[1]))}.{_DS_LEAF[m[2]]}.{m[3]}"
     if (m := _BLOCK_RE.match(gguf_name)) and m[2] in _BLOCK:
         return f"blocks.{m[1]}.{_BLOCK[m[2]]}.{m[3]}"
     raise ValueError(f"unexpected tensor {gguf_name!r} in a {_PROJECTOR} mmproj")
 
 
 def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
-    """The tower state dict under ``visual.``, named as the HF checkpoints load."""
+    """The tower state dict under ``visual.``, named as the HF checkpoints load; merger ``k`` is the tap's rank."""
     index = gguf_tensor_index(mmproj.path)
+    taps = _deepstack_taps(index)
     slices = [mmproj_tensor(index[n]) for n in _PATCH if n in index]
     yield "visual.patch_embed.proj.weight", torch.stack(slices, dim=2)
     for gguf_name, info in index.items():
         if gguf_name not in _PATCH:
-            yield f"visual.{_name(gguf_name)}", mmproj_tensor(info)
+            yield f"visual.{_name(gguf_name, taps)}", mmproj_tensor(info)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -180,7 +209,12 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
         return md[f"{arch}.{key}"]
 
     _check_supported(shim)
+    vision_config = getattr(shim, "vision_config", None)
     rope = {"rope_type": "default", "rope_theta": float(kv("rope.freq_base"))}
+    if vision_config is not None:
+        # every Qwen3-VL release interleaves its [t | h | w] sections; without a tower the text keeps 1-D rope
+        rope["mrope_section"] = [int(s) for s in kv("rope.dimension_sections")][:3]
+        rope["mrope_interleaved"] = True
     scaling = md.get(f"{arch}.rope.scaling.type", "none")
     if scaling == "yarn":
         rope.update(
@@ -216,13 +250,12 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
         text.norm_topk_prob = True
     else:
         text.num_experts = 0
-    # text only: no vision_config, so the wrapper builds no tower and keeps 1-D rope
     return SimpleNamespace(
         text_config=text,
         model_type="qwen3_vl",
         architectures=list(shim.architectures),
-        image_token_id=None,
-        vision_config=None,
+        image_token_id=getattr(shim, "image_token_id", None),
+        vision_config=vision_config,
         tie_word_embeddings=bool(shim.tie_word_embeddings),
     )
 
@@ -238,25 +271,28 @@ def iter_gguf_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """The dense state dict from the GGUF; the routed experts load as GGUF expert banks (``freetoken.models.gguf.experts``)."""
     if not include_non_moe:
         return
     from freetoken.utils import cached_load_hf_config
 
-    text = _hf_config(cached_load_hf_config(model_path)).text_config
+    config = parse_gguf_config(cached_load_hf_config(model_path))
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
     index = gguf_tensor_index(model_path)
-    hidden = text.hidden_size
+    hidden = config.hidden_size
 
     def t(name: str) -> GgufTensorInfo:
         return index[name if name in index else f"{name}.weight"]
 
     yield from fused("model.embed_tokens", [t("token_embd")], [matrix(t("token_embd"))], hidden)
-    if not text.tie_word_embeddings:
+    if not config.tie_word_embeddings:
         yield from fused("lm_head", [t("output")], [matrix(t("output"))], hidden)
     yield "model.norm.weight", float_tensor(t("output_norm"))
 
-    for layer in range(text.num_hidden_layers):
+    for layer in range(config.num_layers):
         blk, pre = f"blk.{layer}", f"model.layers.{layer}"
         yield f"{pre}.input_layernorm.weight", float_tensor(t(f"{blk}.attn_norm"))
         yield f"{pre}.post_attention_layernorm.weight", float_tensor(t(f"{blk}.ffn_norm"))
@@ -269,12 +305,15 @@ def iter_gguf_weights(
         out = t(f"{blk}.attn_output")
         yield from fused(f"{sa}.o_proj", [out], [matrix(out)], int(out.ne[0]))
         mlp = f"{pre}.mlp"
-        if text.num_experts:
+        if config.moe_enabled:
             yield f"{mlp}.gate.weight", float_tensor(t(f"{blk}.ffn_gate_inp"))
         else:
             gate, up, down = (t(f"{blk}.ffn_{p}") for p in ("gate", "up", "down"))
             yield from fused(f"{mlp}.gate_up_proj", [gate, up], [matrix(gate), matrix(up)], hidden)
             yield from fused(f"{mlp}.down_proj", [down], [matrix(down)], int(down.ne[0]))
+
+    if vision:
+        yield from iter_mmproj_weights(find_mmproj(model_path))
 
 
 __all__ = ["gguf_mm_config", "iter_gguf_weights", "iter_mmproj_weights", "parse_gguf_config", "to_gguf"]

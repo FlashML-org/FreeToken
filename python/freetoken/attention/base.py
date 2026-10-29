@@ -70,7 +70,8 @@ class BaseAttnBackend(ABC):
     def prepare_metadata(self, batch: Batch) -> None: ...
 
     @abstractmethod
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None: ...
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        """Static buffers for graphs of ``rows_per_req`` query rows per request: 1 for decode, more for a uniform extend."""
 
     @abstractmethod
     def prepare_for_capture(self, batch: Batch) -> None: ...
@@ -116,8 +117,8 @@ class HybridBackend(BaseAttnBackend):
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
         return backend.prepare_metadata(batch)
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
-        self.decode_backend.init_capture_graph(max_seq_len, bs_list)
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        self.decode_backend.init_capture_graph(max_seq_len, bs_list, rows_per_req)
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.decode_backend.prepare_for_capture(batch)

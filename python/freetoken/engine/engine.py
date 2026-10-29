@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
+from freetoken.attention.linear import LinearAttnBackend, gdn_slot
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
@@ -30,8 +31,9 @@ from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, r
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .spec_protocol import SpecRuntime
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -47,7 +49,8 @@ def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) ->
     small = [s for s in pool_sizes if s < num_experts]
     if not small:
         return
-    limit = min(small) // config.model_config.num_experts_per_tok
+    # a decode step routes every row of every request, decode_rows_per_req rows each
+    limit = min(small) // (config.model_config.num_experts_per_tok * config.decode_rows_per_req)
     if config.max_running_req > limit:
         logger.warning_rank0(
             f"the smallest MoE slot pool has {min(small)} slots; lowering max_running_req "
@@ -109,6 +112,12 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     alone does not cover once page_size > 32 (an unaligned --max-seq-len-override on DSV4's P=128
     or trtllm's forced 64 would index past the row)."""
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
+
+
+def _seq_limits(config, num_tokens: int) -> tuple[int, int]:
+    """(longest request, page-table width). A decode step may widen a request by decode_rows_per_req - 1 provisional rows past its length, so requests get that much less and the table still covers the widened tail."""
+    limit = min(config.max_seq_len, num_tokens)
+    return limit - (config.decode_rows_per_req - 1), _page_table_width(limit, config.page_size)
 
 
 def _required_attn_types(model_config) -> frozenset[AttnType]:
@@ -184,6 +193,34 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         "No attention backend can serve attention types "
         f"{sorted(t.value for t in required)} on this machine."
     )
+
+
+def _spec_runner():
+    from freetoken.engine.spec_protocol import SPEC_RUNNER
+    from freetoken.models.register import _load_attr
+
+    return _load_attr(*SPEC_RUNNER.split(":"))
+
+
+def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
+    """Resolve k and the method's own limits, then check what every speculative method needs of the target."""
+    _spec_runner().adjust_config(config, override)
+    if windowed_kv:
+        raise ValueError(
+            "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
+            "their window frees would release slots a verify step still reads"
+        )
+    parts = [p.strip() for p in config.attention_backend.split(",")]
+    graph = attention_backend_info(parts[-1]).uniform_extend_graph
+    if graph == "host_plan" and len(parts) == 2 and attention_backend_info(parts[0]).uniform_extend_graph == "device":
+        # verify steps run on the decode part; a prefill part that captures on device serves them better
+        logger.info_rank0(f"speculative decoding: attention backend {config.attention_backend} -> {parts[0]}")
+        override("attention_backend", parts[0])
+    elif graph == "none":
+        raise ValueError(
+            f"speculative decoding needs a decode attention backend that captures multi-row graphs "
+            f"(fa, triton or fi), got {config.attention_backend!r}"
+        )
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -447,6 +484,8 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        # draft weights load before any pool is sized, so every free-memory read below counts them
+        self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -499,6 +538,11 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        if self.spec is not None:
+            # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
+            spec_fixed, draft_page = self._spec_budget(config)
+            page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
+            available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -524,8 +568,7 @@ class Engine:
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
@@ -540,16 +583,14 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        self.linear_backend = LinearAttnBackend(self.device, self.linear_state_pool) if self.linear_state_pool is not None else None
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
-        post_free_memory = self._sync_get_memory()[0]
-        logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
-
-        # ======================= Graph capture initialization ========================
+        # padded rows replay this request, so it carries one token per decode row
         self.dummy_req = Req(
-            input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            input_ids=torch.zeros(config.decode_rows_per_req, dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
             cached_len=0,
             output_len=1,
@@ -558,23 +599,22 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         # padded/dummy rows index the GDN padding slot (0) so gather/scatter hits scratch.
-        if self.linear_state_pool is not None:
+        # Naive GDN keys state by table_idx, where slot 0 is a live request and the dummy's own row is the scratch.
+        if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-        self.graph_runner = GraphRunner(
-            stream=self.stream,
-            device=self.device,
-            model=self.model,
-            attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=init_free_memory,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
-            dummy_req=self.dummy_req,
-            moe_offload_cache=self.moe_offload_cache,
-            mrope=config.model_config.model_is_mrope,
-        )
+
+        # ======================= Verify state initialization ========================
+        if config.decode_rows_per_req > 1 and self.linear_state_pool is not None:
+            self.linear_state_pool.attach_verify_scratch(config.max_running_req, config.decode_rows_per_req)
+        if self.spec is not None:
+            self.spec.attach(self)
+
+        post_free_memory = self._sync_get_memory()[0]
+        logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+
+        # ======================= Graph capture initialization ========================
+        self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -699,6 +739,9 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        spec_fixed, draft_page = self._spec_budget(config)
+        fixed_cache_size += spec_fixed
+        cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -805,8 +848,8 @@ class Engine:
                 f"(--moe-cache-scope per-layer gives each layer its own)"
             )
         self._moe_slot_limit = _slot_limit(layer_methods) if layer_methods is not None else (method.slot_limit() if method is not None else None)
-        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one token per step
-        pools = self._moe_pools(1)
+        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's decode step
+        pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
@@ -902,7 +945,6 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         if locked_fetch:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
-        self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
 
@@ -1034,6 +1076,7 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
+        max_tokens *= config.decode_rows_per_req
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1098,8 +1141,7 @@ class Engine:
 
     def _refresh_seq_state(self, config) -> None:
         num_tokens = self.num_pages * config.page_size
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         if aligned_max_seq_len != self.page_table.shape[1]:
             # max_seq_len changed (e.g. KV grew past the startup token budget); the page table
             # columns must track it or new requests would index out of bounds. The scheduler
@@ -1143,7 +1185,7 @@ class Engine:
                 )
             try:
                 # a rebuild does not lower max_running_req again, so with GPU decode every pool must hold a full batch; hybrid caps its fetches instead
-                batch = config.max_running_req if self.moe_offload_cache.decode_target == "gpu" else 1
+                batch = config.max_running_req * config.decode_rows_per_req if self.moe_offload_cache.decode_target == "gpu" else 1
                 moe_pool_sizes = split_slots(moe_cache_size, self._moe_pools(batch), self._moe_expert_counts)
                 self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
@@ -1192,14 +1234,14 @@ class Engine:
             if num_mamba_slots is not None
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
+        spec_fixed, draft_page = self._spec_budget(config)
         self.kv_cache.validate_rebuild(
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
-            extra_fixed_bytes=(
-                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
-            ),
+            extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
+            extra_page_bytes=draft_page,
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
@@ -1218,7 +1260,12 @@ class Engine:
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
+        if self.linear_backend is not None:
+            self.linear_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if self.spec is not None:
+            # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
+            self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -1244,30 +1291,68 @@ class Engine:
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        aligned_max_seq_len = self.page_table.shape[1]
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
-        self.graph_runner = GraphRunner(
+        if self.spec is not None:
+            self.spec.attach(self)
+        # reuse the startup-resolved bs set (see above)
+        self.graph_runner = self._make_graph_runner(prior_graph_bs, free_min, aligned_max_seq_len)
+
+    def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
+        """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
+        config = self.config
+        rows = config.decode_rows_per_req
+        verify = {}
+        if rows > 1:
+            # every decode step is a verify; the verify scratch has max_running_req rows
+            cuda_graph_bs = [
+                bs for bs in _determine_cuda_graph_bs(cuda_graph_bs, config.cuda_graph_max_bs, free_memory)
+                if bs <= config.max_running_req
+            ]
+            verify = dict(rows_per_req=rows, phase="verify", batch_hook=self._prepare_verify_batch)
+        runner = GraphRunner(
             stream=self.stream,
             device=self.device,
-            model=self.model,
+            forward=self.model.forward,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=free_min,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            free_memory=free_memory,
+            max_seq_len=max_seq_len,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            out_dtype=torch.float32,
+            linear_backend=self.linear_backend,
+            **verify,
         )
+        if self.spec is not None:
+            self.spec.capture_graphs(runner.graph_bs_list, runner.graph_pool)
+        return runner
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
-        if batch.mm_gather_plan:
-            self._run_mm_encoder(batch)
+    def _prepare_verify_batch(self, batch: Batch) -> None:
+        batch.features = self.spec.feature_sink(batch)
+
+    def commit_verify(self, reqs, counts, out: torch.Tensor) -> None:
+        """Commit each verified request's first ``counts`` tokens (row i of ``out`` is reqs[i]) to the target's per-request state."""
+        if self.linear_state_pool is not None and self.linear_state_pool.verify_scratch is not None:
+            self.linear_state_pool.commit_verify([gdn_slot(r) for r in reqs], counts)
+        for req, n, tokens in zip(reqs, counts, out):
+            if req.output_token_counts is not None:
+                req.output_token_counts.scatter_add_(0, tokens[:n], req.output_token_counts.new_ones(n))
+
+    def _spec_budget(self, config) -> tuple[int, int]:
+        """(fixed bytes, draft KV bytes per page) speculative decoding adds next to the KV pool."""
+        if getattr(self, "spec", None) is None:
+            return 0, 0
+        fixed, per_token = self.spec.budget(config)
+        return fixed, per_token * config.page_size
+
+    def forward_logits(self, batch: Batch) -> torch.Tensor:
+        """The batch's logits from its captured graph, or eagerly when none fits."""
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -1275,6 +1360,16 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        return logits
+
+    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        assert torch.cuda.current_stream() == self.stream
+        if batch.mm_gather_plan:
+            self._run_mm_encoder(batch)
+        spec_prefill = self.spec is not None and batch.is_prefill
+        if spec_prefill:
+            batch.features = self.spec.feature_sink(batch)
+        logits = self.forward_logits(batch)
 
         for req in batch.reqs:
             req.complete_one()
@@ -1284,6 +1379,9 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if spec_prefill:
+            # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
+            self.spec.on_prefill(batch, next_tokens_gpu)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
@@ -1900,6 +1998,8 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    if getattr(config, "speculative_algorithm", None) is not None:
+        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

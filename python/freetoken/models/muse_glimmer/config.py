@@ -11,6 +11,10 @@ from freetoken.models.config import (
     detect_compressed_tensors_nvfp4,
 )
 
+# the tokenizer's <|image_start|> / <|image_end|>; the config only names the <|patch|> id
+IMAGE_START_ID = 200080
+IMAGE_END_ID = 200081
+
 _SWA_TYPE = "sliding_attention"
 _FULL_TYPE = "full_attention"
 _VISION_LAYER_TYPES = {"window_attention", "full_attention"}
@@ -197,4 +201,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["VisionConfig", "parse_config", "parse_vision_config"]
+__all__ = ["IMAGE_END_ID", "IMAGE_START_ID", "VisionConfig", "parse_config", "parse_vision_config"]

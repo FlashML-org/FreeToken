@@ -11,10 +11,7 @@ from freetoken.message import MMItem
 from freetoken.mm import mm_pad_value
 from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.processor import MMProcessor, PromptReplacement, content_hash
-
-# the tokenizer's <|image_start|> / <|image_end|>; the config only names the <|patch|> id
-_IMAGE_START_ID = 200080
-_IMAGE_END_ID = 200081
+from freetoken.models.muse_glimmer.config import IMAGE_END_ID, IMAGE_START_ID
 
 
 class MuseGlimmerMMProcessor(MMProcessor):
@@ -62,7 +59,7 @@ class MuseGlimmerMMProcessor(MMProcessor):
     def prompt_replacement(self, item: MMItem) -> PromptReplacement:
         t, h, w = item.grid_thw
         pads = [self.image_token_id] * ((t * h * w) // (self.merge * self.merge))
-        return PromptReplacement.select_token_id([_IMAGE_START_ID, *pads, _IMAGE_END_ID], self.image_token_id)
+        return PromptReplacement.select_token_id([IMAGE_START_ID, *pads, IMAGE_END_ID], self.image_token_id)
 
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         merge = self.merge

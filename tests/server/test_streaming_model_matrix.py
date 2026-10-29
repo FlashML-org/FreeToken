@@ -322,6 +322,27 @@ def test_reasoning_generation_level(name):
     assert [c.name for c in full.tool_calls] == ["read"]
 
 
+def test_qwen3_missing_think_closer_recovers_structured_tool_call():
+    # Qwen's template pre-opens <think>. A model can skip its closing tag and
+    # transition directly to a valid XML call; recover the boundary before the
+    # tool parser runs, without treating reasoning itself as executable.
+    text = THINKING + CALL_BLOCKS["qwen3_coder"]
+    events = _stream_events(_random_chunks(text, 23), "qwen3_coder", "qwen3")
+    _assert_stream_invariants(events, "qwen3_coder")
+    assert _reasoning(events).strip() == THINKING
+    calls = _calls(events)
+    assert len(calls) == 1
+    assert calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == READ_ARGS
+    assert events[-1].finish_reason == "tool_calls"
+
+    full = _full_result(text, "qwen3_coder", "qwen3")
+    assert full.reasoning.strip() == THINKING
+    assert full.content == ""
+    assert [call.name for call in full.tool_calls] == ["read"]
+    assert full.finish_reason == "tool_calls"
+
+
 async def _aiter(items):
     for it in items:
         yield it

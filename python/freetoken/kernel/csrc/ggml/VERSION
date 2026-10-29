@@ -12,6 +12,7 @@ Local changes, kept in freetoken.patch (already applied):
 - common.cuh: the native fp4 MMA (BLACKWELL_MMA_AVAILABLE, blackwell_mma_available) is off unless GGML_CUDA_FP4_MMA is defined; it needs an sm_120a/sm_120f build.
 - mmvq.cu, common.cuh: the NVFP4 scale fusion (x_scale, gate_scale) reads strided scale vectors, e.g. columns of a per-expert scale bank.
 - getrows.cu, dequantize.cuh: get_rows reads NVFP4 rows, e.g. an NVFP4 token_embd.
+- mmq.cu/.cuh, mmq-load-tiles.cuh, template-instances/mmq-instance-iq1_m.cu: MMQ runs IQ1_M, which llama.cpp has no MMQ kernel for. Its values times 8 are int8, so it loads into IQ2_XS's tile layout and takes IQ2_XS's configs.
 - mmvq.cu, mmid.cu, mmq.cu/.cuh, quantize.cu: a negative expert id is an inactive route (hybrid decode): MMVQ writes zero rows for it without reading an expert, and MMQ gives it no compact row when called with inactive_ids.
 
 To update: copy the same files from a newer llama.cpp, apply freetoken.patch, and update this file.

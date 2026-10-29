@@ -27,7 +27,8 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
-    next_token: int
+    # tokens committed this step, in order: one per decode step, up to k+1 per speculative verify
+    next_tokens: List[int]
     finished: bool
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it

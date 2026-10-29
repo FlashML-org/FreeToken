@@ -212,7 +212,9 @@ class DSV41SparseAttnBackend(BaseAttnBackend):
         decoder_rows = torch.cat(rows).to(self.device, non_blocking=True) if rows else torch.empty(0, dtype=torch.int64, device=self.device)
         return DSV41AttnMetadata(last_indices=last_indices, segments=segments, decoder_segments=dec, decoder_rows=decoder_rows, decoder_pad=pad)
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
+            raise NotImplementedError("dsv41_sparse captures decode graphs only")
         assert self.capture is None, "Capture already initialized."
         self.max_graph_bs = max(bs_list)
         self.capture = DSV41CaptureData.create(self.max_graph_bs, max_seq_len, self.device)

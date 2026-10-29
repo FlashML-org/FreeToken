@@ -173,13 +173,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_DENSE_PACKED + _STACKED_EXPERTS_PACKED,
     ),
-    # llama.cpp qwen3vl / qwen3vlmoe GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp qwen3vl / qwen3vlmoe GGUF: the same model classes with every tensor in
+    # its packed ggml type; a qwen3vl_merger mmproj adds the tower with its DeepStack mergers
     "Qwen3VLGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_vl",
         "Qwen3VLForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     "Qwen3VLMoeGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_vl",
@@ -187,6 +190,8 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     "MiniMaxM2ForCausalLM": ModelSpec(
         "freetoken.models.minimax_m2",
@@ -220,13 +225,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "MiniMaxM3ForCausalLM",
         packed_modules_mapping=_MINIMAX_M3_PACKED,
     ),
-    # llama.cpp minimax-m3 GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp minimax-m3 GGUF: the same model classes with every tensor in its packed ggml type; a minimax_m3 mmproj adds the vision tower
     "MiniMaxM3GGUFForCausalLM": ModelSpec(
         "freetoken.models.minimax_m3",
-        "MiniMaxM3ForCausalLM",
+        "MiniMaxM3ForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_MINIMAX_M3_GGUF_PACKED,
+        mm_processor=_MINIMAX_M3_PROCESSOR,
+        encoders=_MINIMAX_M3_ENCODERS,
     ),
     "DeepseekV4ForCausalLM": ModelSpec(
         "freetoken.models.deepseek_v4",
@@ -367,13 +374,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_MUSE_GLIMMER_PROCESSOR,
         encoders=_MUSE_GLIMMER_ENCODERS,
     ),
-    # llama.cpp muse-glimmer GGUF (text only): the same model classes with every tensor in its packed ggml type
+    # llama.cpp muse-glimmer GGUF: the same model classes with every tensor in its packed ggml type; a muse-glimmer mmproj adds the vision tower (images only)
     "MuseGlimmerGGUFForCausalLM": ModelSpec(
         "freetoken.models.muse_glimmer",
-        "MuseGlimmerForCausalLM",
+        "MuseGlimmerForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED,
+        mm_processor=_MUSE_GLIMMER_PROCESSOR,
+        encoders=_MUSE_GLIMMER_ENCODERS,
     ),
     "MistralForCausalLM": ModelSpec(
         "freetoken.models.mistral",

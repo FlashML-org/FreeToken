@@ -56,8 +56,8 @@ class Glm5NextDSABackend(DSAAttnBackend):
     # ----- CUDA-graph decode staging ------------------------------------------------------
     # The tail rings are keyed by Req.table_idx; a captured decode step must read it
     # from a static buffer restaged per replay (rows/kvlen precedent in the parent).
-    def init_capture_graph(self, max_seq_len: int, bs_list) -> None:
-        super().init_capture_graph(max_seq_len, bs_list)
+    def init_capture_graph(self, max_seq_len: int, bs_list, rows_per_req: int = 1) -> None:
+        super().init_capture_graph(max_seq_len, bs_list, rows_per_req)
         self._slots_buf = torch.zeros(max(bs_list), dtype=torch.int64, device=self.device)
 
     def _stage_decode(self, batch: "Batch", bs: int, table_idx: torch.Tensor) -> None:
