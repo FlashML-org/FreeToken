@@ -114,7 +114,9 @@ class MTPProposer(Proposer):
             raise ValueError(f"MTP is not supported for {arch} yet")
         path = config.speculative_draft_model_path or config.model_path
         # checked here because a draft that cannot load otherwise fails only after the whole target has loaded
-        if config.speculative_draft_model_path and (os.path.isabs(path) or path.endswith(".gguf")) and not os.path.exists(path):
+        # a HF repo id is "name" or "org/name"; anything else names a local path
+        local = os.path.isabs(path) or path.startswith(".") or path.count("/") > 1 or path.endswith(".gguf")
+        if config.speculative_draft_model_path and local and not os.path.exists(path):
             raise ValueError(f"--speculative-draft-model-path {path} does not exist")
         # FTW keeps only what the target's iter_weights yields, which drops mtp.*
         if is_ftw_checkpoint(path):
