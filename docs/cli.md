@@ -98,6 +98,16 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
+### Speculative decoding
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
+| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`) | Draft tokens per decode step, 1 to 8 for `mtp` |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from; a GGUF target without `mtp.*` tensors needs a GGUF that carries them (a Strata MTP pack) |
+
+Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` also refuses FTW checkpoints and Qwen3.5 / Qwen3.6 GGUF.
+
 ### API behaviour
 
 | Flag | Default | Meaning |
