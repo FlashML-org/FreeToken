@@ -650,7 +650,7 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
         assert tensor.shape == state[key].shape, key
         if key.endswith(".weight"):
             assert tensor.dtype is state[key].dtype, key
-    pieces = list(iter_extra_layer_expert_pieces(folder, f"{MTP}.mlp.experts", torch.device("cpu")))
+    pieces = list(iter_extra_layer_expert_pieces(folder, f"{MTP}.mlp.experts"))
     if name == "bf16":
         assert [p[:3] for p in pieces] == [(0, 0, E)]
         assert torch.equal(pieces[0][3]["gate_up"], raw[f"{MTP}.mlp.experts.gate_up_proj"])

@@ -170,7 +170,7 @@ def per_expert_pieces(
         raise ValueError(f"Incomplete expert tensors in checkpoint (layer, expert): {missing}")
 
 
-def iter_extra_layer_expert_pieces(model_path: str, prefix: str, device: torch.device) -> Iterator[Piece]:
+def iter_extra_layer_expert_pieces(model_path: str, prefix: str) -> Iterator[Piece]:
     """The routed experts stored under ``prefix``, one MoE layer outside the model's stack (an MTP head), as pieces of bank layer 0: stacked ``gate_up``/``down``, or ``gate``/``up``/``down`` per expert with ``_scale`` companions in a block-fp8 checkpoint."""
     import safetensors
 
@@ -193,9 +193,11 @@ def iter_extra_layer_expert_pieces(model_path: str, prefix: str, device: torch.d
         raise ValueError(f"{model_path} has no routed experts under {prefix}")
     stacked = {stacked_re.match(n)[1]: f for n, f in names.items() if stacked_re.match(n)}
     if stacked:
+        if missing := {"gate_up", "down"} - set(stacked):
+            raise ValueError(f"{model_path}: stacked experts under {prefix} lack {sorted(missing)}")
         piece = {}
         for role, file in stacked.items():
-            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
                 piece[role] = f.get_tensor(f"{prefix}.{role}_proj")
         return iter([(0, 0, piece["down"].shape[0], piece)])
 
@@ -205,7 +207,7 @@ def iter_extra_layer_expert_pieces(model_path: str, prefix: str, device: torch.d
 
     def tensors():
         for file in dict.fromkeys(names.values()):
-            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
                 yield from ((name, f.get_tensor(name)) for name, where in names.items() if where == file)
 
     scaled = any(name.endswith("_scale_inv") for name in names)

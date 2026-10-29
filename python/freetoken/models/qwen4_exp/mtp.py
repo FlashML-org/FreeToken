@@ -164,7 +164,7 @@ class Qwen4ExpMTPDraft(BaseOP):
         if pack:
             banks = _pack_expert_banks(model_path, device)
         else:
-            pieces = iter_extra_layer_expert_pieces(model_path, "mtp.layers.0.mlp.experts", device)
+            pieces = iter_extra_layer_expert_pieces(model_path, "mtp.layers.0.mlp.experts")
             banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
         attach_resident_banks([moe], banks)
         # not the root: it reaches the target's embedding, which the target finalized already
