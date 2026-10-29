@@ -66,6 +66,22 @@ class BaseAttnBackend(ABC):
         attn_spec: AttentionSpec | None = None,
     ) -> torch.Tensor: ...
 
+    def forward_gated(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        gate: torch.Tensor,
+        attn_spec: AttentionSpec | None = None,
+    ) -> torch.Tensor:
+        """Attention with the model's elementwise sigmoid output gate."""
+        import torch
+
+        out = self.forward(q, k, v, layer_id, batch, attn_spec=attn_spec)
+        return out * torch.sigmoid(gate).reshape_as(out)
+
     @abstractmethod
     def prepare_metadata(self, batch: Batch) -> None: ...
 
@@ -112,6 +128,19 @@ class HybridBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
         return backend.forward(q, k, v, layer_id, batch, attn_spec=attn_spec)
+
+    def forward_gated(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        gate: torch.Tensor,
+        attn_spec: AttentionSpec | None = None,
+    ) -> torch.Tensor:
+        backend = self.prefill_backend if batch.is_prefill else self.decode_backend
+        return backend.forward_gated(q, k, v, layer_id, batch, gate, attn_spec=attn_spec)
 
     def prepare_metadata(self, batch: Batch) -> None:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
