@@ -48,9 +48,8 @@ static __global__ void mm_ids_helper(
         for (int it = 0; it < n_tokens; ++it) {
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
-                int expert_used = ids[it*si1 + iex];
-                expert_used = expert_used < 0 ? INT_MAX : expert_used; // FreeToken: an inactive route uses no expert
-                nex_prev += expert_used < expert;
+                const int expert_used = ids[it*si1 + iex];
+                nex_prev += (unsigned) expert_used < (unsigned) expert; // FreeToken: unsigned, so an inactive route (negative id) sorts after every expert
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -73,11 +72,10 @@ static __global__ void mm_ids_helper(
             const int it = it0 + threadIdx.x / neu_padded;
 
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
-            int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
-            expert_used = expert_used < 0 ? INT_MAX : expert_used; // FreeToken: an inactive route uses no expert
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += (unsigned) expert_used < (unsigned) expert; // FreeToken: unsigned, so an inactive route (negative id) sorts after every expert
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
