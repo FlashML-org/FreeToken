@@ -320,8 +320,8 @@ def build_ple_metadata(
     """Build ``PLEMetadata`` from a scheduler batch.
 
     The n-gram context is per-request device state (``ple_ngram_ctx`` [num_slots, ngram_size-1],
-    rolled forward once per forward by ``commit_ngram_context``), so it never lags the sampled
-    token under overlap scheduling and follows the slot on COW/snapshot. A decode batch takes its
+    rolled forward once per forward by ``commit_ngram_context``, or by ``PLENgramVerify.commit`` after a verify), so it never lags the sampled
+    token under overlap scheduling and follows the slot on COW/snapshot. A decode or verify batch takes its
     slots straight off ``batch.fla_metadata.cache_indices`` (persistent under a graph), so the
     build is capture-safe and sync-free. Reuses ``batch.fla_metadata`` (slots / indptr / fresh
     mask) when the scheduler built it.
@@ -384,7 +384,7 @@ def build_ple_metadata(
 def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
-    Called ONCE per forward after every PLE layer ran (the layers only read the context);
+    Called ONCE per prefill or decode forward after every PLE layer ran (the layers only read the context; a verify commits through ``PLENgramVerify.commit``);
     also writes the boundary-aligned window to the track slot so a donated snapshot restores
     the context together with the conv state. Pure device arithmetic, capture-safe.
     """
@@ -654,7 +654,7 @@ class PLELayer(BaseOP):
     def _short_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
     ) -> torch.Tensor:
-        """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
+        """silu of the dilated depthwise conv over [state | x], and roll the per-request state (a verify leaves it to ``PLEConvVerify.commit``)."""
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
         if meta.is_verify:
