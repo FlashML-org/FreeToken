@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -39,12 +40,21 @@ class Qwen3_5MTPDraft(BaseOP):
 
     # the draft MTPProposer picks from the target's backends
     attention_backend = None
-    reads_gguf_pack = False
     draft_config = staticmethod(draft_config)
 
     @staticmethod
     def relay_width(config: ModelConfig) -> int:
         return config.hidden_size
+
+    @staticmethod
+    def check_source(path: str, target_path: str) -> None:
+        from freetoken.models.gguf.reader import is_gguf_path
+        from freetoken.models.loader import safetensors_weight_map
+
+        if is_gguf_path(path):
+            raise ValueError(f"the Qwen3.5 MTP draft loads from safetensors, not from the GGUF {path}")
+        if os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
+            raise ValueError(f"{path} has no mtp.* tensors")
 
     def __init__(self, config: ModelConfig, target_model) -> None:
         self.config = draft_config(config)

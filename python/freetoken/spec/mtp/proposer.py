@@ -24,8 +24,6 @@ class MTPDraft(Protocol):
     config: ModelConfig
     # None: the proposer picks from the target's backends
     attention_backend: ClassVar[str | None]
-    # True: the draft can also load from a GGUF that carries mtp.* (a Strata MTP pack)
-    reads_gguf_pack: ClassVar[bool]
 
     @staticmethod
     def draft_config(config: ModelConfig) -> ModelConfig: ...
@@ -33,6 +31,11 @@ class MTPDraft(Protocol):
     @staticmethod
     def relay_width(config: ModelConfig) -> int:
         """Width of the hidden a draft row reads and relays to the next step."""
+        ...
+
+    @staticmethod
+    def check_source(path: str, target_path: str) -> None:
+        """Raise ValueError if ``path`` cannot give this draft its weights; called before the target loads."""
         ...
 
     @classmethod
@@ -105,8 +108,6 @@ class MTPProposer(Proposer):
         import os
 
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
-        from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
-        from freetoken.models.loader import safetensors_weight_map
 
         super().adjust_config(config, override)
         arch = config.hf_config.architectures[0]
@@ -121,16 +122,7 @@ class MTPProposer(Proposer):
         # FTW keeps only what the target's iter_weights yields, which drops mtp.*
         if is_ftw_checkpoint(path):
             raise ValueError("MTP cannot load its draft from an FTW checkpoint yet")
-        if is_gguf_path(path):
-            if not cls._draft_class(config).reads_gguf_pack:
-                raise ValueError(f"MTP for {arch} loads its draft from safetensors, not from the GGUF {path}")
-            if not any(name.startswith("mtp.") for name in gguf_tensor_index(path)):
-                raise ValueError(f"{path} has no mtp.* tensors; pass a GGUF that carries them (a Strata MTP pack) with --speculative-draft-model-path")
-        elif is_gguf_path(config.model_path):
-            # a draft read from a folder takes the target's quant config, which for a GGUF target describes GGUF tensors
-            raise ValueError(f"a GGUF target needs a GGUF draft that carries mtp.* tensors (a Strata MTP pack), not {path}")
-        elif os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
-            raise ValueError(f"{path} has no mtp.* tensors")
+        cls._draft_class(config).check_source(path, config.model_path)
 
     @classmethod
     def _draft_class(cls, config) -> type[MTPDraft]:

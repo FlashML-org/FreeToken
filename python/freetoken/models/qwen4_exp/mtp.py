@@ -13,6 +13,7 @@ Draft row c reads the target's residual streams before the final mix, ``R_c [hc_
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 from typing import TYPE_CHECKING, Iterator
 
@@ -119,12 +120,25 @@ def draft_config(config: ModelConfig) -> ModelConfig:
 
 class Qwen4ExpMTPDraft(BaseOP):
     attention_backend = "qsa_sparse"
-    reads_gguf_pack = True
     draft_config = staticmethod(draft_config)
 
     @staticmethod
     def relay_width(config: ModelConfig) -> int:
         return config.qwen4_args.hc_count * config.hidden_size
+
+    @staticmethod
+    def check_source(path: str, target_path: str) -> None:
+        from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
+        from freetoken.models.loader import safetensors_weight_map
+
+        if is_gguf_path(path):
+            if not any(name.startswith("mtp.") for name in gguf_tensor_index(path)):
+                raise ValueError(f"{path} has no mtp.* tensors; pass a GGUF that carries them (a Strata MTP pack) with --speculative-draft-model-path")
+        elif is_gguf_path(target_path):
+            # a draft read from a folder takes the target's quant config, which for a GGUF target describes GGUF tensors
+            raise ValueError(f"a GGUF target needs a GGUF draft that carries mtp.* tensors (a Strata MTP pack), not {path}")
+        elif os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
+            raise ValueError(f"{path} has no mtp.* tensors")
 
     def __init__(self, config: ModelConfig, target_model, quant=None) -> None:
         draft = draft_config(config)
@@ -143,10 +157,11 @@ class Qwen4ExpMTPDraft(BaseOP):
 
     @classmethod
     def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> Qwen4ExpMTPDraft:
+        from freetoken.models.gguf.reader import is_gguf_path
         from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
         from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
 
-        pack = model_path.endswith(".gguf")
+        pack = is_gguf_path(model_path)
         with torch.device("meta"), torch_dtype(dtype):
             draft = cls(config, target_model, _pack_quant(model_path) if pack else None)
         expected = draft.state_dict()
