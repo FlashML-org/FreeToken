@@ -105,11 +105,9 @@ class EngineConfig:
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
-    # speculative decoding: the draft method (a key of freetoken.spec.PROPOSERS) or None for off
+    # speculative decoding
     speculative_algorithm: str | None = None
-    # draft tokens per decode step (k); 0 takes the method's default
     speculative_num_steps: int = 0
-    # draft weights; None reads them from the target checkpoint
     speculative_draft_model_path: str | None = None
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
