@@ -28,7 +28,7 @@ P = 128
 
 
 class TinyEngine:
-    def __init__(self, checkpoint: str, *, max_seq_len: int = 1024, max_running_req: int = 2, swa_decoder_replay: str = "exact", engram_table=None, quantized: bool = False):
+    def __init__(self, checkpoint: str, *, max_seq_len: int = 1024, max_running_req: int = 2, swa_decoder_replay: str = "exact", swa_encoder_replay: str = "bounded", engram_table=None, quantized: bool = False):
         self.device = torch.device("cuda")
         self.checkpoint = checkpoint
         if try_get_tp_info() is None:
@@ -40,6 +40,7 @@ class TinyEngine:
         args.max_seq_len = max_seq_len
         args.max_batch_size = max_running_req + 1
         args.swa_decoder_replay = swa_decoder_replay
+        args.swa_encoder_replay = swa_encoder_replay
         self.args = args
         quant = NoQuantConfig()
         if quantized:
@@ -152,11 +153,12 @@ class TinyEngine:
                    uid=table_idx, sampling_params=SamplingParams(), cache_handle=None)
 
     def prefill(self, reqs: list[Req]) -> torch.Tensor:
-        """Run each request's ``[cached_len, device_len)`` tokens; returns ``[B, vocab]`` logits."""
+        """Run each request's ``[chunk_lo, device_len)`` tokens (the replay start when an encoder
+        replay is attached); returns ``[B, vocab]`` logits."""
         batch = Batch(reqs=reqs, phase="prefill")
         batch.padded_reqs = list(reqs)
-        batch.input_ids = torch.cat([r.input_ids[r.cached_len : r.device_len] for r in reqs]).to(self.device)
-        batch.positions = torch.cat([torch.arange(r.cached_len, r.device_len) for r in reqs]).to(self.device)
+        batch.input_ids = torch.cat([r.input_ids[r.chunk_lo : r.device_len] for r in reqs]).to(self.device)
+        batch.positions = torch.cat([torch.arange(r.chunk_lo, r.device_len) for r in reqs]).to(self.device)
         self._bind()
         self.backend.prepare_metadata(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
