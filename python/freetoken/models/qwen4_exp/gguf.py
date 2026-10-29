@@ -86,10 +86,12 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
 
 
 def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
-    # NVFP4 weight scales are unvalidated on this arch, so refuse them instead of risking wrong output
-    check_scales(shim.model_path, nvfp4=False)
+    check_scales(shim.model_path)
     # a metadata-only GGUF (an FTW dir's source_metadata.gguf) has no tensor table to check
     index = gguf_tensor_index(shim.model_path)
+    # the PLE row sources read no weight scale, so refuse one instead of serving the table unscaled
+    if "per_layer_token_embd.scale" in index:
+        raise NotImplementedError(f"{shim.model_path}: a PLE table with a weight scale (per_layer_token_embd.scale) is not supported")
     if index and "blk.0.hc_attn_down.weight" not in index:
         raise NotImplementedError(f"{shim.model_path}: no decoder layer tensors (blk.0.hc_attn_down), e.g. an MTP-only draft GGUF")
     md = shim.metadata
