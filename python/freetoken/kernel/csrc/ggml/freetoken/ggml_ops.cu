@@ -243,9 +243,42 @@ void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Opt
     }
 }
 
+namespace {
+
+// One 32-thread group per route: zero row r of out[routes, n] when ids[r] < 0.
+template <typename T>
+__global__ void zero_inactive_routes_kernel(const int32_t * __restrict__ ids, T * __restrict__ out, const int64_t routes, const int64_t n) {
+    const int64_t r = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (r >= routes || ids[r] >= 0) {
+        return;
+    }
+    for (int64_t i = threadIdx.x % 32; i < n; i += 32) {
+        out[r * n + i] = ggml_cuda_cast<T>(0.0f);
+    }
+}
+
+// The matrix kernel writes only the rows of active routes; the inactive ones (negative ids, hybrid decode) read as zero like on the vector kernel.
+void zero_inactive_routes(TensorView ids, TensorView out, ggml_type otype, cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int64_t routes = ids.numel(), n = out.size(2);
+    const dim3 blocks((routes + threads / 32 - 1) / (threads / 32));
+    const int32_t * ip = (const int32_t *) ids.data_ptr();
+    if (otype == GGML_TYPE_BF16) {
+        zero_inactive_routes_kernel<<<blocks, threads, 0, stream>>>(ip, (nv_bfloat16 *) out.data_ptr(), routes, n);
+    } else if (otype == GGML_TYPE_F16) {
+        zero_inactive_routes_kernel<<<blocks, threads, 0, stream>>>(ip, (half *) out.data_ptr(), routes, n);
+    } else {
+        zero_inactive_routes_kernel<<<blocks, threads, 0, stream>>>(ip, (float *) out.data_ptr(), routes, n);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+}  // namespace
+
 // out[T, k, N]: row (t, j) multiplies x[t, j or 0] by expert ids[t, j] of W[E, N, K]; the matrix kernel runs a flat grid over the tiles that hold routes
 // scale[ids[t, j]] multiplies row (t, j); only the vector kernel takes it
-void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out, Optional<TensorView> scale) {
+// inactive: ids may hold negative (inactive) routes, which the matrix kernel then skips and zeroes; the vector kernel always does
+void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, TensorView out, Optional<TensorView> scale, bool inactive) {
     RuntimeCheck(w.ndim() == 3, "mul_mat_id takes w[E, N, row_bytes]");
     RuntimeCheck(is_dtype(ids.dtype(), kDLInt, 32) && ids.ndim() == 2 && ids.IsContiguous(), "ids must be a contiguous int32 [T, k] tensor");
     const DeviceGuard guard(x.device());
@@ -285,7 +318,10 @@ void op_mul_mat_id(TensorView w, int64_t type_id, TensorView x, TensorView ids, 
         }
         ggml_cuda_mul_mat_vec_q(ctx, &src0, &src1, &tids, &dst, scale.has_value() ? &fusion : nullptr);
     } else {
-        ggml_cuda_mul_mat_q(ctx, &src0, &src1, &tids, &dst, 0);
+        ggml_cuda_mul_mat_q(ctx, &src0, &src1, &tids, &dst, 0, inactive);
+        if (inactive) {
+            zero_inactive_routes(ids, out, otype, stream);
+        }
     }
 }
 

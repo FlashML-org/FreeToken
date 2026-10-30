@@ -48,6 +48,21 @@ def causal_conv1d_varlen(
     return x
 
 
+def causal_conv1d_verify(
+    x: torch.Tensor,                # [batch, conv_dim, seqlen] (any strides)
+    conv_state: torch.Tensor,       # [num_slots, conv_dim, kernel-1] (rolled in place)
+    weight: torch.Tensor,           # [conv_dim, kernel]
+    conv_state_indices: torch.Tensor,          # [batch] int32 slot id per request
+    intermediate_conv_window: torch.Tensor,    # [rows, steps, conv_dim, kernel-1], row = batch row
+) -> torch.Tensor:
+    """Speculative-verify conv; triton only, as sgl_kernel's update keeps no per-token window."""
+    from freetoken.kernel.triton.causal_conv1d_triton import (
+        causal_conv1d_verify as triton_causal_conv1d_verify,
+    )
+
+    return triton_causal_conv1d_verify(x, conv_state, weight, conv_state_indices, intermediate_conv_window)
+
+
 def causal_conv1d_decode(
     x: torch.Tensor,                # [batch, conv_dim] (one token per request)
     conv_state: torch.Tensor,       # [num_slots, conv_dim, state_len>=kernel-1] (in place)

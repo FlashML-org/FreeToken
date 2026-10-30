@@ -642,11 +642,9 @@ class CacheManager:
         """
         start = div_ceil(keep_len, self.page_size) * self.page_size
         end = div_ceil(drop_len, self.page_size) * self.page_size
+        assert not self.swa_paged, "rollback_tail frees no SWA slots; speculative decoding rejects SWA targets"
         if end > start:
-            tail = self.page_table[req.table_idx, start:end]
-            if self.swa_paged:
-                self._free_swa(tail)
-            self._free(tail)
+            self._free(self.page_table[req.table_idx, start:end])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

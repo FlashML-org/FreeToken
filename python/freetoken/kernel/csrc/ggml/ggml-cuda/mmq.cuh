@@ -99,6 +99,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_M:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_IQ1_S:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
@@ -238,6 +239,14 @@ struct ggml_cuda_mmq_config {
 #undef CASE
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
+    // FreeToken: IQ1_M fills the same tile as IQ2_XS (int8 values, one scale per 16), so it takes IQ2_XS's configs
+    if (type == GGML_TYPE_IQ1_M) {
+        ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(GGML_TYPE_IQ2_XS, J, fallback, cc, prec_src1);
+        if (config.type == GGML_TYPE_IQ2_XS) {
+            config.type = GGML_TYPE_IQ1_M;
+        }
+        return config;
+    }
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
             return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
@@ -273,6 +282,13 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 }
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
+    if (type == GGML_TYPE_IQ1_M) {
+        ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(GGML_TYPE_IQ2_XS, J, fallback, prec_src1);
+        if (config.type == GGML_TYPE_IQ2_XS) {
+            config.type = GGML_TYPE_IQ1_M;
+        }
+        return config;
+    }
 #ifdef GGML_USE_HIP
 #ifdef GCN
     return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
@@ -420,6 +436,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ3_XXS: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ3_S:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ1_S:   return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_IQ1_M:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_IQ4_XS:  return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_NL:  return MMQ_DP4A_TXS_Q8_0;
         default:                return tile_x_sizes{0, 0, 0};
@@ -628,6 +645,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_load_tiles_iq1_s<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+            case GGML_TYPE_IQ1_M:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_IQ2_XS_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_iq1_m<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_IQ2_XXS:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_IQ2_XXS_Q8_1_MMQ,
@@ -797,6 +820,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 -1,
                 ggml_cuda_mmq_load_tiles_iq1_s<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma<type, J, fallback>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
+        case GGML_TYPE_IQ1_M:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_iq1_m<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback, prec_src1>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
         case GGML_TYPE_IQ2_XXS:
             return ggml_cuda_mmq_util_funcs(
@@ -1638,6 +1667,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
+extern DECL_MMQ_CASE(GGML_TYPE_IQ1_M);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
@@ -1656,6 +1686,6 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 // FreeToken: under ids, ncols_max > 0 bounds the tokens any one expert gets and sizes the tile grid; otherwise the grid is flat, see ggml_cuda_launch_mm_ids_tile_map
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        int64_t ncols_max = -1);
+        int64_t ncols_max = -1, bool inactive_ids = false);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

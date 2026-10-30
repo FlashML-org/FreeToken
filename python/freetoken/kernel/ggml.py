@@ -95,16 +95,19 @@ def uses_mmvq(ggml_type: int, m: int) -> bool:
     return _module().uses_mmvq(ggml_type, m)
 
 
-def mul_mat_id(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+def mul_mat_id(
+    w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tensor, scale: torch.Tensor | None = None, inactive: bool = False
+) -> torch.Tensor:
     """Per-route expert GEMM over ``w[E, N, row_bytes]``: returns ``[T, k, N]`` in ``x``'s dtype; ``x`` is ``[T, K]`` (shared by the k routes) or ``[T, k, K]``.
 
     ``scale`` is an fp32 ``[E]`` view (strided is fine) that multiplies each NVFP4 expert's rows; it needs ``T <= mmvq_max_tokens``.
+    ``inactive`` says ``ids`` may hold -1 (hybrid decode's CPU routes): those rows come back zero. Above ``mmvq_max_tokens`` it costs a memset and a zeroing pass, so pass it only then.
     """
     t, top_k = ids.shape
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if t > mmvq_max_tokens(ggml_type):
         _check_mmq_tail(w, ggml_type, x.shape[-1])
-    _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out, scale)
+    _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out, scale, inactive)
     return out
 
 
