@@ -45,6 +45,8 @@ class Qwen4ExpArgs:
     image_token_id: int | None = None
     # GGUF stores ssm_out with its value-head columns in llama.cpp's tiled order
     gdn_out_heads_tiled: bool = False
+    # PLE n-gram table encoding: native FP8-e4m3 (default) or packed e2m1 NVFP4 (FP4-Local)
+    ple_embedding_dtype: str = "fp8"
 
     @property
     def index_topk_blocks(self) -> int:
@@ -227,6 +229,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
         image_token_id=getattr(hf_config, "image_token_id", None),
+        ple_embedding_dtype=str(getattr(text, "ple_embedding_dtype", "fp8")),
     )
 
     return ModelConfig(
