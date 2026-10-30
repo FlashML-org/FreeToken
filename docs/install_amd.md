@@ -75,5 +75,10 @@ agree on this decision, so one unsafe rank disables graphs for all ranks.
 A failed eager check, or a capture/runtime API error, stops startup rather
 than allowing unverified output.
 
+Hybrid layers whose host banks are OS-locked can also fetch experts through
+pinned staging, using the same `--moe-locked-fetch` and
+`--moe-locked-max-fetch` settings as CUDA. The staging gather waits through
+stream memops when available, or a GPU flag wait otherwise.
+
 After updating the native CPU MoE sources, rebuild the extension with
 `python setup.py build_ext --inplace` in the ROCm environment before serving.

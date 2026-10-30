@@ -163,8 +163,8 @@ struct GpuSync::Impl {
   hipStreamBatchMemOpParams wait_op{};
 };
 
-// The memop-free mode serves only the locked fetch, which ROCm keeps off: every GpuSync here needs memops.
-GpuSync::GpuSync(bool) : impl_(std::make_unique<Impl>()) {
+// Locked fetch can use the signal words with a kernel wait when memops are unavailable.
+GpuSync::GpuSync(bool require_memops) : impl_(std::make_unique<Impl>()) {
   hipError_t rc = alloc_signal(&impl_->ready);
   if (rc == hipSuccess) rc = alloc_signal(&impl_->done);
   if (rc != hipSuccess) {
@@ -173,7 +173,7 @@ GpuSync::GpuSync(bool) : impl_(std::make_unique<Impl>()) {
     hip_check(rc, "signal allocation");
   }
   // Measure now: the measurement captures and allocates, which a graph capture in progress would reject.
-  (void)records_native_memops();
+  if (require_memops) (void)records_native_memops();
 }
 
 GpuSync::~GpuSync() {
