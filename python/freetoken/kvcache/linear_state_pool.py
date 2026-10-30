@@ -6,7 +6,7 @@ from typing import List
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
-from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
+from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec, SlotVerify
 from freetoken.utils import div_even
 
 _SSM_DTYPES = {
@@ -96,6 +96,7 @@ class LinearStatePool:
         self.padding_slot = 0
         # verify batches only read the live state; Engine attaches this when a decode step has more than one row
         self.verify_scratch: LinearVerifyScratch | None = None
+        self._verify_handlers: dict[str, SlotVerify] = {}
         self._free_slots: list[int] = list(range(1, num_slots))
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
@@ -103,11 +104,14 @@ class LinearStatePool:
             spec.name: torch.full(
                 (max(1, len(spec.layer_ids)), num_slots, *spec.shape),
                 spec.fill_value,
-                dtype=spec.dtype if spec.dtype is not None else self._conv_dtype,
+                dtype=self._state_dtype(spec),
                 device=self._device,
             )
             for spec in self._slot_specs
         }
+
+    def _state_dtype(self, spec: SlotStateSpec) -> torch.dtype:
+        return spec.dtype if spec.dtype is not None else self._conv_dtype
 
     def has_slot_state(self, name: str) -> bool:
         return name in self.slot_states
@@ -228,12 +232,26 @@ class LinearStatePool:
         return self._device
 
     def attach_verify_scratch(self, max_bs: int, rows_per_req: int) -> None:
-        """Build the scratch for verify batches of up to ``max_bs`` requests with ``rows_per_req`` rows each; build_fla_metadata hands it to the GDN layers."""
+        """Build the scratch for verify batches of up to ``max_bs`` requests with ``rows_per_req`` rows each, and the verify handler of every slot state; build_fla_metadata hands the GDN scratch to the GDN layers."""
         self.verify_scratch = LinearVerifyScratch(self, max_bs, rows_per_req)
+        self._verify_handlers = {
+            spec.name: spec.verify(spec, max_bs, rows_per_req, self._device, self._state_dtype(spec))
+            for spec in self._slot_specs
+            if spec.verify is not None
+        }
+
+    def verify_handler(self, name: str) -> SlotVerify:
+        """The verify handler of slot state ``name``, for its owner's verify forward."""
+        return self._verify_handlers[name]
 
     def commit_verify(self, slots: List[int], counts: List[int]) -> None:
         """Advance live slot slots[i] over verify row i's first counts[i] tokens."""
         self.verify_scratch.commit(self, slots, counts)
+        if slots and self._verify_handlers:
+            index = torch.tensor([slots, counts], dtype=torch.int64, pin_memory=self._device.type == "cuda")
+            index = index.to(self._device, non_blocking=True)
+            for handler in self._verify_handlers.values():
+                handler.commit(self, *index)
 
     def bytes_per_slot(self) -> int:
         """Total state bytes for one request (all linear layers)."""
@@ -337,7 +355,12 @@ def verify_scratch_bytes(config, rows_per_req: int) -> int:
     rows = n_layers * config.max_running_req * rows_per_req
     stash = rows * (hk * group.key_head_dim + hv * group.value_head_dim + 2 * hv) * 4
     window = rows * conv_dim * (group.conv_kernel_dim - 1) * config.dtype.itemsize
-    return stash + window
+    handlers = sum(
+        spec.verify.nbytes(spec, config.max_running_req, rows_per_req, spec.dtype if spec.dtype is not None else config.dtype)
+        for spec in getattr(config.model_config, "slot_states", ())
+        if spec.verify is not None
+    )
+    return stash + window + handlers
 
 
 def _linear_pool_num_slots(config) -> int:

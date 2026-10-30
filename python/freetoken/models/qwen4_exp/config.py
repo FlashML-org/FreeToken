@@ -81,12 +81,16 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     """Per-request PLE state riding the linear-state slots (see LinearStatePool.slot_states)."""
     if not args.ple_layer_ids:
         return ()
+    # ple.py imports this module
+    from .ple import PLEConvVerify, PLENgramVerify
+
     return (
         # dilated-conv left context; replicated (not TP-sharded), model dtype
         SlotStateSpec(
             name=PLE_CONV_STATE,
             shape=(args.ple_state_width, args.ple_conv_state_len),
             layer_ids=args.ple_layer_ids,
+            verify=PLEConvVerify,
         ),
         # last ngram_size-1 token ids, shared by every PLE layer; eos = hash boundary
         SlotStateSpec(
@@ -94,6 +98,7 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
             shape=(args.ngram_size - 1,),
             dtype=torch.int32,
             fill_value=float(args.ngram_boundary_token_id),
+            verify=PLENgramVerify,
         ),
     )
 

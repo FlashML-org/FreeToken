@@ -924,7 +924,7 @@ def parse_args(
         "--spec-algo",
         type=str,
         default=ServerArgs.speculative_algorithm,
-        help="Speculative decoding with this draft method. Off by default.",
+        help="Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers). Off by default.",
     )
 
     parser.add_argument(

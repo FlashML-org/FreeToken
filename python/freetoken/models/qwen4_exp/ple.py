@@ -285,6 +285,7 @@ class PLEMetadata:
                      ``Req.table_idx``); keys every PLE slot state
       fresh_slots    [B] bool device or None -- request starts a new sequence, so read a zero state
       is_decode      one token per request (the batched 4-tap path)
+      is_verify      the same number of rows per request over read-only state; the verify handlers stage what the commit rolls
     """
 
     input_ids: torch.Tensor
@@ -294,6 +295,7 @@ class PLEMetadata:
     state_slots: torch.Tensor
     fresh_slots: torch.Tensor | None
     is_decode: bool
+    is_verify: bool = False
 
 
 def _state_slot(req) -> int:
@@ -318,8 +320,8 @@ def build_ple_metadata(
     """Build ``PLEMetadata`` from a scheduler batch.
 
     The n-gram context is per-request device state (``ple_ngram_ctx`` [num_slots, ngram_size-1],
-    rolled forward once per forward by ``commit_ngram_context``), so it never lags the sampled
-    token under overlap scheduling and follows the slot on COW/snapshot. A decode batch takes its
+    rolled forward once per forward by ``commit_ngram_context``, or by ``PLENgramVerify.commit`` after a verify), so it never lags the sampled
+    token under overlap scheduling and follows the slot on COW/snapshot. A decode or verify batch takes its
     slots straight off ``batch.fla_metadata.cache_indices`` (persistent under a graph), so the
     build is capture-safe and sync-free. Reuses ``batch.fla_metadata`` (slots / indptr / fresh
     mask) when the scheduler built it.
@@ -356,13 +358,17 @@ def build_ple_metadata(
         cu = fla.cu_seqlens
         slots = fla.cache_indices.long()
         fresh = ~fla.has_initial_state
+    elif fla is not None:
+        # a verify: every request continues its live state
+        cu, slots, fresh = fla.cu_seqlens, fla.cache_indices.long(), None
     else:  # direct-op callers (tests) with no scheduler metadata
         pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
         cu = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0).to(device, non_blocking=True)
         slots = torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin).to(device, non_blocking=True)
         fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(device, non_blocking=True)
     context = context_pool.index_select(0, slots).long()
-    context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
+    if fresh is not None:
+        context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
     return PLEMetadata(
         input_ids=input_ids,
         cu_seqlens=cu,
@@ -371,13 +377,14 @@ def build_ple_metadata(
         state_slots=slots,
         fresh_slots=fresh,
         is_decode=batch.is_decode,
+        is_verify=getattr(batch, "phase", None) == "verify",
     )
 
 
 def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
-    Called ONCE per forward after every PLE layer ran (the layers only read the context);
+    Called ONCE per prefill or decode forward after every PLE layer ran (the layers only read the context; a verify commits through ``PLENgramVerify.commit``);
     also writes the boundary-aligned window to the track slot so a donated snapshot restores
     the context together with the conv state. Pure device arithmetic, capture-safe.
     """
@@ -647,9 +654,11 @@ class PLELayer(BaseOP):
     def _short_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
     ) -> torch.Tensor:
-        """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
+        """silu of the dilated depthwise conv over [state | x], and roll the per-request state (a verify leaves it to ``PLEConvVerify.commit``)."""
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
+        if meta.is_verify:
+            return self._verify_conv(x, meta, states)
         return self._prefill_conv(x, meta, states)
 
     def _decode_conv(
@@ -665,6 +674,21 @@ class PLELayer(BaseOP):
             0, meta.state_slots, torch.cat([state[..., 1:], column], dim=-1).to(states.dtype)
         )
         return F.silu(out.to(x.dtype))
+
+    def _verify_conv(
+        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
+    ) -> torch.Tensor:
+        """The decode taps over every verify row, the live state read-only; device ops only, so a verify graph captures it."""
+        bs = meta.state_slots.numel()
+        rows = x.shape[0] // bs
+        handler = get_global_ctx().linear_state_pool.verify_handler(PLE_CONV_STATE)
+        history = handler.history[self.layer_id][:bs]
+        history[..., : self.state_len].copy_(self._read_state(meta, states, x.dtype))
+        history[..., self.state_len :].copy_(x.view(bs, rows, -1).transpose(1, 2))
+        # contiguous taps reduce in the order the decode taps do
+        window = history.unfold(2, self.state_len + 1, 1)[..., :: self.dilation].contiguous().float()
+        out = (window * self.conv1d.weight.squeeze(1).float().unsqueeze(1)).sum(-1)
+        return F.silu(out.to(x.dtype)).transpose(1, 2).reshape(x.shape)
 
     def _prefill_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
@@ -715,12 +739,63 @@ class PLELayer(BaseOP):
         return packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
 
 
+class PLEConvVerify:
+    """``SlotVerify`` of the conv history: per PLE layer and verify row, the live history then every verify conv input."""
+
+    def __init__(self, spec, max_bs: int, rows_per_req: int, device: torch.device, dtype: torch.dtype) -> None:
+        self.name = spec.name
+        width, self.state_len = spec.shape
+        self.history = {
+            layer_id: torch.zeros(max_bs, width, self.state_len + rows_per_req, dtype=dtype, device=device)
+            for layer_id in spec.layer_ids
+        }
+
+    @staticmethod
+    def nbytes(spec, max_bs: int, rows_per_req: int, dtype: torch.dtype) -> int:
+        width, state_len = spec.shape
+        return len(spec.layer_ids) * max_bs * width * (state_len + rows_per_req) * dtype.itemsize
+
+    def commit(self, pool, slots: torch.Tensor, counts: torch.Tensor) -> None:
+        # after n accepted rows the history is columns n .. n + state_len - 1
+        cols = (counts.unsqueeze(1) + torch.arange(self.state_len, device=counts.device)).unsqueeze(1)
+        for layer_id, history in self.history.items():
+            states = pool.slot_state(self.name, layer_id)
+            window = history[: slots.numel()].gather(2, cols.expand(-1, history.shape[1], -1))
+            states.index_copy_(0, slots, window.to(states.dtype))
+
+
+class PLENgramVerify:
+    """``SlotVerify`` of the n-gram context: per verify row, the live context then every verify input token."""
+
+    def __init__(self, spec, max_bs: int, rows_per_req: int, device: torch.device, dtype: torch.dtype) -> None:
+        self.name = spec.name
+        (self.ctx_len,) = spec.shape
+        self.ids = torch.zeros(max_bs, self.ctx_len + rows_per_req, dtype=dtype, device=device)
+
+    @staticmethod
+    def nbytes(spec, max_bs: int, rows_per_req: int, dtype: torch.dtype) -> int:
+        return max_bs * (spec.shape[0] + rows_per_req) * dtype.itemsize
+
+    def stash(self, meta: PLEMetadata) -> None:
+        """Stage a verify forward's context and input tokens; the forward itself leaves the live context as it was."""
+        bs = meta.state_slots.numel()
+        self.ids[:bs, : self.ctx_len].copy_(meta.ngram_context)
+        self.ids[:bs, self.ctx_len :].copy_(meta.input_ids.view(bs, -1))
+
+    def commit(self, pool, slots: torch.Tensor, counts: torch.Tensor) -> None:
+        context = pool.slot_state(self.name)
+        cols = counts.unsqueeze(1) + torch.arange(self.ctx_len, device=counts.device)
+        context.index_copy_(0, slots, self.ids[: slots.numel()].gather(1, cols).to(context.dtype))
+
+
 __all__ = [
     "GpuResidentTable",
     "NGramEmbedding",
     "ZeroTable",
+    "PLEConvVerify",
     "PLELayer",
     "PLEMetadata",
+    "PLENgramVerify",
     "PLETableBackend",
     "PinnedUVATable",
     "build_ple_metadata",
