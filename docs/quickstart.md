@@ -12,6 +12,9 @@ ft serve --model ~/models/Qwen3.6-35B-A3B
 and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
+`GET /health` answers 200 only while the server accepts requests, and 503, with
+the same JSON body (load progress included), while it loads, rebuilds its cache
+or has failed, so a readiness probe such as llama-swap's waits out the load.
 
 ## Send a request
 
