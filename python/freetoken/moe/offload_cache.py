@@ -124,6 +124,9 @@ class OffloadMoeCache:
     cache_size: int
     device: torch.device
     cache_policy: str = "lru"
+    # A prefill chunk of at most this many tokens admits the experts it routes to into the slot
+    # cache, as decode does, instead of streaming every expert of each layer; 0 streams them all.
+    prefill_demand_tokens: int = 0
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
@@ -172,6 +175,10 @@ class OffloadMoeCache:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
+        if self.prefill_demand_tokens and self.decode_target != "gpu":
+            raise ValueError(
+                f"--moe-prefill-demand-tokens needs GPU decode; this cache decodes on {self.decode_target!r}"
+            )
         if self.layer_layouts is not None:
             assert self.layout is None, "pass layout or layer_layouts, not both"
             assert len(self.layer_layouts) == self.num_layers, (len(self.layer_layouts), self.num_layers)
@@ -1066,6 +1073,33 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+
+    def loads_prefill_on_demand(self, num_tokens: int) -> bool:
+        return 0 < num_tokens <= self.prefill_demand_tokens
+
+    def load_prefill_experts(self, layer_id: int, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Make a demand prefill chunk's routed experts resident, copying in the missing ones,
+        and return ``topk_ids`` as slot ids. The chunk's distinct experts go to the slot cache
+        ``ENSURE_QUERY_WIDTH`` at a time, each query's misses copied before the next query
+        evicts: LRU evicts an earlier query's slots last while the chunk's distinct experts fit the
+        layer's pool, which one admission of the whole chunk needs as well. The admissions stay out
+        of the decode statistics."""
+        from freetoken.moe.offload_kernels import ENSURE_QUERY_WIDTH, ensure_experts
+
+        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
+        routed = torch.zeros(self.num_experts, dtype=torch.bool, device=self.device)
+        routed.index_fill_(0, topk_ids.reshape(-1).long(), True)
+        # the routed experts in ascending order, then the first of them again, which the admission
+        # dedups; a chunk's routes reach at most as many experts as there are routes
+        ordered = torch.where(routed, experts, experts + self.num_experts).sort().values
+        ordered = ordered[: min(self.num_experts, topk_ids.numel())]
+        query = torch.where(ordered < self.num_experts, ordered, ordered[0])
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        for piece in query.split(ENSURE_QUERY_WIDTH):
+            ensure_experts(self, layer_id, piece, record_stats=False)
+            self.copy_missing()
+        return self.slot_for_id[layer_id][topk_ids.long()]
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts

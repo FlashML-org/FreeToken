@@ -418,3 +418,21 @@ def test_fused_topk_sigmoid_matches_torch_reference(num_tokens, num_experts, top
     assert weights.dtype == torch.float32 and ids.dtype == torch.int32
     assert torch.equal(ids, ref_i)
     torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_experts", [1023, 2100])
+def test_moe_align_sorts_every_route_into_its_expert_blocks_past_1024_experts(num_experts):
+    """A prefill over the offload slot cache aligns against its slot count."""
+    from freetoken.moe.fused import moe_align_block_size
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, num_experts, (300, 10), device="cuda", dtype=torch.int32)
+    sorted_ids, expert_ids, padded = moe_align_block_size(ids, 16, num_experts)
+    n = int(padded)
+    flat = ids.flatten()
+    rows = sorted_ids[:n] < flat.numel()
+    real = sorted_ids[:n][rows]
+    assert sorted(real.tolist()) == list(range(flat.numel()))
+    block_of = torch.arange(n, device="cuda") // 16
+    assert torch.equal(flat[real.long()], expert_ids[block_of[rows]])
