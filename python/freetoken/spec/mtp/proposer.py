@@ -119,6 +119,8 @@ class MTPProposer(Proposer):
         arch = config.hf_config.architectures[0]
         if "mtp" not in dict(config.model_spec.spec_drafts):
             raise ValueError(f"MTP is not supported for {arch} yet")
+        if config.use_dummy_weight:
+            raise ValueError("MTP reads its draft from the checkpoint, so it cannot run with --dummy-weight")
         path = config.speculative_draft_model_path or config.model_path
         # checked here because a draft that cannot load otherwise fails only after the whole target has loaded
         # a HF repo id is "name" or "org/name"; anything else names a local path
