@@ -298,6 +298,7 @@ def iter_weights(
 
 # routed experts: expert_pieces.iter_extra_layer_expert_pieces
 _MTP_EXPERTS_PREFIX = "mtp.layers.0.mlp.experts."
+_MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)|(?P<stacked>gate_up|down)_proj)$")
 
 
 def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
@@ -323,6 +324,21 @@ def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[st
         raise ValueError(f"{model_path} has no mtp.* weights")
     if reader.pending:
         raise ValueError(f"{model_path}: incomplete MTP projections: {reader.missing()}")
+
+
+def iter_mtp_expert_pieces(model_path: str):
+    """The MTP head's routed experts: the stacked bf16 pair, or per-expert projections with their block-fp8 scales."""
+    from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
+
+    def locate(name: str):
+        m = _MTP_EXPERT_RE.match(name)
+        if m is None:
+            return None
+        if m["stacked"]:
+            return None, m["stacked"]
+        return int(m["expert"]), m["proj"] + ("_scale" if m["kind"] == "weight_scale_inv" else "")
+
+    return iter_extra_layer_expert_pieces(model_path, _MTP_EXPERTS_PREFIX, locate)
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
@@ -497,6 +513,7 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 __all__ = [
     "nvfp4_expert_spec",
     "PleTable",
+    "iter_mtp_expert_pieces",
     "iter_mtp_weights",
     "iter_weights",
     "load_ple_table",

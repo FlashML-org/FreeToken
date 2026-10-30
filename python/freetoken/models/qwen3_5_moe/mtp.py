@@ -16,7 +16,7 @@ from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.utils import torch_dtype
 
 from .model import Qwen3_5DecoderLayer
-from .weight import iter_mtp_weights
+from .weight import iter_mtp_expert_pieces, iter_mtp_weights
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -82,11 +82,10 @@ class Qwen3_5MTPDraft(BaseOP):
         draft.load_state_dict(loaded)
         if draft.config.moe_enabled:
             from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
-            from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
 
             # packed by the layer's own expert method, as the target's resident layers are
             moe = draft.layers.op_list[0].mlp.experts
-            pieces = iter_extra_layer_expert_pieces(model_path, "mtp.layers.0.mlp.experts")
+            pieces = iter_mtp_expert_pieces(model_path)
             banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
             attach_resident_banks([moe], banks)
         # not the root: it reaches the target's embedding, which the target finalized already

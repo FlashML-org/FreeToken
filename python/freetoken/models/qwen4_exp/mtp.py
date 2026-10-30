@@ -29,7 +29,7 @@ from freetoken.utils import torch_dtype
 
 from .hc import GatedResidual
 from .model import Qwen4ExpDecoderLayer
-from .weight import iter_mtp_weights
+from .weight import iter_mtp_expert_pieces, iter_mtp_weights
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -159,7 +159,6 @@ class Qwen4ExpMTPDraft(BaseOP):
     def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> Qwen4ExpMTPDraft:
         from freetoken.models.gguf.reader import is_gguf_path
         from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
-        from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
 
         pack = is_gguf_path(model_path)
         with torch.device("meta"), torch_dtype(dtype):
@@ -179,7 +178,7 @@ class Qwen4ExpMTPDraft(BaseOP):
         if pack:
             banks = _pack_expert_banks(model_path, device)
         else:
-            pieces = iter_extra_layer_expert_pieces(model_path, "mtp.layers.0.mlp.experts")
+            pieces = iter_mtp_expert_pieces(model_path)
             banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
         attach_resident_banks([moe], banks)
         # not the root: it reaches the target's embedding, which the target finalized already

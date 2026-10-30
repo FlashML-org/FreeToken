@@ -635,8 +635,7 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
     from types import SimpleNamespace
 
     from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
-    from freetoken.models.qwen3_5_moe.weight import iter_mtp_weights
-    from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
+    from freetoken.models.qwen3_5_moe.weight import iter_mtp_expert_pieces, iter_mtp_weights
 
     name, folder, raw = checkpoint
     if name not in ("bf16", "fp8_block"):
@@ -650,7 +649,7 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
         assert tensor.shape == state[key].shape, key
         if key.endswith(".weight"):
             assert tensor.dtype is state[key].dtype, key
-    pieces = list(iter_extra_layer_expert_pieces(folder, f"{MTP}.mlp.experts"))
+    pieces = list(iter_mtp_expert_pieces(folder))
     if name == "bf16":
         assert [p[:3] for p in pieces] == [(0, 0, E)]
         assert torch.equal(pieces[0][3]["gate_up"], raw[f"{MTP}.mlp.experts.gate_up_proj"])
