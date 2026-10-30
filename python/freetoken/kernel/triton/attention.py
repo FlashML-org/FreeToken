@@ -1069,7 +1069,6 @@ def _gather_kv_indices_kernel(
     pt_stride,
     indptr_stride,
     out_stride,
-    NUM_CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     batch_id = tl.program_id(1)
@@ -1078,7 +1077,7 @@ def _gather_kv_indices_kernel(
     n = tl.load(indptr_row + batch_id + 1) - start
     src = page_table + tl.load(rows + batch_id).to(tl.int64) * pt_stride
     dst = out + tl.program_id(0).to(tl.int64) * out_stride + start
-    for off in range(tl.program_id(2) * BLOCK, n, NUM_CHUNKS * BLOCK):
+    for off in range(tl.program_id(2) * BLOCK, n, tl.num_programs(2) * BLOCK):
         cols = off + tl.arange(0, BLOCK)
         mask = cols < n
         tl.store(dst + cols, tl.load(src + cols, mask=mask), mask=mask)
@@ -1097,6 +1096,5 @@ def gather_kv_indices(page_table: torch.Tensor, rows: torch.Tensor, indptr: torc
         page_table.stride(0),
         indptr.stride(0),
         out.stride(0),
-        NUM_CHUNKS=chunks,
         BLOCK=1024,
     )
