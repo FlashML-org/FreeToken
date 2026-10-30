@@ -198,7 +198,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 constants,
                 # verify graphs stop at max_running_req requests, decode graphs at cuda_graph_max_bs
                 max_graph_rows=engine_config.max_running_req * rows if rows > 1 else max(256, engine_config.cuda_graph_max_bs or 0),
-                max_extend_tokens=engine_config.max_extend_tokens,
+                # an eager decode or verify step stages max_running_req * rows tokens, which can exceed a prefill chunk
+                max_eager_tokens=max(engine_config.max_extend_tokens, engine_config.max_running_req * rows),
             )
             self._ple_table = disk_table
             for ple in ple_layers:

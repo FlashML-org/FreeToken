@@ -139,7 +139,7 @@ class DiskRowTable:
         hash_constants: dict,
         *,
         max_graph_rows: int = 256,
-        max_extend_tokens: int = 8192,
+        max_eager_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         from freetoken.kernel.row_store import PleStore
@@ -188,7 +188,7 @@ class DiskRowTable:
         # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
         # dispatch context after the step's fill: a record inside the capture would not be observable)
         self._graph_consumed = torch.cuda.Event()
-        eager_bytes = max_extend_tokens * self._token_bytes
+        eager_bytes = max_eager_tokens * self._token_bytes
         # the overlap scheduler fills batch k+1 while batch k's lookup copy may still be queued: the
         # eager staging alternates two pinned buffers, and each is rewritten only once the H2D copy
         # that last read it has run (``_eager_read[i]``, recorded right after that copy)
