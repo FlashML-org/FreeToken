@@ -49,18 +49,31 @@ or NVFP4 Marlin/b12x (e.g. `--quant-backend moe.nvfp4=marlin` or
 ## CPU and hybrid MoE
 
 `--moe-strategy cpu`, `hybrid` and `--moe-cpu-layers` sync the GPU with the CPU
-expert pool through HIP stream memory operations. Before notifying the CPU,
-FreeToken records a system-release event after copying the expert inputs to
-host memory. The event is recorded as an external graph node so that every
-replay retains the publication point. This application workaround keeps Graph
-and memops enabled on unpatched runtimes; it does not require a custom HIP library.
+expert pool through HIP stream memory operations. As on CUDA, BF16 inputs use
+kernel IO when its startup probe passes: a publish kernel copies the inputs to
+mapped host memory and notifies the CPU; a combine kernel reads the CPU output.
+The publish kernel establishes the memory ordering before notification and
+skips CPU work when no route needs it.
+
+When kernel IO is unavailable or the input is not BF16, FreeToken uses copies.
+With the memop handshake, this fallback records a system-release event after
+the input copies and before notifying the CPU. The event is recorded as an
+external graph node so that every replay retains the publication point. The
+kernel IO path does not record this event. If the memop handshake is unavailable,
+eager execution uses host callbacks instead. No custom HIP library is required.
 
 Native memop capture is detected at runtime. If it is unavailable, FreeToken
 adds explicit memop graph nodes. Before model capture, a numerical check
-compares distinct tasks and changing inputs against eager execution. ROCm
-decode graphs require BF16 inputs and a passing handshake and data check. When
-these checks reject the path, the engine logs a warning and disables decode
-graphs across TP ranks. Capture and runtime API errors still stop startup.
+compares eager and Graph outputs against synchronous CPU execution, including
+changing routes, skipped tasks and Hybrid output accumulation. If kernel IO
+fails this check, FreeToken switches to the event + memcpy path and checks it
+again. Startup checks only the model's activation dtype; BF16 can use kernel IO,
+while FP16 and FP32 use copies. When decode graphs are disabled, the numerical
+check runs eagerly without capturing a graph. If the Graph path is unsafe,
+startup logs a warning and disables decode graphs for the engine. TP ranks
+agree on this decision, so one unsafe rank disables graphs for all ranks.
+A failed eager check, or a capture/runtime API error, stops startup rather
+than allowing unverified output.
 
 After updating the native CPU MoE sources, rebuild the extension with
 `python setup.py build_ext --inplace` in the ROCm environment before serving.

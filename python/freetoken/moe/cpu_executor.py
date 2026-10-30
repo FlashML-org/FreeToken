@@ -172,6 +172,8 @@ class CpuMoeExecutor:
         num_threads: int,
         max_tokens: int,
         device: torch.device,
+        activation_dtype: torch.dtype = torch.bfloat16,
+        graph_enabled: bool = True,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         layer_formats: list[tuple[str, dict[str, int]]] | None = None,
@@ -343,13 +345,12 @@ class CpuMoeExecutor:
         self._kernel_io = False
         if self._flag_sync:
             self._ext.start_flag_coordinator(self._coord_core)
-            if torch.version.hip is None:
-                reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
-                if reason:
-                    logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
-                else:
-                    self._ext.enable_kernel_io()
-                    self._kernel_io = True
+            reason = _cpu_moe.kernel_io_probe(torch.cuda.current_stream().cuda_stream)
+            if reason:
+                logger.warning_rank0(f"cpu-moe kernel IO unavailable ({reason}); using D2H/H2D copies around the doorbell")
+            else:
+                self._ext.enable_kernel_io()
+                self._kernel_io = True
             self._watchdog_stop = False
             # The thread target holds a WEAKREF and re-derefs it each tick: a bound
             # method would strong-reference the executor forever (the loop never ends
@@ -366,14 +367,21 @@ class CpuMoeExecutor:
             )
             self._watchdog.start()
 
+        self._graph_safe_dtypes = {activation_dtype}
         if torch.version.hip is not None:
-            # Check the event + memcpy + memop protocol, beyond the flag-only probe.
             self._graph_capture_safe = self._flag_sync
-            if self._graph_capture_safe:
-                reason = self._probe_graph_io()
+            if self._flag_sync:
+                reason = self._probe_graph_io(activation_dtype, capture_graph=graph_enabled)
+                if reason and self._kernel_io and activation_dtype == torch.bfloat16:
+                    logger.warning_rank0(f"cpu-moe kernel IO probe failed ({reason}); checking event + memcpy IO")
+                    # Python selects the copy path; the native KernelIo allocation lives until executor teardown.
+                    self._kernel_io = False
+                    reason = self._probe_graph_io(activation_dtype, capture_graph=graph_enabled)
                 if reason:
-                    self._graph_capture_safe = False
-                    logger.warning_rank0(f"cpu-moe graph IO probe failed ({reason}); using eager decode")
+                    if not self._eager_io_safe:
+                        raise RuntimeError(f"CPU MoE eager IO probe failed for {activation_dtype}: {reason}")
+                    logger.warning_rank0(f"cpu-moe graph IO probe failed for {activation_dtype} ({reason}); using eager decode")
+                self._graph_capture_safe = graph_enabled and not reason
 
         fmt_label = "; ".join(f"{_format_label(name, opts)}: {n} layers" for (name, opts), n in layer_counts.items())
         logger.info_rank0(
@@ -387,35 +395,71 @@ class CpuMoeExecutor:
         )
 
     def graph_capture_safe(self, dtype: torch.dtype) -> bool:
-        # HIP graph IO is qualified for BF16 inputs.
         return self._graph_capture_safe and (
-            torch.version.hip is None or dtype == torch.bfloat16
+            torch.version.hip is None or dtype in self._graph_safe_dtypes
         )
 
-    def _probe_graph_io(self) -> str:
-        """Check distinct tasks sharing IO, including CPU-route skips, before engine capture."""
+    def _probe_graph_io(self, dtype: torch.dtype, *, capture_graph: bool = True) -> str:
+        """Qualify IO against synchronous CPU execution, including hybrid accumulation."""
+        self._eager_io_safe = False
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            hidden = torch.empty(3, 1, self.H, device="cuda", dtype=torch.bfloat16)
-            ids = torch.empty(3, 1, self.top_k, device="cuda", dtype=torch.int32)
-            weights = torch.empty(3, 1, self.top_k, device="cuda", dtype=torch.float32)
-            base = torch.arange(3 * self.H, dtype=torch.float32).reshape(3, 1, self.H)
-            routes = torch.arange(3 * self.top_k).reshape(3, 1, self.top_k)
+            bs = min(2, self.max_tokens)
+            hidden = torch.empty(3, bs, self.H, device="cuda", dtype=dtype)
+            ids = torch.empty(3, bs, self.top_k, device="cuda", dtype=torch.int32)
+            weights = torch.empty(3, bs, self.top_k, device="cuda", dtype=torch.float32)
+            add = torch.empty_like(hidden)
+            base = torch.arange(hidden.numel(), dtype=torch.float32).reshape(hidden.shape)
+            routes = torch.arange(ids.numel()).reshape(ids.shape)
 
             def inputs(step):
-                hidden.copy_((((base + step * 7) % 31 - 15) / 64).bfloat16())
+                hidden.copy_(((base + step * 7) % 31 - 15) / 64)
                 cpu_ids = ((routes + step) % self.num_experts).int()
                 cpu_ids[step % 3].fill_(-1)
+                cpu_ids[(step + 1) % 3, :, -1] = -1
                 ids.copy_(cpu_ids)
                 weights.copy_(((routes + step) % 7 + 1).float() / (7 * self.top_k))
+                add.copy_(((base + step * 3) % 17 - 8) / 32)
 
             def forward():
-                return [self.decode(i % self.num_layers, hidden[i], weights[i], ids[i]) for i in range(3)]
+                outputs = []
+                for i in range(3):
+                    pending = self.decode_submit(i % self.num_layers, hidden[i], weights[i], ids[i])
+                    outputs.append(self.decode_sync(pending, add_to=add[i].clone() if i == 1 else None))
+                return outputs
+
+            def reference():
+                # No asynchronous IO or notification: both paths can otherwise share the same bug.
+                x = hidden
+                if self._gpu_prequant:
+                    from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
+
+                    x = torch.stack([act_quant_fp8_roundtrip(row, block=self._act_block) for row in hidden])
+                host_x, host_ids, host_w, host_add = x.cpu(), ids.cpu(), weights.cpu(), add.cpu()
+                expected = []
+                for i in range(3):
+                    self._io["x"][:bs].copy_(host_x[i])
+                    self._io["ids"][:bs].copy_(host_ids[i])
+                    self._io["w"][:bs].copy_(host_w[i])
+                    self._ext.run(i % self.num_layers, bs)
+                    # Match the IO rounding boundary before hybrid addition; the BF16 combine kernel
+                    # also adds already-rounded BF16 operands in FP32, then rounds back to BF16.
+                    out = self._io["y"][:bs].to(dtype).clone()
+                    expected.append(out + host_add[i] if i == 1 else out)
+                return expected
+
+            def matches(actual, expected):
+                return all(torch.equal(got.cpu(), want) for got, want in zip(actual, expected))
 
             inputs(0)
-            forward()
+            eager = forward()
             stream.synchronize()
+            if not matches(eager, reference()):
+                return "eager output differs from synchronous CPU reference"
+            self._eager_io_safe = True
+            if not capture_graph:
+                return ""
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 captured = forward()
@@ -423,12 +467,10 @@ class CpuMoeExecutor:
                 inputs(step)
                 graph.replay()
                 stream.synchronize()
-                # Eager must follow replay: otherwise it can prefill shared IO and hide stale graph inputs.
-                eager = forward()
-                stream.synchronize()
                 self.raise_if_unhealthy()
-                if any(not torch.equal(got, expected) for got, expected in zip(captured, eager)):
-                    return "graph output differs from eager with distinct task inputs"
+                # Read the reference only after replay, so it cannot prefill stale graph IO.
+                if not matches(captured, reference()):
+                    return "graph output differs from synchronous CPU reference"
         return ""
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:

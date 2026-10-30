@@ -316,16 +316,20 @@ def test_cpu_fp8_block_graph_distinct_layer_inputs(bs, accumulate):
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
-def test_cpu_fp8_block_event_graph_replay_and_recapture():
+@pytest.mark.parametrize("kernel_io", [True, False])
+def test_cpu_fp8_block_graph_replay_and_recapture(monkeypatch, kernel_io):
+    from freetoken.kernel import _cpu_moe
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
+    if not kernel_io:
+        monkeypatch.setattr(_cpu_moe, "kernel_io_probe", lambda stream: "forced memcpy fallback")
     L, E, H, I, top_k = 3, 8, 256, 128, 4
     cache = _make_fp8_block_cache(L, E, H, I, seed=71)
     ex = CpuMoeExecutor(
         cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
         num_threads=4, max_tokens=3, device=torch.device("cuda"),
     )
-    assert ex._flag_sync and not ex._kernel_io
+    assert ex._flag_sync and ex._kernel_io == kernel_io
     assert ex.graph_capture_safe(torch.bfloat16)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -348,7 +352,7 @@ def test_cpu_fp8_block_event_graph_replay_and_recapture():
                 return [ex.decode(layer, hidden[layer], weights[layer], ids[layer]) for layer in range(L)]
 
             inputs(0)
-            # New tasks may allocate their publication event inside capture.
+            # The memcpy fallback may allocate its publication event inside capture.
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 outputs = forward()

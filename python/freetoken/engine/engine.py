@@ -1088,6 +1088,11 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
         max_tokens *= config.decode_rows_per_req
+        # Match GraphRunner's explicit-size precedence, including an empty list.
+        if config.cuda_graph_bs is not None:
+            graph_enabled = bool(config.cuda_graph_bs)
+        else:
+            graph_enabled = config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1098,13 +1103,16 @@ class Engine:
             num_threads=config.moe_cpu_threads,
             max_tokens=max_tokens,
             device=self.device,
+            activation_dtype=self.dtype,
+            graph_enabled=graph_enabled,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
-        _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
+        if graph_enabled:
+            _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""

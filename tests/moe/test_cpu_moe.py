@@ -546,7 +546,7 @@ def test_cpu_moe_hip_probe_error_recovery(hip_probe_fault_library, fault):
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
-@pytest.mark.parametrize("fallback", ["handshake-probe", "graph-data", "fp16"])
+@pytest.mark.parametrize("fallback", ["handshake-probe", "graph-data"])
 def test_cpu_moe_hip_unsafe_graph_keeps_eager_usable(monkeypatch, fallback):
     from freetoken.kernel import _cpu_moe
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -567,7 +567,7 @@ def test_cpu_moe_hip_unsafe_graph_keeps_eager_usable(monkeypatch, fallback):
         cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
         num_threads=4, max_tokens=1, device=torch.device("cuda"),
     )
-    dtype = torch.float16 if fallback == "fp16" else torch.bfloat16
+    dtype = torch.bfloat16
     assert not ex.graph_capture_safe(dtype)
     if fallback == "graph-data":
         assert ex._flag_sync and not ex._kernel_io
@@ -586,14 +586,11 @@ def test_cpu_moe_hip_unsafe_graph_keeps_eager_usable(monkeypatch, fallback):
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
-def test_cpu_moe_hip_event_path_does_not_require_kernel_io(monkeypatch):
+def test_cpu_moe_hip_event_fallback_when_kernel_io_unavailable(monkeypatch):
     from freetoken.kernel import _cpu_moe
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
-    def reject_kernel_probe(stream):
-        raise AssertionError("HIP event publication must not depend on the publish kernel")
-
-    monkeypatch.setattr(_cpu_moe, "kernel_io_probe", reject_kernel_probe)
+    monkeypatch.setattr(_cpu_moe, "kernel_io_probe", lambda stream: "mapped IO unavailable")
     cache = _make_cache(3, 8, 256, 128, scale=0.03)
     ex = CpuMoeExecutor(
         cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
@@ -603,30 +600,177 @@ def test_cpu_moe_hip_event_path_does_not_require_kernel_io(monkeypatch):
     assert ex.graph_capture_safe(torch.bfloat16)
 
 
-def test_cpu_moe_hip_event_record_failure_is_loud(hip_probe_fault_library):
+@pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
+@pytest.mark.parametrize("graph_bs,max_bs", [(None, 0), ([], 4), (None, 1), ([1], 0), (None, None), (None, -1)])
+def test_cpu_moe_hip_kernel_graph_mismatch_uses_event(monkeypatch, caplog, graph_bs, max_bs):
+    from freetoken.engine.engine import Engine, logger
+    from freetoken.engine.graph import _determine_cuda_graph_bs
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(0)
+    graph_enabled = bool(_determine_cuda_graph_bs(graph_bs, max_bs, free_memory=1 << 30))
+    monkeypatch.setattr(logger, "propagate", True)
+    original = CpuMoeExecutor.decode_sync
+
+    def corrupt_kernel_capture(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        if self._kernel_io and torch.cuda.is_current_stream_capturing():
+            return out + 1
+        return out
+
+    monkeypatch.setattr(CpuMoeExecutor, "decode_sync", corrupt_kernel_capture)
+    cache = _make_cache(3, 8, 256, 128, scale=0.03)
+    cache.set_cpu_executor = lambda executor: setattr(cache, "cpu_executor", executor)
+    config = SimpleNamespace(
+        max_running_req=1, decode_rows_per_req=1, moe_cpu_threads=4,
+        cuda_graph_bs=graph_bs, cuda_graph_max_bs=max_bs, tp_info=SimpleNamespace(size=1),
+    )
+    layers = [SimpleNamespace(
+        layer_id=i, top_k=4, activation="silu", apply_router_weight_on_input=False,
+        alpha=1.702, limit=None, quant_method=SimpleNamespace(cpu_spec=lambda: ("bf16", {})),
+    ) for i in range(3)]
+    engine = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16, tp_cpu_group=None)
+    Engine._init_cpu_moe_executor(engine, config, cache, layers)
+    ex = engine.cpu_moe_executor
+    assert "not graph-safe" not in caplog.text
+    assert bool(_determine_cuda_graph_bs(config.cuda_graph_bs, config.cuda_graph_max_bs, free_memory=1 << 30)) == graph_enabled
+    assert ex._flag_sync and ex._kernel_io == (not graph_enabled)
+    assert ex.graph_capture_safe(torch.bfloat16) == graph_enabled
+    hidden = torch.randn(1, 256, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 2, -1, 5]], device="cuda", dtype=torch.int32)
+    weights = torch.tensor([[0.2, 0.3, 0.1, 0.4]], device="cuda")
+    if not graph_enabled:
+        actual = ex.decode(1, hidden, weights, ids)
+        expected = _reference(cache, 1, hidden, ids.cpu(), weights.cpu())
+        relative = (actual.float().cpu() - expected).abs().max() / (expected.abs().max() + 1e-6)
+        assert relative < 2e-2, relative
+        return
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = ex.decode(1, hidden, weights, ids)
+    for step in range(3):
+        hidden.add_(0.125)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _reference(cache, 1, hidden, ids.cpu(), weights.cpu())
+        relative = (actual.float().cpu() - expected).abs().max() / (expected.abs().max() + 1e-6)
+        assert relative < 2e-2, relative
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
+@pytest.mark.parametrize("kernel_only", [False, True])
+@pytest.mark.parametrize("graph_enabled", [False, True])
+def test_cpu_moe_hip_probe_rejects_common_eager_graph_error(monkeypatch, kernel_only, graph_enabled):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    original = CpuMoeExecutor.decode_sync
+
+    def corrupt(self, pending, add_to=None):
+        out = original(self, pending, add_to=add_to)
+        return out + 1 if not kernel_only or pending[2] else out
+
+    monkeypatch.setattr(CpuMoeExecutor, "decode_sync", corrupt)
+    cache = _make_cache(3, 8, 256, 128, scale=0.03)
+
+    def make():
+        return CpuMoeExecutor(cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+                              num_threads=4, max_tokens=2, device=torch.device("cuda"), graph_enabled=graph_enabled)
+
+    if kernel_only:
+        ex = make()
+        assert not ex._kernel_io
+        assert ex.graph_capture_safe(torch.bfloat16) == graph_enabled
+    else:
+        with pytest.raises(RuntimeError, match="eager IO probe failed"):
+            make()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_cpu_moe_graph_dtype_and_hybrid_accumulation(dtype, accumulate):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    cache = _make_cache(3, 8, 256, 128, scale=0.03)
+    ex = CpuMoeExecutor(cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+                       num_threads=4, max_tokens=2, device=torch.device("cuda"), activation_dtype=dtype)
+    assert ex.graph_capture_safe(dtype)
+    hidden = torch.randn(2, 256, device="cuda", dtype=dtype)
+    ids = torch.tensor([[0, 2, -1, 5], [-1, -1, -1, -1]], device="cuda", dtype=torch.int32)
+    weights = torch.rand(2, 4, device="cuda")
+    add = torch.randn_like(hidden)
+
+    def forward():
+        pending = ex.decode_submit(1, hidden, weights, ids)
+        assert pending[2] == (ex._kernel_io and dtype == torch.bfloat16)
+        return ex.decode_sync(pending, add_to=add.clone() if accumulate else None)
+
+    forward()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = forward()
+    for step in range(6):
+        hidden.add_(0.125)
+        ids.fill_(-1) if step % 2 else ids[0].copy_(torch.tensor([1, 3, -1, 7], device="cuda"))
+        graph.replay()
+        torch.cuda.synchronize()
+        ex._io["x"][:2].copy_(hidden.cpu())
+        ex._io["ids"][:2].copy_(ids.cpu())
+        ex._io["w"][:2].copy_(weights.cpu())
+        ex._ext.run(1, 2)
+        expected = ex._io["y"][:2].to(dtype).clone()
+        if accumulate:
+            expected += add.cpu()
+        assert torch.equal(actual.cpu(), expected)
+
+
+@pytest.mark.parametrize("kernel_io", [False, True])
+def test_cpu_moe_hip_event_record_failure_is_loud(hip_probe_fault_library, kernel_io):
     import os
     from pathlib import Path
     import subprocess
     import sys
 
     script = r"""
-import ctypes, runpy, sys
+import ctypes, os, runpy, sys
 import pytest
 import torch
+from freetoken.kernel import _cpu_moe
 from freetoken.moe.cpu_executor import CpuMoeExecutor
 helpers = runpy.run_path(sys.argv[1])
 shim = ctypes.CDLL(sys.argv[2])
+kernel_io = sys.argv[3] == 'True'
+if not kernel_io:
+    _cpu_moe.kernel_io_probe = lambda stream: 'forced memcpy fallback'
 cache = helpers['_make_cache'](3, 8, 256, 128, scale=0.03)
-with pytest.raises(RuntimeError, match='publish input copies'):
-    CpuMoeExecutor(cache, top_k=4, activation='silu', apply_router_weight_on_input=False,
+def make_executor():
+    return CpuMoeExecutor(cache, top_k=4, activation='silu', apply_router_weight_on_input=False,
         num_threads=4, max_tokens=1, device=torch.device('cuda'))
+if kernel_io:
+    ex = make_executor()
+    assert ex._kernel_io and ex.graph_capture_safe(torch.bfloat16)
+    hidden = torch.randn(1, 256, device='cuda', dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 2, -1, 5]], device='cuda', dtype=torch.int32)
+    weights = torch.tensor([[0.2, 0.3, 0.1, 0.4]], device='cuda')
+    ex.decode(1, hidden, weights, ids)
+    torch.cuda.synchronize()
+    assert shim.probe_test_injected() == 0
+    with pytest.raises(RuntimeError, match='publish input copies'):
+        ex.decode(1, hidden.half(), weights, ids)
+else:
+    with pytest.raises(RuntimeError, match='publish input copies'):
+        make_executor()
 torch.cuda.synchronize()
 assert shim.probe_test_injected() > 0
 """
     env = dict(os.environ, LD_PRELOAD=str(hip_probe_fault_library),
                FREETOKEN_TEST_HIP_PROBE_FAULT="publication-event", FREETOKEN_CPU_MOE_FLAG_SYNC="1")
     result = subprocess.run(
-        [sys.executable, "-c", script, str(Path(__file__).resolve()), str(hip_probe_fault_library)],
+        [sys.executable, "-c", script, str(Path(__file__).resolve()), str(hip_probe_fault_library), str(kernel_io)],
         env=env, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
