@@ -43,6 +43,17 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+def _disable_unsafe_cpu_moe_graphs(config: EngineConfig, executor, dtype, tp_cpu_group) -> None:
+    safe = torch.tensor([executor.graph_capture_safe(dtype)], dtype=torch.int32)
+    if config.tp_info.size > 1:
+        torch.distributed.all_reduce(safe, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group)
+    if not safe.item():
+        logger.warning_rank0("CPU MoE IO/handshake is not graph-safe on every TP rank for this dtype; disabling decode graphs")
+        # Clear explicit sizes too; GraphRunner gives them priority over max_bs, including on rebuild.
+        object.__setattr__(config, "cuda_graph_bs", [])
+        object.__setattr__(config, "cuda_graph_max_bs", 0)
+
+
 def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
     """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
     num_experts = config.model_config.num_experts
@@ -1077,6 +1088,11 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
         max_tokens *= config.decode_rows_per_req
+        # Match GraphRunner's explicit-size precedence, including an empty list.
+        if config.cuda_graph_bs is not None:
+            graph_enabled = bool(config.cuda_graph_bs)
+        else:
+            graph_enabled = config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1087,12 +1103,16 @@ class Engine:
             num_threads=config.moe_cpu_threads,
             max_tokens=max_tokens,
             device=self.device,
+            activation_dtype=self.dtype,
+            graph_enabled=graph_enabled,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+        if graph_enabled:
+            _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
