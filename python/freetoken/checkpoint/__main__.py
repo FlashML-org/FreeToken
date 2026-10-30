@@ -15,6 +15,7 @@ import time
 import torch
 
 from freetoken.gpu_select import assign_gpu, bind_assigned_gpu, single_gpu_arg
+from freetoken.utils.hf import download_hf_weight
 
 from .convert import convert_checkpoint
 
@@ -54,11 +55,15 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     except (ValueError, RuntimeError) as e:
         p.error(str(e))
 
+    # Resolve a repo ID to a local directory before conversion.
+    # If the user passed a real path, leave it alone.       
+    model_path = download_hf_weight(ns.model)
+
     shard_limit = int(ns.shard_gib * (1 << 30))
     shard_limit -= shard_limit % 4096  # keep aligned
     t = time.perf_counter()
     index = convert_checkpoint(
-        ns.model, ns.out, dtype=_DTYPES[ns.dtype],
+        model_path, ns.out, dtype=_DTYPES[ns.dtype],
         moe_backend=ns.moe_backend, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
     )
     dt = time.perf_counter() - t
