@@ -11,7 +11,7 @@ import torch
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
 from freetoken.spec.proposer import DraftContext, Proposer
-from freetoken.spec.relay import HiddenRelay
+from freetoken.spec.mtp.relay import HiddenRelay
 
 if TYPE_CHECKING:
     from freetoken.core import Req
