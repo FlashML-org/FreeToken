@@ -23,15 +23,13 @@ if TYPE_CHECKING:
 
 
 def draft_config(config: ModelConfig) -> ModelConfig:
-    """One full-attention layer with the target's geometry; its MoE is resident on the GPU whatever the target's strategy."""
+    """One full-attention layer with the target's geometry."""
     groups = [g for g in config.attention_groups if isinstance(g, FullAttentionGroupConfig)]
     group = groups[0] if groups else config.default_full_attention_group()
     return dataclasses.replace(
         config,
         num_layers=1,
         attention_groups=(dataclasses.replace(group, layer_ids=(0,)),),
-        moe_strategy="fused",
-        decode_target="gpu",
     )
 
 

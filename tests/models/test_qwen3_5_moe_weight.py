@@ -631,18 +631,23 @@ def test_a_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, qu
 
 
 def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
-    """The MTP reader fills exactly the draft the engine builds, and the routed experts keep the form the checkpoint stores."""
+    """The MTP reader fills exactly the draft the engine builds, whose MoE stays resident though the target offloads, and the routed experts keep the form the checkpoint stores."""
     from types import SimpleNamespace
 
+    from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
     from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
     from freetoken.models.qwen3_5_moe.weight import iter_mtp_expert_pieces, iter_mtp_weights
+    from freetoken.spec.mtp.proposer import with_resident_moe
 
     name, folder, raw = checkpoint
     if name not in ("bf16", "fp8_block"):
         pytest.skip("layouts with an MTP head only")
     _install(folder)
     target = SimpleNamespace(model=SimpleNamespace(embed_tokens=None))
-    state = _meta_state_dict(folder, lambda config: Qwen3_5MTPDraft(config, target))
+    built = {}
+    state = _meta_state_dict(folder, lambda config: built.setdefault("draft", Qwen3_5MTPDraft(with_resident_moe(config), target)))
+    moe = list(iter_moe_layers(built["draft"]))
+    assert moe and not any(isinstance(m, OffloadMoELayer) for m in moe)
     loaded = dict(iter_mtp_weights(folder, torch.device("cpu")))
     assert set(loaded) == set(state)
     for key, tensor in loaded.items():

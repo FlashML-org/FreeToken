@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, List, Protocol
 
@@ -50,6 +51,11 @@ class MTPDraft(Protocol):
     def head_input(self, hidden: torch.Tensor) -> torch.Tensor:
         """What the target's LM head reads from a draft hidden."""
         ...
+
+
+def with_resident_moe(config: ModelConfig) -> ModelConfig:
+    """``config`` with its MoE resident on the GPU, the strategy every draft builds with whatever the target's."""
+    return dataclasses.replace(config, moe_strategy="fused", decode_target="gpu")
 
 
 @dataclass
@@ -139,7 +145,7 @@ class MTPProposer(Proposer):
         rows = config.max_running_req + 1
         # relay hidden and carry, and the verify hiddens
         fixed = rows * (config.speculative_num_steps + 3) * relay_bytes
-        groups = draft_cls.draft_config(config.model_config).kv_cache_group_specs()
+        groups = draft_cls.draft_config(with_resident_moe(config.model_config)).kv_cache_group_specs()
         return fixed, sum(spec_kv_bytes_per_token(group, config) for group in groups)
 
     def __init__(self, config, target_model) -> None:
@@ -147,7 +153,14 @@ class MTPProposer(Proposer):
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.dtype = config.dtype
         path = config.speculative_draft_model_path or config.model_path
-        self.draft = self._draft_class(config).load(config.model_config, target_model, path, self.device, config.dtype)
+        from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
+
+        draft_cls = self._draft_class(config)
+        self.draft = draft_cls.load(with_resident_moe(config.model_config), target_model, path, self.device, config.dtype)
+        # an offloaded or shared MoE layer here would read the target's experts as its own, silently
+        target_moe = {id(m) for m in iter_moe_layers(target_model)}
+        if any(isinstance(m, OffloadMoELayer) or id(m) in target_moe for m in iter_moe_layers(self.draft)):
+            raise RuntimeError(f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU")
         self.lm_head = target_model.lm_head
         self.mrope = config.model_config.model_is_mrope
         self._prefill_state: dict[int, tuple[int, int]] = {}  # table row -> (uid, first position not drafted yet)

@@ -104,7 +104,7 @@ def _pack_quant(model_path: str):
 
 
 def draft_config(config: ModelConfig) -> ModelConfig:
-    """The target config cut to one QSA layer (layer id 0) without PLE; its MoE is resident on the GPU whatever the target's strategy."""
+    """The target config cut to one QSA layer (layer id 0) without PLE."""
     group = next(g for g in config.attention_groups if isinstance(g, FullAttentionGroupConfig) and g.index_ratio > 1)
     return dataclasses.replace(
         config,
@@ -113,8 +113,6 @@ def draft_config(config: ModelConfig) -> ModelConfig:
         qwen4_args=dataclasses.replace(config.qwen4_args, ple_layer_ids=()),
         slot_states=(),
         vision_config=None,
-        moe_strategy="fused",
-        decode_target="gpu",
     )
 
 
