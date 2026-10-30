@@ -108,6 +108,15 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
 
+Every chat completion, completion and Responses response also carries a llama.cpp-shaped
+`timings` object next to `usage` (`prompt_n`, `prompt_ms`, `prompt_per_second`,
+`predicted_n`, `predicted_ms`, `predicted_per_second`, `cache_n`), so frontends like
+llama-swap and Open Web UI show per-request prefill/decode rates and the prefix-cache hit.
+Its spans match the cumulative timing on `GET /v1/stats`: prefill runs from request start
+to the first output token, decode between output tokens. `cache_n` follows llama.cpp
+(always present, `prompt_n` counts only the evaluated tokens) and is not gated by
+`--enable-cache-report`, which controls only `usage.prompt_tokens_details.cached_tokens`.
+
 ### Image input
 
 Experimental. Needs a checkpoint whose family registers a vision encoder ([models.md](models.md#image-input) lists them and how each one

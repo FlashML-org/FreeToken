@@ -75,6 +75,7 @@ from .generation import (
     resolve_sampling,
     split_tool_lists,
     submit_generation,
+    timings_block,
     with_keepalive,
 )
 from .request_logger import log_request
@@ -454,14 +455,20 @@ def build_responses_response(
             result.cached_tokens if cache_report else 0,
         ),
         incomplete_reason="max_output_tokens" if truncated else None,
+        timings=timings_block(
+            result.prompt_tokens, result.completion_tokens, result.cached_tokens,
+            result.prompt_ms, result.predicted_ms,
+        ),
     )
 
 
 def _response_obj(
     response_id: str, created: int, model: str, output: list[Any],
     *, status: str, usage: ResponseUsage | None, error: ResponseError | None = None,
-    incomplete_reason: str | None = None,
+    incomplete_reason: str | None = None, timings: dict[str, Any] | None = None,
 ) -> Response:
+    # Response allows extra fields, so timings rides along without forking the schema.
+    extra: dict[str, Any] = {"timings": timings} if timings is not None else {}
     return Response(
         id=response_id,
         created_at=created,
@@ -475,6 +482,7 @@ def _response_obj(
         parallel_tool_calls=True,
         tool_choice="auto",
         tools=[],
+        **extra,
     )
 
 
@@ -502,10 +510,10 @@ async def responses_stream_generator(
 ) -> AsyncIterator[str]:
     seq = _Seq()
 
-    def snapshot(status, output, usage=None, incomplete_reason=None):
+    def snapshot(status, output, usage=None, incomplete_reason=None, timings=None):
         return _response_obj(
             response_id, created, req.model, output,
-            status=status, usage=usage, incomplete_reason=incomplete_reason,
+            status=status, usage=usage, incomplete_reason=incomplete_reason, timings=timings,
         )
 
     yield _sse(ResponseCreatedEvent(
@@ -522,6 +530,8 @@ async def responses_stream_generator(
     usage_pt = 0
     usage_ct = 0
     usage_cached = 0
+    usage_prompt_ms = 0.0
+    usage_predicted_ms = 0.0
 
     def close_current() -> list[str]:
         nonlocal current, output_index
@@ -707,6 +717,8 @@ async def responses_stream_generator(
                 finish_reason = ev.finish_reason
                 usage_pt, usage_ct = ev.prompt_tokens, ev.completion_tokens
                 usage_cached = ev.cached_tokens if cache_report else 0
+                usage_prompt_ms, usage_predicted_ms = ev.prompt_ms, ev.predicted_ms
+                final_timings = timings_block(usage_pt, usage_ct, ev.cached_tokens, usage_prompt_ms, usage_predicted_ms)
                 for f in close_current():
                     yield f
                 if finish_reason == "length":
@@ -716,6 +728,7 @@ async def responses_stream_generator(
                             "incomplete", output_items,
                             usage=_usage(usage_pt, usage_ct, usage_cached),
                             incomplete_reason="max_output_tokens",
+                            timings=final_timings,
                         ),
                     ))
                 else:
@@ -724,6 +737,7 @@ async def responses_stream_generator(
                         response=snapshot(
                             "completed", output_items,
                             usage=_usage(usage_pt, usage_ct, usage_cached),
+                            timings=final_timings,
                         ),
                     ))
     except GenerationError as exc:
