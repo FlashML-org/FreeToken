@@ -103,6 +103,25 @@ def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
     return copied
 
 
+def _refuse_occupied_output(out_dir: str) -> None:
+    """Refuse an output dir that already holds FTW output: the index of a finished conversion,
+    or shards left by an interrupted one. There is no resume; the writer would open shard
+    00000 with "wb" and a stale index could then describe the wrong bytes."""
+    from .ftw import INDEX_NAME, is_ftw_checkpoint
+
+    if is_ftw_checkpoint(out_dir):
+        found = INDEX_NAME
+    else:
+        shards = glob.glob(os.path.join(glob.escape(out_dir), "freetoken-*.ftw"))
+        if not shards:
+            return
+        found = os.path.basename(min(shards))
+    raise SystemExit(
+        f"{out_dir} already holds an FTW checkpoint ({found}); "
+        f"convert into an empty directory or remove the old one first"
+    )
+
+
 class _ConvertSink:
     """Layer-completion sink for ``load_expert_banks(layer_sink=...)``: writes each
     completed layer's banks as their own FTW entries immediately (name
@@ -184,6 +203,7 @@ def convert_checkpoint(
 
     if is_ftw_checkpoint(model_path):
         raise SystemExit(f"{model_path} is already an FTW checkpoint")
+    _refuse_occupied_output(out_dir)
     tp = try_get_tp_info()
     if tp is None:
         set_tp_info(rank=0, size=1)
