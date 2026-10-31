@@ -11,7 +11,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
 
-import safetensors
 import torch
 
 from freetoken.mm import MM_PAD_SHIFT_VALUE, restore_placeholder
@@ -20,13 +19,7 @@ from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.utils import init_logger
 
-from .weight import (
-    _PLE_SCALE_SUFFIX,
-    _PLE_SHARD_RE,
-    _PLE_ST_DTYPES,
-    _ple_table_files,
-    _safetensors_header,
-)
+from .weight import PleShardIdentity, check_ple_geometry, ple_table_layout, revalidate_ple_shard
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
@@ -55,56 +48,32 @@ class PleRowSource:
     ggml_type: int | None = None
     row_values: int | None = None
     row_dtype: torch.dtype = torch.float8_e4m3fn
+    files: tuple[PleShardIdentity, ...] = ()  # what preflight saw of each file, re-checked before the store opens them
 
     @property
     def total_rows(self) -> int:
         return len(self.extent_base) * self.rows_per_extent
 
 
-def source_from_safetensors(folder: str) -> PleRowSource:
-    """Map the checkpoint's ``ngram_embedding.shard_<i>`` tensors in place: one extent per shard, no copy."""
-    rows = cols = 0
-    dtype: torch.dtype | None = None
-    scale: torch.Tensor | None = None
+def source_from_safetensors(folder: str, qwen4_args=None) -> PleRowSource:
+    """Map the checkpoint's ``ngram_embedding.shard_<i>`` tensors in place: one extent per shard, no copy.
+
+    The shard headers must describe one consistent table (:func:`ple_table_layout`) and, given the config, exactly the table it addresses (:func:`check_ple_geometry`)."""
+    layout = ple_table_layout(folder)
+    if qwen4_args is not None:
+        check_ple_geometry(layout, qwen4_args)
     paths: list[str] = []
     path_idx: dict[str, int] = {}
-    shards: dict[int, tuple[int, int]] = {}
-    for path in _ple_table_files(folder):
-        header, base = _safetensors_header(path)
-        for key, meta in header.items():
-            if key == "__metadata__":
-                continue
-            if key.endswith(_PLE_SCALE_SUFFIX):
-                with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-                    scale = f.get_tensor(key).reshape(())
-                continue
-            match = _PLE_SHARD_RE.search(key)
-            if match is None:
-                continue
-            shard_dtype = _PLE_ST_DTYPES.get(meta["dtype"])
-            if shard_dtype is None or dtype not in (None, shard_dtype):
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected one of {sorted(_PLE_ST_DTYPES)} for every shard")
-            dtype = shard_dtype
-            if rows and tuple(meta["shape"]) != (rows, cols):
-                raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
-            rows, cols = meta["shape"]
-            if path not in path_idx:
-                path_idx[path] = len(paths)
-                paths.append(path)
-            idx = int(match.group("shard"))
-            if idx in shards:
-                raise ValueError(f"duplicate PLE shard {idx} in {path}")
-            shards[idx] = (path_idx[path], base + meta["data_offsets"][0])
-    if sorted(shards) != list(range(len(shards))) or not shards:
-        raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
-    if scale is None:
-        if dtype is torch.float8_e4m3fn:
-            raise ValueError("PLE table has no weight_scale")
-        scale = torch.tensor(1.0)
-    order = [shards[i] for i in range(len(shards))]
-    row_bytes = cols * dtype.itemsize
-    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, row_bytes, row_bytes, float(scale),
-                        row_values=cols, row_dtype=dtype)
+    for part in layout.parts:
+        if part.path not in path_idx:
+            path_idx[part.path] = len(paths)
+            paths.append(part.path)
+    row_bytes = layout.cols * layout.dtype.itemsize
+    return PleRowSource(
+        paths, [path_idx[p.path] for p in layout.parts], [p.file_offset for p in layout.parts],
+        layout.rows_per_part, row_bytes, row_bytes, float(layout.scale),
+        row_values=layout.cols, row_dtype=layout.dtype, files=layout.files,
+    )
 
 
 def source_from_gguf(model_path: str) -> PleRowSource:
@@ -119,7 +88,7 @@ def source_from_gguf(model_path: str) -> PleRowSource:
     return PleRowSource([info.path], [0], [info.offset], rows, nbytes, nbytes, 1.0, info.ggml_type, values)
 
 
-def resolve_row_source(model_path: str) -> PleRowSource:
+def resolve_row_source(model_path: str, qwen4_args=None) -> PleRowSource:
     """Pick the row source for a checkpoint; the seam where a repacked format would plug in."""
     from freetoken.models.gguf.reader import gguf_config_source
 
@@ -127,7 +96,7 @@ def resolve_row_source(model_path: str) -> PleRowSource:
         return source_from_gguf(gguf_src)
     from freetoken.utils import download_hf_weight
 
-    return source_from_safetensors(download_hf_weight(model_path))
+    return source_from_safetensors(download_hf_weight(model_path), qwen4_args)
 
 
 class DiskRowTable:
@@ -142,6 +111,8 @@ class DiskRowTable:
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
+        for shard in source.files:  # the files the store is about to pin descriptors to are the ones preflight parsed
+            revalidate_ple_shard(shard)
         from freetoken.kernel.row_store import PleStore
         from freetoken.layers.quantization.ggml_types import float_dtype
 

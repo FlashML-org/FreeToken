@@ -38,6 +38,11 @@ IHD = 64  # indexer head dim
 BLOCK = 128
 E, I = 3, 6  # routed experts, moe_intermediate_size
 NGRAM_DIM, NGRAM_ROWS, NGRAM_SHARDS = 4, 7, 4
+# the config geometry the 28-row toy table must derive from: 4 heads, primes after 2 = 3+5+7+11 = 26, padded to 4 -> 28
+NGRAM_ARGS = SimpleNamespace(
+    split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM, ngram_size=3, heads_per_ngram=2,
+    ngram_vocab_size_base=3, make_ngram_vocab_size_divisible_by=4, ple_layer_ids=(0,),
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -397,8 +402,7 @@ def test_hash_constants_stay_int64(loaded):
 
 def test_load_ple_table_concatenates_shards_in_index_order(checkpoint):
     folder, raw = checkpoint
-    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
-    table = load_ple_table(folder, args, pin=False)
+    table = load_ple_table(folder, NGRAM_ARGS, pin=False)
     assert table.tensor.shape == (NGRAM_SHARDS * NGRAM_ROWS, NGRAM_DIM)
     assert table.tensor.dtype is torch.float8_e4m3fn
     prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
@@ -414,14 +418,14 @@ def test_load_ple_table_reads_an_unscaled_bf16_table(tmp_path):
     prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
     shards = {f"{prefix}.shard_{i}.weight": _bf16(NGRAM_ROWS, NGRAM_DIM) for i in range(NGRAM_SHARDS)}
     save_file(shards, str(tmp_path / "model.safetensors"))
-    table = load_ple_table(str(tmp_path), SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM), pin=False)
+    table = load_ple_table(str(tmp_path), NGRAM_ARGS, pin=False)
     assert torch.equal(table.tensor, torch.cat([shards[f"{prefix}.shard_{i}.weight"] for i in range(NGRAM_SHARDS)]))
     assert float(table.weight_scale) == 1.0
 
 
 def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
     folder, _raw = checkpoint
-    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS + 1, ngram_head_dim=NGRAM_DIM)
+    args = SimpleNamespace(**{**vars(NGRAM_ARGS), "split_ngram_parts": NGRAM_SHARDS + 1})
     with pytest.raises(ValueError, match="shards 0"):
         load_ple_table(folder, args, pin=False)
 
