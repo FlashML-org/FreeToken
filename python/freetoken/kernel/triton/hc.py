@@ -326,9 +326,11 @@ def _hc_combine_norm_kernel(
     tl.store(out_ptr + row * stride_out + offs, out, mask=mask_inner)
 
     out = out.to(tl.float32)
-    # Keep the two-axis reduction: flattening the padded tile is ~40% slower
-    # at decode sizes.
-    sum_sq = tl.sum(tl.sum(out * out, axis=1), axis=0)
+    # The standalone grouped RMSNorm reduces one padded [next_pow2(HC_DIM)]
+    # vector; reshape keeps the identical tree (same element
+    # order, same masked zeros), so the fused statistic is bit-exact vs the split.
+    flat = tl.reshape(out * out, [NUM_TILES_PAD * BLOCK_SIZE])
+    sum_sq = tl.sum(flat)
     rrms = tl.rsqrt(sum_sq / HC_DIM + EPS)
 
     if launch_pdl:
