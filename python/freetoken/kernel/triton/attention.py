@@ -19,6 +19,15 @@ _MAX_KV_SPLITS = 64
 _STAGE2_TILE_ELEMS = 8192
 
 
+@functools.lru_cache(maxsize=None)
+def _decode_gate_sigmoid_table(device_index: int) -> torch.Tensor:
+    # Initialize before capture: Torch supplies its exact BF16 sigmoid rounding.
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Initialize the decode gate sigmoid table before Graph capture")
+    bits = torch.arange(65536, device=torch.device("cuda", device_index), dtype=torch.int32).to(torch.int16)
+    return bits.view(torch.bfloat16).sigmoid()
+
+
 def _stage2_launch(max_kv_splits: int, block_dv: int) -> tuple[int, int]:
     """(splits merged per step, num_warps) for stage 2; the tile is at most the split cap rounded up to a power of two."""
     tile = min(triton.next_power_of_2(max_kv_splits), max(4, _STAGE2_TILE_ELEMS // block_dv), 64)
@@ -317,6 +326,10 @@ def _decode_stage2_kernel(
     q_pos_ptr,
     max_kv_splits,
     sinks_ptr,
+    gate_ptr,
+    sigmoid_ptr,
+    stride_gt,
+    stride_gh,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -332,6 +345,7 @@ def _decode_stage2_kernel(
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    HAS_GATE: tl.constexpr,
     SPLIT_TILE: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
@@ -384,11 +398,28 @@ def _decode_stage2_kernel(
         m_i = m_new
 
     out = tl.where(l_i == 0.0, 0.0, acc / l_i)
-    tl.store(
-        o_ptr + batch_id * stride_ot + q_head * stride_oh + offs_d,
-        out.to(o_ptr.dtype.element_ty),
-        mask=mask_d,
-    )
+    if HAS_GATE:
+        rounded_attention = out.to(o_ptr.dtype.element_ty).to(tl.float32)
+        gate_bits = tl.load(
+            gate_ptr + batch_id * stride_gt + q_head * stride_gh + offs_d,
+            mask=mask_d, other=0,
+        ).to(tl.int32) & 65535
+        sigmoid = tl.load(sigmoid_ptr + gate_bits).to(tl.float32)
+        product = rounded_attention * sigmoid
+        # Explicit RNE prevents narrowing the BF16 product to a gfx12 dot2.
+        bits = product.to(tl.uint32, bitcast=True)
+        rounded = (bits + 0x7fff + ((bits >> 16) & 1)) >> 16
+        rounded = tl.where((bits & 0x7fffffff) > 0x7f800000, (bits >> 16) | 0x40, rounded)
+        tl.store(
+            o_ptr.to(tl.pointer_type(tl.uint16)) + batch_id * stride_ot + q_head * stride_oh + offs_d,
+            rounded.to(tl.uint16), mask=mask_d,
+        )
+    else:
+        tl.store(
+            o_ptr + batch_id * stride_ot + q_head * stride_oh + offs_d,
+            out.to(o_ptr.dtype.element_ty),
+            mask=mask_d,
+        )
 
 
 def decode_paged_attention(
@@ -405,11 +436,17 @@ def decode_paged_attention(
     sinks: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     max_kv_splits: int | None = None,
+    *,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """SGLang-style split-k grouped decode attention for one query per request.
 
     Each request takes ``max(ceil(keys / 128), min(8, ceil(keys / 32)))`` splits, capped by ``max_kv_splits`` (default :func:`decode_kv_split_cap`) and by the split dim of ``attn_logits`` / ``attn_lse``.
     The kernels compute the split count on the device, so a captured graph serves any context length.
+
+    ``output_gate`` optionally fuses ``out * sigmoid(output_gate)`` into stage 2.
+    It must be a contiguous BF16 tensor shaped like q; initialize
+    ``_decode_gate_sigmoid_table(q.device.index)`` before Graph capture.
     """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
@@ -439,6 +476,20 @@ def decode_paged_attention(
         assert sinks.dim() == 1
         assert sinks.numel() >= num_q_heads
         sinks = sinks.contiguous()
+
+    gate_bits = q
+    sigmoid_table = q
+    stride_gt = stride_gh = 0
+    if output_gate is not None:
+        if (q.dtype != torch.bfloat16 or output_gate.dtype != torch.bfloat16
+                or output_gate.shape != q.shape or output_gate.device != q.device
+                or not output_gate.is_contiguous()):
+            raise ValueError("output_gate must be contiguous BF16 on q's device with q's shape")
+        if out is not None and out.dtype != torch.bfloat16:
+            raise ValueError("gated decode output must be BF16")
+        sigmoid_table = _decode_gate_sigmoid_table(q.device.index)
+        gate_bits = output_gate.view(torch.int16)
+        stride_gt, stride_gh = output_gate.stride(0), output_gate.stride(1)
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
@@ -517,6 +568,10 @@ def decode_paged_attention(
         q_positions,
         max_kv_splits,
         sinks_arg,
+        gate_bits,
+        sigmoid_table,
+        stride_gt,
+        stride_gh,
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
@@ -532,6 +587,7 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         HAS_SINKS=sinks is not None,
+        HAS_GATE=output_gate is not None,
         SPLIT_TILE=split_tile,
         num_warps=stage2_warps,
     )
