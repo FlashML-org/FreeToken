@@ -699,8 +699,9 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                 # The tier label comes from the bf16 dot chooser, so it can over-report tiers
                 # the actual per-format kernel doesn't distinguish. Disclose the real story.
                 if fmt == "nvfp4":  # nvfp4 is the only use_vnni format
-                    _note(entry, "isa tier labels are nominal: this W4A8 kernel rides AVX-VNNI "
-                                 "regardless of the forced tier")
+                    _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
+                                 "(avx512 runs W4A8 with AVX512-VNNI, avx2 with AVX-VNNI; "
+                                 "a tier without its VNNI runs fp32 W4A16)")
                 elif fmt in ("mxfp4_triton", "ds_fp4", "fp8_block"):
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
                                  "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)")
