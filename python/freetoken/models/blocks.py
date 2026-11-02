@@ -48,9 +48,11 @@ class SupportsMultimodal(Protocol):
         ...
 
 
-@runtime_checkable
 class FeatureSink(Protocol):
-    """Where a forward hands per-row hidden states to a draft model; set on ``batch.features``."""
+    """Where a forward hands per-row hidden states to a draft model; set on ``batch.features``.
+
+    A CUDA graph replays the sink it was captured with, never the one set at replay: write only to buffers the draft owns, keep no per-step state on the sink.
+    """
 
     wanted_layers: frozenset[int]
 
