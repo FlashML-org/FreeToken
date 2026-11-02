@@ -11,7 +11,6 @@ import torch
 from freetoken.layers import GemmaPlusOneRMSNorm, GemmaPlusOneRMSNormFused, LinearReplicated, OPList
 from freetoken.layers.quantization import finalize_quant
 from freetoken.layers.base import BaseOP
-from freetoken.models.blocks import embed_input_ids
 from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.utils import torch_dtype
 
@@ -19,6 +18,7 @@ from .model import Qwen3_5DecoderLayer
 from .weight import iter_mtp_expert_pieces, iter_mtp_weights
 
 if TYPE_CHECKING:
+    from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
 
 
@@ -91,12 +91,9 @@ class Qwen3_5MTPDraft(BaseOP):
         finalize_quant(draft.layers)
         return draft
 
-    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._embed_tokens.forward(input_ids)
-
-    def embed_batch(self, batch) -> torch.Tensor:
-        """The target batch's token embeddings with its multimodal rows merged in, as the target embeds them."""
-        return embed_input_ids(self._embed_tokens, batch.input_ids, batch)
+    @property
+    def embed_tokens(self) -> VocabParallelEmbedding:
+        return self._embed_tokens
 
     def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
         """Draft hidden of each row from the embedding of its token and the hidden of the position before it."""

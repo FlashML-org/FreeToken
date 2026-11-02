@@ -10,19 +10,19 @@ import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
+from freetoken.models.blocks import embed_input_ids
 from freetoken.spec.proposer import DraftContext, Proposer
 from freetoken.spec.mtp.relay import HiddenRelay
 
 if TYPE_CHECKING:
     from freetoken.core import Req
+    from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
 
 
 class MTPDraft(Protocol):
     """The class a family registers as ``ModelSpec.spec_drafts["mtp"]``."""
 
-    # the draft's own config, from draft_config
-    config: ModelConfig
     # None: the proposer picks from the target's backends
     attention_backend: ClassVar[str | None]
 
@@ -42,9 +42,10 @@ class MTPDraft(Protocol):
     @classmethod
     def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> MTPDraft: ...
 
-    def embed(self, input_ids: torch.Tensor) -> torch.Tensor: ...
-
-    def embed_batch(self, batch: Batch) -> torch.Tensor: ...
+    @property
+    def embed_tokens(self) -> VocabParallelEmbedding:
+        """The target's token embedding, which the draft shares."""
+        ...
 
     def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor: ...
 
@@ -176,7 +177,7 @@ class MTPProposer(Proposer):
         from freetoken.kvcache import create_kvcache_pool
 
         super().attach(ctx)
-        cfg = self.draft.config
+        cfg = self.draft.draft_config(with_resident_moe(self.config.model_config))
         rows = self.config.max_running_req + 1
         # the draft's own layers on the target's slot ids: same page size, same pages plus the dummy page padded rows write to
         # a rebuild that keeps the target KV pool keeps this one, which the prefix cache still indexes
@@ -292,7 +293,7 @@ class MTPProposer(Proposer):
             # chain step j drafts at position C+j-1 with the previous step's draft hidden standing in for the target's
             views = [self._view(r, c + j - 1, c + j) for r, c in zip(reqs, cs)]
             batch = self._draft_batch(views, "decode", 1, self.chain_backend)
-            hidden = self._forward(batch, self.chain_backend, self.draft.embed(token), hidden)
+            hidden = self._forward(batch, self.chain_backend, self.draft.embed_tokens.forward(token), hidden)
             token = self._draft_token(hidden)
             drafts.append(token)
         return torch.stack(drafts, dim=1)
@@ -307,7 +308,7 @@ class MTPProposer(Proposer):
         """Draft hiddens of a verify-shaped batch; returns each request's row at its last accepted position and that row's argmax."""
         input_ids = get_global_ctx().batch.input_ids
         n = input_ids.shape[0]
-        hidden = self.draft.forward_hidden(self.draft.embed(input_ids), self.verify_hidden[:n])
+        hidden = self.draft.forward_hidden(self.draft.embed_tokens.forward(input_ids), self.verify_hidden[:n])
         picked = hidden[self.picked_rows[: n // (self.k + 1)]]
         return picked, self._draft_token(picked)
 
@@ -343,7 +344,7 @@ class MTPProposer(Proposer):
         sink, self._prefill_sink = self._prefill_sink, None
         hidden = sink.hidden
         # image rows take the embeddings the target used
-        embeds = self.draft.embed_batch(batch)
+        embeds = embed_input_ids(self.draft.embed_tokens, batch.input_ids, batch)
         views, emb, prev, finals = [], [], [], []
         offset = drafted = 0
         for i, (req, (s, e)) in enumerate(zip(batch.reqs, sink.spans)):
@@ -360,7 +361,7 @@ class MTPProposer(Proposer):
                 # draft row p embeds the token at p+1
                 emb.append(chunk_embeds[frontier + 1 - s : min(end + 1, e) - s])
                 if final:
-                    emb.append(self.draft.embed(next_tokens_gpu[i : i + 1]))
+                    emb.append(self.draft.embed_tokens.forward(next_tokens_gpu[i : i + 1]))
                 if frontier == s - 1:
                     # cloned: the carry of this row is overwritten below, before the draft forward reads it
                     prev += [self.relay.carry[row : row + 1].clone(), rows[: end - s]]

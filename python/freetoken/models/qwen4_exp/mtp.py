@@ -23,7 +23,6 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import GemmaPlusOneRMSNorm, LinearReplicated, OPList
 from freetoken.layers.base import BaseOP
 from freetoken.layers.quantization import finalize_quant
-from freetoken.models.blocks import embed_input_ids
 from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.utils import torch_dtype
 
@@ -32,6 +31,7 @@ from .model import Qwen4ExpDecoderLayer
 from .weight import iter_mtp_expert_pieces, iter_mtp_weights
 
 if TYPE_CHECKING:
+    from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
 
 
@@ -184,12 +184,9 @@ class Qwen4ExpMTPDraft(BaseOP):
             finalize_quant(module)
         return draft
 
-    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._embed_tokens.forward(input_ids)
-
-    def embed_batch(self, batch) -> torch.Tensor:
-        """The target batch's token embeddings with its multimodal rows merged in, as the target embeds them."""
-        return embed_input_ids(self._embed_tokens, batch.input_ids, batch)
+    @property
+    def embed_tokens(self) -> VocabParallelEmbedding:
+        return self._embed_tokens
 
     def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
         """``R_out`` of each row from the embedding of its token and the residual streams of the position before it."""

@@ -143,7 +143,7 @@ class ChainGraphs:
         token, hidden = p.relay.d1[rows], p.relay.hidden[rows]
         self.drafts[:bs, 0] = token
         for step, batch in enumerate(batches):
-            hidden = p._forward(batch, p.chain_backend, p.draft.embed(token), hidden)
+            hidden = p._forward(batch, p.chain_backend, p.draft.embed_tokens.forward(token), hidden)
             token = p._draft_token(hidden)
             self.drafts[:bs, step + 1] = token
 
