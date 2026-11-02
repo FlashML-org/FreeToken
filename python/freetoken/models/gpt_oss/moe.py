@@ -41,7 +41,8 @@ class GptOssMLP(BaseOP):
             config.num_experts,
             has_bias=config.has_router_bias,
         )
-        if config.moe_weight_format != "mxfp4":
+        gguf = config.expert_quant == "gguf"
+        if config.moe_weight_format != "mxfp4" and not gguf:
             raise ValueError(
                 f"gpt-oss supports only mxfp4 expert weights, got "
                 f"moe_weight_format={config.moe_weight_format!r}"
@@ -49,10 +50,11 @@ class GptOssMLP(BaseOP):
         self.experts = make_moe_layer(
             config,
             layer_id=layer_id,
-            activation="gpt_oss_swiglu",
+            # the GGUF banks store gate|up split: swigluoai is the uninterleaved spelling of gpt_oss_swiglu
+            activation="swigluoai" if gguf else "gpt_oss_swiglu",
             alpha=config.hidden_act_alpha,
             limit=config.swiglu_limit,
-            interleaved=True,
+            interleaved=not gguf,
             has_bias=True,
             resident_cls=GptOssMoELayer,
             offload_cls=GptOssOffloadMoELayer,

@@ -466,7 +466,7 @@ class CpuMoeExecutor:
         return banks, {}, (H, I)
 
     def _resolve_gguf_banks(self, banks: dict, rep: int, gate_up_type: int, down_type: int, scaled: bool = False) -> tuple[dict, dict, tuple[int, int]]:
-        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each; float rows keep their dtype.
+        """GGUF rows read in place: gate_up [E, 2I, row_bytes(H)] (gate rows, then up rows) and down [E, H, row_bytes(I)], one ggml type each; float types never reach here (cpu_spec sends them to the bf16 format, whose banks load bf16).
 
         ``scaled`` adds global [E, 4] fp32, each expert's (gate, up, down, 1) NVFP4 weight_scale_2."""
         from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes, type_name
