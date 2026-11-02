@@ -35,10 +35,12 @@ def expert_types(cfg: MoEConfig) -> tuple[int, int]:
     return gate, down
 
 
-def _bank_spec(ggml_type: int, rows: int, k: int) -> BankSpec:
-    # F16 / F32 expert banks are loaded and run as bf16, the fused MoE's dtype
-    dtype = float_dtype(ggml_type)
-    return BankSpec((rows, k), torch.bfloat16) if dtype is not None else BankSpec((rows, row_bytes(ggml_type, k)), torch.uint8)
+def _bank_spec(ggml_type: int, rows: int, k: int, bf16: bool) -> BankSpec:
+    # a float bank loads and runs bf16 when the whole layer is float (the fused MoE's dtype);
+    # the float half of a mixed layer keeps the file's dtype, as on main
+    if float_dtype(ggml_type) is None:
+        return BankSpec((rows, row_bytes(ggml_type, k)), torch.uint8)
+    return BankSpec((rows, k), torch.bfloat16 if bf16 else float_dtype(ggml_type))
 
 
 _DECODE_CONFIG = {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "num_warps": 8}
@@ -53,7 +55,7 @@ def float_mul_mat_id(w: torch.Tensor, x: torch.Tensor, ids: torch.Tensor, topk_w
 
     t, top_k = ids.shape
     per_route = x.dim() == 3
-    # the float banks run bf16, so the activations cast to the banks' dtype
+    # the bank takes its own dtype's activations: bf16 for a whole-layer float layer, the file's dtype for a mixed layer's float half
     a = x.reshape(-1, x.shape[-1]).to(w.dtype).contiguous()
     out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
     if config is None:
@@ -84,7 +86,8 @@ class GgmlMoEKernel(MoEKernel):
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)
         i, h = cfg.local_intermediate, cfg.hidden
-        banks = {"gate_up": _bank_spec(gate_up, 2 * i, h), "down": _bank_spec(down, h, i)}
+        bf16 = float_dtype(gate_up) is not None and float_dtype(down) is not None
+        banks = {"gate_up": _bank_spec(gate_up, 2 * i, h, bf16), "down": _bank_spec(down, h, i, bf16)}
         if cfg.scheme.weight.scale is not None:
             # each expert's NVFP4 weight_scale_2 as (gate, up, down, 1): a 16-byte row, which the slot cache's copies need
             banks["global"] = BankSpec((4,), torch.float32)
@@ -114,7 +117,7 @@ class GgmlMoEKernel(MoEKernel):
         ids = topk_ids.to(torch.int32)
         inactive = not is_prefill and cfg.decode_target == "hybrid"  # only hybrid decode hands over -1 routes
         gate_up = view.tensors["gate_up"]
-        # a float half runs on the bf16 fused MoE's grouped GEMM, with its config for this layer's shape
+        # a float half runs on the fused MoE's grouped GEMM, with its config for this layer's shape
         config = None
         if not (is_quantized(gate_up_type) and is_quantized(down_type)) and (is_prefill or is_resident(layer)):
             from freetoken.moe.fused import try_get_optimal_moe_config
@@ -156,7 +159,10 @@ class GgmlMoEKernel(MoEKernel):
             y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids, scale=down_scales[:, 2], inactive=inactive)
         else:
             y = mul_mat_id(view.tensors["down"], down_type, inter)
-            if down_scales is not None:
+            if down_scales is not None and down_bias is not None:
+                # the bias adds after weight_scale_2, so the scale cannot fold into the routing weights
+                y.mul_(down_scales[ids, 2].unsqueeze(-1))
+            elif down_scales is not None:
                 topk_weights = topk_weights * down_scales[ids, 2]
         if down_bias is not None:
             y.add_(down_bias[ids])
@@ -187,8 +193,8 @@ class GGUFMoEMethod(MoEMethod):
         if self.cfg.has_bias:
             raise NotImplementedError("GGUF experts with per-expert biases (gpt-oss) do not run on the cpu executor")
         gate_up, down = expert_types(self.cfg)
-        # every float type (BF16 / F16 / F32) loads and runs as bf16 banks: the executor's bf16
-        # kernels, which use AVX512-BF16 where the CPU has it (ggml-cpu is built for AVX2 only)
+        # a whole-layer float layer (any mix of BF16 / F16 / F32) loads and runs as bf16 banks: the executor's
+        # bf16 kernels, which use AVX512-BF16 where the CPU has it (ggml-cpu is built for AVX2 only)
         if float_dtype(gate_up) is not None and float_dtype(down) is not None:
             return "bf16", {}
         # an NVFP4 layer of a file with weight scales reads the layout's global bank too

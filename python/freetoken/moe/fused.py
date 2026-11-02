@@ -227,7 +227,8 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
-    assert w1_bias is None or not apply_router_weight_on_input, "per-expert biases need the unweighted first GEMM"
+    # both bias adds assume the router weight scales the expert output
+    assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, "per-expert biases need the router weight on the output"
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
@@ -347,7 +348,8 @@ def fused_experts_decode_impl(
     assert w1.dtype == hidden_states.dtype and w2.dtype == hidden_states.dtype
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
-    assert w1_bias is None or not apply_router_weight_on_input, "per-expert biases need the unweighted first GEMM"
+    # both bias adds assume the router weight scales the expert output
+    assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, "per-expert biases need the router weight on the output"
     M, _ = hidden_states.shape
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]

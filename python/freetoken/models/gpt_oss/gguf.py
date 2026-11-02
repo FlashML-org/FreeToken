@@ -26,16 +26,14 @@ if TYPE_CHECKING:
 # gpt-oss swiglu constants, as llama.cpp's swiglu_oai op and every HF config ship them
 _ACT_ALPHA = 1.702
 _ACT_LIMIT = 7.0
+# every HF config's rope_scaling.truncate: false; llama.cpp always truncates, so no GGUF key carries it
+_ROPE_TRUNCATE = False
 
 _LAYER_LEAVES = {
     "self_attn.q_proj": "attn_q",
     "self_attn.k_proj": "attn_k",
     "self_attn.v_proj": "attn_v",
     "self_attn.o_proj": "attn_output",
-    "mlp.gate_proj": "ffn_gate",
-    "mlp.up_proj": "ffn_up",
-    "mlp.down_proj": "ffn_down",
-    "mlp.gate": "ffn_gate_inp",
     "mlp.experts.0.gate_proj": "ffn_gate_exps",
     "mlp.experts.0.up_proj": "ffn_up_exps",
     "mlp.experts.0.down_proj": "ffn_down_exps",
@@ -93,18 +91,17 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
             "original_max_position_embeddings": int(kv("rope.scaling.original_context_length")),
             "beta_fast": float(md.get(f"{arch}.rope.scaling.yarn_beta_fast", 32.0)),
             "beta_slow": float(md.get(f"{arch}.rope.scaling.yarn_beta_slow", 1.0)),
+            "truncate": _ROPE_TRUNCATE,
         }
     elif scaling == "none":
         rope_scaling = None
     else:
         raise NotImplementedError(f"{shim.model_path}: rope scaling {scaling!r} is not supported")
     num_layers = int(kv("block_count"))
-    # llama.cpp's load_swa_pattern (openai-moe.cpp, default 2): the per-layer pattern array
-    # verbatim, else the scalar's il % p < p - 1 layout, layer 0 sliding
-    pattern = md.get(f"{arch}.attention.sliding_window.pattern")
-    if pattern is None:
-        layer_types = ["sliding_attention" if i % 2 < 1 else "full_attention" for i in range(num_layers)]
-    elif isinstance(pattern, list):
+    # llama.cpp's load_swa_pattern (openai-moe.cpp): the per-layer pattern array verbatim,
+    # else the scalar (default 2) as il % p < p - 1, layer 0 sliding
+    pattern = md.get(f"{arch}.attention.sliding_window.pattern", 2)
+    if isinstance(pattern, list):
         if len(pattern) != num_layers:
             raise NotImplementedError(
                 f"{shim.model_path}: attention.sliding_window.pattern has {len(pattern)} entries for {num_layers} layers"

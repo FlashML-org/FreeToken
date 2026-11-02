@@ -1,6 +1,6 @@
 """Routed-expert banks straight from a GGUF's ``blk.N.ffn_{gate,up,down}_exps`` tensors, in their packed ggml rows: pinned host banks for the offload cache, or device banks for resident experts.
 
-Each layer keeps its own ggml types, so each layer gets its own bank shapes: ``gate_up`` [E, 2I, row_bytes] (expert e's gate rows, then its up rows) and ``down`` [E, H, row_bytes]; float experts (BF16 / F16 / F32) load and run bf16 ([E, 2I, H] and [E, H, I]).
+Each layer keeps its own ggml types, so each layer gets its own bank shapes: ``gate_up`` [E, 2I, row_bytes] (expert e's gate rows, then its up rows) and ``down`` [E, H, row_bytes]; a layer whose gate_up and down are both float (BF16 / F16 / F32) loads and runs bf16 ([E, 2I, H] and [E, H, I], the fused MoE's dtype), while a mixed float/quant layer keeps the float half in the file's own dtype, as main does.
 A GGUF that stores ``ffn_gate_up_exps`` (gemma4) already holds the gate_up rows in that order.
 When NVFP4 experts carry per-expert ``.scale`` tensors, every layer also gets ``global`` [E, 4] fp32: the (gate, up, down, 1) weight_scale_2, 1 where a tensor has none.
 gpt-oss files carry per-expert gate / up / down biases; every layer then also gets ``gate_up_bias`` [E, 2I] and ``down_bias`` [E, H] bf16 rows, so the bias follows the expert through the slot cache like its weights do."""
@@ -23,11 +23,12 @@ logger = init_logger(__name__)
 
 
 def _expert_rows(info: GgufTensorInfo) -> torch.Tensor:
-    """[E, rows, row_bytes] packed ggml rows, or [E, rows, K] bf16 for an F16 / BF16 / F32 tensor (the fused MoE runs bf16)."""
+    """[E, rows, row_bytes] packed ggml rows, or an [E, rows, K] view in the file's float dtype; the
+    bank allocation that copies decides bf16 (a whole-layer float layer) or the file's dtype (a mixed one)."""
     k, rows, experts = info.ne
     raw = torch.from_numpy(info.data()).view(experts, rows, info.nbytes // (experts * rows))
     dtype = float_dtype(info.ggml_type)
-    return raw if dtype is None else raw.view(dtype).to(torch.bfloat16)
+    return raw if dtype is None else raw.view(dtype)
 
 
 def _drop_page_cache(info: GgufTensorInfo) -> None:
@@ -97,19 +98,22 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             if biased:
                 tails["gate_up_bias"].append(0)
                 tails["down_bias"].append(0)
+            # a whole-layer float layer runs the bf16 fused MoE; a mixed float/quant layer keeps the float half's own dtype
+            pure_float = float_dtype(gate.ggml_type) is not None and float_dtype(down.ggml_type) is not None
             rows = [_expert_rows(info) for info in parts]
             d = _expert_rows(down)
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
+            gu_dtype, down_dtype = (torch.bfloat16, torch.bfloat16) if pure_float else (rows[0].dtype, d.dtype)
             if device is None:
-                host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype), "down": HostBank(tuple(d.shape), d.dtype)}
+                host = {"gate_up": HostBank(gate_up_shape, gu_dtype), "down": HostBank(tuple(d.shape), down_dtype)}
                 if scaled:
                     host["global"] = HostBank((experts, 4), torch.float32)
                 banks = {role: bank.tensor for role, bank in host.items()}
             else:
                 banks = {
-                    "gate_up": _device_bank(gate_up_shape, gate.ggml_type, gate.ne[0], rows[0].dtype, device),
-                    "down": _device_bank(tuple(d.shape), down.ggml_type, down.ne[0], d.dtype, device),
+                    "gate_up": _device_bank(gate_up_shape, gate.ggml_type, gate.ne[0], gu_dtype, device),
+                    "down": _device_bank(tuple(d.shape), down.ggml_type, down.ne[0], down_dtype, device),
                 }
                 if scaled:
                     banks["global"] = torch.empty(experts, 4, dtype=torch.float32, device=device)
@@ -153,7 +157,8 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 sources[role].append(bank)
     total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
     logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
-    return ExpertBanks("gguf_scaled" if scaled else "gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
+    # the _bias formats are the gguf layouts plus the per-expert bias bank rows (_BANK_SCHEMAS)
+    return ExpertBanks(("gguf_scaled" if scaled else "gguf") + ("_bias" if biased else ""), sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
 
 
 __all__ = ["load_gguf_expert_banks"]
