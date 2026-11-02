@@ -51,7 +51,7 @@ _LINEAR_LEAVES = frozenset({
     "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
     "gate_proj", "up_proj", "down_proj",
     "input_mix_weight_down", "block_inject_weight", "input_mix_weight_up",
-    "key_proj", "value_proj", "lm_head",
+    "key_proj", "value_proj", "lm_head", "fc_embedding", "fc_hidden",
 })
 # activation scales of modules whose scheme carries no input_scale role
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
