@@ -5,7 +5,7 @@
     exactly the causal prefix and the layer output must match ``TorchDenseQSAReference`` (fp32)
     and a flashinfer dense run over the same pool;
 (b) chunked prefill at unaligned cut points equals one-shot prefill (the dual-source compress);
-(c) a captured decode replay equals the eager decode step.
+(c) a captured decode or verify replay equals the eager step.
 """
 
 from __future__ import annotations
@@ -149,31 +149,34 @@ def test_chunked_prefill_matches_one_shot(cut: int):
 
 
 @requires_cuda
-def test_decode_graph_replay_matches_eager():
+@pytest.mark.parametrize("rows_per_req", [1, 4], ids=["decode", "verify"])
+def test_decode_graph_replay_matches_eager(rows_per_req):
     config = parsed_config()
-    fixture = Fixture(config, num_pages=256)
+    # the pending ring holds the rows a verify may reject
+    fixture = Fixture(config, num_pages=256, num_speculative_tokens=rows_per_req - 1)
     attn = fixture.layer(QSA_LAYER)
     lengths, steps = [300, 411], 4
-    bs = len(lengths)
-    inputs = _inputs(fixture, lengths, extra=steps)
+    bs, phase = len(lengths), "decode" if rows_per_req == 1 else "verify"
+    inputs = _inputs(fixture, lengths, extra=steps * rows_per_req)
     reqs = [fixture.req(i, 0, n) for i, n in enumerate(lengths)]
     attn.forward(
         torch.cat([row[:n] for row, n in zip(inputs, lengths)]),
         fixture.batch(reqs, "prefill"),
     )
 
-    fixture.backend.init_capture_graph(max_seq_len=fixture.page_table.shape[1], bs_list=[bs])
+    fixture.backend.init_capture_graph(max_seq_len=fixture.page_table.shape[1], bs_list=[bs], rows_per_req=rows_per_req)
     dummy = SimpleNamespace(
-        table_idx=fixture.num_req_slots - 1, cached_len=1, device_len=2, extend_len=1
+        table_idx=fixture.num_req_slots - 1, cached_len=1, device_len=1 + rows_per_req, extend_len=rows_per_req
     )
+    rows = bs * rows_per_req
     static = {
-        "x": torch.zeros(bs, config.hidden_size, device=fixture.device, dtype=fixture.dtype),
-        "positions": torch.zeros(bs, dtype=torch.int32, device=fixture.device),
-        "out_loc": torch.zeros(bs, dtype=torch.int32, device=fixture.device),
+        "x": torch.zeros(rows, config.hidden_size, device=fixture.device, dtype=fixture.dtype),
+        "positions": torch.zeros(rows, dtype=torch.int32, device=fixture.device),
+        "out_loc": torch.zeros(rows, dtype=torch.int32, device=fixture.device),
     }
     capture_batch = SimpleNamespace(
-        padded_reqs=[dummy] * bs, reqs=[dummy] * bs, phase="decode", size=bs, padded_size=bs,
-        is_prefill=False, is_decode=True, positions=static["positions"],
+        padded_reqs=[dummy] * bs, reqs=[dummy] * bs, phase=phase, size=bs, padded_size=bs,
+        is_prefill=False, is_decode=rows_per_req == 1, positions=static["positions"],
         get_attn_positions=lambda: static["positions"],
         out_loc=static["out_loc"], attn_metadata=None, active_table_idx=None,
     )
@@ -187,9 +190,10 @@ def test_decode_graph_replay_matches_eager():
 
     for step in range(steps):
         for req in reqs:
-            fixture.step(req)
-        x = torch.stack([row[n + step] for row, n in zip(inputs, lengths)])
-        batch = fixture.batch(reqs, "decode")
+            fixture.step(req, rows_per_req)
+        start = step * rows_per_req
+        x = torch.cat([row[n + start : n + start + rows_per_req] for row, n in zip(inputs, lengths)])
+        batch = fixture.batch(reqs, phase)
         static["x"].copy_(x)
         static["positions"].copy_(batch.positions)
         static["out_loc"].copy_(batch.out_loc)
@@ -199,8 +203,36 @@ def test_decode_graph_replay_matches_eager():
         assert md.block_table.data_ptr() == fixture.backend._graph["block_table"].data_ptr()
         graph.replay()
         replayed = captured_out.clone()
-        eager = attn.forward(x, fixture.batch(reqs, "decode"))
-        assert torch.equal(replayed, eager), f"graph replay diverged at decode step {step}"
+        eager = attn.forward(x, fixture.batch(reqs, phase))
+        assert torch.equal(replayed, eager), f"graph replay diverged at {phase} step {step}"
+
+
+@requires_cuda
+def test_verify_after_rejected_rows_compresses_like_decode():
+    """A verify whose last rows get rejected must leave the pending ring able to close the open group: the next verify compresses it as decode steps do."""
+    config = parsed_config()
+    rows, ratio = 4, config.qwen4_args.index_ratio
+    fixture = Fixture(config, num_pages=64, num_speculative_tokens=rows - 1)
+    attn = fixture.layer(QSA_LAYER)
+    # group 300..303 is open after the prompt, its first member in the ring
+    length = 301
+    x = _inputs(fixture, [length], extra=rows + 1)[0]
+    spec, decode = fixture.req(0, 0, length), fixture.req(1, 0, length)
+    attn.forward(torch.cat([x[:length]] * 2), fixture.batch([spec, decode], "prefill"))
+    # verify 301..304 and keep only 301, then verify 302..305, which closes the group at 303
+    fixture.step(spec, rows)
+    attn.forward(x[length : length + rows], fixture.batch([spec], "verify"))
+    spec.device_len = length + 1
+    fixture.step(spec, rows)
+    attn.forward(x[length + 1 : length + 1 + rows], fixture.batch([spec], "verify"))
+    for position in range(length, length + 3):
+        fixture.step(decode)
+        attn.forward(x[position : position + 1], fixture.batch([decode], "decode"))
+
+    group = length - length % ratio
+    slab = fixture.pool.cmp_k_cache(0)
+    got, want = (slab[int(fixture.page_table[r.table_idx, group]) // ratio].float() for r in (spec, decode))
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
 
 
 @requires_cuda

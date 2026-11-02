@@ -210,6 +210,9 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
             "their window frees would release slots a verify step still reads"
         )
+    # at config time: the state pool that holds the handlers is built only after the weights load
+    if unverified := [s.name for s in config.model_config.slot_states if s.verify is None]:
+        raise ValueError(f"speculative decoding does not support per-request state {unverified} yet: it declares no verify handler")
     parts = [p.strip() for p in config.attention_backend.split(",")]
     graph = attention_backend_info(parts[-1]).uniform_extend_graph
     if graph == "host_plan" and len(parts) == 2 and attention_backend_info(parts[0]).uniform_extend_graph == "device":

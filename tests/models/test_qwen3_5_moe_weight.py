@@ -113,6 +113,34 @@ def _quantize(raw: dict[str, torch.Tensor], modules: list[str], quantize) -> Non
         raw.update({f"{module}.{suffix}": t for suffix, t in quantize(weight).items()})
 
 
+MTP = "mtp.layers.0"
+MTP_LINEARS = [f"{MTP}.self_attn.{p}_proj" for p in "qkvo"] + [f"{MTP}.mlp.shared_expert.{p}_proj" for p in ("gate", "up", "down")]
+# the released FP8 checkpoints keep these MTP modules bf16
+MTP_UNQUANTIZED = ["mtp.fc", "mtp.norm", "mtp.pre_fc_norm_embedding", "mtp.pre_fc_norm_hidden", f"{MTP}.mlp.gate", f"{MTP}.mlp.shared_expert_gate",
+                   f"{MTP}.input_layernorm", f"{MTP}.post_attention_layernorm", f"{MTP}.self_attn.q_norm", f"{MTP}.self_attn.k_norm"]
+
+
+def _mtp_head(raw: dict[str, torch.Tensor], quantize=None) -> None:
+    """The ``mtp.*`` head of a MoE checkpoint: stacked bf16 experts, or per-expert tensors with the linears under ``quantize``."""
+    raw.update({"mtp.fc.weight": _bf16(H, 2 * H), "mtp.norm.weight": _bf16(H), "mtp.pre_fc_norm_embedding.weight": _bf16(H),
+                "mtp.pre_fc_norm_hidden.weight": _bf16(H), f"{MTP}.input_layernorm.weight": _bf16(H),
+                f"{MTP}.post_attention_layernorm.weight": _bf16(H), f"{MTP}.self_attn.q_norm.weight": _bf16(AHD),
+                f"{MTP}.self_attn.k_norm.weight": _bf16(AHD), f"{MTP}.mlp.gate.weight": _bf16(E, H),
+                f"{MTP}.mlp.shared_expert_gate.weight": _bf16(1, H)})
+    for proj, shape in (("q", (2 * QH * AHD, H)), ("k", (KVH * AHD, H)), ("v", (KVH * AHD, H)), ("o", (H, QH * AHD))):
+        raw[f"{MTP}.self_attn.{proj}_proj.weight"] = _bf16(*shape)
+    for proj, shape in (("gate", (I, H)), ("up", (I, H)), ("down", (H, I))):
+        raw[f"{MTP}.mlp.shared_expert.{proj}_proj.weight"] = _bf16(*shape)
+    if quantize is None:
+        raw[f"{MTP}.mlp.experts.gate_up_proj"] = _bf16(E, 2 * MI, H)
+        raw[f"{MTP}.mlp.experts.down_proj"] = _bf16(E, H, MI)
+        return
+    _quantize(raw, MTP_LINEARS, quantize)
+    for expert in range(E):
+        for proj, shape in (("gate_proj", (MI, H)), ("up_proj", (MI, H)), ("down_proj", (H, MI))):
+            raw.update({f"{MTP}.mlp.experts.{expert}.{proj}.{suffix}": t for suffix, t in quantize(_bf16(*shape)).items()})
+
+
 def _experts(raw: dict[str, torch.Tensor], quantize=None) -> None:
     """Routed experts: stacked bf16 per layer, or per-expert tensors under ``quantize``."""
     for layer in (0, 1):
@@ -163,7 +191,7 @@ def _ct(config_groups: dict, ignore: list[str], fmt: str) -> dict:
 # Qwen/Qwen3.6-35B-A3B-FP8: 128x128 block-fp8 everywhere but the listed modules
 QWEN_FP8 = {
     "quant_method": "fp8", "activation_scheme": "dynamic", "fmt": "e4m3", "weight_block_size": [128, 128],
-    "modules_to_not_convert": ["lm_head", "model.embed_tokens", *GDN_BA, *ROUTERS,
+    "modules_to_not_convert": ["lm_head", "model.embed_tokens", *GDN_BA, *ROUTERS, *MTP_UNQUANTIZED,
                                *[f"{LM}.layers.{l}.{n}" for l in (0, 1) for n in ("input_layernorm", "post_attention_layernorm")]],
 }
 # nvidia/Qwen3.6-35B-A3B-NVFP4: per-tensor FP8 attention / GDN, NVFP4 shared expert, experts and lm_head
@@ -208,10 +236,12 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
     raw = _dense_bf16(moe)
     if name == "bf16":
         _experts(raw)
+        _mtp_head(raw)
         return moe, None, raw
     if name == "fp8_block":
         _quantize(raw, GDN_QKVZ_OUT + ATTN + SHARED, lambda w: _fp8_block(w, ct=False))
         _experts(raw, lambda w: _fp8_block(w, ct=False))
+        _mtp_head(raw, lambda w: _fp8_block(w, ct=False))
         return moe, QWEN_FP8, raw
     if name.startswith("modelopt_mixed"):
         _quantize(raw, GDN_QKVZ_OUT + ATTN, _fp8_tensor)
@@ -294,8 +324,8 @@ def _load(folder: str, *, experts: bool = False, vision: bool = True) -> dict[st
     return {n: t.clone() for n, t in iter_weights(folder, torch.device("cpu"), include_moe_experts=experts, include_non_moe=True, include_vision=vision)}
 
 
-def _meta_state_dict(folder: str) -> dict[str, torch.Tensor]:
-    """State dict of the model the engine builds for ``folder`` (routed experts offloaded), on the meta device."""
+def _meta_state_dict(folder: str, build=None) -> dict[str, torch.Tensor]:
+    """State dict of the model the engine builds for ``folder`` (routed experts offloaded), or of ``build(model_config)``, on the meta device."""
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.engine import _decode_target
     from freetoken.layers import rotary
@@ -313,7 +343,7 @@ def _meta_state_dict(folder: str) -> dict[str, torch.Tensor]:
     rotary.get_rope.cache_clear()
     try:
         with torch.device("meta"), torch_dtype(torch.bfloat16):
-            return create_model(config.model_config).state_dict()
+            return (build or create_model)(config.model_config).state_dict()
     finally:
         rotary.set_rope_device(saved)
         rotary.get_rope.cache_clear()
@@ -598,3 +628,39 @@ def test_a_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, qu
     (tmp_path / "config.json").write_text(json.dumps(_config_json(True, quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
+    """The MTP reader fills exactly the draft the engine builds, whose MoE stays resident though the target offloads, and the routed experts keep the form the checkpoint stores."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
+    from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
+    from freetoken.models.qwen3_5_moe.weight import iter_mtp_expert_pieces, iter_mtp_weights
+    from freetoken.spec.mtp.proposer import with_resident_moe
+
+    name, folder, raw = checkpoint
+    if name not in ("bf16", "fp8_block"):
+        pytest.skip("layouts with an MTP head only")
+    _install(folder)
+    target = SimpleNamespace(model=SimpleNamespace(embed_tokens=None))
+    built = {}
+    state = _meta_state_dict(folder, lambda config: built.setdefault("draft", Qwen3_5MTPDraft(with_resident_moe(config), target)))
+    moe = list(iter_moe_layers(built["draft"]))
+    assert moe and not any(isinstance(m, OffloadMoELayer) for m in moe)
+    loaded = dict(iter_mtp_weights(folder, torch.device("cpu")))
+    assert set(loaded) == set(state)
+    for key, tensor in loaded.items():
+        assert tensor.shape == state[key].shape, key
+        if key.endswith(".weight"):
+            assert tensor.dtype is state[key].dtype, key
+    pieces = list(iter_mtp_expert_pieces(folder))
+    if name == "bf16":
+        assert [p[:3] for p in pieces] == [(0, 0, E)]
+        assert torch.equal(pieces[0][3]["gate_up"], raw[f"{MTP}.mlp.experts.gate_up_proj"])
+        return
+    assert sorted(p[1] for p in pieces) == list(range(E))
+    for _layer, expert, _end, piece in pieces:
+        assert set(piece) == {"gate", "up", "down", "gate_scale", "up_scale", "down_scale"}
+        assert _same(piece["down"][0], raw[f"{MTP}.mlp.experts.{expert}.down_proj.weight"])
+        assert _same(piece["gate_scale"][0], raw[f"{MTP}.mlp.experts.{expert}.gate_proj.weight_scale_inv"])

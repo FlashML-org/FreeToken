@@ -49,7 +49,7 @@ class Proposer:
         self.k = config.speculative_num_steps
 
     def attach(self, ctx: DraftContext) -> None:
-        """Build the draft KV pool, backends and relays; called again with a new context after a rebuild."""
+        """Build the draft KV pool, backends and buffers; called again with a new context after a rebuild."""
         self.ctx = ctx
 
     def detach(self, *, keep_kv: bool) -> None:

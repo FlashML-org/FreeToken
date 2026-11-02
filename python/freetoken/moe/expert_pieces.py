@@ -169,10 +169,52 @@ def per_expert_pieces(
         raise ValueError(f"Incomplete expert tensors in checkpoint (layer, expert): {missing}")
 
 
+def iter_extra_layer_expert_pieces(model_path: str, prefix: str, locate: Callable[[str], tuple[int | None, str] | None]) -> Iterator[Piece]:
+    """The routed experts of one MoE layer outside the model's stack (an MTP head), as pieces of bank layer 0.
+
+    The family names the tensors: ``locate(name)`` -> ``(expert, role)`` of a per-expert tensor, ``(None, "gate_up" | "down")`` of a stacked one, or None. A name under ``prefix`` that ``locate`` does not read is refused.
+    """
+    import safetensors
+
+    from freetoken.models.loader import iter_weight_files
+
+    found: dict[str, tuple[str, int | None, str]] = {}
+    unknown: list[str] = []
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                if (where := locate(name)) is not None:
+                    found[name] = (file, *where)
+                elif name.startswith(prefix):
+                    unknown.append(name)
+    if unknown:
+        raise ValueError(f"{model_path}: the experts under {prefix}* use a format this reader does not support, e.g. {sorted(unknown)[:3]}")
+    if not found:
+        raise ValueError(f"{model_path} has no routed experts under {prefix}*")
+    stacked = {role: (file, name) for name, (file, expert, role) in found.items() if expert is None}
+    if stacked:
+        if missing := {"gate_up", "down"} - set(stacked):
+            raise ValueError(f"{model_path}: stacked experts under {prefix}* lack {sorted(missing)}")
+        piece = {}
+        for role, (file, name) in stacked.items():
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                piece[role] = f.get_tensor(name)
+        return iter([(0, 0, piece["down"].shape[0], piece)])
+
+    def tensors():
+        for file in dict.fromkeys(file for file, _, _ in found.values()):
+            with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+                yield from ((name, f.get_tensor(name)) for name, where in found.items() if where[0] == file)
+
+    roles = {role for _, _, role in found.values()}
+    return per_expert_pieces(tensors(), lambda name: (0, *found[name][1:]), tensors_per_expert=len(roles))
+
+
 __all__ = [
     "Piece",
     "bank_layer_of",
     "iter_expert_pieces",
+    "iter_extra_layer_expert_pieces",
     "num_moe_layers",
     "packed_expert_source_info",
     "per_expert_pieces",

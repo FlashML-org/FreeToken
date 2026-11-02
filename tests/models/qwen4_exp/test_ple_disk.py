@@ -364,7 +364,7 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
 
 
-def _wait_sync_large_graph(tmp_path, kernels):
+def _wait_sync_large_graph(tmp_path, kernels, rows_per_req=1):
     from freetoken.core import Batch, Context, Req, set_global_ctx
     from freetoken.distributed import set_tp_info
     from freetoken.engine.graph import GraphRunner
@@ -373,7 +373,7 @@ def _wait_sync_large_graph(tmp_path, kernels):
     set_global_ctx(Context(page_size=1))
     disk, oracle, args = _make_table(tmp_path)
     emb = _embedding()
-    row_ids = torch.zeros((8, args.num_ngram_heads), dtype=torch.int64, device="cuda")
+    row_ids = torch.zeros((8 * rows_per_req, args.num_ngram_heads), dtype=torch.int64, device="cuda")
     pad = torch.zeros(256, device="cuda")
     release = threading.Event()
     fill = disk.fill
@@ -390,8 +390,10 @@ def _wait_sync_large_graph(tmp_path, kernels):
         return out
 
     disk.fill = delayed_fill
-    req = Req(input_ids=torch.tensor([3, 4, 9], dtype=torch.int32), table_idx=0,
+    # a verify request widened by rows_per_req - 1 drafts; the store reads its rows from the device
+    req = Req(input_ids=torch.tensor([3, 4] + [9] * rows_per_req, dtype=torch.int32), table_idx=0,
               cached_len=2, output_len=3, uid=0, sampling_params=None, cache_handle=None)
+    phase = "decode" if rows_per_req == 1 else "verify"
     attn = SimpleNamespace(init_capture_graph=lambda **kwargs: None,
                            prepare_for_capture=lambda batch: None, prepare_for_replay=lambda batch: None)
     stream = torch.cuda.Stream()
@@ -400,14 +402,16 @@ def _wait_sync_large_graph(tmp_path, kernels):
         # Exercise the capture-time upload from #697 as well as the PLE dispatch hook.
         runner = GraphRunner(stream=stream, device=torch.device("cuda"), forward=forward,
                              attn_backend=attn, cuda_graph_bs=[8], cuda_graph_max_bs=None,
-                             free_memory=1024**3, max_seq_len=16, dummy_req=req, out_dtype=torch.float32)
-        batch = Batch(reqs=[req] * 8, phase="decode")
+                             free_memory=1024**3, max_seq_len=16, dummy_req=req, out_dtype=torch.float32,
+                             rows_per_req=rows_per_req, phase=phase)
+        batch = Batch(reqs=[req] * 8, phase=phase, rows_per_req=rows_per_req)
         runner.pad_batch(batch)
-        batch.positions = torch.full((8,), 2, dtype=torch.int32, device="cuda")
-        batch.out_loc = torch.arange(8, dtype=torch.int32, device="cuda")
+        batch.positions = torch.full((8 * rows_per_req,), 2, dtype=torch.int32, device="cuda")
+        batch.out_loc = torch.arange(8 * rows_per_req, dtype=torch.int32, device="cuda")
         for step, token in enumerate((9, 13, 5)):
             release.clear()
-            batch.input_ids = torch.full((8,), token, dtype=torch.int32, device="cuda")
+            tokens = [token + row for row in range(rows_per_req)]
+            batch.input_ids = torch.tensor(tokens * 8, dtype=torch.int32, device="cuda")
             with disk.forward_host_ctx(batch, use_graph=True):
                 # Keep the WAIT unsatisfied when the first replay starts.
                 assert int(disk._flag[0]) == 0
@@ -418,7 +422,7 @@ def _wait_sync_large_graph(tmp_path, kernels):
                 finally:
                     timer.join()
             stream.synchronize()
-            ids = emb.row_ids(_meta([[token]] * 8, [[3, 4]] * 8, decode=True)).cuda()
+            ids = emb.row_ids(_meta([tokens] * 8, [[3, 4]] * 8, decode=rows_per_req == 1)).cuda()
             assert _bitwise_equal(out.to(disk.dtype), oracle.lookup(ids))
             assert torch.equal(pad, torch.full_like(pad, (step + 1) * kernels))
             assert int(disk._flag[0]) == 0
@@ -426,7 +430,8 @@ def _wait_sync_large_graph(tmp_path, kernels):
 
 
 @requires_cuda
-def test_wait_sync_large_graph(tmp_path):
+@pytest.mark.parametrize("rows_per_req", [1, 4], ids=["decode", "verify"])
+def test_wait_sync_large_graph(tmp_path, rows_per_req):
     from freetoken.kernel.row_store import probe_wait_sync
 
     if not probe_wait_sync("auto", torch.device("cuda")):
@@ -437,7 +442,7 @@ def test_wait_sync_large_graph(tmp_path):
     script = (
         "from pathlib import Path; "
         "from tests.models.qwen4_exp.test_ple_disk import _wait_sync_large_graph; "
-        f"_wait_sync_large_graph(Path({str(tmp_path)!r}), 16384)"
+        f"_wait_sync_large_graph(Path({str(tmp_path)!r}), 16384, {rows_per_req})"
     )
     result = subprocess.run(
         [sys.executable, "-c", script], cwd=root, env=env, capture_output=True, text=True, timeout=45,

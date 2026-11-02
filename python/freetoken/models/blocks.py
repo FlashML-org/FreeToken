@@ -48,14 +48,16 @@ class SupportsMultimodal(Protocol):
         ...
 
 
-@runtime_checkable
 class FeatureSink(Protocol):
-    """Where a forward hands per-row hidden states to a draft model; set on ``batch.features``."""
+    """Where a forward hands per-row hidden states to a draft model; set on ``batch.features``.
+
+    A CUDA graph replays the sink it was captured with, never the one set at replay: write only to buffers the draft owns, keep no per-step state on the sink.
+    """
 
     wanted_layers: frozenset[int]
 
     def final_hidden(self, x: torch.Tensor) -> None:
-        """Every row's hidden state before the LM head; the LM head calls it once per forward."""
+        """Every row's final hidden state, once per forward: the LM head's input, or what the model hands over itself before the head."""
         ...
 
     def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:

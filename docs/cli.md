@@ -98,6 +98,16 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
+### Speculative decoding
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
+| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`) | Draft tokens per decode step, 1 to 8 for `mtp` |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a GGUF target needs one; the `nextn` MTP blocks llama.cpp writes are not read; a separate checkpoint folder is read with the target's quantization config |
+
+Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` also refuses Qwen3.5 / Qwen3.6 GGUF targets and an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors.
+
 ### API behaviour
 
 | Flag | Default | Meaning |
