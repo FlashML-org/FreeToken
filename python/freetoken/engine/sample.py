@@ -80,7 +80,7 @@ class Sampler:
         # parameters for those rows instead of approximating argmax at low temperature.
         ts = [1.0 if g else max(p.temperature, MIN_T) for p, g in zip(params, is_greedy)]
         top_ks = [
-            p.top_k if not g and p.top_k >= 1 else self.vocab_size
+            min(p.top_k, self.vocab_size) if not g and p.top_k >= 1 else self.vocab_size
             for p, g in zip(params, is_greedy)
         ]
         top_ps = [
