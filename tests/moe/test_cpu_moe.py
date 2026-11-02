@@ -111,24 +111,28 @@ def _make_nvfp4_cache(L, E, H, I, seed=0):
     )
 
 
-@pytest.mark.parametrize("bs", [1, 3, 8])
-def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs):
-    """CPU inline-dequant NVFP4 GEMV vs. canonical dequant_nvfp4 + bf16 GPU decode.
+# FREETOKEN_CPU_MOE_ISA tier -> the tier the executor reports. A tier the CPU or the build lacks is capped to a lower one, which turns into a skip.
+_NVFP4_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f"}
 
-    Both paths read byte-identical quantized banks; the CPU dequantizes inside the
-    K-loop (fp32), the reference materializes bf16 weights first, so the only spread
-    is weight bf16-rounding + reduction order -> tight relative tolerance.
+
+@pytest.mark.parametrize("isa", list(_NVFP4_TIERS))
+@pytest.mark.parametrize("bs", [1, 3, 8])
+def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs, isa, monkeypatch):
+    """CPU NVFP4 GEMV vs. canonical dequant_nvfp4 + bf16 GPU decode, per ISA tier.
+
+    Both paths read byte-identical quantized banks. The avx2 / avx512 tiers run W4A8 when the CPU has their VNNI, and the int8 activation rounding dominates the spread; the fp32 dots differ only by weight bf16-rounding + reduction order.
     """
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused import fused_experts_decode_impl
 
     torch.manual_seed(100 + bs)
-    L, E, H, I, top_k = 3, 16, 1024, 512, 4
+    L, E, H, I, top_k = 3, 16, 1024, 752, 4  # 47 blocks of 16: the W4A8 down dots run their partial-chunk and scalar tails
     layer = 1
     dev = torch.device("cuda")
     cache = _make_nvfp4_cache(L, E, H, I)
 
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", isa)
     ex = CpuMoeExecutor(
         cache,
         top_k=top_k,
@@ -138,6 +142,8 @@ def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs):
         max_tokens=bs,
         device=dev,
     )
+    if ex.isa.split("+")[0] != _NVFP4_TIERS[isa]:
+        pytest.skip(f"asked for {isa}, host/build selected {ex.isa}: not supported here")
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
     ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
