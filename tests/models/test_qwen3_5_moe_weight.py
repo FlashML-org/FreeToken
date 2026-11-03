@@ -8,6 +8,8 @@ config; the dense pass has to fill exactly those buffers whatever the checkpoint
 from __future__ import annotations
 
 import json
+import struct
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +21,7 @@ from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 from freetoken.models.qwen3_5_moe.config import parse_config
 from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces, iter_weights, nvfp4_expert_spec
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
+from freetoken.third_party import gguf as gguf_lib
 from freetoken.utils import cached_load_hf_config
 
 H, V = 128, 256  # hidden_size (every block-fp8 projection needs in/out multiples of 128), vocab
@@ -664,3 +667,274 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
         assert set(piece) == {"gate", "up", "down", "gate_scale", "up_scale", "down_scale"}
         assert _same(piece["down"][0], raw[f"{MTP}.mlp.experts.{expert}.down_proj.weight"])
         assert _same(piece["gate_scale"][0], raw[f"{MTP}.mlp.experts.{expert}.gate_proj.weight_scale_inv"])
+
+
+# --------------------------------------------------------------------------- the trunk's nextn block (GGUF)
+
+
+F32, BF16, Q8_0 = 0, 30, int(gguf_lib.GGMLQuantizationType.Q8_0)
+
+
+def _gguf_bytes(tensor: torch.Tensor, ggml_type: int) -> bytes:
+    if ggml_type == F32:
+        return tensor.float().numpy().tobytes()
+    if ggml_type == BF16:
+        return tensor.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
+    raise KeyError(ggml_type)
+
+
+def _write_gguf(path, arch: str, kv: dict[str, object], tensors: dict[str, tuple[int, tuple[int, ...], bytes]]) -> None:
+    """A minimal GGUF: header, the given KVs (u32 / string) and tensors; the reader needs no more."""
+    out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv) + 1))
+
+    def field(name: str, vtype: int, payload: bytes) -> None:
+        key = name.encode()
+        out.extend(struct.pack("<Q", len(key)) + key + struct.pack("<I", vtype) + payload)
+
+    field("general.architecture", 8, struct.pack("<Q", len(arch)) + arch.encode())
+    for name, value in kv.items():
+        field(f"{arch}.{name}", 4, struct.pack("<I", int(value)))
+
+    data = bytearray()
+    infos = []
+    for name, (ggml_type, ne, raw) in tensors.items():
+        infos.append((name, ggml_type, ne, len(data)))
+        data += raw
+        data += b"\0" * (-len(data) % 32)
+    for name, ggml_type, ne, offset in infos:
+        nb = name.encode()
+        out += struct.pack("<Q", len(nb)) + nb + struct.pack("<I", len(ne))
+        out += b"".join(struct.pack("<Q", d) for d in ne) + struct.pack("<IQ", ggml_type, offset)
+    out += b"\0" * (-len(out) % 32)
+    path.write_bytes(out + data)
+
+
+def _nextn_gguf(tmp_path, *, moe: bool, nextn_layers: int = 1, q_quantized: bool = False,
+                experts_quantized: bool = False):
+    """A synthetic trunk GGUF whose last block is the nextn block, shaped like the fixture's checkpoint; returns (path, raw tensors, packed q bytes)."""
+    torch.manual_seed(7)
+    blk = 2
+    q_shape = (2 * QH * AHD, H)
+    q8 = torch.randint(0, 256, (q_shape[0], q_shape[1] // 32 * 34), dtype=torch.uint8) if q_quantized else None
+    tensors: dict[str, tuple[int, tuple[int, ...], bytes]] = {}
+    raw: dict[str, torch.Tensor] = {}
+
+    def put(name: str, tensor: torch.Tensor, ggml_type: int = BF16) -> None:
+        raw[name] = tensor.float()
+        tensors[f"blk.{blk}.{name}.weight"] = (ggml_type, tuple(reversed(tensor.shape)), _gguf_bytes(tensor, ggml_type))
+
+    for name in ("attn_norm", "post_attention_norm", "attn_q_norm", "attn_k_norm"):
+        put(name, torch.randn({"attn_norm": H, "post_attention_norm": H, "attn_q_norm": AHD, "attn_k_norm": AHD}[name]), F32)
+    if q_quantized:
+        raw["attn_q"] = q8
+        tensors[f"blk.{blk}.attn_q.weight"] = (Q8_0, (H, q_shape[0]), q8.numpy().tobytes())
+    else:
+        put("attn_q", torch.randn(*q_shape))
+    put("attn_k", torch.randn(KVH * AHD, H))
+    put("attn_v", torch.randn(KVH * AHD, H))
+    put("attn_output", torch.randn(H, QH * AHD))
+    if moe:
+        put("ffn_gate_inp", torch.randn(E, H))
+        put("ffn_gate_inp_shexp", torch.randn(H))
+        for name, shape in (("ffn_gate_shexp", (I, H)), ("ffn_up_shexp", (I, H)), ("ffn_down_shexp", (H, I))):
+            put(name, torch.randn(*shape))
+        if experts_quantized:
+            for name, rows, k in (("ffn_gate_exps", E * MI, H), ("ffn_up_exps", E * MI, H), ("ffn_down_exps", E * H, MI)):
+                raw[name] = torch.randint(0, 256, (rows, k // 32 * 34), dtype=torch.uint8)
+                tensors[f"blk.{blk}.{name}.weight"] = (Q8_0, (k, rows // E, E), raw[name].numpy().tobytes())
+        else:
+            for name, shape in (("ffn_gate_exps", (E, MI, H)), ("ffn_up_exps", (E, MI, H)), ("ffn_down_exps", (E, H, MI))):
+                put(name, torch.randn(*shape))
+    else:
+        for name, shape in (("ffn_gate", (I, H)), ("ffn_up", (I, H)), ("ffn_down", (H, I))):
+            put(name, torch.randn(*shape))
+    put("nextn.eh_proj", torch.randn(H, 2 * H))
+    for name in ("nextn.enorm", "nextn.hnorm", "nextn.shared_head_norm"):
+        put(name, torch.randn(H), F32)
+    kv = {"block_count": blk + nextn_layers, "embedding_length": H}
+    if nextn_layers:
+        kv["nextn_predict_layers"] = nextn_layers
+    path = tmp_path / f"trunk_{'moe' if moe else 'dense'}.gguf"
+    _write_gguf(path, "qwen35moe" if moe else "qwen35", kv, tensors)
+    return str(path), raw, q8
+
+
+def _gguf_draft(path: str, *, moe: bool, tmp_path):
+    """The draft the engine builds for the GGUF trunk (its quant the file's ggml types), and its state dict."""
+    from dataclasses import replace
+
+    from freetoken.layers import rotary
+    from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
+    from freetoken.spec.mtp.proposer import with_resident_moe
+    from freetoken.utils.torch_utils import torch_dtype
+
+    spec = get_model_spec("Qwen3_5MoeGGUFForCausalLM" if moe else "Qwen3_5GGUFForCausalLM")
+    quant = checkpoint_quant_config(path, SimpleNamespace(model_path=path), spec)
+    folder = tmp_path / "cfg"
+    folder.mkdir(exist_ok=True)
+    (folder / "config.json").write_text(json.dumps(_config_json(moe, None)))
+    trunk = replace(parse_config(cached_load_hf_config(str(folder))), quant=quant)
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))
+    rotary.get_rope.cache_clear()
+    try:
+        with torch.device("meta"), torch_dtype(torch.bfloat16):
+            draft = Qwen3_5MTPDraft(with_resident_moe(trunk), SimpleNamespace(model=SimpleNamespace(embed_tokens=None)))
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()
+    return draft, draft.state_dict()
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_nextn_block_maps_onto_the_draft_state_dict(tmp_path, moe):
+    """The nextn reader fills exactly the draft the safetensors path builds: same names for an all-float file, norms un-plus-one'd, projections fused in q|k|v and gate|up order."""
+    from freetoken.models.qwen3_5_moe.gguf import iter_nextn_weights, nextn_block_index
+    from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
+
+    path, raw, _ = _nextn_gguf(tmp_path, moe=moe)
+    Qwen3_5MTPDraft.check_source(path, path)
+    assert nextn_block_index(path) == 2
+    draft, state = _gguf_draft(path, moe=moe, tmp_path=tmp_path)
+    loaded = {n: t.to(dtype=state[n].dtype) for n, t in iter_nextn_weights(path, draft.config)}
+    assert set(loaded) == set(state)
+    for key, tensor in loaded.items():
+        assert tensor.shape == state[key].shape and tensor.dtype is state[key].dtype, key
+
+    def norm(name: str) -> torch.Tensor:
+        return (raw[name] - 1.0).to(torch.bfloat16)
+
+    for key, source in (
+        ("norm.weight", "nextn.shared_head_norm"), ("pre_fc_norm_embedding.weight", "nextn.enorm"),
+        ("pre_fc_norm_hidden.weight", "nextn.hnorm"), ("layers.0.input_layernorm.weight", "attn_norm"),
+        ("layers.0.post_attention_layernorm.weight", "post_attention_norm"),
+        ("layers.0.self_attn.q_norm.weight", "attn_q_norm"), ("layers.0.self_attn.k_norm.weight", "attn_k_norm"),
+    ):
+        assert torch.equal(loaded[key], norm(source)), key
+    assert _same(loaded["fc.weight"], raw["nextn.eh_proj"].to(torch.bfloat16))
+    qkv = loaded["layers.0.self_attn.qkv_proj.weight"]
+    for part, source in zip(_slices(qkv, [raw[n] for n in ("attn_q", "attn_k", "attn_v")]), ("attn_q", "attn_k", "attn_v")):
+        assert _same(part, raw[source].to(torch.bfloat16))
+    assert _same(loaded["layers.0.self_attn.o_proj.weight"], raw["attn_output"].to(torch.bfloat16))
+    if moe:
+        gate_up = loaded["layers.0.mlp.shared_expert.gate_up_proj.weight"]
+        assert _same(gate_up[:I], raw["ffn_gate_shexp"].to(torch.bfloat16))
+        assert _same(gate_up[I:], raw["ffn_up_shexp"].to(torch.bfloat16))
+        assert torch.equal(loaded["layers.0.mlp.shared_expert_gate.weight"], raw["ffn_gate_inp_shexp"].reshape(1, -1).to(torch.bfloat16))
+        assert not any(".experts." in k for k in loaded)
+    else:
+        gate_up = loaded["layers.0.mlp.gate_up_proj.weight"]
+        assert _same(gate_up[:I], raw["ffn_gate"].to(torch.bfloat16))
+        assert _same(gate_up[I:], raw["ffn_up"].to(torch.bfloat16))
+        assert _same(loaded["layers.0.mlp.down_proj.weight"], raw["ffn_down"].to(torch.bfloat16))
+
+
+def test_a_quantized_nextn_tensor_lands_in_its_own_state_dict_leaf(tmp_path):
+    """A qkv whose q half is ggml-quantized and k|v float fills one packed ``weight`` leaf and one float ``weight_1`` leaf, bytes as stored."""
+    from freetoken.layers.quantization.ggml_types import pad_rows, row_bytes
+    from freetoken.models.qwen3_5_moe.gguf import iter_nextn_weights
+
+    path, raw, q8 = _nextn_gguf(tmp_path, moe=False, q_quantized=True)
+    draft, state = _gguf_draft(path, moe=False, tmp_path=tmp_path)
+    loaded = {n: t.to(dtype=state[n].dtype) for n, t in iter_nextn_weights(path, draft.config)}
+    for key, tensor in loaded.items():
+        assert tensor.shape == state[key].shape and tensor.dtype is state[key].dtype, key
+    packed, float_rows = loaded["layers.0.self_attn.qkv_proj.weight"], loaded["layers.0.self_attn.qkv_proj.weight_1"]
+    rows = 2 * QH * AHD
+    assert packed.dtype is torch.uint8 and packed.shape == (rows + pad_rows(Q8_0, H), row_bytes(Q8_0, H))
+    assert _same(packed[:rows], q8)
+    assert float_rows.dtype is torch.bfloat16
+    for part, source in zip(_slices(float_rows, [raw[n] for n in ("attn_k", "attn_v")]), ("attn_k", "attn_v")):
+        assert _same(part, raw[source].to(torch.bfloat16))
+    # the eh_proj of the same file stays float, one plain leaf
+    assert _same(loaded["fc.weight"], raw["nextn.eh_proj"].to(torch.bfloat16))
+
+
+def test_nextn_expert_banks_fill_the_drafts_resident_moe(tmp_path):
+    """The nextn block's stacked experts become the draft's one resident ggml bank set, gate rows before up rows."""
+    from freetoken.layers.moe import OffloadMoELayer, iter_moe_layers
+    from freetoken.models.qwen3_5_moe.gguf import nextn_expert_banks
+    from freetoken.moe.expert_banks import attach_resident_banks
+
+    path, raw, _ = _nextn_gguf(tmp_path, moe=True)
+    draft, _state = _gguf_draft(path, moe=True, tmp_path=tmp_path)
+    moe = draft.layers.op_list[0].mlp.experts
+    assert not any(isinstance(m, OffloadMoELayer) for m in iter_moe_layers(draft))
+    banks = nextn_expert_banks(path, torch.device("cpu"))
+    attach_resident_banks([moe], banks)
+    gate_up, down = moe._expert_banks["gate_up"], moe._expert_banks["down"]
+    assert gate_up.dtype is torch.bfloat16 and gate_up.shape == (E, 2 * MI, H)
+    assert _same(gate_up[:, :MI], raw["ffn_gate_exps"].to(torch.bfloat16))
+    assert _same(gate_up[:, MI:], raw["ffn_up_exps"].to(torch.bfloat16))
+    assert _same(down, raw["ffn_down_exps"].to(torch.bfloat16))
+
+
+def test_a_no_mtp_gguf_refusal_names_the_two_causes(tmp_path):
+    from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
+
+    path, _raw, _q8 = _nextn_gguf(tmp_path, moe=True, nextn_layers=0)
+    with pytest.raises(ValueError, match=r"no MTP \(nextn\) block.*--no-mtp.*Strata"):
+        Qwen3_5MTPDraft.check_source(path, path)
+
+
+def test_the_sidecar_draft_loads_under_the_sidecars_own_quant(tmp_path):
+    """`load` builds the draft's quant from the sidecar's own tensor table: the target's class
+    is the one the HF and GGUF rows share, and that name's HF row builds the draft unquantized
+    against the sidecar's packed rows."""
+    from freetoken.layers import rotary
+    from freetoken.layers.quantization.ggml_types import pad_rows, row_bytes
+    from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTPDraft
+    from freetoken.spec.mtp.proposer import with_resident_moe
+
+    for name in ("t", "q8"):
+        (tmp_path / name).mkdir()
+    trunk, _raw, _ = _nextn_gguf(tmp_path / "t", moe=False)
+    sidecar, _r, q8 = _nextn_gguf(tmp_path / "q8", moe=False, q_quantized=True)
+    (tmp_path / "cfg").mkdir()
+    (tmp_path / "cfg" / "config.json").write_text(json.dumps(_config_json(False, None)))
+    trunk_config = parse_config(cached_load_hf_config(str(tmp_path / "cfg")))
+    # the fake target carries the class name the HF and GGUF rows share
+    target = type("Qwen3_5ForConditionalGeneration", (), {})()
+    target.model = SimpleNamespace(embed_tokens=None)
+
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))
+    rotary.get_rope.cache_clear()
+    try:
+        draft = Qwen3_5MTPDraft.load(with_resident_moe(trunk_config), target, sidecar, torch.device("cpu"), torch.bfloat16)
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()
+
+    state = draft.state_dict()
+    rows = 2 * QH * AHD
+    packed, float_rows = state["layers.0.self_attn.qkv_proj.weight"], state["layers.0.self_attn.qkv_proj.weight_1"]
+    assert packed.dtype is torch.uint8 and packed.shape == (rows + pad_rows(Q8_0, H), row_bytes(Q8_0, H))
+    assert _same(packed[:rows], q8)
+    assert float_rows.dtype is torch.bfloat16 and float_rows.shape == (2 * KVH * AHD, H)
+    # eh_proj stays float in the same file: one plain bf16 leaf
+    assert state["fc.weight"].dtype is torch.bfloat16
+
+
+def test_quantized_nextn_expert_banks_keep_their_packed_rows(tmp_path):
+    """The nextn experts at their shipped ggml types stay packed: gate rows before up rows
+    per expert, byte for byte as stored, the down bank in its own row width."""
+    from freetoken.layers.moe import iter_moe_layers, OffloadMoELayer
+    from freetoken.layers.quantization.ggml_types import row_bytes
+    from freetoken.models.qwen3_5_moe.gguf import nextn_expert_banks
+    from freetoken.moe.expert_banks import attach_resident_banks
+
+    path, raw, _ = _nextn_gguf(tmp_path, moe=True, experts_quantized=True)
+    draft, _state = _gguf_draft(path, moe=True, tmp_path=tmp_path)
+    moe = draft.layers.op_list[0].mlp.experts
+    assert not any(isinstance(m, OffloadMoELayer) for m in iter_moe_layers(draft))
+    banks = nextn_expert_banks(path, torch.device("cpu"))
+    attach_resident_banks([moe], banks)
+    gate_up, down = moe._expert_banks["gate_up"], moe._expert_banks["down"]
+    rb, rb_down = row_bytes(Q8_0, H), row_bytes(Q8_0, MI)
+    assert gate_up.dtype is torch.uint8 and gate_up.shape == (E, 2 * MI, rb)
+    assert down.dtype is torch.uint8 and down.shape == (E, H, rb_down)
+    for e in range(E):
+        assert torch.equal(gate_up[e, :MI].reshape(-1, rb), raw["ffn_gate_exps"][e * MI : (e + 1) * MI])
+        assert torch.equal(gate_up[e, MI:].reshape(-1, rb), raw["ffn_up_exps"][e * MI : (e + 1) * MI])
+        assert torch.equal(down[e].reshape(-1, rb_down), raw["ffn_down_exps"][e * H : (e + 1) * H])
