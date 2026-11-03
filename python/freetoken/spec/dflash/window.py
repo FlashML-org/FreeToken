@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 
 from freetoken.models.config import SlotStateSpec
@@ -43,11 +41,6 @@ class DFlashWindow:
     def slot_specs(cls, R: int, H: int, fmt: str = "unquantized") -> tuple[SlotStateSpec, ...]:
         cls._check(fmt)
         return (SlotStateSpec(name=cls.NAME, shape=(R, H), verify=DFlashWindowVerify),)
-
-    @classmethod
-    def bytes_per_slot(cls, R: int, H: int, fmt: str, dtype: torch.dtype) -> int:
-        """Window bytes of one slot when the pool's compute dtype is ``dtype``."""
-        return sum(math.prod(spec.shape) * (spec.dtype or dtype).itemsize for spec in cls.slot_specs(R, H, fmt))
 
     @classmethod
     def _check(cls, fmt: str) -> None:

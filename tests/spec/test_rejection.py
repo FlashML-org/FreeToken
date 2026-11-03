@@ -108,10 +108,12 @@ def test_sparse_q_rejection_commits_the_target_distribution():
     q = torch.softmax(torch.randn(k, K, device=device), dim=-1)
     picks = torch.stack([torch.multinomial(q[j], n, replacement=True) for j in range(k)], dim=1)
     drafts = cand.gather(1, picks.T).T
-    # rows cycle through: q trusted, q with a NaN, greedy
+    # rows cycle through: q trusted, q unusable (a NaN or a total of 2), greedy
     kind = torch.arange(n, device=device) % 3
     q_rows = q.expand(n, k, K).clone()
-    q_rows[kind == 1, 0, 0] = float("nan")
+    unusable = (kind == 1).nonzero().squeeze(1)
+    q_rows[unusable[::2], 0, 0] = float("nan")
+    q_rows[unusable[1::2], 0] *= 2
     # softmax(log p) at T=1 hands the verify exactly p on every row
     logits = p.log().repeat(n, 1)
     args = BatchSamplingArgs(temperatures=torch.ones(n, device=device), greedy_mask=kind == 2)
@@ -135,32 +137,3 @@ def test_sparse_q_rejection_commits_the_target_distribution():
     assert torch.equal(emitted[greedy], (drafts[greedy] == argmax[:k]).cumprod(dim=1).sum(dim=1))
     committed = torch.arange(k + 1, device=device) <= emitted[greedy].unsqueeze(1)
     assert torch.equal(out[greedy][committed], argmax.expand(int(greedy.sum()), -1)[committed])
-
-
-@cuda
-def test_sparse_q_rejection_rows_without_a_usable_q_take_the_one_hot_result():
-    """A greedy row keeps the argmax prefix match where q would accept its first draft, and a row whose q has a NaN or a wrong total is verified as if its drafts were argmaxes where trusting q would reject every slot."""
-    import math
-
-    from freetoken.engine.sample import BatchSamplingArgs
-    from freetoken.spec.rejection import sparse_q_rejection
-
-    device = torch.device("cuda")
-    torch.manual_seed(4)
-    k, K = 3, 2
-    # p is one-hot at [3, 1, 2, 0], except that row 0's first position splits 0.55 / 0.45 between tokens 3 and 7
-    logits = torch.full((k + 1, VOCAB), -30.0, device=device)
-    for pos, t in enumerate([3, 1, 2, 0]):
-        logits[pos, t] = 30.0
-    logits = logits.repeat(3, 1)
-    logits[0, 3], logits[0, 7] = math.log(0.55), math.log(0.45)
-    drafts = torch.tensor([[7, 1, 7], [3, 1, 7], [3, 1, 7]], device=device)
-    cand = torch.tensor([[[7, 4], [1, 4], [7, 4]], [[3, 4], [1, 4], [7, 4]], [[3, 4], [1, 4], [7, 4]]], device=device)
-    # row 0: q(7) = 0.01 << p(7) accepts for sure; row 2: q(d) = 1e6 >> p(d) rejects for sure
-    q = torch.tensor([[[0.01, 0.99], [0.5, 0.5], [0.5, 0.5]], [[0.5, float("nan")], [0.5, 0.5], [0.5, 0.5]], [[1e6, 0.5]] * k], device=device)
-    args = BatchSamplingArgs(temperatures=torch.ones(3, device=device), greedy_mask=torch.tensor([True, False, False], device=device))
-
-    out, emitted = sparse_q_rejection(logits, drafts, cand, q, args, _sampler(device))
-
-    assert emitted.tolist() == [0, 2, 2]
-    assert int(out[0, 0]) == 3 and out[1:, :3].tolist() == [[3, 1, 2]] * 2

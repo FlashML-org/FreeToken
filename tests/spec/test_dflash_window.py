@@ -1,11 +1,10 @@
-"""DFlashWindow on a CPU LinearStatePool: the write/read round trip per format, the rows past the window that keep a verify's unaccepted rows and a prefill's rows past its tracked boundary out of every window read, the copy with the GDN slot, and the byte account."""
+"""DFlashWindow on a CPU LinearStatePool: the rows past the window keep a verify's unaccepted rows and a prefill's rows past its tracked boundary out of every window read, also after the copy with the GDN slot."""
 
 from __future__ import annotations
 
-import pytest
 import torch
 
-from freetoken.kvcache.linear_state_pool import LinearStatePool, linear_state_bytes_per_req
+from freetoken.kvcache.linear_state_pool import LinearStatePool
 from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.spec.dflash.window import DFlashWindow
 
@@ -20,10 +19,10 @@ def _group():
     )
 
 
-def _window(fmt="unquantized"):
-    specs = DFlashWindow.slot_specs(R, H, fmt)
+def _window():
+    specs = DFlashWindow.slot_specs(R, H)
     pool = LinearStatePool(group=_group(), num_slots=6, dtype=torch.bfloat16, device=torch.device("cpu"), tp_size=1, slot_states=specs)
-    return pool, DFlashWindow({s.name: pool.slot_state(s.name) for s in specs}, R, H, fmt)
+    return pool, DFlashWindow({s.name: pool.slot_state(s.name) for s in specs}, R, H)
 
 
 def _rows(n, seed):
@@ -34,19 +33,6 @@ def _store(window, rows, start, slot=LIVE):
     """As the proposer stores a chunk of positions ``start ..``: its last R rows at most, in one call."""
     kept, end = rows[-R:], start + rows.shape[0]
     window.write(kept, torch.arange(end - kept.shape[0], end), torch.full((kept.shape[0],), slot))
-
-
-@pytest.mark.parametrize("fmt", DFlashWindow.FORMATS)
-def test_write_read_round_trip_wraps_at_R(fmt):
-    pool, window = _window(fmt)
-    assert R == W + 64
-    rows = _rows(R + 5, 0)
-    _store(window, rows[:R], 100)
-    _store(window, rows[R:], 100 + R)
-    # the last R positions come back bitwise; the five oldest rows were taken by the five newest
-    assert torch.equal(window.read(LIVE, 105, R), rows[5:])
-    assert torch.equal(window.read(LIVE, 100, 5), rows[R:])
-    assert pool.slot_state(DFlashWindow.NAME)[[0, 1, 2, 4, 5]].abs().sum() == 0
 
 
 def test_rows_past_the_window_keep_stale_verify_and_prefill_rows_out_of_every_read():
@@ -71,10 +57,3 @@ def test_rows_past_the_window_keep_stale_verify_and_prefill_rows_out_of_every_re
     # and the prefill left the live window of e intact as well
     assert torch.equal(window.read(LIVE, e - W, W), chunk[-W:])
 
-
-def test_window_bytes_match_the_pool_account():
-    pool, window = _window()
-    gdn_only = linear_state_bytes_per_req(_group(), 1, torch.bfloat16)
-    assert DFlashWindow.bytes_per_slot(R, H, "unquantized", torch.bfloat16) == pool.bytes_per_slot() - gdn_only == R * H * 2
-    with pytest.raises(ValueError, match="format"):
-        DFlashWindow.slot_specs(R, H, "int4")

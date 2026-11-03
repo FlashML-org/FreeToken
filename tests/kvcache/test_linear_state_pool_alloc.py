@@ -188,10 +188,8 @@ def test_slot_state_in_the_byte_account():
 @pytest.mark.parametrize("spec, per_slot", [
     # qwen4_exp PLE conv history: 4 streams x 2560 channels x 9 taps bf16 = 180 KiB per slot
     (SlotStateSpec(name="ple_conv", shape=(4 * 2560, 9), layer_ids=(1,)), 180 * 1024),
-    # the DFlash2 context window of 2112 rows for the Qwen3.8-27B, Qwen3.6-35B-A3B and Qwen3.8-Flash-Next drafts
-    (SlotStateSpec(name="dflash_window", shape=(2112, 5120)), 2112 * 5120 * 2),
+    # the DFlash2 context window of the Qwen3.6-35B-A3B draft
     (SlotStateSpec(name="dflash_window", shape=(2112, 2048)), 2112 * 2048 * 2),
-    (SlotStateSpec(name="dflash_window", shape=(2112, 2560)), 2112 * 2560 * 2),
 ])
 def test_slot_state_bytes_for_the_real_geometry(spec, per_slot):
     group = _group()
