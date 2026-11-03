@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from freetoken.kernel.triton.dflash import RingAttention, grouped_conv, norm_rope_store, selector_walk
 from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
@@ -101,20 +100,24 @@ class DFlash2DraftModel(BaseOP):
 
     @classmethod
     def load(cls, config: DFlashDraftConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> DFlash2DraftModel:
-        # the draft's own quant config, not the target's: the context projection below concatenates raw weights
+        # the draft's own quant config, not the target's: the context projection below reads raw weights
         quant = QuantConfig.from_hf(cached_load_hf_config(model_path))
         if not isinstance(quant, NoQuantConfig):
             raise ValueError(f"{model_path}: quantized DFlash drafts are not supported yet")
         with torch.device("meta"), torch_dtype(dtype):
             draft = cls(config, target_model, quant)
         expected = draft.state_dict()
+        # all layers' q|k|v weights in one tensor: each layer uses its own slice, the context projection the K/V rows of every layer
+        qkv = torch.empty(config.num_layers, *expected["layers.0.self_attn.qkv_proj.weight"].shape, dtype=dtype, device=device)
+        qkv_slices = {f"layers.{i}.self_attn.qkv_proj.weight": w for i, w in enumerate(qkv)}
         loaded = {}
         for name, tensor in iter_weights(model_path, device):
             if name not in expected:
                 raise ValueError(f"{model_path}: unexpected DFlash tensor {name!r}")
             if tensor.shape != expected[name].shape:
                 raise ValueError(f"{model_path}: {name} is {tuple(tensor.shape)}, expected {tuple(expected[name].shape)}")
-            loaded[name] = tensor.to(device=device, dtype=expected[name].dtype)
+            dst = qkv_slices.get(name)
+            loaded[name] = tensor.to(device=device, dtype=expected[name].dtype) if dst is None else dst.copy_(tensor)
         if missing := sorted(set(expected) - set(loaded)):
             raise ValueError(f"{model_path}: DFlash tensors missing: {missing}")
         draft.load_state_dict(loaded)
@@ -122,8 +125,7 @@ class DFlash2DraftModel(BaseOP):
         for op in (draft.fc, draft.layers, draft.candidate_selector):
             finalize_quant(op)
         layers = draft.layers.op_list
-        # K/V weights of every layer stacked, so the context projection is one GEMM
-        draft._kv_all = torch.cat([layer.self_attn.qkv_proj.weight[layer.self_attn.q_size :] for layer in layers])
+        draft._kv_all = qkv[:, layers[0].self_attn.q_size :]
         draft._k_norms = torch.stack([layer.self_attn.k_norm.weight for layer in layers]).contiguous()
         draft._mask_embedding = draft._embed_tokens.forward(torch.tensor([config.mask_token_id], device=device))[0]
         return draft
@@ -150,10 +152,13 @@ class DFlash2DraftModel(BaseOP):
 
     def store_context(self, ctx: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, ring: DFlashRing) -> None:
         """Every layer's K/V of the context rows into the ring rows ``rows`` at ``positions``, which must be distinct modulo the ring within one call."""
+        c, n = self.config, ctx.shape[0]
+        kv = torch.empty(n, c.num_layers, self._kv_all.shape[1], dtype=ctx.dtype, device=ctx.device)
+        torch.bmm(ctx.expand(c.num_layers, *ctx.shape), self._kv_all.transpose(1, 2), out=kv.transpose(0, 1))
         norm_rope_store(
-            F.linear(ctx, self._kv_all), num_layers=self.config.num_layers, num_q_heads=0, q_out=None, q_norm=None,
+            kv.view(n, -1), num_layers=c.num_layers, num_q_heads=0, q_out=None, q_norm=None,
             k_norms=self._k_norms, cos_sin=ring.cos_sin, positions=positions, rows=rows,
-            ring_k=ring.k, ring_v=ring.v, layer0=0, eps=self.config.rms_norm_eps,
+            ring_k=ring.k, ring_v=ring.v, layer0=0, eps=c.rms_norm_eps,
         )
 
     # ---------------------------------------------------------------- block draft
