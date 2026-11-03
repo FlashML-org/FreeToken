@@ -39,8 +39,9 @@ class LinearStatePool:
     page table uses, so the scheduler's existing admit/free of ``table_idx`` covers the
     state's lifetime. One fixed slot per running request; no paging, no eviction.
 
-    A model can declare extra per-request tensors on the same slots through
-    ``ModelConfig.slot_states`` (see ``SlotStateSpec``); they advance, snapshot, COW and
+    A model (``ModelConfig.slot_states``) or a proposer (``Proposer.slot_states``) can declare
+    extra per-request tensors on the same slots; the pool gets both as ``EngineConfig.slot_states``
+    (see ``SlotStateSpec``). They advance, snapshot, COW and
     rebuild with the GDN state and are read back through ``slot_state(name, layer_id)``.
     Consumers must re-read them each forward: ``rebuild`` replaces the tensors.
     """
@@ -334,7 +335,7 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     slot count). The engine adds this to the KV family's fixed cost when budgeting --
     the state pool is a sibling pool, not a KV tier."""
     linear_group = config.model_config.linear_attention_group()
-    slot_states = getattr(config.model_config, "slot_states", ())
+    slot_states = getattr(config, "slot_states", ())
     if linear_group is None:
         if slot_states:
             raise ValueError("slot_states ride the linear-state slots; model has no linear group")
@@ -357,7 +358,7 @@ def verify_scratch_bytes(config, rows_per_req: int) -> int:
     window = rows * conv_dim * (group.conv_kernel_dim - 1) * config.dtype.itemsize
     handlers = sum(
         spec.verify.nbytes(spec, config.max_running_req, rows_per_req, spec.dtype if spec.dtype is not None else config.dtype)
-        for spec in getattr(config.model_config, "slot_states", ())
+        for spec in getattr(config, "slot_states", ())
         if spec.verify is not None
     )
     return stash + window + handlers

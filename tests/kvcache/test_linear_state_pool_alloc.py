@@ -169,18 +169,17 @@ def test_slot_state_in_the_byte_account():
     assert with_state - gdn_only == 32 * 9 * 2
     assert _pool(slot_states=_SPECS).bytes_per_slot() == with_state
 
-    mc = SimpleNamespace(slot_states=_SPECS)
-    mc.linear_attention_group = lambda: group
+    mc = SimpleNamespace(linear_attention_group=lambda: group)
     config = SimpleNamespace(
-        model_config=mc, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        model_config=mc, slot_states=_SPECS, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
         cache_type="naive", max_running_req=3, linear_state_cache_ratio=0.5,
     )
     assert state_pool_bytes(config, num_slots=4) == with_state * 4
 
-    mc.slot_states = ()
+    config.slot_states = ()
     assert state_pool_bytes(config, num_slots=4) == gdn_only * 4
 
-    mc.slot_states = _SPECS
+    config.slot_states = _SPECS
     mc.linear_attention_group = lambda: None
     with pytest.raises(ValueError, match="slot_states"):
         state_pool_bytes(config, num_slots=4)
@@ -200,10 +199,9 @@ def test_slot_state_bytes_for_the_real_geometry(spec, per_slot):
     with_state = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,))
     assert with_state - gdn_only == per_slot
 
-    mc = SimpleNamespace(slot_states=(spec,))
-    mc.linear_attention_group = lambda: group
+    mc = SimpleNamespace(linear_attention_group=lambda: group)
     config = SimpleNamespace(
-        model_config=mc, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        model_config=mc, slot_states=(spec,), dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
         cache_type="hybrid_radix", max_running_req=4, linear_state_cache_ratio=2.0,
     )
     # the hybrid-radix slot count of max_running_req 1 and 4 (4 mr + max(4, 2 mr) + 1 slots)
