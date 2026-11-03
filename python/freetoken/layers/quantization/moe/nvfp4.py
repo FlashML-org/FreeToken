@@ -163,7 +163,7 @@ def _marlin_symbols_ok() -> bool:
         )
         from vllm.scalar_type import scalar_types  # noqa: F401
     except Exception as exc:
-        logger.warning(
+        logger.warning_once(
             f"NVFP4 marlin backend is installed but unusable ({exc!r}); "
             "falling back to the Triton inline-dequant backend"
         )
@@ -371,7 +371,7 @@ def _b12x_symbols_ok() -> bool:
             prepare_w4a16_packed_weights,
         )
     except Exception as exc:
-        logger.warning(
+        logger.warning_once(
             f"NVFP4 b12x backend is installed but unusable ({exc!r}); "
             "falling back to the Triton inline-dequant backend"
         )

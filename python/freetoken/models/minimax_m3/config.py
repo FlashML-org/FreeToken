@@ -34,8 +34,11 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
 )
+from freetoken.utils import init_logger
 
 from .args import load_args
+
+logger = init_logger(__name__)
 
 # the config names only the image token; the reference processor reads these two from the tokenizer's fixed added tokens
 IMAGE_START_ID = 200029  # ]<]start of image[>[
@@ -94,33 +97,18 @@ def parse_vision_config(hf_config: Any) -> VisionConfig | None:
     )
 
 
-# House rule: an env switch that changes WHAT IS SERVED must leave a server-log
-# trace. parse_config runs a few times per process (engine + weight loader), so
-# each resolved-mode line is logged once per distinct value.
-_LOGGED_MODES: set = set()
-
-
-def _log_mode_once(key: str, message: str) -> None:
-    if key in _LOGGED_MODES:
-        return
-    _LOGGED_MODES.add(key)
-    from freetoken.utils import init_logger
-
-    init_logger(__name__).info(message)
-
-
 def parse_config(hf_config: Any) -> ModelConfig:
     text = _text_config(hf_config)
 
     num_layers = text.num_hidden_layers
+    # House rule: an env switch that changes WHAT IS SERVED must leave a server-log trace; parse_config runs a few times per process.
     # Dev/testing only: cap the layer count (e.g. FREETOKEN_M3_MAX_LAYERS=5 -> 3 dense
     # + 2 MoE layers) so the forward path / KV / offload cache can be exercised without
     # pinning the full ~230 GB of experts. Unset in normal use (GLM-5.2 precedent).
     _cap = os.environ.get("FREETOKEN_M3_MAX_LAYERS")
     if _cap and int(_cap) < num_layers:  # a cap >= the real count changes nothing
         num_layers = int(_cap)
-        _log_mode_once(
-            f"cap={num_layers}",
+        logger.info_once(
             f"FREETOKEN_M3_MAX_LAYERS: serving a TRUNCATED model "
             f"({num_layers}/{text.num_hidden_layers} layers) -- dev/testing only, "
             "outputs are garbage; unset the env for real serving.",
@@ -128,8 +116,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
     sparse_enabled = os.getenv("FREETOKEN_M3_SPARSE", "1") != "0"
     if not sparse_enabled:
-        _log_mode_once(
-            "sparse=0",
+        logger.info_once(
             "FREETOKEN_M3_SPARSE=0: serving the DENSE-attention ablation (plain "
             "MHA pool, no indexer; different math and outputs from the shipped "
             "block-sparse model).",
