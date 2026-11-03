@@ -102,11 +102,13 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
-| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`) | Draft tokens per decode step, 1 to 8 for `mtp` |
-| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a GGUF target needs one; the `nextn` MTP blocks llama.cpp writes are not read; a separate checkpoint folder is read with the target's quantization config |
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF checkpoints, and Qwen3.8-Flash-Next HF or GGUF. `dflash` drafts a block of tokens per step with a DFlash 2 draft checkpoint over the target's layer outputs, for the Qwen3.5 / Qwen3.6 / Qwen3.8 family and Qwen3.8-Flash-Next: `incoai/Qwen3.8-27B-DFlash2` for Qwen3.8-27B, `incoai/Qwen3.6-35B-A3B-DFlash2` for Qwen3.6-35B-A3B, `incoai/Qwen3.8-Flash-Next-DFlash2` for Qwen3.8-Flash-Next |
+| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`, 7 for `dflash`) | Draft tokens per decode step, 1 to 8 for `mtp`; 1 to 7 for `dflash`, at most the draft's `block_size` - 1 |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a GGUF target needs one; the `nextn` MTP blocks llama.cpp writes are not read; a separate checkpoint folder is read with the target's quantization config. `dflash` requires it: the DFlash 2 draft checkpoint (bf16 safetensors with its `config.json`), whose `target_layer_ids`, `num_target_layers`, hidden size and vocabulary must match the target |
 
 Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` also refuses Qwen3.5 / Qwen3.6 GGUF targets and an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors.
+
+`dflash` keeps the draft's context in a per-request ring of the draft's sliding window (2048 positions for the released drafts) and, on a hybrid GDN target, in a window on the GDN state slots, so a prefix-cache hit restores it with the GDN snapshot; the window adds `(window + 64) x hidden` activation-dtype bytes to every GDN slot (`/v1/cache/status` counts them). A target without GDN layers needs `--cache-type naive`. Quantized drafts and DFlash v1 drafts are refused. With sampling, the drafts are drawn from the draft's own distribution over its top-16 candidates and verified by rejection sampling against the target's distribution, so the output distribution is the target's.
 
 ### API behaviour
 
