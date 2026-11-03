@@ -39,6 +39,7 @@ Run (one backend):
 
 Run (all three backends, one server per backend):
     ... --model /path/to/model --backend offload,cpu,hybrid --json out.json
+    halo
 """
 
 from __future__ import annotations
