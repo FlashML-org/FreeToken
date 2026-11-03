@@ -287,7 +287,7 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        stats = ReqStats(enqueued_at=time.monotonic())
+        stats = ReqStats(enqueued_at=time.perf_counter())
         self.pending_list.append(
             PendingReq(
                 req.uid,
@@ -339,7 +339,7 @@ class PrefillManager:
                     )
                     # The first prefill chunk is launching: queue time ends here and the
                     # prompt span starts (ReqStats carries both to the final chunk's Req).
-                    pending_req.stats.first_chunk_at = time.monotonic()
+                    pending_req.stats.first_chunk_at = time.perf_counter()
                     pending_req.stats.cache_n = req.cache_handle.cached_len
                     pending_req.stats.prompt_n = pending_req.input_len - req.cache_handle.cached_len
                     if pending_req.mm_items and self.encoder_cache is not None:

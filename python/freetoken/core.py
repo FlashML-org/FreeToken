@@ -35,7 +35,7 @@ class SamplingParams:
 @dataclass
 class ReqStats:
     """Per-request timing and draft counters, stamped by the scheduler with
-    time.monotonic(). Spans follow llama.cpp's server_slot_stats plus a queue
+    time.perf_counter(). Spans follow llama.cpp's server_slot_stats plus a queue
     span: queue = waiting queue -> first prefill chunk launch, prompt = first
     chunk launch -> first sampled token on the host (chunk gaps included),
     predicted = first token -> last committed token. One instance is shared by
