@@ -127,7 +127,7 @@ class Qwen4ExpModel(BaseOP):
         for i, layer in enumerate(self.layers.op_list):
             hidden = layer.forward(hidden, batch)
             if i in wanted:
-                features.layer_output(i, hidden, self.hc_count)
+                features.layer_output(i, hidden, num_streams=self.hc_count)
         if meta is not None and meta.is_verify:
             # the commit rolls the context by the accepted rows only
             get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)

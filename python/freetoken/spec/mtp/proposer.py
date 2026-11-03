@@ -87,7 +87,7 @@ class _PrefillSink:
     def final_hidden(self, x: torch.Tensor) -> None:
         self.hidden = x
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         pass
 
 
@@ -102,7 +102,7 @@ class _VerifySink:
     def final_hidden(self, x: torch.Tensor) -> None:
         self.buffer[: x.shape[0]].copy_(x)
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         pass
 
 

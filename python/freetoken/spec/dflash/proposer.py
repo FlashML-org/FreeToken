@@ -25,12 +25,17 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _write_tap(dst: torch.Tensor, col: int, x: torch.Tensor, num_streams: int, hidden: int) -> None:
-    """Column block ``col`` of ``dst`` takes the rows of ``x``, averaged over their ``num_streams`` residual streams."""
+def _write_tap(dst: torch.Tensor, col: int, x: torch.Tensor, residual: torch.Tensor | None, num_streams: int, hidden: int) -> None:
+    """Column block ``col`` of ``dst`` takes the rows of ``x`` (plus ``residual`` when given), averaged over their ``num_streams`` residual streams."""
     assert x.shape[1] == num_streams * hidden, f"a tapped layer gave {x.shape[1]} columns, expected {num_streams} x {hidden}"
+    out = dst[: x.shape[0], col * hidden : (col + 1) * hidden]
     if num_streams > 1:
-        x = x.view(x.shape[0], num_streams, hidden).float().mean(1)
-    dst[: x.shape[0], col * hidden : (col + 1) * hidden].copy_(x)
+        x = x if residual is None else x + residual
+        out.copy_(x.view(x.shape[0], num_streams, hidden).float().mean(1))
+    elif residual is None:
+        out.copy_(x)
+    else:
+        torch.add(x, residual, out=out)
 
 
 class _PrefillSink:
@@ -45,9 +50,10 @@ class _PrefillSink:
     def final_hidden(self, x: torch.Tensor) -> None:
         pass
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         self.got.add(layer_id)
-        _write_tap(self.aux, self.cols[layer_id], x.index_select(0, self.rows_idx), num_streams, self.hidden)
+        kept = None if residual is None else residual.index_select(0, self.rows_idx)
+        _write_tap(self.aux, self.cols[layer_id], x.index_select(0, self.rows_idx), kept, num_streams, self.hidden)
 
 
 class _VerifySink:
@@ -61,8 +67,8 @@ class _VerifySink:
     def final_hidden(self, x: torch.Tensor) -> None:
         pass
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
-        _write_tap(self.buffer, self.cols[layer_id], x, num_streams, self.hidden)
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+        _write_tap(self.buffer, self.cols[layer_id], x, residual, num_streams, self.hidden)
 
 
 def _draft_entry(config) -> tuple[str, str]:

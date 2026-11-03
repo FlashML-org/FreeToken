@@ -79,7 +79,9 @@ class RecordingSink:
     def final_hidden(self, x):
         pass
 
-    def layer_output(self, layer_id, x, num_streams=1):
+    def layer_output(self, layer_id, x, residual=None, num_streams=1):
+        if residual is not None:
+            x = x + residual
         taps["streams"], taps["width"] = num_streams, x.shape[1]
         taps_got[layer_id][: x.shape[0], : x.shape[1]].copy_(x)
 

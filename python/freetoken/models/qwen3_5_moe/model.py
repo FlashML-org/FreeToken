@@ -98,7 +98,7 @@ class Qwen3_5Model(BaseOP):
             x, residual = layer.forward(x, residual)
             if i in wanted:
                 # the layer's output is the sum the next fused add forms
-                features.layer_output(i, x + residual)
+                features.layer_output(i, x, residual)
         x, _ = self.norm.forward(x, residual)
         return x
 
