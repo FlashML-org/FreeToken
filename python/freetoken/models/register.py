@@ -42,8 +42,9 @@ _QWEN_VL_ROOTS = _LANGUAGE_MODEL_ROOT + (("visual", "model.visual"),)
 _QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
 # TODO: video once the processor samples frames; the tower already takes grid_thw with t > 1
 _QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
-_QWEN3_5_DRAFTS = (("mtp", "freetoken.models.qwen3_5_moe.mtp:Qwen3_5MTPDraft"),)
-_QWEN4_EXP_DRAFTS = (("mtp", "freetoken.models.qwen4_exp.mtp:Qwen4ExpMTPDraft"),)
+_DFLASH2 = ("dflash", "freetoken.models.dflash:DFlash2DraftModel")
+_QWEN3_5_DRAFTS = (("mtp", "freetoken.models.qwen3_5_moe.mtp:Qwen3_5MTPDraft"), _DFLASH2)
+_QWEN4_EXP_DRAFTS = (("mtp", "freetoken.models.qwen4_exp.mtp:Qwen4ExpMTPDraft"), _DFLASH2)
 # Fused projections split back into their HF leaves so the quantization_config lookup sees the stored names.
 _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
@@ -321,6 +322,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=(_DFLASH2,),
     ),
     "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -332,6 +334,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=(_DFLASH2,),
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA

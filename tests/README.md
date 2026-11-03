@@ -69,6 +69,9 @@ checkpoint is set:
 | `FREETOKEN_MINIMAX_M3_MODEL` | `tokenizer/test_mm_tokenize.py` — local MiniMax-M3 checkpoint (start/end expansion, token budget) |
 | `FREETOKEN_TEST_MOE_CACHE_SIZE` | `e2e/test_aime.py` — >0 switches to the offload MoE backend with this cache size |
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
+| `FREETOKEN_TEST_SPEC_ALGORITHM` | `e2e/test_aime.py` — speculative decoding method (`mtp`, `dflash`); prints the accepted drafts per verify step of each sample |
+| `FREETOKEN_TEST_SPEC_DRAFT_PATH` | `e2e/test_aime.py` — the draft checkpoint (`--speculative-draft-model-path`) |
+| `FREETOKEN_TEST_SPEC_NUM_STEPS` | `e2e/test_aime.py` — draft tokens per step (default `0`, the method's own) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — local checkpoint directory or GGUF file; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
 | `FREETOKEN_REBUILD_EXTRA_ARGS` | `e2e/test_cache_rebuild.py` — extra server flags, e.g. `--moe-strategy hybrid --moe-cache-size 1024 --max-running-requests 1` for offloaded MoE |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |

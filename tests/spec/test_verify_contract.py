@@ -1,6 +1,6 @@
 """A k+1-row verify step commits exactly what k+1 decode steps would: with drafts taken from a plain greedy run and wrong at a different place each step (so every accept count occurs), speculative decoding must reproduce that run token for token.
 
-Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone.
+Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone; a second run drafts with a DFlash 2 draft of random weights, whose wrong drafts must leave the target's output alone through its ring, window and graphs.
 A verify row and a decode step run different GEMM and attention shapes, so their logits can differ by an ulp: the runs may part at a near tie, and the test checks they part only there. fp16 keeps such ties rare (bf16 has 3 fewer mantissa bits), and fan-in scaled dummy weights keep the activations O(1), so ulp noise does not grow through the layers.
 """
 
@@ -44,10 +44,11 @@ current = {}
 # the tapped layers' outputs as the sink got them, and as the next layer read them
 taps_got, taps_ref = {}, {}
 taps = {"prefill": 0, "verify": 0, "mismatch": 0, "streams": None, "width": None}
+steps = {"verify": 0}
 
 
 def check_taps(batch):
-    if getattr(batch, "features", None) is None:
+    if not isinstance(getattr(batch, "features", None), RecordingSink):
         return
     n, width = batch.input_ids.shape[0], taps["width"]
     taps["prefill" if batch.is_prefill else "verify"] += 1
@@ -61,6 +62,7 @@ def watch(cls, name):
         current["batch"] = batch
         result = original(self, batch, *args)
         check_taps(batch)
+        steps["verify"] += batch.phase == "verify"
         return result
 
     setattr(cls, name, wrapped)
@@ -229,8 +231,8 @@ prompts = [llm.tokenizer.encode(p) for p in ("The capital of France is", "1, 2, 
 params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True, presence_penalty=p, frequency_penalty=p)
           for n, p in ((48, 0.0), (37, 0.6), (41, 0.0))]
 res = llm.generate(prompts, params)
-result = {"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()]}
-if llm.engine.spec is not None:
+result = {"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()], "verify_steps": steps["verify"]}
+if isinstance(getattr(llm.engine.spec, "proposer", None), OracleProposer):
     proposer = llm.engine.spec.proposer
     result["oracle"] = {"steps": proposer.steps, "commits": NoopVerify.commits, "state_shape": list(proposer.state.shape),
                         "num_slots": llm.engine.linear_state_pool.num_slots, "taps": taps}
@@ -277,6 +279,46 @@ def _tiny_model(path: str, family: str) -> str:
     return path
 
 
+def _tiny_draft(path: str) -> str:
+    """A DFlash 2 draft of the tiny targets: two layers over target layers 1 and 2, a 16-position window, random fan-in scaled weights."""
+    from safetensors.torch import save_file
+
+    os.makedirs(path, exist_ok=True)
+    hidden, layers, heads, kv_heads, head_dim, inter, group = 256, 2, 4, 2, 64, 512, 16
+    config = {
+        "architectures": ["DFlash2DraftModel"], "model_type": "qwen3", "is_causal": False, "hidden_size": hidden,
+        "num_hidden_layers": layers, "num_attention_heads": heads, "num_key_value_heads": kv_heads, "head_dim": head_dim,
+        "intermediate_size": inter, "hidden_act": "silu", "rms_norm_eps": 1e-6, "vocab_size": 248320, "num_target_layers": 4,
+        "layer_types": ["sliding_attention"] * layers, "use_sliding_window": True, "sliding_window": 16, "max_position_embeddings": 4096,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+        "dflash_config": {"block_size": 8, "conv_kernel_size": 2, "conv_group_size": group, "mask_token_id": 248300,
+                          "selector_rank": 8, "selector_top_k": 4, "target_layer_ids": [1, 2]},
+    }
+    with open(os.path.join(path, "config.json"), "w") as f:
+        json.dump(config, f)
+    shapes = {"fc.weight": (hidden, 2 * hidden), "hidden_norm.weight": (hidden,), "norm.weight": (hidden,),
+              "candidate_selector.hidden_projection.weight": (8, hidden),
+              "candidate_selector.predecessor_codebook": (248320, 8), "candidate_selector.successor_codebook": (248320, 8)}
+    for i in range(layers):
+        p = f"layers.{i}"
+        shapes.update({
+            f"{p}.self_attn.q_proj.weight": (heads * head_dim, hidden), f"{p}.self_attn.k_proj.weight": (kv_heads * head_dim, hidden),
+            f"{p}.self_attn.v_proj.weight": (kv_heads * head_dim, hidden), f"{p}.self_attn.o_proj.weight": (hidden, heads * head_dim),
+            f"{p}.self_attn.q_norm.weight": (head_dim,), f"{p}.self_attn.k_norm.weight": (head_dim,),
+            f"{p}.mlp.gate_proj.weight": (inter, hidden), f"{p}.mlp.up_proj.weight": (inter, hidden), f"{p}.mlp.down_proj.weight": (hidden, inter),
+            f"{p}.input_layernorm.weight": (hidden,), f"{p}.post_attention_layernorm.weight": (hidden,),
+        })
+        for conv in ("attention_conv", "mlp_conv"):
+            shapes.update({f"{p}.{conv}.base_kernel": (2, 2, hidden), f"{p}.{conv}.kernel_projection.weight": (4 * hidden // group, hidden)})
+    g = torch.Generator().manual_seed(0)
+    weights = {}
+    for name, shape in shapes.items():
+        t = torch.randn(*shape, generator=g)
+        weights[name] = (t * shape[-1] ** -0.5 if len(shape) > 1 else 1 + 0.1 * t).to(torch.bfloat16)
+    save_file(weights, os.path.join(path, "model.safetensors"))
+    return path
+
+
 def _run(model: str, out: str, reference: str, **kwargs) -> dict:
     run = subprocess.run([sys.executable, "-c", _SCRIPT, model, out, reference, json.dumps(kwargs)],
                          capture_output=True, text=True, timeout=900, env=dict(os.environ))
@@ -286,16 +328,18 @@ def _run(model: str, out: str, reference: str, **kwargs) -> dict:
 
 
 @pytest.mark.parametrize("graphs", [True, False])
+@pytest.mark.parametrize("algorithm", ["oracle", "dflash"])
 @pytest.mark.parametrize("family, backend", [("qwen3_5", "fa"), ("qwen3_5", "triton"), ("qwen4_exp", "qsa_sparse")])
-def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, graphs):
+def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, algorithm, graphs):
     if backend == "fa":
         pytest.importorskip("sgl_kernel")
     model = _tiny_model(str(tmp_path / "model"), family)
     # resident experts take the model dtype
     kwargs = {"attention_backend": backend, "cuda_graph_max_bs": 4 if graphs else 0, "moe_strategy": "fused"}
+    draft = {"speculative_draft_model_path": _tiny_draft(str(tmp_path / "draft"))} if algorithm == "dflash" else {}
     reference = _run(model, str(tmp_path / "decode.json"), "-", **kwargs)
     spec = _run(model, str(tmp_path / "spec.json"), str(tmp_path / "decode.json"),
-                speculative_algorithm="oracle", speculative_num_steps=K, **kwargs)
+                speculative_algorithm=algorithm, speculative_num_steps=K, **draft, **kwargs)
     agreed = 0
     for uid, (want, got) in enumerate(zip(reference["outputs"], spec["outputs"])):
         assert len(got) == len(want)
@@ -310,6 +354,9 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, graphs)
                 assert {a, b} == pair and va - vb <= 2 * ulp, f"request {uid} parts at {split}: top-2 {(a, b)} gap {va - vb}"
     # most of the run must still be compared, or a tie early in every request would hide a bug
     assert agreed >= 0.5 * sum(map(len, reference["outputs"]))
+    assert spec["verify_steps"] > 0
+    if algorithm == "dflash":
+        return
     # the oracle's slot state rode the target's GDN slots, and its handler saw every verify commit
     oracle = spec["oracle"]
     assert oracle["state_shape"] == [oracle["num_slots"], 4] and oracle["commits"] == oracle["steps"] > 0

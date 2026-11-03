@@ -924,7 +924,10 @@ def parse_args(
         "--spec-algo",
         type=str,
         default=ServerArgs.speculative_algorithm,
-        help="Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers). Off by default.",
+        help=(
+            "Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers; dflash: a DFlash 2 draft "
+            "checkpoint from --speculative-draft-model-path). Off by default."
+        ),
     )
 
     parser.add_argument(
@@ -940,7 +943,7 @@ def parse_args(
         "--spec-draft-model",
         type=str,
         default=ServerArgs.speculative_draft_model_path,
-        help="Draft weights; by default they come from the target checkpoint.",
+        help="Draft weights; by default they come from the target checkpoint. Required for dflash, which reads a separate draft checkpoint.",
     )
 
     parser.add_argument(

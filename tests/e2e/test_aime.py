@@ -23,6 +23,10 @@ Env knobs:
   FREETOKEN_TEST_MOE_CACHE_AUTO 1 sizes the MoE cache from free VRAM instead of MOE_CACHE_SIZE
   FREETOKEN_TEST_KV_RESERVE     KV token floor reserved before auto-cache fills experts
   FREETOKEN_TEST_MEM_RATIO      offload memory ratio (default 0.9)
+  FREETOKEN_TEST_SPEC_ALGORITHM speculative decoding method (mtp, dflash); the accepted
+                                draft tokens per verify step are printed after each sample
+  FREETOKEN_TEST_SPEC_DRAFT_PATH  draft checkpoint (--speculative-draft-model-path)
+  FREETOKEN_TEST_SPEC_NUM_STEPS draft tokens per step (0 = the method's default)
 
 fp8 / offload recipe: point FREETOKEN_TEST_MODEL at the fp8 checkpoint dir and set
 FREETOKEN_TEST_MOE_CACHE_SIZE (e.g. 8192).
@@ -195,7 +199,23 @@ def build_llm(model_path: Path) -> LLM:
             max_seq_len_override=max_tokens() + 2048,
             cuda_graph_max_bs=1,
         )
+    if algorithm := os.environ.get("FREETOKEN_TEST_SPEC_ALGORITHM"):
+        kwargs.update(
+            speculative_algorithm=algorithm,
+            speculative_draft_model_path=os.environ.get("FREETOKEN_TEST_SPEC_DRAFT_PATH") or None,
+            speculative_num_steps=int(os.environ.get("FREETOKEN_TEST_SPEC_NUM_STEPS", "0")),
+            # the accept counters reset at every decode log line; one sample never reaches this many steps
+            decode_log_interval=1 << 30,
+        )
     return LLM(**kwargs)
+
+
+def accepted_per_step(llm: LLM) -> float | None:
+    """Mean draft tokens accepted per verify step since the last call; None without speculative decoding."""
+    reporter = llm.status_reporter
+    steps, tokens = reporter._spec_req_steps, reporter._spec_tokens
+    reporter._spec_req_steps = reporter._spec_tokens = 0
+    return tokens / steps - 1 if steps else None
 
 
 def free_gpu_memory_gib() -> float:
@@ -256,6 +276,8 @@ def test_aime():
         for _ in range(n_samples):
             outputs = llm.generate([formatted_prompt], sampling)
             answers.append(extract_answer(str(outputs[0]["text"])))
+            if (accepted := accepted_per_step(llm)) is not None:
+                print(f"req {idx + 1}: {len(outputs[0]['token_ids'])} tokens, {accepted:.2f} drafts accepted per step, answer {answers[-1]}")
         if expected not in answers:
             failures.append((idx + 1, answers, expected))
 

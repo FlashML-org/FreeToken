@@ -95,6 +95,12 @@ class RingAttention:
     KEYS_PER_SPLIT = 128
     BLOCK_N = 64
 
+    @classmethod
+    def scratch_bytes(cls, *, max_bs: int, block: int, num_heads: int, num_kv_heads: int, head_dim: int, ring: int) -> int:
+        """Bytes of the split partials an instance of this geometry allocates."""
+        block_m = max(16, triton.next_power_of_2(num_heads // num_kv_heads * block))
+        return max_bs * num_kv_heads * triton.cdiv(ring, cls.KEYS_PER_SPLIT) * block_m * (head_dim + 2) * 4
+
     def __init__(self, *, max_bs: int, block: int, num_heads: int, num_kv_heads: int, head_dim: int, ring: int, window: int, device: torch.device) -> None:
         self.block, self.num_kv_heads, self.head_dim, self.ring, self.window = block, num_kv_heads, head_dim, ring, window
         self.group = num_heads // num_kv_heads
