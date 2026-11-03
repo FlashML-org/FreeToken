@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, ClassVar, List, NamedTuple
 
 import torch
@@ -11,6 +12,13 @@ if TYPE_CHECKING:
     from freetoken.engine.spec_protocol import SpecProposal
     from freetoken.models.blocks import FeatureSink
     from freetoken.models.config import SlotStateSpec
+
+
+def check_draft_path(path: str) -> None:
+    """Fail at config time on a local ``--speculative-draft-model-path`` that does not exist; a HF repo id is "name" or "org/name"."""
+    local = os.path.isabs(path) or path.startswith(".") or path.count("/") > 1 or path.endswith(".gguf")
+    if local and not os.path.exists(path):
+        raise ValueError(f"--speculative-draft-model-path {path} does not exist")
 
 
 class DraftContext(NamedTuple):

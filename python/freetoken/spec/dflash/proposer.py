@@ -5,7 +5,6 @@ The draft's context rows live in a per-table-row K/V ring (positions ``p % R``) 
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
@@ -15,7 +14,7 @@ from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.kernel.triton.dflash import RingAttention
 from freetoken.spec.dflash.window import DFlashWindow
-from freetoken.spec.proposer import DraftContext, Proposer
+from freetoken.spec.proposer import DraftContext, Proposer, check_draft_path
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
@@ -86,10 +85,7 @@ class DFlashProposer(Proposer):
         path = config.speculative_draft_model_path
         if not path:
             raise ValueError("--speculative-algorithm dflash needs --speculative-draft-model-path: a DFlash 2 draft checkpoint")
-        # a HF repo id is "name" or "org/name"; anything else names a local path
-        local = os.path.isabs(path) or path.startswith(".") or path.count("/") > 1
-        if local and not os.path.exists(path):
-            raise ValueError(f"--speculative-draft-model-path {path} does not exist")
+        check_draft_path(path)
         archs = list(getattr(cached_load_hf_config(path), "architectures", None) or [])
         if archs[:1] != [name]:
             raise ValueError(f"{path}: expected a {name} checkpoint, got architectures {archs}")
