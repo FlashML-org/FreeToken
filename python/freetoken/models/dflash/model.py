@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.kernel.triton.dflash import RingAttention, grouped_conv, norm_rope_store, selector_walk
-from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused, get_rope
+from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
 from freetoken.layers.base import BaseOP
 from freetoken.layers.quantization import NoQuantConfig, QuantConfig, finalize_quant
 from freetoken.models.blocks import GatedMLP
@@ -137,9 +137,10 @@ class DFlash2DraftModel(BaseOP):
             max_bs=max_rows, block=block, num_heads=c.num_heads, num_kv_heads=c.num_kv_heads, head_dim=c.head_dim,
             ring=ring, window=c.window, device=device,
         )
-        with torch.device(device):
-            rope = get_rope(c.head_dim, c.head_dim, max_position, c.rope_theta, is_neox=True)
-        return DFlashRing(k, torch.zeros_like(k), attention, rope._cos_sin_cache)
+        # not the cached get_rope: max_position follows the page table, so each rebuild would cache one more table
+        inv_freq = 1.0 / (c.rope_theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float, device=device) / c.head_dim))
+        freqs = torch.arange(max_position, dtype=torch.float, device=device)[:, None] * inv_freq[None, :]
+        return DFlashRing(k, torch.zeros_like(k), attention, torch.cat((freqs.cos(), freqs.sin()), dim=-1))
 
     # ---------------------------------------------------------------- context KV
 

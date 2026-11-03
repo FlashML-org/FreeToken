@@ -60,13 +60,11 @@ def _load_draft(tmp_path, w: dict[str, torch.Tensor], dtype=torch.bfloat16):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
     from freetoken.layers.quantization import finalize_quant
-    from freetoken.layers.rotary import get_rope
     from freetoken.models.dflash import DFlash2DraftModel, parse_config
     from freetoken.utils import cached_load_hf_config, torch_dtype
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    get_rope.cache_clear()
     path = tmp_path / "draft"
     path.mkdir()
     (path / "config.json").write_text(json.dumps(CONFIG))

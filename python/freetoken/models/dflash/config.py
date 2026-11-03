@@ -45,6 +45,11 @@ def parse_config(hf_config: Any) -> DFlashDraftConfig:
     rope = getattr(hf_config, "rope_parameters", None) or {"rope_theta": getattr(hf_config, "rope_theta", 10000.0)}
     if rope.get("rope_type", "default") != "default":
         raise ValueError(f"rope_type {rope.get('rope_type')!r} is not supported for DFlash drafts")
+    # the draft forward does not apply these; ignoring them would only show up as lower acceptance
+    identity = {"output_multiplier": (None, 1.0), "final_logit_softcapping": (None, 0.0), "attention_value_scale": (None, 1.0)}
+    scaled = {key: dc[key] for key, values in identity.items() if dc.get(key) not in values}
+    if scaled:
+        raise ValueError(f"DFlash drafts with {scaled} in dflash_config are not supported")
     return DFlashDraftConfig(
         hidden_size=int(hf_config.hidden_size),
         num_layers=int(hf_config.num_hidden_layers),
