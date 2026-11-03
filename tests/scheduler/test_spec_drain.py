@@ -108,3 +108,41 @@ def test_drain_commits_the_accepted_tokens_and_returns_the_rejected_slots():
     for req in (a, c):
         stub._free_req_resources(req)
     cm.check_integrity()
+
+
+def test_drain_counts_drafts_and_attaches_timings():
+    """The verify drain feeds ReqStats: k drafts per step, accepted = committed - 1
+    after stop truncation, and the terminal reply carries the finished request's spans."""
+    pool, cm, tm, dm, stub, events = _setup()
+    reqs = [_decoding_req(pool, cm, tm, 1, 16), _decoding_req(pool, cm, tm, 2, 3)]
+    dm.filter_reqs(reqs)
+    for req in reqs:
+        req.widen_pending(K)
+    cm.allocate_paged(reqs)
+    # spans the prefill drain would have stamped: enqueued -> first chunk -> first token
+    for req in reqs:
+        req.stats.enqueued_at = 1.0
+        req.stats.first_chunk_at = 2.0
+        req.stats.first_token_at = 3.0
+        req.stats.prompt_n = PROMPT
+    out = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]])
+    output = SimpleNamespace(next_tokens_gpu=out, next_tokens_cpu=out, emitted_cpu=torch.tensor([3, 3]))
+    batch = Batch(reqs=reqs, phase="verify", rows_per_req=K + 1)
+    reply, finished = [], set()
+
+    Scheduler._drain_verify(stub, batch, output, reply, finished)
+
+    # every draft of the step is counted; of the committed tokens the last is the
+    # target's own, so accepted = n - 1 -- for req 2 the length cut truncates n from 4
+    # to 2 AFTER the drafts were proposed, and the counter follows the truncation
+    assert reqs[0].stats.draft_n == K and reqs[0].stats.draft_n_accepted == 3
+    assert reqs[1].stats.draft_n == K and reqs[1].stats.draft_n_accepted == 1
+    # only the terminal reply carries timings
+    assert reply[0].timings is None
+    t = reply[1].timings
+    assert t["queue_ms"] == 1000.0  # enqueued -> first chunk
+    assert t["prompt_ms"] == 1000.0  # first chunk -> first token
+    assert t["prompt_n"] == PROMPT
+    assert t["predicted_n"] == 3  # first token + the two committed here
+    assert t["predicted_ms"] > 0.0  # first -> last committed token
+    assert t["draft_n"] == K and t["draft_n_accepted"] == 1

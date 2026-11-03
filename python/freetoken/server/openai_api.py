@@ -238,10 +238,7 @@ async def handle_chat_completion(
             _reported_cached(state, result.cached_tokens),
         ),
     }
-    if (timings := timings_block(
-        result.prompt_tokens, result.completion_tokens, result.cached_tokens,
-        result.prompt_ms, result.predicted_ms,
-    )) is not None:
+    if (timings := timings_block(state, result.timings)) is not None:
         response["timings"] = timings
     return response
 
@@ -266,8 +263,10 @@ async def stream_chat_completion_chunks(
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
-    prompt_ms = 0.0
-    predicted_ms = 0.0
+    timings: dict[str, Any] | None = None
+    # timings ride the stream's LAST chunk only: the usage chunk when the client asked
+    # for one, otherwise the finish chunk
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions")
@@ -377,18 +376,13 @@ async def stream_chat_completion_chunks(
             prompt_tokens = ev.prompt_tokens
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
-            prompt_ms = ev.prompt_ms
-            predicted_ms = ev.predicted_ms
-            # llama.cpp puts timings on the finish chunk too, so streams without
-            # include_usage still get them.
+            timings = ev.timings
             done = _chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}])
-            if (timings := timings_block(
-                prompt_tokens, completion_tokens, cached_tokens, prompt_ms, predicted_ms
-            )) is not None:
-                done["timings"] = timings
+            if not include_usage and (t := timings_block(state, timings)) is not None:
+                done["timings"] = t
             yield _sse(done)
 
-    if req.stream_options and req.stream_options.include_usage:
+    if include_usage:
         final: dict[str, Any] = {
             "id": f"chatcmpl-{uid}",
             "object": "chat.completion.chunk",
@@ -399,10 +393,8 @@ async def stream_chat_completion_chunks(
                 prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
             ),
         }
-        if (timings := timings_block(
-            prompt_tokens, completion_tokens, cached_tokens, prompt_ms, predicted_ms
-        )) is not None:
-            final["timings"] = timings
+        if (t := timings_block(state, timings)) is not None:
+            final["timings"] = t
         yield _sse(final)
 
     yield b"data: [DONE]\n\n"
@@ -447,9 +439,10 @@ async def handle_completion(
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
-    started = time.monotonic()
-    first_output_at: float | None = None
-    last_output_at: float | None = None
+    # with several prompts the timings are the FIRST prompt's own spans, as llama.cpp
+    # returns arr[0]; one clock across the sequential loop would mix the later prompts'
+    # queue and prefill into the rates
+    first_timings: dict[str, Any] | None = None
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
         await state.send_one(
@@ -469,18 +462,14 @@ async def handle_completion(
             prompt_tokens += ack.prompt_tokens_delta
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
-            if ack.completion_tokens_delta > 0:
-                now = time.monotonic()
-                if first_output_at is None:
-                    first_output_at = now
-                last_output_at = now
             text += ack.incremental_output
             if ack.finished:
+                if index == 0:
+                    first_timings = getattr(ack, "timings", None)
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
         choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
 
-    ended = time.monotonic()
     response: dict[str, Any] = {
         "id": f"cmpl-{uuid.uuid4().hex}",
         "object": "text_completion",
@@ -489,11 +478,7 @@ async def handle_completion(
         "choices": choices,
         "usage": _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)),
     }
-    if (timings := timings_block(
-        prompt_tokens, completion_tokens, cached_tokens,
-        ((first_output_at if first_output_at is not None else ended) - started) * 1000.0,
-        (last_output_at - first_output_at) * 1000.0 if first_output_at is not None else 0.0,
-    )) is not None:
+    if (timings := timings_block(state, first_timings)) is not None:
         response["timings"] = timings
     return response
 
@@ -502,9 +487,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
-    started = time.monotonic()
-    first_output_at: float | None = None
-    last_output_at: float | None = None
+    timings: dict[str, Any] | None = None
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     finish_reason = "stop"
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
@@ -514,11 +498,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
-        if ack.completion_tokens_delta > 0:
-            now = time.monotonic()
-            if first_output_at is None:
-                first_output_at = now
-            last_output_at = now
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
         if ack.incremental_output:
             yield _sse(
                 {
@@ -540,7 +521,6 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
 
-    ended = time.monotonic()
     done_chunk: dict[str, Any] = {
         "id": f"cmpl-{uid}",
         "object": "text_completion.chunk",
@@ -548,15 +528,12 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
         "model": req.model,
         "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
     }
-    if (timings := timings_block(
-        prompt_tokens, completion_tokens, cached_tokens,
-        ((first_output_at if first_output_at is not None else ended) - started) * 1000.0,
-        (last_output_at - first_output_at) * 1000.0 if first_output_at is not None else 0.0,
-    )) is not None:
-        done_chunk["timings"] = timings
+    if not include_usage and (t := timings_block(state, timings)) is not None:
+        # as on the chat stream: the finish chunk is the last one only when no usage
+        # chunk follows
+        done_chunk["timings"] = t
     yield _sse(done_chunk)
-    if req.stream_options and req.stream_options.include_usage:
-        ended = time.monotonic()
+    if include_usage:
         final: dict[str, Any] = {
             "id": f"cmpl-{uid}",
             "object": "text_completion.chunk",
@@ -567,12 +544,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
                 prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
             ),
         }
-        if (timings := timings_block(
-            prompt_tokens, completion_tokens, cached_tokens,
-            ((first_output_at if first_output_at is not None else ended) - started) * 1000.0,
-            (last_output_at - first_output_at) * 1000.0 if first_output_at is not None else 0.0,
-        )) is not None:
-            final["timings"] = timings
+        if (t := timings_block(state, timings)) is not None:
+            final["timings"] = t
         yield _sse(final)
     yield b"data: [DONE]\n\n"
 

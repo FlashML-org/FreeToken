@@ -167,7 +167,7 @@ async def handle_responses(
     if req.stream:
         events = responses_stream_generator(
             generate_events(uid, spec, state, source="/v1/responses"), req, response_id, created,
-            cache_report=cache_report,
+            cache_report=cache_report, state=state,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -177,7 +177,9 @@ async def handle_responses(
         result = await generate_full(uid, spec, state, source="/v1/responses")
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
-    response = build_responses_response(result, req, response_id, created, cache_report=cache_report)
+    response = build_responses_response(
+        result, req, response_id, created, cache_report=cache_report, state=state
+    )
     return JSONResponse(content=response.model_dump(mode="json"))
 
 
@@ -411,6 +413,7 @@ def build_responses_response(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    state: Any = None,
 ) -> Response:
     truncated = result.finish_reason == "length"
     item_status = "incomplete" if truncated else "completed"
@@ -455,10 +458,7 @@ def build_responses_response(
             result.cached_tokens if cache_report else 0,
         ),
         incomplete_reason="max_output_tokens" if truncated else None,
-        timings=timings_block(
-            result.prompt_tokens, result.completion_tokens, result.cached_tokens,
-            result.prompt_ms, result.predicted_ms,
-        ),
+        timings=timings_block(state, result.timings),
     )
 
 
@@ -507,13 +507,14 @@ async def responses_stream_generator(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    state: Any = None,
 ) -> AsyncIterator[str]:
     seq = _Seq()
 
-    def snapshot(status, output, usage=None, incomplete_reason=None, timings=None):
+    def snapshot(status, output, usage=None, incomplete_reason=None):
         return _response_obj(
             response_id, created, req.model, output,
-            status=status, usage=usage, incomplete_reason=incomplete_reason, timings=timings,
+            status=status, usage=usage, incomplete_reason=incomplete_reason,
         )
 
     yield _sse(ResponseCreatedEvent(
@@ -530,8 +531,6 @@ async def responses_stream_generator(
     usage_pt = 0
     usage_ct = 0
     usage_cached = 0
-    usage_prompt_ms = 0.0
-    usage_predicted_ms = 0.0
 
     def close_current() -> list[str]:
         nonlocal current, output_index
@@ -717,8 +716,7 @@ async def responses_stream_generator(
                 finish_reason = ev.finish_reason
                 usage_pt, usage_ct = ev.prompt_tokens, ev.completion_tokens
                 usage_cached = ev.cached_tokens if cache_report else 0
-                usage_prompt_ms, usage_predicted_ms = ev.prompt_ms, ev.predicted_ms
-                final_timings = timings_block(usage_pt, usage_ct, ev.cached_tokens, usage_prompt_ms, usage_predicted_ms)
+                final_timings = timings_block(state, ev.timings)
                 for f in close_current():
                     yield f
                 if finish_reason == "length":
@@ -728,8 +726,8 @@ async def responses_stream_generator(
                             "incomplete", output_items,
                             usage=_usage(usage_pt, usage_ct, usage_cached),
                             incomplete_reason="max_output_tokens",
-                            timings=final_timings,
                         ),
+                        **({"timings": final_timings} if final_timings is not None else {}),
                     ))
                 else:
                     yield _sse(ResponseCompletedEvent(
@@ -737,8 +735,8 @@ async def responses_stream_generator(
                         response=snapshot(
                             "completed", output_items,
                             usage=_usage(usage_pt, usage_ct, usage_cached),
-                            timings=final_timings,
                         ),
+                        **({"timings": final_timings} if final_timings is not None else {}),
                     ))
     except GenerationError as exc:
         # Request failed before/instead of producing output (template render error, over-length

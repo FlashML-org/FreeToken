@@ -336,6 +336,8 @@ class Scheduler(SchedulerIOMixin):
         batch, output = last_data[0].batch, last_data[1]
         _, next_tokens_cpu, copy_done = output[:3]
         copy_done.synchronize()
+        # tokens are on the host from here: the per-request timings' token stamps
+        now = time.monotonic()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         generated = None
@@ -370,7 +372,10 @@ class Scheduler(SchedulerIOMixin):
                         # client's terminal reply.
                         continue
                     msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                    req.stats.stamp_token(now)
                     reply.append(msg)
+                    if msg.finished:
+                        msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
                     finished = msg.finished
 
                     # NOTE: overlap scheduling may make the request freed twice, skip second free
@@ -424,12 +429,20 @@ class Scheduler(SchedulerIOMixin):
         """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
         k = self.config.decode_rows_per_req - 1
         counts, finished = [], []
+        now = time.monotonic()
         for i, req in enumerate(batch.reqs):
             # spec forces normal_loop, which frees an aborted request between steps; overlap would need rollback_tail here and must not donate the GDN slot the verify rolled
             assert not req.aborted, "a verify batch drained an aborted request"
             cached = req.cached_len
             msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : int(output.emitted_cpu[i]) + 1])
+            # k drafts were proposed; of the n committed tokens the last is the target's
+            # own, and n is already post stop-truncation, so accepted never overcounts
+            req.stats.stamp_token(now)
+            req.stats.draft_n += k
+            req.stats.draft_n_accepted += max(n - 1, 0)
             reply.append(msg)
+            if msg.finished:
+                msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
             req.commit_pending(n)
             self.cache_manager.rollback_tail(req, req.cached_len, cached + k + 1)
             counts.append(n)
