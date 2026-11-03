@@ -49,6 +49,68 @@ def _reference_paged_attention(
     return torch.stack(outs, dim=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs a GPU")
+@pytest.mark.parametrize("path", ["paged", "decode", "extend", "split_extend"])
+@pytest.mark.parametrize("offset_bits", [31, 32])
+def test_triton_attention_high_physical_slots(path: str, offset_bits: int):
+    from freetoken.kernel.triton.attention import (
+        decode_paged_attention,
+        extend_paged_attention,
+        paged_attention,
+    )
+
+    torch.manual_seed(1347)
+    device = torch.device("cuda")
+    head_dim, num_kv_heads, num_q_heads = 64, 2, 4
+    stride = num_kv_heads * head_dim
+    low, count = 128, 66
+    high = (1 << 32) // stride + low
+    required = (high + count) * stride * 2
+    if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+        # Release inactive cached blocks before deciding this case cannot fit.
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+            pytest.skip("High-offset attention regression needs 9 GiB of free GPU memory")
+
+    # Share K/V storage to keep the real allocation near 8 GiB. Int32 overflow
+    # aliases initialized low rows, so a regression fails numerically, not by OOB.
+    cache = torch.empty(high + count, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    cache[low : low + count].fill_(-2)
+    cache[high : high + count].normal_(mean=3, std=2)
+    if offset_bits == 31:
+        # Keep the old negative offset inside allocated guard storage too.
+        guard = (1 << 31) // stride
+        cache = cache[guard:]
+        high -= guard
+    q = torch.randn(1, num_q_heads, head_dim, device=device, dtype=cache.dtype)
+    indices = torch.arange(high, high + count, device=device, dtype=torch.int32)
+    indptr = torch.tensor([0, count], device=device, dtype=torch.int32)
+    q_to_req = torch.zeros(1, device=device, dtype=torch.int32)
+    q_positions = torch.tensor([count - 1], device=device, dtype=torch.int64)
+    sm_scale = head_dim**-0.5
+    expected = _reference_paged_attention(
+        q, cache, cache, indptr, indices, q_to_req, q_positions, sm_scale, None,
+    )
+
+    if path == "paged":
+        actual = paged_attention(q, cache, cache, indptr, indices, q_to_req, q_positions, sm_scale)
+    elif path == "decode":
+        mid = torch.empty(1, num_q_heads, 64, head_dim, device=device, dtype=torch.float32)
+        lse = torch.empty(1, num_q_heads, 64, device=device, dtype=torch.float32)
+        actual = decode_paged_attention(q, cache, cache, indptr, indices, q_positions, mid, lse, sm_scale)
+    else:
+        qo_indptr = torch.tensor([0, 1], device=device, dtype=torch.int32)
+        prefix_lens = torch.tensor([count - 1], device=device, dtype=torch.int32)
+        # 65 cached tokens cover both the full-tile and masked split-prefix loads.
+        extend = cache[high + count - 1 : high + count] if path == "split_extend" else None
+        actual = extend_paged_attention(
+            q, cache, cache, qo_indptr, indptr, indices, prefix_lens, 1, sm_scale,
+            k_extend=extend, v_extend=extend,
+        )
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
 def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
     from freetoken.attention import AttentionSpec
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
