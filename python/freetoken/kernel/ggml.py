@@ -100,6 +100,7 @@ def mul_mat_id(
 ) -> torch.Tensor:
     """Per-route expert GEMM over ``w[E, N, row_bytes]``: returns ``[T, k, N]`` in ``x``'s dtype; ``x`` is ``[T, K]`` (shared by the k routes) or ``[T, k, K]``.
 
+    Repeated nonnegative expert IDs within a token are allowed; each route produces its own output.
     ``scale`` is an fp32 ``[E]`` view (strided is fine) that multiplies each NVFP4 expert's rows; it needs ``T <= mmvq_max_tokens``.
     ``inactive`` says ``ids`` may hold -1 (hybrid decode's CPU routes): those rows come back zero. Above ``mmvq_max_tokens`` it costs a memset and a zeroing pass, so pass it only then.
     """
