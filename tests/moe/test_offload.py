@@ -1129,14 +1129,18 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch, mem
     # memops: the GPU waits on the doorbell with a stream memop, else the gather kernel spins on it
     from types import SimpleNamespace
 
-    from freetoken.moe.locked_fetch import LockedLayerFetch
+    from freetoken.moe.locked_fetch import attach_locked_fetch, settle_banks
 
     monkeypatch.setenv("FREETOKEN_LOCKED_FETCH_THREADS", "2")
     torch.manual_seed(0)
     cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
     cache.decode_target = "hybrid"
     cache.locked_hybrid = frozenset({1})
-    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops))
+    config = SimpleNamespace(moe_strategy="hybrid", moe_locked_fetch=1.0, moe_locked_max_fetch=2)
+    _, _, staging = settle_banks(config, SimpleNamespace(sources=sources), probe=False, has_locked=True)
+    assert staging is not None
+    cache.cpu_executor = SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops)
+    attach_locked_fetch(cache, config, staging, layer_rows=None)
 
     top_k = 3
     ids = torch.zeros(top_k, dtype=torch.int32, device="cuda")

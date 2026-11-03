@@ -34,6 +34,14 @@ extern "C" hipError_t hipStreamWriteValue64(hipStream_t stream, void* address, u
   return real<decltype(&hipStreamWriteValue64)>("hipStreamWriteValue64")(stream, address, value, flags);
 }
 
+extern "C" hipError_t hipEventRecordWithFlags(hipEvent_t event, hipStream_t stream, unsigned flags) {
+  if (mode("publication-event") && flags == hipEventRecordExternal) {
+    ++injected;
+    return hipErrorNotSupported;
+  }
+  return real<decltype(&hipEventRecordWithFlags)>("hipEventRecordWithFlags")(event, stream, flags);
+}
+
 extern "C" hipError_t hipStreamUpdateCaptureDependencies(
     hipStream_t stream, hipGraphNode_t* dependencies, size_t count, unsigned flags) {
   if (mode("dependency")) {

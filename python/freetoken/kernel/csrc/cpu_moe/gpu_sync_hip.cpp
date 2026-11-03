@@ -157,13 +157,14 @@ hipError_t wait_done(hipStream_t stream, uint64_t* done, hipStreamBatchMemOpPara
 struct GpuSync::Impl {
   uint64_t* ready = nullptr;  // signal memory
   uint64_t* done = nullptr;
+  std::map<uint64_t, hipEvent_t> publication_events;
   // Explicit nodes keep these addresses, so one parameter pair per distinct task, never moved (std::map nodes are stable).
   std::map<uint64_t, std::array<hipStreamBatchMemOpParams, 2>> submit_ops;  // done = 0, ready = task
   hipStreamBatchMemOpParams wait_op{};
 };
 
-// The memop-free mode serves only the locked fetch, which ROCm keeps off: every GpuSync here needs memops.
-GpuSync::GpuSync(bool) : impl_(std::make_unique<Impl>()) {
+// Locked fetch can use the signal words with a kernel wait when memops are unavailable.
+GpuSync::GpuSync(bool require_memops) : impl_(std::make_unique<Impl>()) {
   hipError_t rc = alloc_signal(&impl_->ready);
   if (rc == hipSuccess) rc = alloc_signal(&impl_->done);
   if (rc != hipSuccess) {
@@ -172,10 +173,12 @@ GpuSync::GpuSync(bool) : impl_(std::make_unique<Impl>()) {
     hip_check(rc, "signal allocation");
   }
   // Measure now: the measurement captures and allocates, which a graph capture in progress would reject.
-  (void)records_native_memops();
+  if (require_memops) (void)records_native_memops();
 }
 
 GpuSync::~GpuSync() {
+  for (const auto& [task, event] : impl_->publication_events)
+    if (event != nullptr) (void)hipEventDestroy(event);
   free_signal(impl_->ready);
   free_signal(impl_->done);
 }
@@ -244,6 +247,13 @@ bool GpuSync::probe(uintptr_t /*stream*/) {
 void GpuSync::gpu_submit(uintptr_t stream, uint64_t task) {
   auto s = reinterpret_cast<hipStream_t>(stream);
   hipStreamBatchMemOpParams* ops = needs_explicit_nodes(s) ? impl_->submit_ops[task].data() : nullptr;
+  // Keep each task's event alive across graph capture, replay and recapture.
+  auto& publication = impl_->publication_events[task];
+  if (publication == nullptr)
+    hip_check(hipEventCreateWithFlags(&publication, hipEventDisableTiming | hipEventReleaseToSystem),
+              "create input publication event");
+  // External recording retains the D2H publication point in every graph replay.
+  hip_check(hipEventRecordWithFlags(publication, s, hipEventRecordExternal), "publish input copies");
   // Reset done before raising ready, so the coordinator's completion for this step can never be wiped.
   hip_check(write_value(s, impl_->done, 0, ops), "write done");
   hip_check(write_value(s, impl_->ready, task, ops ? ops + 1 : nullptr), "write ready");

@@ -261,3 +261,108 @@ def test_fp16_bits_carry_every_e4m3_byte():
     finite = torch.isfinite(ref)
     assert torch.equal(got[finite], ref[finite])
     assert torch.equal(got[~finite].abs(), torch.full((2,), 480.0))  # 0x7F / 0xFF, as e4m3_decode
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("bs", [1, 3])
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_cpu_fp8_block_graph_distinct_layer_inputs(bs, accumulate):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    L, E, H, I, top_k = 3, 8, 256, 128, 4
+    cache = _make_fp8_block_cache(L, E, H, I, seed=7)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ex = CpuMoeExecutor(
+            cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+            num_threads=4, max_tokens=bs, device=torch.device("cuda"),
+        )
+        hidden = torch.randn(L, bs, H, device="cuda", dtype=torch.bfloat16)
+        ids = torch.zeros(L, bs, top_k, device="cuda", dtype=torch.int32)
+        weights = torch.rand(L, bs, top_k, device="cuda")
+        gpu_out = torch.randn_like(hidden)
+
+        def forward():
+            outputs = []
+            for layer in range(L):
+                pending = ex.decode_submit(layer, hidden[layer], weights[layer], ids[layer])
+                outputs.append(ex.decode_sync(pending, add_to=gpu_out[layer].clone() if accumulate else None))
+            return outputs
+
+        forward()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = forward()
+
+        for step in range(3):
+            torch.manual_seed(101 + step)
+            hidden.copy_(torch.randn(L, bs, H, dtype=torch.bfloat16))
+            new_ids = torch.randint(0, E, (L, bs, top_k), dtype=torch.int32)
+            new_ids[step].fill_(-1)
+            new_ids[(step + 1) % L, :, 0] = -1
+            ids.copy_(new_ids)
+            weights.copy_(torch.rand(L, bs, top_k))
+            gpu_out.copy_(torch.randn(L, bs, H, dtype=torch.bfloat16))
+            # Do not run eager first: it would prefill the shared host IO with this step's data.
+            graph.replay()
+            stream.synchronize()
+            eager = forward()
+            stream.synchronize()
+            for got, expected in zip(captured, eager):
+                torch.testing.assert_close(got, expected, rtol=0, atol=0)
+            skipped = gpu_out[step] if accumulate else torch.zeros_like(gpu_out[step])
+            torch.testing.assert_close(captured[step], skipped, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="requires ROCm")
+@pytest.mark.parametrize("kernel_io", [True, False])
+def test_cpu_fp8_block_graph_replay_and_recapture(monkeypatch, kernel_io):
+    from freetoken.kernel import _cpu_moe
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    if not kernel_io:
+        monkeypatch.setattr(_cpu_moe, "kernel_io_probe", lambda stream: "forced memcpy fallback")
+    L, E, H, I, top_k = 3, 8, 256, 128, 4
+    cache = _make_fp8_block_cache(L, E, H, I, seed=71)
+    ex = CpuMoeExecutor(
+        cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        num_threads=4, max_tokens=3, device=torch.device("cuda"),
+    )
+    assert ex._flag_sync and ex._kernel_io == kernel_io
+    assert ex.graph_capture_safe(torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Reuse the executor after destroying each graph, including a repeated task size.
+        for bs in (1, 3, 1):
+            hidden = torch.empty(L, bs, H, device="cuda", dtype=torch.bfloat16)
+            ids = torch.empty(L, bs, top_k, device="cuda", dtype=torch.int32)
+            weights = torch.empty(L, bs, top_k, device="cuda", dtype=torch.float32)
+
+            def inputs(step):
+                generator = torch.Generator().manual_seed(1700 + step)
+                hidden.copy_(torch.randn(hidden.shape, dtype=hidden.dtype, generator=generator))
+                routes = torch.randint(E, ids.shape, dtype=ids.dtype, generator=generator)
+                routes[step % L].fill_(-1)
+                ids.copy_(routes)
+                weights.copy_(torch.rand(weights.shape, generator=generator))
+
+            def forward():
+                return [ex.decode(layer, hidden[layer], weights[layer], ids[layer]) for layer in range(L)]
+
+            inputs(0)
+            # The memcpy fallback may allocate its publication event inside capture.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = forward()
+            for step in range(1, 11):
+                inputs(step)
+                graph.replay()
+                stream.synchronize()
+                references = forward()
+                stream.synchronize()
+                for actual, expected in zip(outputs, references):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            graph.reset()
+    ex.raise_if_unhealthy()

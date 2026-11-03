@@ -19,8 +19,8 @@ logger = init_logger(__name__)
 
 
 def locked_fetch_wanted(config) -> bool:
-    """Whether locked layers fetch through pinned staging: hybrid, --moe-locked-fetch not 0, CUDA (the copy kernels are untested on ROCm)."""
-    return config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0 and torch.version.hip is None
+    """Whether hybrid layers fetch through pinned staging instead of staying CPU-only."""
+    return config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0
 
 
 def check_locked_fetch_config(config) -> None:
