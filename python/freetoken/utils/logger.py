@@ -4,6 +4,8 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 _LOG_LEVEL = None
+# module-level: init_logger runs again for the same name and rebuilds the logger's methods
+_LOGGED_ONCE: set[tuple] = set()
 
 
 def init_logger(
@@ -110,6 +112,13 @@ def init_logger(
         if tp_info is None or tp_info.is_primary():
             getattr(logger, _which)(msg, *args, **kwargs)
 
+    def _call_once(msg, *args, _which, **kwargs):
+        key = (name, _which, msg, args)
+        if key in _LOGGED_ONCE:
+            return
+        _LOGGED_ONCE.add(key)
+        _call_rank0(msg, *args, _which=_which, **kwargs)
+
     if TYPE_CHECKING:
 
         class WrapperLogger(logging.Logger):
@@ -119,6 +128,10 @@ def init_logger(
             def warning_rank0(self, msg, *args, **kwargs): ...
             def debug_rank0(self, msg, *args, **kwargs): ...
             def critical_rank0(self, msg, *args, **kwargs): ...
+            # rank 0 only, once per distinct (msg, args) in this process; args must hash by value (not exceptions or tensors)
+            def debug_once(self, msg, *args, **kwargs): ...
+            def info_once(self, msg, *args, **kwargs): ...
+            def warning_once(self, msg, *args, **kwargs): ...
 
         return WrapperLogger(name)
     else:
@@ -126,4 +139,7 @@ def init_logger(
         logger.debug_rank0 = partial(_call_rank0, _which="debug")
         logger.critical_rank0 = partial(_call_rank0, _which="critical")
         logger.warning_rank0 = partial(_call_rank0, _which="warning")
+        logger.debug_once = partial(_call_once, _which="debug")
+        logger.info_once = partial(_call_once, _which="info")
+        logger.warning_once = partial(_call_once, _which="warning")
         return logger

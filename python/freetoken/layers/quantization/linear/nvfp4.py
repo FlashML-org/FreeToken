@@ -38,21 +38,16 @@ class TritonNvfp4LinearKernel(LinearKernel):
         return nvfp4_dense_linear_t(x, layer.weight, layer.weight_scale, layer.weight_global, layer.bias)
 
 
-@functools.cache
-def _warn_part_globals() -> None:
-    logger.warning_rank0(
-        "an NVFP4 linear fuses parts whose weight global scales differ by more than %d%%; the W4A4 kernels use the largest "
-        "for every part, which scales the other parts' outputs by their ratio; --quant-backend linear.nvfp4=triton keeps "
-        "each part's global", round((_PART_GLOBAL_WARN_RATIO - 1) * 100),
-    )
-
-
 def _tensor_global(layer: Any) -> torch.Tensor:
     """The one weight global the W4A4 GEMMs and the small-batch kernels take: the largest per-part global, the block scales unchanged."""
     g = layer.weight_global.float()
     g_max = g.max()
     if g_max > _PART_GLOBAL_WARN_RATIO * g.min():
-        _warn_part_globals()
+        logger.warning_once(
+            "an NVFP4 linear fuses parts whose weight global scales differ by more than %d%%; the W4A4 kernels use the largest "
+            "for every part, which scales the other parts' outputs by their ratio; --quant-backend linear.nvfp4=triton keeps "
+            "each part's global", round((_PART_GLOBAL_WARN_RATIO - 1) * 100),
+        )
     return g_max
 
 
