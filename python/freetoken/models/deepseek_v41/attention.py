@@ -144,7 +144,11 @@ class DSV41Attention(BaseOP):
     def publish_prefill(self, x: torch.Tensor, segments: List[PrefillSegment]) -> None:
         """Full mode: compress this layer's input for every segment into the source's main KV and
         index keys. Runs on EVERY new token (under bounded replay the decoder source publishes for
-        the whole prompt even though its attention runs on the prompt's last window only)."""
+        the whole prompt even though its attention runs on the prompt's last window only), except a
+        segment's ``publish_floor``: an encoder bounded replay re-sends the hit's last window, and
+        those groups' global tiers are read as-is -- republishing them would rewrite the shared
+        rows every other reader of the hit already sees. The floor is page-aligned and a page holds
+        whole groups, so no group straddles it."""
         assert self.compressor is not None and self.indexer is not None
         attn, ratio, src = self.attn, self.role.ratio, self.layer_id
         for seg in segments:
@@ -153,6 +157,10 @@ class DSV41Attention(BaseOP):
             if self.compressor.needs_tail_carry(seg.start_pos):
                 tail = int(attn.window_slots_of(seg.table_idx, seg.start_pos - 1, seg.start_pos).item())
             latent, starts = self.compressor.forward_prefill(x[seg.offset : seg.offset + seg.n], seg.start_pos, slots, tail)
+            if seg.publish_floor:
+                keep = starts >= seg.publish_floor
+                if not bool(keep.all()):
+                    latent, starts = latent[keep], starts[keep]
             if not latent.shape[0]:
                 continue
             rows = attn.compressed_rows_of(seg.table_idx, starts, ratio)
