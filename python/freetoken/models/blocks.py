@@ -61,7 +61,7 @@ class FeatureSink(Protocol):
         ...
 
     def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
-        """A layer's output rows; called only for layers in ``wanted_layers``."""
+        """A layer's output rows, ``[T, num_streams*H]`` stream-major; called only for layers in ``wanted_layers``. The forward may overwrite ``x`` afterwards, so copy what is kept."""
         ...
 
 

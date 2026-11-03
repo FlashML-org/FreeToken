@@ -36,10 +36,22 @@ from freetoken.spec import runner as R
 from freetoken.spec.proposer import Proposer
 
 model, out, reference, kwargs = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+TAPS, H = (1, 2), 256
 
 # (uid, output index) -> top-2 token ids and logits of the row that picked it
 top2 = {}
 current = {}
+# the tapped layers' outputs as the sink got them, and as the next layer read them
+taps_got, taps_ref = {}, {}
+taps = {"prefill": 0, "verify": 0, "mismatch": 0, "streams": None, "width": None}
+
+
+def check_taps(batch):
+    if getattr(batch, "features", None) is None:
+        return
+    n, width = batch.input_ids.shape[0], taps["width"]
+    taps["prefill" if batch.is_prefill else "verify"] += 1
+    taps["mismatch"] += sum(not torch.equal(taps_got[i][:n, :width], taps_ref[i][:n, :width]) for i in TAPS)
 
 
 def watch(cls, name):
@@ -47,13 +59,54 @@ def watch(cls, name):
 
     def wrapped(self, batch, *args):
         current["batch"] = batch
-        return original(self, batch, *args)
+        result = original(self, batch, *args)
+        check_taps(batch)
+        return result
 
     setattr(cls, name, wrapped)
 
 
 watch(E.Engine, "forward_batch")
 watch(R.SpecRunner, "verify_step")
+
+
+class RecordingSink:
+    # copies the tapped layers' outputs into persistent buffers, so a captured verify graph writes them too
+    wanted_layers = frozenset(TAPS)
+
+    def final_hidden(self, x):
+        pass
+
+    def layer_output(self, layer_id, x, num_streams=1):
+        taps["streams"], taps["width"] = num_streams, x.shape[1]
+        taps_got[layer_id][: x.shape[0], : x.shape[1]].copy_(x)
+
+
+def tap_next_layer_inputs(model):
+    # the reference for layer i's output is what layer i+1 reads: the residual its fused add forms (qwen3_5), or its input streams (qwen4_exp)
+    layers = model.model.layers.op_list
+    for i in TAPS:
+        taps_got[i] = torch.zeros(4096, 4 * H, dtype=torch.float16, device="cuda")
+        taps_ref[i] = torch.zeros(4096, 4 * H, dtype=torch.float16, device="cuda")
+    if hasattr(layers[0], "input_layernorm"):
+        cls, by_id = type(layers[0].input_layernorm), {id(layers[i + 1].input_layernorm): i for i in TAPS}
+        original = cls.forward
+
+        def wrapped(self, x, residual=None):
+            x, residual = original(self, x, residual)
+            if (i := by_id.get(id(self))) is not None:
+                taps_ref[i][: x.shape[0], : x.shape[1]].copy_(residual)
+            return x, residual
+    else:
+        cls, by_id = type(layers[0]), {id(layers[i + 1]): i for i in TAPS}
+        original = cls.forward
+
+        def wrapped(self, hidden, batch):
+            if (i := by_id.get(id(self))) is not None:
+                taps_ref[i][: hidden.shape[0], : hidden.shape[1]].copy_(hidden)
+            return original(self, hidden, batch)
+
+    cls.forward = wrapped
 
 
 def record(rows, logits):
@@ -111,6 +164,9 @@ class OracleProposer(Proposer):
         super().attach(ctx)
         self.state = ctx.slot_states["oracle_state"]
 
+    def feature_sink(self, batch):
+        return RecordingSink()
+
     def propose(self, reqs, rows, pending):
         drafts = []
         for req in reqs:
@@ -159,7 +215,10 @@ def create_model_with_ple_rows(*args, **kwargs):
             super().__init__(torch.randn(num_rows, head_dim, generator=generator, device="cuda", dtype=dtype))
 
     ple.ZeroTable = RandomTable
-    return create_model(*args, **kwargs)
+    model = create_model(*args, **kwargs)
+    if reference != "-":
+        tap_next_layer_inputs(model)
+    return model
 
 
 E.create_model = create_model_with_ple_rows
@@ -174,7 +233,7 @@ result = {"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, 
 if llm.engine.spec is not None:
     proposer = llm.engine.spec.proposer
     result["oracle"] = {"steps": proposer.steps, "commits": NoopVerify.commits, "state_shape": list(proposer.state.shape),
-                        "num_slots": llm.engine.linear_state_pool.num_slots}
+                        "num_slots": llm.engine.linear_state_pool.num_slots, "taps": taps}
 json.dump(result, open(out, "w"))
 """
 
@@ -254,3 +313,7 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, graphs)
     # the oracle's slot state rode the target's GDN slots, and its handler saw every verify commit
     oracle = spec["oracle"]
     assert oracle["state_shape"] == [oracle["num_slots"], 4] and oracle["commits"] == oracle["steps"] > 0
+    # every prefill and verify forward handed the sink each tapped layer's output, as the next layer read it, as [rows, streams * H]
+    taps = oracle["taps"]
+    assert taps["prefill"] > 0 and taps["verify"] > 0 and taps["mismatch"] == 0
+    assert taps["streams"] == (4 if family == "qwen4_exp" else 1) and taps["width"] == taps["streams"] * 256

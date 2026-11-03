@@ -89,10 +89,16 @@ class Qwen3_5Model(BaseOP):
         self.norm = GemmaPlusOneRMSNormFused(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
+        batch = get_global_ctx().batch
+        x = embed_input_ids(self.embed_tokens, input_ids, batch)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        features = getattr(batch, "features", None)
+        wanted = features.wanted_layers if features is not None else ()
+        for i, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
+            if i in wanted:
+                # the layer's output is the sum the next fused add forms
+                features.layer_output(i, x + residual)
         x, _ = self.norm.forward(x, residual)
         return x
 
