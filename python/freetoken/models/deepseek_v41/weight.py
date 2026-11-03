@@ -182,9 +182,12 @@ def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     loader never reads ``.safetensors`` as weights, so the shard's other tensors ride along unused."""
     import shutil
 
+    from freetoken.models.gguf.reader import gguf_config_source
     from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils import download_hf_weight
 
+    if gguf_config_source(model_path) is not None:
+        raise NotImplementedError(f"{model_path}: an FTW of a DeepSeek-V4.1 GGUF has no Engram table to read; serve the .gguf directly")
     folder = download_hf_weight(model_path)
     args = load_args(folder)
     shard_of = safetensors_weight_map(folder)

@@ -22,6 +22,7 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "flint": "FlintGGUFForCausalLM",
     "deepseek4": "DeepseekV4GGUFForCausalLM",
+    "deepseek41": "DeepseekV41GGUFForCausalLM",
     "gemma4": "Gemma4GGUFForCausalLM",
     "gpt-oss": "GptOssGGUFForCausalLM",
     "glm4moe": "Glm4MoeGGUFForCausalLM",

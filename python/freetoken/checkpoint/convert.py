@@ -219,6 +219,15 @@ def convert_checkpoint(
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
+    # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table); first, since a hook may refuse the checkpoint
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
+    except (AttributeError, KeyError, ValueError):
+        side_hook = None
+    side_files = side_hook(model_path, out_dir) if side_hook is not None else []
+
     dense_bytes = 0
     from freetoken.models.gguf.reader import gguf_config_source
 
@@ -231,15 +240,6 @@ def convert_checkpoint(
         n_weight += 1
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
-
-    # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table)
-    from freetoken.models.register import _load_attr, get_model_spec
-
-    try:
-        side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
-    except (AttributeError, KeyError, ValueError):
-        side_hook = None
-    side_files = side_hook(model_path, out_dir) if side_hook is not None else []
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None

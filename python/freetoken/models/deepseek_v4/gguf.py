@@ -31,10 +31,9 @@ from typing import TYPE_CHECKING, Iterator
 import numpy as np
 import torch
 
-from freetoken.layers.quantization.ggml_types import is_quantized
 from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names, load_gguf_metadata
-from freetoken.models.gguf.tensors import check_scales, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, dequantized_tensor as _float, fused, matrix
 from freetoken.utils import init_logger
 
 from .args import DeepseekV4Args
@@ -397,25 +396,6 @@ def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
 # ----------------------------------------------------------------------------------------------
 # Weights
 # ----------------------------------------------------------------------------------------------
-
-def _float(info: GgufTensorInfo) -> torch.Tensor:
-    """A float tensor in torch order, dequantizing packed ggml rows: dynamic quants quantize
-    tensors the module consumes as floats (the mHC mixers, the compressor gates, the router).
-    Trailing unit dims in ``ne`` are dropped -- some writers ship tensors 4-D (llama.cpp's
-    loaders try that shape first) and a trailing 1 carries no elements."""
-    ne = info.ne
-    while len(ne) > 1 and ne[-1] == 1:
-        ne = ne[:-1]
-    if not is_quantized(info.ggml_type):
-        from freetoken.models.gguf.tensors import float_tensor
-
-        return float_tensor(info).view(*reversed(ne))
-    from freetoken.third_party.gguf import quants
-    from freetoken.third_party.gguf.constants import GGMLQuantizationType
-
-    flat = quants.dequantize(np.array(info.data()), GGMLQuantizationType(info.ggml_type))
-    return torch.from_numpy(flat).view(*reversed(ne))
-
 
 def _tid2eid(info: GgufTensorInfo) -> torch.Tensor:
     """The hash-route table as the module's int64 [vocab, top_k]."""

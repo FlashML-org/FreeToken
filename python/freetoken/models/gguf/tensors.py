@@ -19,6 +19,22 @@ def float_tensor(info: GgufTensorInfo) -> torch.Tensor:
     return torch.from_numpy(np.array(info.data())).view(_FLOAT_DTYPES[info.ggml_type]).view(*reversed(info.ne))
 
 
+def dequantized_tensor(info: GgufTensorInfo) -> torch.Tensor:
+    """A float tensor in torch order, dequantizing packed ggml rows: dynamic quants quantize tensors the module consumes as floats (the mHC mixers, the compressor gates, the router).
+
+    Trailing unit dims in ``ne`` are dropped: some writers ship tensors 4-D (llama.cpp's loaders try that shape first) and a trailing 1 carries no elements."""
+    ne = info.ne
+    while len(ne) > 1 and ne[-1] == 1:
+        ne = ne[:-1]
+    if not is_quantized(info.ggml_type):
+        return float_tensor(info).view(*reversed(ne))
+    from freetoken.third_party.gguf import quants
+    from freetoken.third_party.gguf.constants import GGMLQuantizationType
+
+    flat = quants.dequantize(np.array(info.data()), GGMLQuantizationType(info.ggml_type))
+    return torch.from_numpy(flat).view(*reversed(ne))
+
+
 def packed_rows(info: GgufTensorInfo) -> torch.Tensor:
     """Packed ggml rows ``[rows, row_bytes]`` of a quantized tensor."""
     rows = int(np.prod(info.ne[1:]))
@@ -105,4 +121,4 @@ def fused(prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k
         yield f"{prefix}.ggml_scale", scales
 
 
-__all__ = ["check_scales", "float_tensor", "fused", "matrix", "packed_rows", "table_matrix", "weight_scale"]
+__all__ = ["check_scales", "dequantized_tensor", "float_tensor", "fused", "matrix", "packed_rows", "table_matrix", "weight_scale"]
