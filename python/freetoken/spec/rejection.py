@@ -39,10 +39,9 @@ def sparse_q_rejection(
     """``reject`` for drafts sampled from q: slot j accepts d with probability min(1, p(d)/q(d)) and on a reject samples max(0, p - q); greedy rows and rows whose q is not a distribution take the one-hot result."""
     from freetoken.engine.sample import sampling_module
 
-    out, emitted = reject(logits, drafts, args, sampler)
     p = sampler.probs(logits, args, drafts)
     if p is None:
-        return out, emitted
+        return reject(logits, drafts, args, sampler)
     bs, k = drafts.shape
     p = p.view(bs, k + 1, -1)
     # a NaN or a wrong total in q would reach the target's output through the residual
@@ -52,17 +51,21 @@ def sparse_q_rejection(
     q = torch.where(ok.view(-1, 1, 1), q, torch.zeros_like(q))
     d = drafts.unsqueeze(-1)
     p_d = p[:, :k].gather(2, d).squeeze(-1)
-    q_d = (q * (cand == d)).sum(dim=-1)
+    # a row without a usable q verifies with q one-hot at its draft, which is ``reject``: accept with p(d), else sample p without d; a greedy row's p is one-hot at its argmax
+    q_d = torch.where(ok.view(-1, 1), (q * (cand == d)).sum(dim=-1), 1.0)
     accept = torch.rand_like(p_d) * q_d < p_d
-    emitted_q = accept.to(torch.int64).cumprod(dim=1).sum(dim=1)
-    # the residual max(0, p - q) at every draft slot; the bonus row is p itself
-    resid = p.clone()
-    resid[:, :k].scatter_(2, cand, (p[:, :k].gather(2, cand) - q).clamp_(min=0.0))
+    emitted = accept.to(torch.int64).cumprod(dim=1).sum(dim=1)
     rows = torch.arange(bs, device=p.device)
-    pick = resid[rows, emitted_q]
+    slot = emitted.clamp(max=k - 1)
+    rejected = (emitted < k).view(-1, 1)
+    # the residual max(0, p - q) at the first rejected slot; the bonus row is p itself
+    pick = p[rows, emitted]
+    pick.scatter_add_(1, cand[rows, slot], -q[rows, slot] * rejected)
+    pick.scatter_add_(1, drafts[rows, slot].view(-1, 1), -(rejected & ~ok.view(-1, 1)).float())
+    pick.clamp_(min=0.0)
     total = pick.sum(dim=-1, keepdim=True)
-    pick = torch.where(total > 0, pick / total.clamp_min(1e-30), p[rows, emitted_q])
+    pick = torch.where(total > 0, pick / total.clamp_min(1e-30), p[rows, emitted])
     recovered = sampling_module().sampling_from_probs(pick).to(torch.int64)
-    out_q = torch.cat([drafts, drafts[:, -1:]], dim=1)
-    out_q.scatter_(1, emitted_q.view(-1, 1), recovered.view(-1, 1))
-    return torch.where(ok.view(-1, 1), out_q, out), torch.where(ok, emitted_q, emitted)
+    out = torch.cat([drafts, drafts[:, -1:]], dim=1)
+    out.scatter_(1, emitted.view(-1, 1), recovered.view(-1, 1))
+    return out, emitted
