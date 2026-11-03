@@ -37,7 +37,7 @@ def sparse_q_rejection(
     sampler: Sampler,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``reject`` for drafts sampled from q: slot j accepts d with probability min(1, p(d)/q(d)) and on a reject samples max(0, p - q); greedy rows and rows whose q is not a distribution take the one-hot result."""
-    from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.engine.sample import sampling_module
 
     out, emitted = reject(logits, drafts, args, sampler)
     p = sampler.probs(logits, args, drafts)
@@ -62,11 +62,7 @@ def sparse_q_rejection(
     pick = resid[rows, emitted_q]
     total = pick.sum(dim=-1, keepdim=True)
     pick = torch.where(total > 0, pick / total.clamp_min(1e-30), p[rows, emitted_q])
-    if is_flashinfer_installed():
-        import flashinfer.sampling as sampling
-    else:
-        import freetoken.kernel.triton.sampling as sampling
-    recovered = sampling.sampling_from_probs(pick).to(torch.int64)
+    recovered = sampling_module().sampling_from_probs(pick).to(torch.int64)
     out_q = torch.cat([drafts, drafts[:, -1:]], dim=1)
     out_q.scatter_(1, emitted_q.view(-1, 1), recovered.view(-1, 1))
     return torch.where(ok.view(-1, 1), out_q, out), torch.where(ok, emitted_q, emitted)
