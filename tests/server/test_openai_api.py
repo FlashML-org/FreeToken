@@ -358,8 +358,8 @@ def test_completion_rejects_token_id_prompts():
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("n", [0, 2])
-def test_completion_refuses_n_other_than_one(n, stream):
+@pytest.mark.parametrize("n", [0, 129])
+def test_completion_refuses_n_out_of_range(n, stream):
     state = FakeState([UserReply(uid=42, incremental_output="hello", finished=True)])
     response = run(
         handle_completion(
@@ -409,6 +409,132 @@ def test_completion_forwards_length_finish_reason():
         )
     )
     assert response["choices"][0]["finish_reason"] == "length"
+
+
+class MultiUserState(FakeState):
+    """One reply list per uid, in submission order; logs sends, acks and aborts."""
+
+    def __init__(self, replies_by_uid: dict[int, list[UserReply]]) -> None:
+        super().__init__([])
+        self.replies_by_uid = replies_by_uid
+        self.next_uid = 42
+        self.log: list[tuple[str, int]] = []
+
+    def new_user(self) -> int:
+        self.next_uid += 1
+        return self.next_uid - 1
+
+    async def send_one(self, msg):
+        self.log.append(("send", msg.uid))
+
+    async def wait_for_ack(self, uid: int):
+        for reply in self.replies_by_uid[uid]:
+            await asyncio.sleep(0)  # each engine reply is a separate message, so siblings can run
+            self.log.append(("ack", uid))
+            yield reply
+        await asyncio.Event().wait()  # an unfinished request stays open, as in the engine
+
+    async def abort_user(self, uid: int):
+        self.log.append(("abort", uid))
+
+
+def _reply(uid: int, text: str, finished: bool = True, **kwargs) -> UserReply:
+    return UserReply(uid=uid, incremental_output=text, finished=finished, **kwargs)
+
+
+def test_completion_n_orders_choices_and_counts_prompt_once():
+    usage = {"prompt_tokens_delta": 5, "completion_tokens_delta": 1}
+    state = MultiUserState({
+        42: [_reply(42, "a0", **usage)],
+        43: [_reply(43, "a1", **usage)],
+        44: [_reply(44, "b0", **usage)],
+        45: [_reply(45, "b1", **usage)],
+    })
+    response = run(handle_completion(
+        CompletionRequest(model="m", prompt=["a", "b"], n=2),
+        request=None, state=state, model_sampling={},
+    ))
+
+    assert [(c["index"], c["text"]) for c in response["choices"]] == [
+        (0, "a0"), (1, "a1"), (2, "b0"), (3, "b1"),
+    ]
+    assert response["usage"] == {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+
+
+def test_completion_n_submits_siblings_after_first_sampled_token():
+    # The engine's first reply is the admission notice, sent before the prompt is cached.
+    state = MultiUserState({
+        42: [_reply(42, "", finished=False, prompt_tokens_delta=5),
+             _reply(42, "x", finished=False, completion_tokens_delta=1),
+             _reply(42, "y", completion_tokens_delta=1)],
+        43: [_reply(43, "z", completion_tokens_delta=1)],
+    })
+    run(handle_completion(
+        CompletionRequest(model="m", prompt="p", n=2),
+        request=None, state=state, model_sampling={},
+    ))
+
+    acks_42 = [i for i, entry in enumerate(state.log) if entry == ("ack", 42)]
+    assert state.log.index(("send", 43)) > acks_42[1]
+
+
+def test_completion_n_error_aborts_sibling_choices():
+    state = MultiUserState({
+        42: [_reply(42, "partial", finished=False, completion_tokens_delta=1)],
+        43: [_reply(43, "", error="prompt too long")],
+    })
+
+    async def go():
+        response = await handle_completion(
+            CompletionRequest(model="m", prompt="p", n=2),
+            request=None, state=state, model_sampling={},
+        )
+        await asyncio.sleep(0)  # let the scheduled aborts run
+        return response
+
+    response = run(go())
+    assert response.status_code == 400
+    assert ("abort", 42) in state.log
+
+
+def test_completion_n_choice_zero_error_submits_no_siblings():
+    state = MultiUserState({
+        42: [_reply(42, "", error="prompt too long")],
+        43: [_reply(43, "x", completion_tokens_delta=1)],
+        44: [_reply(44, "y", completion_tokens_delta=1)],
+    })
+    response = run(handle_completion(
+        CompletionRequest(model="m", prompt="p", n=3),
+        request=None, state=state, model_sampling={},
+    ))
+
+    assert response.status_code == 400
+    assert [entry for entry in state.log if entry[0] == "send"] == [("send", 42)]
+
+
+def test_stream_completion_n_tags_chunks_and_finishes_each_choice_once():
+    state = MultiUserState({
+        42: [_reply(42, "a", finished=False, prompt_tokens_delta=5, completion_tokens_delta=1),
+             _reply(42, "b", completion_tokens_delta=1, finish_reason="length")],
+        43: [_reply(43, "c", prompt_tokens_delta=5, completion_tokens_delta=1)],
+    })
+
+    async def collect():
+        response = await handle_completion(
+            CompletionRequest(model="m", prompt="p", n=2, stream=True,
+                              stream_options={"include_usage": True}),
+            request=None, state=state, model_sampling={},
+        )
+        return [chunk async for chunk in response.body_iterator]
+
+    events = parse_sse(run(collect()))
+    assert events[-1] == "[DONE]"
+    choices = [c for e in events[:-1] for c in e["choices"]]
+    text = {i: "".join(c["text"] for c in choices if c["index"] == i) for i in (0, 1)}
+    finishes = [(c["index"], c["finish_reason"]) for c in choices if c["finish_reason"]]
+    assert text == {0: "ab", 1: "c"}
+    assert sorted(finishes) == [(0, "length"), (1, "stop")]
+    assert events[-2]["usage"] == {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
 
 
 def test_omitted_max_tokens_honors_server_default():

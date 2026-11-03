@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import uuid
@@ -9,6 +10,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
@@ -24,6 +26,7 @@ from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    ChoiceFanOut,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -387,6 +390,10 @@ async def stream_chat_completion_chunks(
     yield b"data: [DONE]\n\n"
 
 
+#: OpenAI's own ceiling for ``n``.
+MAX_N = 128
+
+
 async def handle_completion(
     req: CompletionRequest,
     request: Request | None,
@@ -396,8 +403,8 @@ async def handle_completion(
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
-    if req.n != 1:
-        return create_error_response("Only n=1 is supported", param="n")
+    if not 1 <= req.n <= MAX_N:
+        return create_error_response(f"n must be between 1 and {MAX_N}", param="n")
     try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
         default_max_tokens = (
             getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
@@ -406,50 +413,59 @@ async def handle_completion(
     except ValueError as exc:
         return create_error_response(str(exc), param="max_tokens")
 
+    def sampling() -> SamplingParams:
+        return _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
+
     prompts = [req.prompt] if isinstance(req.prompt, str) else req.prompt
     assert isinstance(prompts, list)
     if req.stream:
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
-        uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
-                req, model_sampling, default_max_tokens=default_max_tokens
-            ))
-        )
-        chunks = stream_completion_chunks(uid, req, state)
+        fan_out = _completion_fan_out(req.n, prompts[0], sampling, state)
+        await fan_out.start()
+        chunks = stream_completion_chunks(fan_out, req, state)
         if request is not None:
-            chunks = state.stream_with_cancellation(chunks, request, uid)
-        return StreamingResponse(chunks, media_type="text/event-stream")
+            chunks = state.stream_with_cancellation(chunks, request, fan_out.take_live_uids)
+
+        async def abort_if_never_streamed() -> None:
+            # Choice 0 is already submitted; a body that never starts never reaches cleanup.
+            fan_out.abort_live()
+
+        return StreamingResponse(
+            chunks, media_type="text/event-stream", background=BackgroundTask(abort_if_never_streamed)
+        )
 
     choices: list[dict[str, Any]] = []
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
-    for index, prompt in enumerate(prompts):
-        uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(
-                uid=uid,
-                text=prompt,
-                sampling_params=_resolve_sampling(
-                    req, model_sampling, default_max_tokens=default_max_tokens
-                ),
-            )
+    for prompt_index, prompt in enumerate(prompts):
+        texts = [""] * req.n
+        finish_reasons = ["stop"] * req.n
+        fan_out = _completion_fan_out(req.n, prompt, sampling, state)
+        await fan_out.start()
+        try:
+            async with contextlib.aclosing(fan_out.events()) as events:
+                async for index, ack in events:
+                    # Every choice re-reports the shared prompt; OpenAI counts it once per prompt.
+                    if index == 0:
+                        prompt_tokens += ack.prompt_tokens_delta
+                        cached_tokens += ack.cached_tokens
+                    completion_tokens += ack.completion_tokens_delta
+                    texts[index] += ack.incremental_output
+                    if ack.finished:
+                        finish_reasons[index] = getattr(ack, "finish_reason", None) or "stop"
+        except GenerationError as exc:
+            return create_error_response(str(exc))
+        choices.extend(
+            {
+                "index": prompt_index * req.n + index,
+                "text": text,
+                "finish_reason": finish_reason,
+                "logprobs": None,
+            }
+            for index, (text, finish_reason) in enumerate(zip(texts, finish_reasons))
         )
-        text = ""
-        finish_reason = "stop"
-        async for ack in state.wait_for_ack(uid):
-            if getattr(ack, "error", None):
-                return create_error_response(ack.error)
-            prompt_tokens += ack.prompt_tokens_delta
-            completion_tokens += ack.completion_tokens_delta
-            cached_tokens += ack.cached_tokens
-            text += ack.incremental_output
-            if ack.finished:
-                finish_reason = getattr(ack, "finish_reason", None) or "stop"
-                break
-        choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex}",
@@ -461,61 +477,70 @@ async def handle_completion(
     }
 
 
-async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any) -> AsyncIterator[bytes]:
-    prompt_tokens = 0
-    completion_tokens = 0
-    cached_tokens = 0
-    finish_reason = "stop"
-    async for ack in state.wait_for_ack(uid):
-        if getattr(ack, "error", None):
-            yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
-            yield b"data: [DONE]\n\n"
-            return
-        prompt_tokens += ack.prompt_tokens_delta
-        completion_tokens += ack.completion_tokens_delta
-        cached_tokens += ack.cached_tokens
-        if ack.incremental_output:
-            yield _sse(
-                {
-                    "id": f"cmpl-{uid}",
-                    "object": "text_completion.chunk",
-                    "created": int(time.time()),
-                    "model": req.model,
-                    "choices": [
-                        {
-                            "text": ack.incremental_output,
-                            "index": 0,
-                            "finish_reason": None,
-                            "logprobs": None,
-                        }
-                    ],
-                }
-            )
-        if ack.finished:
-            finish_reason = getattr(ack, "finish_reason", None) or "stop"
-            break
+def _completion_fan_out(
+    n: int, prompt: str, sampling: Callable[[], SamplingParams], state: Any
+) -> ChoiceFanOut:
+    async def submit(uid: int) -> None:
+        await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=sampling()))
 
-    yield _sse(
-        {
-            "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
-            "created": int(time.time()),
-            "model": req.model,
-            "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
-        }
-    )
-    if req.stream_options and req.stream_options.include_usage:
-        yield _sse(
+    async def consume(uid: int) -> AsyncIterator[Any]:
+        async for ack in state.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                raise GenerationError(ack.error)
+            yield ack
+            if ack.finished:
+                return
+
+    def releases_siblings(ack: Any) -> bool:
+        # The first reply only reports admission; the prompt is cached by the first sampled token.
+        return ack.finished or ack.completion_tokens_delta > 0
+
+    return ChoiceFanOut(n, state, submit, consume, releases_siblings)
+
+
+async def stream_completion_chunks(
+    fan_out: ChoiceFanOut, req: CompletionRequest, state: Any
+) -> AsyncIterator[bytes]:
+    completion_id = f"cmpl-{uuid.uuid4().hex}"
+
+    def chunk(choices: list[dict[str, Any]], **extra: Any) -> bytes:
+        return _sse(
             {
-                "id": f"cmpl-{uid}",
+                "id": completion_id,
                 "object": "text_completion.chunk",
                 "created": int(time.time()),
                 "model": req.model,
-                "choices": [],
-                "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
-                ),
+                "choices": choices,
+                **extra,
             }
+        )
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    cached_tokens = 0
+    try:
+        async with contextlib.aclosing(fan_out.events()) as events:
+            async for index, ack in events:
+                if index == 0:
+                    prompt_tokens += ack.prompt_tokens_delta
+                    cached_tokens += ack.cached_tokens
+                completion_tokens += ack.completion_tokens_delta
+                if ack.incremental_output:
+                    yield chunk(
+                        [{"text": ack.incremental_output, "index": index, "finish_reason": None, "logprobs": None}]
+                    )
+                if ack.finished:
+                    finish_reason = getattr(ack, "finish_reason", None) or "stop"
+                    yield chunk([{"text": "", "index": index, "finish_reason": finish_reason, "logprobs": None}])
+    except GenerationError as exc:
+        yield _sse({"error": {"message": str(exc), "type": "invalid_request_error", "code": None}})
+        yield b"data: [DONE]\n\n"
+        return
+
+    if req.stream_options and req.stream_options.include_usage:
+        yield chunk(
+            [],
+            usage=_usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)),
         )
     yield b"data: [DONE]\n\n"
 
