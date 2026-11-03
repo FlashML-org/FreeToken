@@ -94,10 +94,13 @@ def test_q4_matrix_matches_cpu(dtype, batch):
 @pytest.mark.parametrize("batch", [1, 4, 17])
 @pytest.mark.parametrize("per_route_x", [False, True])
 @pytest.mark.parametrize("inactive", [False, True])
-def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive):
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive, duplicate):
     w, ref = _q4_weights((4, 64, 256))
     x = _activation((batch, 2, 256) if per_route_x else (batch, 256), dtype)
     ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
+    if duplicate:
+        ids[:, 1] = ids[:, 0]
     if inactive:  # hybrid decode hands the GPU the CPU's routes as id -1: zero rows, no expert read
         ids[::2, 0] = -1
     actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids, inactive=inactive)
@@ -109,7 +112,8 @@ def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch", [1, 17, 300])
-def test_iq1_m_matrix_and_moe_routes_match_cpu(dtype, batch):
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_iq1_m_matrix_and_moe_routes_match_cpu(dtype, batch, duplicate):
     # llama.cpp has no IQ1_M MMQ: above the vector kernel's batch this runs FreeToken's IQ1_M tile loader
     exact_sums = dtype != torch.float32
     w, ref = _iq1_m_weights((64, 512), exact_sums)
@@ -118,6 +122,8 @@ def test_iq1_m_matrix_and_moe_routes_match_cpu(dtype, batch):
     torch.testing.assert_close(actual.cpu(), F.linear(x.cpu().float(), ref).to(dtype), atol=2e-4, rtol=1e-3)
     w, ref = _iq1_m_weights((4, 64, 512), exact_sums)
     ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
+    if duplicate:
+        ids[:, 1] = ids[:, 0]
     actual = ggml.mul_mat_id(w, int(QType.IQ1_M), x, ids)
     expected = torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.cpu().long()]).to(dtype)
     torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
