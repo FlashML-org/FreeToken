@@ -118,6 +118,26 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
 
 
+def test_terminal_replies_carry_scheduler_timings_over_the_wire():
+    timings = {"queue_ms": 5.5, "cache_n": 8, "prompt_n": 2, "prompt_ms": 100.0,
+               "predicted_n": 4, "predicted_ms": 250.0, "draft_n": 6, "draft_n_accepted": 3}
+    msg = DetokenizeMsg(uid=3, next_tokens=[42], finished=True, timings=timings)
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(decoded, DetokenizeMsg)
+    assert decoded.timings == timings
+
+    reply = UserReply(uid=3, incremental_output="", finished=True,
+                      completion_tokens_delta=1, timings=timings)
+    out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert isinstance(out, UserReply)
+    assert out.timings == timings
+    # intermediate replies and aborts/errors never carry timings
+    plain = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(
+        UserReply(uid=3, incremental_output="x", finished=False)
+    ))
+    assert plain.timings is None
+
+
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
     """Tool JSON Schemas and chat_template_kwargs are free-form client data. A field literally
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --

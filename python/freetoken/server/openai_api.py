@@ -37,6 +37,7 @@ from .generation import (
     prerender_error,
     render_messages,
     resolve_sampling,
+    timings_block,
     submit_generation,
 )
 
@@ -219,7 +220,7 @@ async def handle_chat_completion(
     if result.tool_calls:
         message["tool_calls"] = _tool_calls_to_openai(result.tool_calls)
 
-    return {
+    response: dict[str, Any] = {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -237,6 +238,9 @@ async def handle_chat_completion(
             _reported_cached(state, result.cached_tokens),
         ),
     }
+    if (timings := timings_block(state, result.timings)) is not None:
+        response["timings"] = timings
+    return response
 
 
 async def stream_chat_completion_chunks(
@@ -259,6 +263,10 @@ async def stream_chat_completion_chunks(
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    timings: dict[str, Any] | None = None
+    # timings ride the stream's LAST chunk only: the usage chunk when the client asked
+    # for one, otherwise the finish chunk
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions")
@@ -368,21 +376,26 @@ async def stream_chat_completion_chunks(
             prompt_tokens = ev.prompt_tokens
             completion_tokens = ev.completion_tokens
             cached_tokens = ev.cached_tokens
-            yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}]))
+            timings = ev.timings
+            done = _chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}])
+            if not include_usage and (t := timings_block(state, timings)) is not None:
+                done["timings"] = t
+            yield _sse(done)
 
-    if req.stream_options and req.stream_options.include_usage:
-        yield _sse(
-            {
-                "id": f"chatcmpl-{uid}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model,
-                "choices": [],
-                "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
-                ),
-            }
-        )
+    if include_usage:
+        final: dict[str, Any] = {
+            "id": f"chatcmpl-{uid}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [],
+            "usage": _usage(
+                prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
+            ),
+        }
+        if (t := timings_block(state, timings)) is not None:
+            final["timings"] = t
+        yield _sse(final)
 
     yield b"data: [DONE]\n\n"
 
@@ -426,6 +439,10 @@ async def handle_completion(
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    # with several prompts the timings are the FIRST prompt's own spans, as llama.cpp
+    # returns arr[0]; one clock across the sequential loop would mix the later prompts'
+    # queue and prefill into the rates
+    first_timings: dict[str, Any] | None = None
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
         await state.send_one(
@@ -447,11 +464,13 @@ async def handle_completion(
             cached_tokens += ack.cached_tokens
             text += ack.incremental_output
             if ack.finished:
+                if index == 0:
+                    first_timings = getattr(ack, "timings", None)
                 finish_reason = getattr(ack, "finish_reason", None) or "stop"
                 break
         choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
 
-    return {
+    response: dict[str, Any] = {
         "id": f"cmpl-{uuid.uuid4().hex}",
         "object": "text_completion",
         "created": int(time.time()),
@@ -459,12 +478,17 @@ async def handle_completion(
         "choices": choices,
         "usage": _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)),
     }
+    if (timings := timings_block(state, first_timings)) is not None:
+        response["timings"] = timings
+    return response
 
 
 async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any) -> AsyncIterator[bytes]:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    timings: dict[str, Any] | None = None
+    include_usage = bool(req.stream_options and req.stream_options.include_usage)
     finish_reason = "stop"
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
@@ -474,6 +498,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
         if ack.incremental_output:
             yield _sse(
                 {
@@ -495,28 +521,32 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
             finish_reason = getattr(ack, "finish_reason", None) or "stop"
             break
 
-    yield _sse(
-        {
+    done_chunk: dict[str, Any] = {
+        "id": f"cmpl-{uid}",
+        "object": "text_completion.chunk",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
+    }
+    if not include_usage and (t := timings_block(state, timings)) is not None:
+        # as on the chat stream: the finish chunk is the last one only when no usage
+        # chunk follows
+        done_chunk["timings"] = t
+    yield _sse(done_chunk)
+    if include_usage:
+        final: dict[str, Any] = {
             "id": f"cmpl-{uid}",
             "object": "text_completion.chunk",
             "created": int(time.time()),
             "model": req.model,
-            "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
+            "choices": [],
+            "usage": _usage(
+                prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
+            ),
         }
-    )
-    if req.stream_options and req.stream_options.include_usage:
-        yield _sse(
-            {
-                "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
-                "created": int(time.time()),
-                "model": req.model,
-                "choices": [],
-                "usage": _usage(
-                    prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
-                ),
-            }
-        )
+        if (t := timings_block(state, timings)) is not None:
+            final["timings"] = t
+        yield _sse(final)
     yield b"data: [DONE]\n\n"
 
 

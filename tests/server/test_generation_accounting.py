@@ -24,6 +24,7 @@ from freetoken.server.generation import (  # noqa: E402
     GenSpec,
     generate_events,
     generate_full,
+    timings_block,
 )
 
 
@@ -63,7 +64,10 @@ class FakeState:
             yield reply
 
 
-def _ack(prompt: int = 0, completion: int = 0, out: str = "", finished: bool = False) -> UserReply:
+def _ack(
+    prompt: int = 0, completion: int = 0, out: str = "", finished: bool = False,
+    timings: dict | None = None,
+) -> UserReply:
     return UserReply(
         uid=42,
         incremental_output=out,
@@ -71,7 +75,20 @@ def _ack(prompt: int = 0, completion: int = 0, out: str = "", finished: bool = F
         prompt_tokens_delta=prompt,
         completion_tokens_delta=completion,
         finish_reason="stop" if finished else None,
+        timings=timings,
     )
+
+
+def _sched_timings(**over) -> dict:
+    """A scheduler ReqStats.finish payload: raw spans and counts, no derived rates."""
+    t = dict(queue_ms=0.0, cache_n=0, prompt_n=0, prompt_ms=0.0, predicted_n=0,
+             predicted_ms=0.0, draft_n=0, draft_n_accepted=0)
+    t.update(over)
+    return t
+
+
+def _timings_state() -> SimpleNamespace:
+    return SimpleNamespace(config=SimpleNamespace(enable_timings_report=True))
 
 
 def _spec() -> GenSpec:
@@ -206,3 +223,69 @@ def test_ttft_mean_is_zero_without_samples():
     request_ring.reset()
     request_ring.record_request(_row(ttft_ms=None))
     assert request_ring.requests_ttft_mean_ms() == 0
+
+
+def test_timings_block_follows_llama_cpp_semantics():
+    t = timings_block(_timings_state(), _sched_timings(
+        queue_ms=500.0, cache_n=800, prompt_n=200, prompt_ms=2500.0,
+        predicted_n=21, predicted_ms=2000.0,
+    ))
+    # prompt_n excludes the cache; decode steps are n - 1 (llama.cpp semantics).
+    assert t["cache_n"] == 800
+    assert t["prompt_n"] == 200
+    assert t["prompt_per_second"] == 80.0  # 200 evaluated tokens / 2.5 s
+    assert t["predicted_n"] == 21
+    assert t["predicted_per_second"] == 10.0  # 20 decode steps / 2.0 s
+    assert t["prompt_ms"] == 2500.0 and t["predicted_ms"] == 2000.0
+    assert t["queue_ms"] == 500.0  # FreeToken extension
+    assert "draft_n" not in t and "draft_n_accepted" not in t  # no drafting
+
+
+def test_timings_block_is_opt_in_and_needs_measured_spans():
+    raw = _sched_timings(prompt_n=10, prompt_ms=100.0, predicted_n=2, predicted_ms=50.0)
+    # off without the flag: usage.prompt_tokens - prompt_n would still leak the cache hit
+    assert timings_block(SimpleNamespace(config=SimpleNamespace()), raw) is None
+    # the responses helpers may pass no state at all
+    assert timings_block(None, raw) is None
+    # errors and aborts deliver no scheduler timings
+    assert timings_block(_timings_state(), None) is None
+
+
+def test_timings_block_rates_survive_the_edge_shapes():
+    state = _timings_state()
+    # one output token: the first rides the last prompt batch, so no decode steps
+    t = timings_block(state, _sched_timings(prompt_n=10, prompt_ms=100.0, predicted_n=1, predicted_ms=0.001))
+    assert t["predicted_per_second"] == 0.0 and t["predicted_per_token_ms"] == 0.0
+    # fully cached prompt: nothing was evaluated
+    t = timings_block(state, _sched_timings(prompt_n=0, prompt_ms=100.0, predicted_n=2, predicted_ms=50.0))
+    assert t["prompt_per_second"] == 0.0 and t["prompt_per_token_ms"] == 0.0
+    # values are passed through unrounded
+    t = timings_block(state, _sched_timings(prompt_n=3, prompt_ms=1234.5678, predicted_n=2, predicted_ms=50.0))
+    assert t["prompt_ms"] == 1234.5678 and t["prompt_per_token_ms"] == 1234.5678 / 3
+    # speculative decoding adds the draft counters, and only then
+    t = timings_block(state, _sched_timings(prompt_n=3, prompt_ms=300.0, predicted_n=5,
+                                            predicted_ms=400.0, draft_n=64, draft_n_accepted=40))
+    assert t["draft_n"] == 64 and t["draft_n_accepted"] == 40
+
+
+def test_gen_done_and_result_carry_the_scheduler_timings():
+    raw = _sched_timings(queue_ms=5.0, prompt_n=7, prompt_ms=70.0, predicted_n=5, predicted_ms=80.0)
+    st = FakeState([
+        _ack(prompt=7, completion=1, out="x"),
+        _ack(completion=4, out="yz", finished=True, timings=raw),
+    ])
+
+    async def drain():
+        done = None
+        async for ev in generate_events(42, _spec(), st):
+            if isinstance(ev, GenDone):
+                done = ev
+        return done
+
+    done = asyncio.run(drain())
+    assert done.timings is raw  # the terminal ack's scheduler spans, unchanged
+
+    result = asyncio.run(generate_full(42, _spec(), FakeState(
+        [_ack(prompt=5, completion=1, out="a"), _ack(completion=2, out="bc", finished=True, timings=raw)]
+    )))
+    assert result.timings is raw

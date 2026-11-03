@@ -116,7 +116,22 @@ Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+
+With `--enable-timings-report` every chat completion, completion and Responses response
+also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
+`prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+`predicted_per_token_ms`, `predicted_per_second`, plus `queue_ms` as a FreeToken
+extension and `draft_n` / `draft_n_accepted` under speculative decoding), so frontends
+like llama-swap and Open Web UI show per-request prefill/decode rates. All spans are
+measured in the scheduler: `queue_ms` covers admission to the first prefill chunk,
+`prompt_ms` the first chunk to the first sampled token (chunk gaps included),
+`predicted_ms` the first to the last committed token; `prompt_n` counts only the
+evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
+streams the object rides the final chunk; a multi-prompt `/v1/completions` request
+reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
+(llama.cpp emits no timings there either).
 
 ### Image input
 
