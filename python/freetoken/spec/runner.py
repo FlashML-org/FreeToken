@@ -10,7 +10,7 @@ from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecForwardOutput
 
 from .proposer import DraftContext, Proposer
-from .rejection import reject
+from .rejection import reject, sparse_q_rejection
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
@@ -92,7 +92,11 @@ class SpecRunner:
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
         batch.features = self.feature_sink(batch)
         logits = engine.forward_logits(batch)[: bs * width]
-        out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+        proposal = self._proposal
+        if proposal.q is not None:
+            out, emitted = sparse_q_rejection(logits, drafts, proposal.cand, proposal.q, sample_args, engine.sampler)
+        else:
+            out, emitted = reject(logits, drafts, sample_args, engine.sampler)
         host = self._host[:bs]
         host.copy_(torch.cat([out, emitted.unsqueeze(1)], dim=1), non_blocking=True)
         copy_done = torch.cuda.Event()

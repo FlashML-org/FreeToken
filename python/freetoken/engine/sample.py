@@ -145,6 +145,33 @@ class Sampler:
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
         return tokens
 
+    def probs(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor | None:
+        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, as the fused samplers apply them), penalized like sample_verify; None when every request is greedy."""
+        if args.temperatures is None:
+            return None
+        from freetoken.kernel.backend import is_flashinfer_installed
+
+        if is_flashinfer_installed():
+            import flashinfer.sampling as sampling
+        else:
+            import freetoken.kernel.triton.sampling as sampling
+
+        width = drafts.shape[1] + 1
+        if args.penalties:
+            logits = self._penalize_rows(logits, args, drafts)
+        probs = sampling.softmax(logits.float(), args.temperatures.repeat_interleave(width), enable_pdl=is_sm90_supported())
+        renormed = False
+        if args.top_k is not None:
+            probs = sampling.top_k_renorm_probs(probs, args.top_k.repeat_interleave(width))
+            renormed = True
+        if args.top_p is not None:
+            probs = sampling.top_p_renorm_probs(probs, args.top_p.repeat_interleave(width))
+            renormed = True
+        if renormed:
+            # the triton renorm leaves the kept mass unscaled; rejection sampling needs a true distribution
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs
+
     def _penalize_rows(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor:
         k = drafts.shape[1]
         width = k + 1
