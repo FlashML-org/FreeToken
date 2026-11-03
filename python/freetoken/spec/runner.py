@@ -15,6 +15,7 @@ from .rejection import reject
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.engine.sample import BatchSamplingArgs
+    from freetoken.engine.spec_protocol import SpecProposal
     from freetoken.models.blocks import FeatureSink
 
 
@@ -36,6 +37,8 @@ class SpecRunner:
         self.proposer = proposer_class(config)(config, engine.model)
         self.radix_lookahead = self.proposer.radix_lookahead
         self.engine = None
+        # the step's drafts, from propose_into to the verify_step of the same batch
+        self._proposal: SpecProposal | None = None
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
@@ -77,9 +80,10 @@ class SpecRunner:
     def propose_into(self, reqs: List[Req], token_pool: torch.Tensor) -> None:
         """Draft k tokens per request into token_pool after its pending token at cached_len."""
         rows = make_device_tensor([r.table_idx for r in reqs], torch.int64, self.device)
-        drafts = self.proposer.propose(reqs, rows)
-        cols = make_device_tensor([r.cached_len for r in reqs], torch.int64, self.device).unsqueeze(1)
-        token_pool[rows.unsqueeze(1), cols + 1 + torch.arange(self.k, device=self.device)] = drafts.to(token_pool.dtype)
+        cols = make_device_tensor([r.cached_len for r in reqs], torch.int64, self.device)
+        self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
+        cols = cols.unsqueeze(1) + 1 + torch.arange(self.k, device=self.device)
+        token_pool[rows.unsqueeze(1), cols] = self._proposal.tokens.to(token_pool.dtype)
 
     def verify_step(self, batch: Batch, sample_args: BatchSamplingArgs) -> SpecForwardOutput:
         engine = self.engine

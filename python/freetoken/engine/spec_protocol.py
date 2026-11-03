@@ -14,6 +14,14 @@ if TYPE_CHECKING:
 SPEC_RUNNER = "freetoken.spec.runner:SpecRunner"
 
 
+class SpecProposal(NamedTuple):
+    """One step's drafts; ``cand``/``q`` carry the draft distribution of each slot when the drafts were sampled, None when they are argmaxes."""
+
+    tokens: torch.Tensor                 # [bs, k] int64 target-vocab ids
+    cand: torch.Tensor | None = None     # [bs, k, K] the support of q
+    q: torch.Tensor | None = None        # [bs, k, K] fp32, each slot's q over cand
+
+
 class SpecForwardOutput(NamedTuple):
     """Drop-in for ForwardOutput at the drain: row i committed ``next_tokens[i, : emitted[i] + 1]``."""
 

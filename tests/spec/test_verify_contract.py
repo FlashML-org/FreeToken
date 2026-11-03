@@ -27,6 +27,7 @@ _SCRIPT = """
 import json, os, sys, torch
 from freetoken.core import SamplingParams
 from freetoken.engine import engine as E, sample as S
+from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.llm import LLM
 from freetoken.scheduler.prefill import ChunkedReq
 from freetoken.spec import PROPOSERS
@@ -86,7 +87,7 @@ class OracleProposer(Proposer):
         self.reference = json.load(open(reference))
         self.steps = 0
 
-    def propose(self, reqs, rows):
+    def propose(self, reqs, rows, pending):
         drafts = []
         for req in reqs:
             done = req.cached_len - req.prompt_len  # outputs committed before the pending token at cached_len
@@ -97,7 +98,7 @@ class OracleProposer(Proposer):
                 want[wrong] = (want[wrong] + 1) % 1000
             drafts.append(want)
         self.steps += 1
-        return torch.tensor(drafts, dtype=torch.int64, device=rows.device)
+        return SpecProposal(torch.tensor(drafts, dtype=torch.int64, device=rows.device))
 
 
 def fan_in_scaled(tensor):

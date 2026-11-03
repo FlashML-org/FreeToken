@@ -10,6 +10,7 @@ import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
+from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.models.blocks import embed_input_ids
 from freetoken.spec.proposer import DraftContext, Proposer
 from freetoken.spec.mtp.relay import HiddenRelay
@@ -282,10 +283,10 @@ class MTPProposer(Proposer):
         if self.k > 1 and ChainGraphs.supports(self.chain_backend):
             self.chain_graphs = ChainGraphs(self, bs_list, self.extend_graphs.graph_pool)
 
-    def propose(self, reqs: List[Req], rows: torch.Tensor) -> torch.Tensor:
+    def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
         cs = [r.cached_len for r in reqs]
         if self.chain_graphs is not None and (drafts := self.chain_graphs.replay(reqs, cs)) is not None:
-            return drafts
+            return SpecProposal(drafts)
         token = self.relay.d1[rows]
         hidden = self.relay.hidden[rows]
         drafts = [token]
@@ -296,7 +297,7 @@ class MTPProposer(Proposer):
             hidden = self._forward(batch, self.chain_backend, self.draft.embed_tokens.forward(token), hidden)
             token = self._draft_token(hidden)
             drafts.append(token)
-        return torch.stack(drafts, dim=1)
+        return SpecProposal(torch.stack(drafts, dim=1))
 
     def feature_sink(self, batch: Batch) -> _PrefillSink | _VerifySink:
         if batch.phase == "verify":

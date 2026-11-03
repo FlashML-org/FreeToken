@@ -8,6 +8,7 @@ import torch
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
+    from freetoken.engine.spec_protocol import SpecProposal
     from freetoken.models.blocks import FeatureSink
 
 
@@ -56,8 +57,8 @@ class Proposer:
         """Free draft graphs and drop the context before a rebuild swaps the pools; draft KV on the target's slots goes too unless keep_kv says the target KV pool stays."""
         self.ctx = None
 
-    def propose(self, reqs: List[Req], rows: torch.Tensor) -> torch.Tensor:
-        """[bs, k] target-vocab drafts after each request's pending token; ``rows`` holds the requests' table_idx on the device."""
+    def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
+        """k drafts per request after its pending token; ``rows`` holds the requests' table_idx and ``pending`` their pending tokens, on the device."""
         raise NotImplementedError
 
     def feature_sink(self, batch: Batch) -> FeatureSink | None:
