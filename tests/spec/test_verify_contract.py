@@ -29,6 +29,7 @@ from freetoken.core import SamplingParams
 from freetoken.engine import engine as E, sample as S
 from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.llm import LLM
+from freetoken.models.config import SlotStateSpec
 from freetoken.scheduler.prefill import ChunkedReq
 from freetoken.spec import PROPOSERS
 from freetoken.spec import runner as R
@@ -78,14 +79,37 @@ S.Sampler.sample_verify = lambda self, logits, args, drafts: (
     record(verify_rows(current["batch"], drafts.shape[1] + 1), logits), sample_verify(self, logits, args, drafts))[1]
 
 
+class NoopVerify:
+    # verify handler of the oracle's slot state: counts the commits it is handed
+    commits = 0
+
+    def __init__(self, spec, max_bs, rows_per_req, device, dtype):
+        pass
+
+    @staticmethod
+    def nbytes(spec, max_bs, rows_per_req, dtype):
+        return 0
+
+    def commit(self, pool, slots, counts):
+        NoopVerify.commits += 1
+
+
 class OracleProposer(Proposer):
     default_k = 3
     max_k = 8
+
+    @classmethod
+    def slot_states(cls, config):
+        return (SlotStateSpec(name="oracle_state", shape=(4,), verify=NoopVerify),)
 
     def __init__(self, config, target_model):
         super().__init__(config, target_model)
         self.reference = json.load(open(reference))
         self.steps = 0
+
+    def attach(self, ctx):
+        super().attach(ctx)
+        self.state = ctx.slot_states["oracle_state"]
 
     def propose(self, reqs, rows, pending):
         drafts = []
@@ -146,7 +170,12 @@ prompts = [llm.tokenizer.encode(p) for p in ("The capital of France is", "1, 2, 
 params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True, presence_penalty=p, frequency_penalty=p)
           for n, p in ((48, 0.0), (37, 0.6), (41, 0.0))]
 res = llm.generate(prompts, params)
-json.dump({"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()]}, open(out, "w"))
+result = {"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()]}
+if llm.engine.spec is not None:
+    proposer = llm.engine.spec.proposer
+    result["oracle"] = {"steps": proposer.steps, "commits": NoopVerify.commits, "state_shape": list(proposer.state.shape),
+                        "num_slots": llm.engine.linear_state_pool.num_slots}
+json.dump(result, open(out, "w"))
 """
 
 
@@ -222,3 +251,6 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, graphs)
                 assert {a, b} == pair and va - vb <= 2 * ulp, f"request {uid} parts at {split}: top-2 {(a, b)} gap {va - vb}"
     # most of the run must still be compared, or a tie early in every request would hide a bug
     assert agreed >= 0.5 * sum(map(len, reference["outputs"]))
+    # the oracle's slot state rode the target's GDN slots, and its handler saw every verify commit
+    oracle = spec["oracle"]
+    assert oracle["state_shape"] == [oracle["num_slots"], 4] and oracle["commits"] == oracle["steps"] > 0

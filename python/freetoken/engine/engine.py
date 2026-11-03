@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import dataclasses
 import errno
 import gc
 import math
@@ -215,7 +216,11 @@ def _spec_runner():
 
 def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
     """Resolve k and the method's own limits, then check what every speculative method needs of the target."""
-    _spec_runner().adjust_config(config, override)
+    runner = _spec_runner()
+    runner.adjust_config(config, override)
+    if extra := runner.slot_states(config):
+        # before the state pool is sized and built, which read model_config.slot_states
+        override("model_config", dataclasses.replace(config.model_config, slot_states=config.model_config.slot_states + extra))
     if windowed_kv:
         raise ValueError(
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
@@ -2023,6 +2028,8 @@ def _adjust_config(config: EngineConfig):
     _validate_attention_backend_choice(config, override, required_attn_types)
     if getattr(config, "speculative_algorithm", None) is not None:
         _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
+        # a proposer with slot states replaced model_config; the MoE fields below must land on the new one
+        model_config = config.model_config
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

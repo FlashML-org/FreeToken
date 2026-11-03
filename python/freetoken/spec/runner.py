@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from freetoken.engine.sample import BatchSamplingArgs
     from freetoken.engine.spec_protocol import SpecProposal
     from freetoken.models.blocks import FeatureSink
+    from freetoken.models.config import SlotStateSpec
 
 
 def proposer_class(config) -> type[Proposer]:
@@ -56,13 +57,19 @@ class SpecRunner:
     def budget(cls, config) -> tuple[int, int]:
         return proposer_class(config).budget(config)
 
+    @classmethod
+    def slot_states(cls, config) -> tuple[SlotStateSpec, ...]:
+        return proposer_class(config).slot_states(config)
+
     def attach(self, engine) -> None:
         """Second construction phase, after the pools and before graph capture."""
         self.engine = engine
         self._host = torch.zeros(self.config.max_running_req + 1, self.k + 2, dtype=torch.int64, pin_memory=True)
+        pool = engine.linear_state_pool
+        states = {s.name: pool.slot_state(s.name) for s in self.proposer.slot_states(self.config)} if pool is not None else {}
         self.proposer.attach(DraftContext(
             page_table=engine.page_table, num_pages=engine.num_pages, device=engine.device,
-            stream=engine.stream, dummy_req=engine.dummy_req,
+            stream=engine.stream, dummy_req=engine.dummy_req, slot_states=states,
         ))
 
     def detach(self, *, keep_kv: bool) -> None:

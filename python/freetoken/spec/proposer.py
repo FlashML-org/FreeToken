@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.engine.spec_protocol import SpecProposal
     from freetoken.models.blocks import FeatureSink
+    from freetoken.models.config import SlotStateSpec
 
 
 class DraftContext(NamedTuple):
@@ -21,6 +22,8 @@ class DraftContext(NamedTuple):
     stream: torch.cuda.Stream
     # the engine's padding request: its table row points at the dummy page
     dummy_req: Req
+    # the tensors of the proposer's slot_states, ``[num_slots, *shape]`` each, on the target's GDN slots
+    slot_states: dict[str, torch.Tensor]
 
 
 class Proposer:
@@ -44,6 +47,11 @@ class Proposer:
     def budget(cls, config) -> tuple[int, int]:
         """(fixed bytes, draft KV bytes per target KV token), from the config alone."""
         return 0, 0
+
+    @classmethod
+    def slot_states(cls, config) -> tuple[SlotStateSpec, ...]:
+        """Per-request draft state that rides the target's GDN slots, snapshot and restored with them; from the config alone."""
+        return ()
 
     def __init__(self, config, target_model) -> None:
         self.config = config
