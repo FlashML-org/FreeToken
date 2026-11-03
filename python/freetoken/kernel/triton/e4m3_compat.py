@@ -160,3 +160,17 @@ def f32_to_e4m3(x):
     h = tl.inline_asm_elementwise(
         "cvt.rn.satfinite.e4m3x2.f32 $0, 0f00000000, $1;", "=h,r", [x], dtype=tl.uint16, is_pure=True, pack=1)
     return h.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+
+KV_TILE_SCALE = tl.constexpr(256.0)
+
+
+@jit
+def kv_load_e4m3_tile_f32(ptrs, mask):
+    return e4m3_u8_to_f32(tl.load(ptrs, mask=mask, other=0))
+
+
+@jit
+def kv_load_e4m3_tile_scaled16(ptrs, mask):
+    """Decode codes divided by 256; fold that factor into the row scales."""
+    w = tl.load(ptrs, mask=mask, other=0).to(tl.uint16)
+    return ((w + (w & 0x80)) << 7).to(tl.float16, bitcast=True)

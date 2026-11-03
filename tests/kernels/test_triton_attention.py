@@ -116,6 +116,12 @@ def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
 
     class FakeKVCache:
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
+
         def __init__(self):
             self.device = torch.device("cpu")
             self.k = torch.zeros(4, 1, 4)
@@ -775,6 +781,12 @@ def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
     from freetoken.attention.triton import TritonAttentionBackend
 
     class FakeKVCache:
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
+
         def __init__(self, device: torch.device, head_dim: int):
             self.device = device
             self.dtype = torch.float32
@@ -845,6 +857,12 @@ def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(mon
     from freetoken.attention.triton import TritonAttentionBackend
 
     class FakeKVCache:
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
+
         def __init__(self, device: torch.device, head_dim: int):
             self.device = device
             self.dtype = torch.bfloat16
@@ -895,6 +913,12 @@ def test_triton_backend_replay_metadata_uses_capture_buffers(monkeypatch):
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
 
     class FakeKVCache:
+        def k_scale(self, layer_id):
+            return None
+
+        def v_scale(self, layer_id):
+            return None
+
         def __init__(self, device: torch.device):
             self.device = device
 

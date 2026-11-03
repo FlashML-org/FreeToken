@@ -16,9 +16,18 @@ class CacheRebuildRejected(Exception):
     this is recoverable, unlike a failure after the free."""
 
 
+def kv_storage_bytes_per_elem(config) -> int:
+    quant = getattr(config, "kv_quant", "none")
+    if quant == "fp8":
+        return 1
+    if quant != "none":
+        raise ValueError(f"unknown kv_quant {quant!r}")
+    return config.dtype.itemsize
+
+
 def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
+    """One paged-KV group's bytes per token, including FP8 row scales when enabled,
+    plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
     hardcodes; keep the two in lockstep if the slab dtype ever changes.)
@@ -29,9 +38,14 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * kv_storage_bytes_per_elem(config)
         * spec.num_layers
     )
+    if getattr(config, "kv_quant", "none") == "fp8":
+        per_token += (
+            (1 if spec.mla else 2) * spec.num_layers
+            * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True) * 4
+        )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 
@@ -79,19 +93,30 @@ class BaseKVCachePool(ABC):
         is written)."""
 
     @classmethod
+    def runtime_cost(cls, config, **kwargs) -> tuple[int, int, int, int]:
+        """Pool cost plus geometry-dependent attention workspace, when required."""
+        return cls.kv_cost(config, **kwargs)
+
+    @property
+    def prefill_workspace_shape(self) -> tuple[int, int, int] | None:
+        return None
+
+    @classmethod
     def solve_num_pages(cls, config, available_memory: int) -> int:
         """Largest usable page count fitting ``available_memory`` (bytes measured by the
         engine: memory_ratio x baseline free minus resident weights and any sibling pool's
         fixed cost), honoring ``config.num_page_override``."""
-        cache_per_page, fixed_cache_size, _, _ = cls.kv_cost(config)
+        cache_per_page, fixed_cache_size, _, _ = cls.runtime_cost(config)
         num_pages = config.num_page_override
         if num_pages is None:
             num_pages = (available_memory - fixed_cache_size) // cache_per_page
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         real_kv_size = num_pages * cache_per_page + fixed_cache_size
+        if getattr(config, "kv_quant", "none") == "fp8" and real_kv_size > available_memory:
+            raise ValueError("FP8 KV pool and prefill workspace exceed the available memory budget")
         logger.info(
             f"Allocating {num_pages * config.page_size} tokens for KV cache, "
-            f"K + V = {mem_GB(real_kv_size)}"
+            f"pool and workspace budget = {mem_GB(real_kv_size)}"
         )
         return num_pages
 
@@ -125,7 +150,7 @@ class BaseKVCachePool(ABC):
         cost_kwargs = {
             k: v for k, v in targets.items() if v is not None and k in cost_params
         }
-        cache_per_page, fixed_cache_size, _, _ = type(self).kv_cost(config, **cost_kwargs)
+        cache_per_page, fixed_cache_size, _, _ = type(self).runtime_cost(config, **cost_kwargs)
         budget = net_cache_budget_bytes(
             config.memory_ratio, baseline_free, weights_bytes,
             fixed_cache_size + extra_fixed_bytes,
@@ -179,6 +204,16 @@ class BaseKVCachePool(ABC):
     @property
     @abstractmethod
     def dtype(self) -> torch.dtype: ...
+
+    @property
+    def store_dtype(self) -> torch.dtype:
+        return self.dtype
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return None
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return None
 
     @property
     @abstractmethod
