@@ -179,3 +179,27 @@ def test_selector_walk_matches_torch_walk(greedy):
     torch.testing.assert_close(q, torch.stack(want_q, 1), atol=1e-5, rtol=0)
     if greedy:
         assert torch.equal(tokens[2], ids[2, :, 0])
+
+
+def test_selector_walk_never_draws_a_zero_q_candidate():
+    """A draw just below 1 past an fp32 cdf total that ends below 1 still lands on a candidate with q > 0, not on the last one whose q underflowed to 0."""
+    from freetoken.kernel.triton.dflash import selector_walk
+
+    torch.manual_seed(0)
+    bs, top_k, rank, vocab = 512, 16, 32, 1000
+    pre = torch.randn(vocab, rank, device=DEV, dtype=torch.bfloat16)
+    suc = torch.randn(vocab, rank, device=DEV, dtype=torch.bfloat16)
+    ids = torch.arange(top_k, device=DEV).expand(bs, 1, top_k).contiguous()
+    unary = torch.full((bs, 1, top_k), -1e4, device=DEV)
+    unary[..., :2] = torch.rand(bs, 1, 2, device=DEV)
+    state = torch.zeros(bs, 1, rank, device=DEV, dtype=torch.bfloat16)
+    anchor = torch.zeros(bs, dtype=torch.int64, device=DEV)
+    temperature = torch.ones(bs, device=DEV)
+    greedy = torch.zeros(bs, dtype=torch.bool, device=DEV)
+    uniforms = torch.full((bs, 1), 1 - 2**-24, device=DEV)
+
+    tokens, q = selector_walk(ids, unary, state, anchor, pre, suc, temperature, greedy, uniforms)
+
+    # two nonzero terms sum the same in any order, so this is the kernel's own cdf total: the draw must sit past it on some rows
+    assert (q.sum(-1) <= uniforms).any()
+    assert (q.gather(-1, tokens[..., None]) > 0).all()

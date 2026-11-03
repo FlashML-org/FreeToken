@@ -255,6 +255,8 @@ def _selector_kernel(
             probs = e / tl.sum(e, axis=0)
             u = tl.load(u_ptr + b * SLOTS + slot)
             index = tl.minimum(tl.sum(tl.where(u >= tl.cumsum(probs, axis=0), 1, 0), axis=0), TOP_K - 1)
+            # fp32 cdf rounding can land u on a candidate whose q underflowed to 0, which rejection would accept on any p > 0
+            index = tl.max(tl.where((c <= index) & (probs > 0), c, 0), axis=0)
         tl.store(q_ptr + base + c, probs)
         prev = tl.sum(tl.where(c == index, cand, 0), axis=0)
         tl.store(tok_ptr + b * SLOTS + slot, prev)
