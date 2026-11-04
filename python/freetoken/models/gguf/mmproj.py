@@ -93,12 +93,19 @@ def _find(model_path: str, override: str) -> Mmproj | None:
         except Exception as e:  # noqa: BLE001 -- a broken download next to the model must not stop it from serving text
             logger.warning("vision: skipping unreadable %s: %s", path, e)
             continue
-        if described is not None and (width is None or described[2] == int(width)):
-            found.append((_TYPE_RANK.get(described[1], len(_TYPE_RANK)), path, described))
+        if described is None:
+            continue
+        if width is not None and described[2] != int(width):
+            logger.info("vision: skipping %s: its output width %d does not match the text model's embedding_length %d", path, described[2], int(width))
+            continue
+        found.append((_TYPE_RANK.get(described[1], len(_TYPE_RANK)), path, described))
     # same-width towers of several models in one folder: take the one named like the text model, else do not guess
     names = {f[2][3] for f in found}
     if len(names) > 1:
         text_name = _model_key(md.get("general.basename") or md.get("general.name"))
+        for _, path, described in found:
+            if text_name is not None and described[3] is not None and described[3] != text_name:
+                logger.info("vision: skipping %s: it is %s's mmproj, not this model's", path, described[3])
         found = [f for f in found if text_name is not None and f[2][3] == text_name]
         if not found:
             logger.warning("vision: %s holds mmproj files of several models (%s); pick one with --mmproj", folder, ", ".join(sorted(map(str, names))))
