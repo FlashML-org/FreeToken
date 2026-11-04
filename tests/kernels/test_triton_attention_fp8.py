@@ -39,19 +39,68 @@ def _oracle(q, k, v, prefix):
     return torch.einsum("htn,hnd->thd", score.masked_fill(~mask[None], -torch.inf).softmax(-1), v.float())
 
 
-@pytest.mark.parametrize("tokens", [17, 512, 8193, 32768])
+@pytest.mark.parametrize("tokens,window,padding,offset", [
+    (17, None, 0, 0), (512, None, 0, 0), (8193, None, 0, 0),
+    (32768, None, 0, 0), (513, 137, 0, 0),
+    (65, None, 4, 4), (65, None, 0, 1), (65, 17, 1, 0),
+])
 @pytest.mark.parametrize("splits", [1, 8, 64])
-def test_fp8_decode_keeps_adaptive_split_range(tokens, splits):
-    _, _, slots, kc, vc, ks, vs = _data(tokens)
-    q = torch.randn(1, 32, 128, device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("q_heads,kv_heads,dim", [(16, 8, 128), (32, 8, 128), (32, 4, 128), (16, 2, 256)])
+def test_fp8_decode_keeps_adaptive_split_range(tokens, window, padding, offset, splits, q_heads, kv_heads, dim):
+    _, _, slots, kc, vc, ks, vs = _data(tokens, heads=kv_heads, dim=dim)
+    if padding or offset:
+        # Independent K/V layouts catch byte-vs-word addressing and view-offset mistakes.
+        k_storage = torch.empty((tokens + 64) * kv_heads * (dim + padding) + offset,
+                                device="cuda", dtype=torch.uint8)
+        k_view = k_storage[offset:].view(tokens + 64, kv_heads, dim + padding)[..., :dim]
+        k_view.copy_(kc)
+        kc = k_view
+        v_storage = torch.empty(tokens + 64, kv_heads, dim + 4, device="cuda", dtype=torch.uint8)
+        v_view = v_storage[..., :dim]
+        v_view.copy_(vc)
+        vc = v_view
+    q = torch.randn(1, q_heads, dim, device="cuda", dtype=torch.bfloat16)
     out = decode_paged_attention(
         q, kc, vc, torch.tensor([0, tokens], device="cuda", dtype=torch.int32), slots,
         torch.tensor([tokens-1], device="cuda", dtype=torch.int32),
-        torch.empty(1, 32, 64, 128, device="cuda"), torch.empty(1, 32, 64, device="cuda"),
-        128**-0.5, max_kv_splits=splits, k_scale=ks, v_scale=vs,
+        torch.empty(1, q_heads, 64, dim, device="cuda"), torch.empty(1, q_heads, 64, device="cuda"),
+        dim**-0.5, max_kv_splits=splits, k_scale=ks, v_scale=vs, sliding_window=window,
     )
-    reference = _oracle(q, _read(kc, ks, slots), _read(vc, vs, slots), tokens-1)
+    visible_slots = slots[-window:] if window else slots
+    reference = _oracle(q, _read(kc, ks, visible_slots), _read(vc, vs, visible_slots), len(visible_slots)-1)
     torch.testing.assert_close(out.float(), reference, atol=0.002, rtol=0.02)
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_fp8_rdna4_packed_decode_preserves_every_finite_code(transpose):
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.attention import _gfx1201, _kv_load_gfx12_bf16
+
+    if not _gfx1201(torch.cuda.current_device()):
+        pytest.skip("RDNA4 packed KV conversion requires gfx1201")
+
+    @triton.jit
+    def decode_codes(x, y, TRANSPOSE: tl.constexpr):
+        rows = tl.arange(0, 64)
+        words = tl.arange(0, 32)
+        if TRANSPOSE:
+            ptrs = x + rows[None, :] * 32 + words[:, None]
+        else:
+            ptrs = x + rows[:, None] * 32 + words[None, :]
+        values = _kv_load_gfx12_bf16(ptrs, tl.full(ptrs.shape, True, tl.int1), TRANSPOSE)
+        if TRANSPOSE:
+            values = tl.trans(values)
+        tl.store(y + rows[:, None] * 128 + tl.arange(0, 128)[None, :], values)
+
+    codes = torch.arange(256, device="cuda", dtype=torch.uint8).repeat(32)
+    actual = torch.empty(codes.numel(), device="cuda", dtype=torch.bfloat16)
+    decode_codes[(1,)](codes.view(torch.uint32), actual, transpose, num_warps=2)
+    expected = codes.view(torch.float8_e4m3fn).bfloat16()
+    finite = expected.isfinite()
+    # Integer comparison also checks negative zero and byte order within each word.
+    assert torch.equal(actual.view(torch.int16)[finite], expected.view(torch.int16)[finite])
 
 
 @pytest.mark.parametrize("path", ["paged", "extend", "split-extend"])
@@ -126,19 +175,20 @@ def test_fp8_multi_request_decode_keeps_rows_separate():
     torch.testing.assert_close(out.float(), torch.cat(refs), atol=0.003, rtol=0.03)
 
 
-def test_fp8_graph_replays_changed_inputs_and_slot_mapping():
-    k, v, slots, kc, vc, ks, vs = _data(8, heads=2)
+@pytest.mark.parametrize("q_heads,kv_heads,dim", [(8, 2, 128), (16, 2, 256)])
+def test_fp8_graph_replays_changed_inputs_and_slot_mapping(q_heads, kv_heads, dim):
+    k, v, slots, kc, vc, ks, vs = _data(8, heads=kv_heads, dim=dim)
     k, v = k.reshape(8, -1).contiguous(), v.reshape(8, -1).contiguous()
-    q = torch.randn(1, 8, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, q_heads, dim, device="cuda", dtype=torch.bfloat16)
     kptr = torch.tensor([0, 8], device="cuda", dtype=torch.int32)
     pos = torch.tensor([7], device="cuda", dtype=torch.int32)
-    mid = torch.empty(1, 8, 64, 128, device="cuda")
-    lse = torch.empty(1, 8, 64, device="cuda")
+    mid = torch.empty(1, q_heads, 64, dim, device="cuda")
+    lse = torch.empty(1, q_heads, 64, device="cuda")
     out = torch.empty_like(q)
 
     def forward():
         quantize_kv_to_cache(k, v, slots, kc, vc, ks, vs)
-        return decode_paged_attention(q, kc, vc, kptr, slots, pos, mid, lse, 128**-0.5,
+        return decode_paged_attention(q, kc, vc, kptr, slots, pos, mid, lse, dim**-0.5,
                                       out=out, k_scale=ks, v_scale=vs)
 
     forward()
@@ -196,7 +246,8 @@ def test_fp8_first_prefill_preserves_bf16_attention_and_populates_codes():
 
 @pytest.mark.parametrize("page_size", [1, 8])
 @pytest.mark.parametrize("query", [4, 129])
-def test_fp8_workspace_reuse_rebuild_and_graph(page_size, query):
+@pytest.mark.parametrize("q_heads,dim", [(8, 128), (16, 256)])
+def test_fp8_workspace_reuse_rebuild_and_graph(page_size, query, q_heads, dim):
     from types import SimpleNamespace
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
     from freetoken.distributed import set_tp_info, try_get_tp_info
@@ -205,7 +256,7 @@ def test_fp8_workspace_reuse_rebuild_and_graph(page_size, query):
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
     torch.manual_seed(2203)
-    prefix, heads, dim = 65, 2, 128
+    prefix, heads = 65, 2
     pool = MHAKVCache(heads, 2, dim, 256 // page_size, page_size,
                       torch.bfloat16, torch.device("cuda"), kv_quant="fp8")
     backend = object.__new__(TritonAttentionBackend)
@@ -225,7 +276,7 @@ def test_fp8_workspace_reuse_rebuild_and_graph(page_size, query):
         capacity = pages * page_size
         assert backend.prefill_workspace.shape == (2, capacity, heads, dim)
         pointer = backend.prefill_workspace.data_ptr()
-        q = torch.randn(query, 8, dim, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(query, q_heads, dim, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(prefix + query, heads * dim, device="cuda", dtype=torch.bfloat16)
         v = torch.randn_like(k) * .1
         slots = torch.randperm(capacity, device="cuda")[:prefix + query].int()

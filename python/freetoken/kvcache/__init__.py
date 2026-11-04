@@ -85,13 +85,15 @@ def _validate_kv_quant_pool(model_config, kv_quant: str) -> None:
         return
     from freetoken.attention import AttnType
 
-    specs = model_config.kv_cache_group_specs()
+    # Linear layers own recurrent state, not paged KV. Quantize only the full group.
+    specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
     if (
         kv_quant != "fp8"
+        or not specs
         or any(s.attn_type != AttnType.FULL for s in specs)
-        or getattr(model_config, "has_linear_attention", False)
+        or (getattr(model_config, "has_linear_attention", False) and len(specs) != 1)
     ):
-        raise ValueError("FP8 KV currently supports only the plain MHA/GQA pool")
+        raise ValueError("FP8 KV requires MHA/GQA full-attention storage")
 
 
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
