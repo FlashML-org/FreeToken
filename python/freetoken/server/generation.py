@@ -115,6 +115,7 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -130,6 +131,46 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
+
+
+def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
+    """llama.cpp's per-request timings object (server_slot_stats::to_json, b10408+) as
+    frontends like llama-swap read it, plus queue_ms as a FreeToken extension. The spans
+    and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack:
+    queue_ms covers waiting-queue admission to the first prefill chunk, prompt_ms the
+    first chunk to the first sampled token on the host, predicted_ms the first to the
+    last committed token. prompt_n counts only the evaluated tokens and the decode rates
+    divide by predicted_n - 1 steps (the first token rides the last prompt batch),
+    matching llama.cpp's arithmetic. Values are not rounded. Off unless
+    --enable-timings-report: usage.prompt_tokens - prompt_n would otherwise still
+    reveal the prefix-cache hit that --enable-cache-report hides."""
+    if timings is None:
+        return None
+    config = getattr(state, "config", None) if state is not None else None
+    if not getattr(config, "enable_timings_report", False):
+        return None
+    prompt_n = timings["prompt_n"]
+    predicted_n = timings["predicted_n"]
+    prompt_ms = timings["prompt_ms"]
+    predicted_ms = timings["predicted_ms"]
+    gen_steps = max(predicted_n - 1, 0)
+    block: dict[str, Any] = {
+        "cache_n": timings["cache_n"],
+        "prompt_n": prompt_n,
+        "prompt_ms": prompt_ms,
+        "prompt_per_token_ms": prompt_ms / prompt_n if prompt_n > 0 else 0.0,
+        "prompt_per_second": 1e3 / prompt_ms * prompt_n if prompt_ms > 0 else 0.0,
+        "predicted_n": predicted_n,
+        "predicted_ms": predicted_ms,
+        "predicted_per_token_ms": predicted_ms / gen_steps if gen_steps > 0 else 0.0,
+        "predicted_per_second": 1e3 / predicted_ms * gen_steps if predicted_ms > 0 else 0.0,
+        "queue_ms": timings["queue_ms"],
+    }
+    if timings.get("draft_n", 0) > 0:
+        block["draft_n"] = timings["draft_n"]
+        block["draft_n_accepted"] = timings["draft_n_accepted"]
+    return block
 
 
 @dataclass
@@ -699,12 +740,15 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    timings: dict[str, Any] | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -787,6 +831,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        timings=timings,
     )
 
 
@@ -797,6 +842,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    timings: dict[str, Any] | None = None
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
@@ -805,6 +851,8 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
@@ -831,4 +879,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        timings=timings,
     )

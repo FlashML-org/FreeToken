@@ -32,6 +32,48 @@ class SamplingParams:
         return self.temperature <= 0.0 or self.top_k == 1
 
 
+@dataclass
+class ReqStats:
+    """Per-request timing and draft counters, stamped by the scheduler with
+    time.perf_counter(). Spans follow llama.cpp's server_slot_stats plus a queue
+    span: queue = waiting queue -> first prefill chunk launch, prompt = first
+    chunk launch -> first sampled token on the host (chunk gaps included),
+    predicted = first token -> last committed token. One instance is shared by
+    every chunk Req of a request, so the stamps survive chunked prefill."""
+
+    enqueued_at: float | None = None     # entered the scheduler's waiting queue
+    first_chunk_at: float | None = None  # first prefill chunk launched
+    first_token_at: float | None = None  # first sampled token back on the host
+    last_token_at: float | None = None   # last committed token
+    cache_n: int = 0                     # prompt tokens served from the prefix cache at admission
+    prompt_n: int = 0                    # prompt tokens actually computed
+    draft_n: int = 0                     # drafted tokens summed over verify steps
+    draft_n_accepted: int = 0            # accepted drafts that were committed, after stop truncation
+
+    def stamp_token(self, now: float) -> None:
+        if self.first_token_at is None:
+            self.first_token_at = now
+        self.last_token_at = now
+
+    def finish(self, completion_tokens: int) -> dict | None:
+        """Raw spans and counts for the terminal reply; None when no prefill ever
+        launched or no token was committed (errors and aborts emit nothing)."""
+        if self.first_chunk_at is None or self.first_token_at is None:
+            return None
+        return {
+            "queue_ms": (self.first_chunk_at - self.enqueued_at) * 1000.0
+            if self.enqueued_at is not None else 0.0,
+            "cache_n": self.cache_n,
+            "prompt_n": self.prompt_n,
+            "prompt_ms": (self.first_token_at - self.first_chunk_at) * 1000.0,
+            "predicted_n": completion_tokens,
+            # 1 us floor as in llama.cpp: the first token can land in the same instant
+            "predicted_ms": max((self.last_token_at - self.first_token_at) * 1000.0, 0.001),
+            "draft_n": self.draft_n,
+            "draft_n_accepted": self.draft_n_accepted,
+        }
+
+
 @dataclass(eq=False)
 class Req:
     input_ids: torch.Tensor  # cpu tensor
@@ -68,6 +110,9 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Timing/draft counters shared with every other chunk Req of this request (set by
+    # the PrefillManager from the PendingReq's instance; a default blank otherwise).
+    stats: ReqStats = field(default_factory=ReqStats, init=False, repr=False)
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:

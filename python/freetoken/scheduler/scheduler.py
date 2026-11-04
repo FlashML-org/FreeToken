@@ -336,6 +336,8 @@ class Scheduler(SchedulerIOMixin):
         batch, output = last_data[0].batch, last_data[1]
         _, next_tokens_cpu, copy_done = output[:3]
         copy_done.synchronize()
+        # tokens are on the host from here: the per-request timings' token stamps
+        now = time.perf_counter()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         generated = None
@@ -370,7 +372,10 @@ class Scheduler(SchedulerIOMixin):
                         # client's terminal reply.
                         continue
                     msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                    req.stats.stamp_token(now)
                     reply.append(msg)
+                    if msg.finished:
+                        msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
                     finished = msg.finished
 
                     # NOTE: overlap scheduling may make the request freed twice, skip second free
@@ -424,12 +429,24 @@ class Scheduler(SchedulerIOMixin):
         """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
         k = self.config.decode_rows_per_req - 1
         counts, finished = [], []
+        now = time.perf_counter()
         for i, req in enumerate(batch.reqs):
             # spec forces normal_loop, which frees an aborted request between steps; overlap would need rollback_tail here and must not donate the GDN slot the verify rolled
             assert not req.aborted, "a verify batch drained an aborted request"
             cached = req.cached_len
-            msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : int(output.emitted_cpu[i]) + 1])
+            emitted = int(output.emitted_cpu[i])
+            msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : emitted + 1])
+            # k drafts were proposed; the step hands _commit_tokens the emitted accepted
+            # drafts plus the target's own token, so when a stop lands on a draft every
+            # committed token is an accepted draft: count min(n, emitted), with n already
+            # post stop-truncation. Never exceeds predicted_n - 1: the request's first
+            # committed token came from prefill, outside every verify step.
+            req.stats.stamp_token(now)
+            req.stats.draft_n += k
+            req.stats.draft_n_accepted += min(n, emitted)
             reply.append(msg)
+            if msg.finished:
+                msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
             req.commit_pending(n)
             self.cache_manager.rollback_tail(req, req.cached_len, cached + k + 1)
             counts.append(n)

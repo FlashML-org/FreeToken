@@ -38,7 +38,8 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
             continue
         if kernel.worth_it(cfg):
             if skipped:
-                logger.info("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
+                # every layer selects its own kernel
+                logger.info_once("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
             return kernel
         if fallback is None:
             fallback = kernel

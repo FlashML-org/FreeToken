@@ -152,6 +152,46 @@ def test_batched_prefill_carries_each_new_prompt_admission():
     assert batch.prompt_admissions == [(1, 3, 0), (2, 5, 0)]
 
 
+def test_chunked_reqs_share_one_stats_stamped_at_the_first_chunk():
+    """The queue span ends and the prompt span starts when the FIRST chunk launches, and
+    every chunk Req shares one ReqStats, so the token stamps the final chunk's drain
+    takes land on the instance the admission stamps populated. A per-chunk restamp would
+    hide the queue wait and the earlier chunks' prefill time."""
+    from types import SimpleNamespace
+
+    from freetoken.core import SamplingParams
+
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    prompt_len = 3 * CHUNK
+    pm.add_one_req(SimpleNamespace(
+        uid=UID, input_ids=torch.arange(prompt_len, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4), mm_items=None,
+        mrope_positions=None, mrope_delta=0,
+    ))
+    pending = pm.pending_list[0]
+    assert pending.stats.enqueued_at is not None
+
+    seen_first_chunks = []
+    while pm.runnable:
+        batch = pm.schedule_next_batch(CHUNK)
+        assert batch is not None
+        cm.allocate_paged(batch.reqs)
+        for req in batch.reqs:
+            req.complete_one()
+            seen_first_chunks.append(req.stats.first_chunk_at)
+            assert req.stats is pending.stats
+        if pm.pending_list:  # the final chunk leaves no continuation behind
+            assert pm.pending_list[0].stats is pending.stats
+
+    assert pending.stats.first_chunk_at is not None
+    assert pending.stats.first_chunk_at >= pending.stats.enqueued_at
+    assert pending.stats.cache_n == 0
+    assert pending.stats.prompt_n == prompt_len
+    # stamped once, on the first chunk: every later chunk reads the same value
+    assert len(seen_first_chunks) == 3
+    assert all(f == pending.stats.first_chunk_at for f in seen_first_chunks)
+
+
 def test_chunk_ends_before_an_image_it_would_cut_on_bidirectional_models():
     from freetoken.core import SamplingParams
     from freetoken.message import MMItem
