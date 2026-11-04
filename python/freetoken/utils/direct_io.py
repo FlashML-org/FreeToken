@@ -169,4 +169,19 @@ class DirectFile:
         self.close()
 
 
-__all__ = ["DIRECT_ALIGN", "DIRECT_READS", "DirectFile"]
+def drop_page_cache(path: str, offset: int = 0, nbytes: int = 0) -> None:
+    """Drop ``path``'s cached pages from ``offset`` on, ``nbytes`` of them or to the end: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
+    # Windows has no posix_fadvise; its file cache is standby memory the memory manager repurposes on demand.
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, offset, nbytes, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+__all__ = ["DIRECT_ALIGN", "DIRECT_READS", "DirectFile", "drop_page_cache"]

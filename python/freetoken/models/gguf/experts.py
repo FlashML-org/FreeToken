@@ -8,12 +8,12 @@ gpt-oss files carry per-expert gate / up / down biases; every layer then also ge
 from __future__ import annotations
 
 import contextlib
-import os
 
 import torch
 
 from freetoken.layers.quantization import QuantKind
 from freetoken.layers.quantization.ggml_types import float_dtype, has_expert_scales, mmq_tail_bytes, pad_rows, type_name
+from freetoken.models.loader import drop_page_cache
 from freetoken.utils import init_logger
 
 from .reader import GgufTensorInfo, gguf_tensor_index
@@ -29,17 +29,6 @@ def _expert_rows(info: GgufTensorInfo) -> torch.Tensor:
     raw = torch.from_numpy(info.data()).view(experts, rows, info.nbytes // (experts * rows))
     dtype = float_dtype(info.ggml_type)
     return raw if dtype is None else raw.view(dtype)
-
-
-def _drop_page_cache(info: GgufTensorInfo) -> None:
-    try:
-        fd = os.open(info.path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, info.offset, info.nbytes, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
 
 
 def _device_bank(shape: tuple[int, ...], ggml_type: int, k: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -158,7 +147,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                     start += r.shape[1]
                 banks["down"].copy_(d)
                 for info in (*parts, down):
-                    _drop_page_cache(info)
+                    drop_page_cache(info.path, info.offset, info.nbytes)
             if device is None:
                 pins(layer, host)
             for role, bank in banks.items():

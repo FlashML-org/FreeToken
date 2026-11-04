@@ -34,7 +34,7 @@ from typing import Callable
 import torch
 
 from freetoken.utils import init_logger
-from freetoken.utils.direct_io import DIRECT_ALIGN, DIRECT_READS, DirectFile
+from freetoken.utils.direct_io import DIRECT_ALIGN, DIRECT_READS, DirectFile, drop_page_cache
 
 logger = init_logger(__name__)
 
@@ -497,7 +497,7 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
     if drop_cache:
-        _drop_cached_pages(path, 0, 0)
+        drop_page_cache(path)
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
     file = DirectFile(path)
 
@@ -511,20 +511,6 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     finally:
         file.close()
     return size
-
-
-def _drop_cached_pages(path: str, offset: int, nbytes: int) -> None:
-    """Evict ``path``'s cached pages where the platform can; Windows has no fadvise, and its unbuffered open flushes them."""
-    if not hasattr(os, "posix_fadvise"):
-        return
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, offset, nbytes, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
 
 
 def _preadv_all(file: DirectFile, dst: memoryview, offset: int, need: int) -> None:
@@ -554,7 +540,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
                                     dest_offset=dest_offset, workers=workers, chunk=chunk)
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
-        _drop_cached_pages(path, file_offset, nbytes)
+        drop_page_cache(path, file_offset, nbytes)
     file = DirectFile(path)
     scratch = threading.local()
 
