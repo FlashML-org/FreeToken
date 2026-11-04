@@ -46,12 +46,41 @@ class Qwen3_5MTPDraft(BaseOP):
 
     @staticmethod
     def check_source(path: str, target_path: str) -> None:
-        from freetoken.models.gguf.reader import is_gguf_path
+        from freetoken.models.gguf.reader import gguf_architecture, gguf_tensor_index, is_gguf_path, load_gguf_metadata
         from freetoken.models.loader import safetensors_weight_map
 
         if is_gguf_path(path):
-            raise ValueError(f"the Qwen3.5 MTP draft loads from safetensors, not from the GGUF {path}")
-        if os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
+            if not is_gguf_path(target_path):
+                raise ValueError(f"the Qwen3.5 MTP draft loads from safetensors mtp.* tensors, not from the GGUF {path}")
+            from .gguf import nextn_block_index
+
+            blk = nextn_block_index(path)
+            index = gguf_tensor_index(path)
+            if f"blk.{blk}.nextn.eh_proj.weight" not in index:
+                raise ValueError(f"{path}: blk.{blk} carries no nextn tensors")
+            if os.path.abspath(path) != os.path.abspath(target_path):
+                # a separate draft file must be an mtp-*.gguf sidecar: only the MTP block, same
+                # arch; anything else is another trunk read under this target's shapes
+                blocks = {name.split(".")[1] for name in index if name.startswith("blk.")}
+                if blocks != {str(blk)} or gguf_architecture(path) != gguf_architecture(target_path):
+                    raise ValueError(
+                        f"the MTP draft of a GGUF target is the trunk's own nextn block or an "
+                        f"mtp-*.gguf sidecar of the same model, not {path}"
+                    )
+                # the same arch string spans sizes (qwen35 covers the 9B and the 27B); a wrong-size
+                # sidecar would otherwise die on a bare shape assert deep in load_state_dict
+                side_hidden = load_gguf_metadata(path).get(f"{gguf_architecture(path)}.embedding_length")
+                target_hidden = load_gguf_metadata(target_path).get(f"{gguf_architecture(target_path)}.embedding_length")
+                if side_hidden is not None and target_hidden is not None and int(side_hidden) != int(target_hidden):
+                    raise ValueError(
+                        f"{path}: an mtp-*.gguf sidecar of a model with hidden size {int(side_hidden)}, but the "
+                        f"target {target_path} has hidden size {int(target_hidden)}; the sidecar must be the "
+                        f"MTP layer of the same model as the target"
+                    )
+        elif is_gguf_path(target_path):
+            # a folder draft would build under the trunk's GGUF quant names
+            raise ValueError(f"a GGUF target's MTP draft is the trunk's own nextn block, not {path}")
+        elif os.path.isdir(path) and not any(name.startswith("mtp.") for name in safetensors_weight_map(path)):
             raise ValueError(f"{path} has no mtp.* tensors")
 
     def __init__(self, config: ModelConfig, target_model) -> None:
@@ -67,11 +96,26 @@ class Qwen3_5MTPDraft(BaseOP):
 
     @classmethod
     def load(cls, config: ModelConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> Qwen3_5MTPDraft:
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        # a GGUF trunk keeps the draft in its own ggml types, mapped by the target config's own to_gguf;
+        # an mtp-*.gguf sidecar carries a different mix, so its table names the draft's types
+        gguf = is_gguf_path(model_path)
+        if gguf:
+            from .gguf import nextn_quant
+
+            config = dataclasses.replace(config, quant=nextn_quant(model_path))
         with torch.device("meta"), torch_dtype(dtype):
             draft = cls(config, target_model)
         expected = draft.state_dict()
         loaded = {}
-        for name, tensor in iter_mtp_weights(model_path, device):
+        if gguf:
+            from .gguf import iter_nextn_weights
+
+            weights = iter_nextn_weights(model_path, draft.config)
+        else:
+            weights = iter_mtp_weights(model_path, device)
+        for name, tensor in weights:
             if name not in expected:
                 raise ValueError(f"{model_path}: unexpected MTP tensor {name!r}")
             loaded[name] = tensor.to(device=device, dtype=expected[name].dtype)
@@ -83,8 +127,13 @@ class Qwen3_5MTPDraft(BaseOP):
 
             # packed by the layer's own expert method, as the target's resident layers are
             moe = draft.layers.op_list[0].mlp.experts
-            pieces = iter_mtp_expert_pieces(model_path)
-            banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
+            if gguf:
+                from .gguf import nextn_expert_banks
+
+                banks = nextn_expert_banks(model_path, device)
+            else:
+                pieces = iter_mtp_expert_pieces(model_path)
+                banks = build_expert_banks(moe.quant_method, 1, pieces, device=device, resident=True)
             attach_resident_banks([moe], banks)
         # not the root: it reaches the target's embedding, which the target finalized already
         finalize_quant(draft.fc)

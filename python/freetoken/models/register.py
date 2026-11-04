@@ -310,7 +310,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # llama.cpp qwen35 / qwen35moe GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
-    # no MTP draft yet: the nextn blocks and mtp-*.gguf files need a loader of their own
+    # the MTP draft reads the nextn block llama.cpp keeps after the last decoder layer
     "Qwen3_5GGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5ForConditionalGeneration",
@@ -321,6 +321,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -332,6 +333,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA
