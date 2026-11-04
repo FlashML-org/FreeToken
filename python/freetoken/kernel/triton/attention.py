@@ -20,15 +20,12 @@ _STAGE2_TILE_ELEMS = 8192
 
 
 def _kv_offset_dtype(k_cache: torch.Tensor, v_cache: torch.Tensor):
-    # Bound physical offsets, not request lengths. Nonnegative offsets can use
-    # all 32 bits before falling back to int64, even when slot IDs fit in int32.
+    # Bound physical offsets, not request lengths.
     max_offset = max(
         sum((size - 1) * stride for size, stride in zip(cache.shape, cache.stride()))
         for cache in (k_cache, v_cache)
     )
-    if max_offset < 1 << 31:
-        return tl.int32
-    return tl.uint32 if max_offset < 1 << 32 else tl.int64
+    return tl.int32 if max_offset < 1 << 31 else tl.int64
 
 
 def _stage2_launch(max_kv_splits: int, block_dv: int) -> tuple[int, int]:
