@@ -6,6 +6,9 @@ from freetoken.engine import EngineConfig
 
 
 ZMQ_LINK_COUNT = 5
+# A connect to 127.0.0.2 leaves from 127.0.0.1, so it can never be handed the address it connects to; on 127.0.0.1
+# a connect made before its link binds can get the link's own port, connect to itself, and ZMQ never retries that.
+ZMQ_LINK_HOST = "127.0.0.2"
 
 
 def _free_loopback_ports(count: int) -> list[int]:
@@ -14,7 +17,7 @@ def _free_loopback_ports(count: int) -> list[int]:
     held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
     try:
         for sock in held:
-            sock.bind(("127.0.0.1", 0))
+            sock.bind((ZMQ_LINK_HOST, 0))
         return [sock.getsockname()[1] for sock in held]
     finally:
         for sock in held:
@@ -30,7 +33,7 @@ def _choose_zmq_links() -> tuple[str, ...]:
 
     if zmq.has("ipc"):
         return tuple(f"ipc:///tmp/freetoken_{link}.pid={os.getpid()}" for link in range(ZMQ_LINK_COUNT))
-    return tuple(f"tcp://127.0.0.1:{port}" for port in _free_loopback_ports(ZMQ_LINK_COUNT))
+    return tuple(f"tcp://{ZMQ_LINK_HOST}:{port}" for port in _free_loopback_ports(ZMQ_LINK_COUNT))
 
 
 @dataclass(frozen=True)
