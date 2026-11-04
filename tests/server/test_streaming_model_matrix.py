@@ -671,6 +671,78 @@ def test_with_keepalive_emits_sentinel_during_silence():
     assert out[:-1] and all(ev is KEEPALIVE for ev in out[:-1])
 
 
+@pytest.mark.parametrize("include_usage", [False, True])
+def test_chat_keepalive_only_before_content(monkeypatch, include_usage):
+    from openai.types.chat import ChatCompletionChunk
+    from freetoken.server import openai_api as O
+
+    interval = 0.02
+    monkeypatch.setattr(O, "KEEPALIVE_INTERVAL_S", interval, raising=False)
+    now = 100
+    monkeypatch.setattr(O.time, "time", lambda: now)
+
+    async def run():
+        nonlocal now
+        prefill = asyncio.Event()
+        decode = asyncio.Event()
+        state = FakeState([], tool_call_parser="llama3")
+
+        async def wait_for_ack(uid):
+            await prefill.wait()
+            yield UserReply(uid=uid, incremental_output="hi", finished=False,
+                            prompt_tokens_delta=2, completion_tokens_delta=1)
+            await decode.wait()
+            yield UserReply(uid=uid, incremental_output="!", finished=True,
+                            finish_reason="length", completion_tokens_delta=1)
+
+        monkeypatch.setattr(state, "wait_for_ack", wait_for_ack)
+        req = ChatCompletionRequest(model="m", messages=[], stream=True,
+                                    stream_options={"include_usage": include_usage})
+        stream = stream_chat_completion_chunks(42, req, state, _spec(tools=None))
+        try:
+            role = json.loads((await anext(stream)).decode().removeprefix("data: "))
+            now = 101
+            for _ in range(2):
+                frame = await asyncio.wait_for(anext(stream), timeout=1)
+                chunk = ChatCompletionChunk.model_validate_json(frame.decode().removeprefix("data: "))
+                assert (chunk.id, chunk.model, chunk.created, chunk.object) == (
+                    role["id"], role["model"], role["created"], "chat.completion.chunk",
+                )
+                assert json.loads(frame.decode().removeprefix("data: "))["choices"] == [
+                    {"index": 0, "delta": {}, "finish_reason": None},
+                ]
+                assert chunk.usage is None
+
+            now = 102
+            prefill.set()
+            content = json.loads((await asyncio.wait_for(anext(stream), 1)).decode().removeprefix("data: "))
+            assert content["choices"][0]["delta"] == {"content": "hi"}
+            pending = asyncio.create_task(anext(stream))
+            try:
+                done, _ = await asyncio.wait({pending}, timeout=interval * 3)
+                assert not done, "heartbeat after the first content delta"
+                decode.set()
+                frames = [await asyncio.wait_for(pending, 1)]
+                frames.extend([frame async for frame in stream])
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+            assert frames[-1] == b"data: [DONE]\n\n"
+            chunks = [json.loads(frame.decode().removeprefix("data: ")) for frame in frames[:-1]]
+            assert len(chunks) == (3 if include_usage else 2)
+            assert chunks[0]["choices"][0]["delta"] == {"content": "!"}
+            assert chunks[1]["choices"] == [{"delta": {}, "index": 0, "finish_reason": "length"}]
+            if include_usage:
+                assert chunks[2]["choices"] == []
+                assert chunks[2]["usage"] == {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+            assert all(chunk["created"] == role["created"] for chunk in [content, *chunks])
+        finally:
+            await stream.aclose()
+
+    asyncio.run(run())
+
+
 # --------------------------------------------------------------------------- #
 # Review regressions: empty args, same-chunk trailing text, non-stream parity
 # --------------------------------------------------------------------------- #

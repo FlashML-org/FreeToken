@@ -24,6 +24,7 @@ from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
+    KEEPALIVE,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -40,7 +41,11 @@ from .generation import (
     resolve_sampling,
     timings_block,
     submit_generation,
+    with_keepalive,
 )
+
+KEEPALIVE_INTERVAL_S = 15.0
+
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -266,10 +271,12 @@ async def stream_chat_completion_chunks(
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
         spec = chat_request_to_genspec(req, {})
+    created = int(time.time())
     yield _sse(
         _chat_chunk(
             req,
             uid,
+            created,
             [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}],
         )
     )
@@ -293,121 +300,141 @@ async def stream_chat_completion_chunks(
 
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
-    events = generate_events(uid, spec, state, source="/v1/chat/completions", usage=usage)
-    while True:
-        try:
-            ev = await events.__anext__()
-        except StopAsyncIteration:
-            break
-        except GenerationError as exc:
-            # Request failed before producing output — emit an error chunk + [DONE] so the
-            # client gets a terminal signal instead of a stalled stream.
-            yield _sse(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
-            )
-            break
-        if isinstance(ev, ReasoningDelta):
-            yield emit(
-                _chat_chunk(
-                    req,
-                    uid,
-                    [{"delta": {"reasoning_content": ev.text}, "index": 0, "finish_reason": None}],
+    output_started = False
+    events = with_keepalive(
+        generate_events(uid, spec, state, source="/v1/chat/completions", usage=usage),
+        KEEPALIVE_INTERVAL_S,
+    )
+    try:
+        while True:
+            try:
+                ev = await events.__anext__()
+            except StopAsyncIteration:
+                break
+            except GenerationError as exc:
+                # Request failed before producing output — emit an error chunk + [DONE] so the
+                # client gets a terminal signal instead of a stalled stream.
+                yield _sse(
+                    {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
                 )
-            )
-        elif isinstance(ev, ContentDelta):
-            yield emit(
-                _chat_chunk(
-                    req,
-                    uid,
-                    [{"delta": {"content": ev.text}, "index": 0, "finish_reason": None}],
-                )
-            )
-        elif isinstance(ev, ToolCallStart):
-            open_tool = {
-                "index": tool_calls_sent,
-                "ordinal": ev.tool_index,
-                "sent": "",
-                "stable": ev.args_prefix_stable,
-            }
-            yield emit(
-                _chat_chunk(
-                    req, uid,
-                    [{
-                        "delta": {"tool_calls": [{
-                            "index": open_tool["index"],
-                            "id": _tool_call_id(ev.name, open_tool["index"]),
-                            "type": "function",
-                            "function": {"name": ev.name, "arguments": ""},
-                        }]},
-                        "index": 0, "finish_reason": None,
-                    }],
-                )
-            )
-        elif isinstance(ev, ToolCallArgsDelta):
-            # Clients concatenate argument fragments, so only prefix-stable
-            # fragments stream; otherwise the full arguments arrive at close.
-            if open_tool is not None and open_tool["stable"] and ev.fragment:
-                open_tool["sent"] += ev.fragment
+                break
+            if ev is KEEPALIVE:
+                if not output_started:
+                    # Event-based idle timers ignore SSE comments during queue/prefill silence.
+                    yield _sse(_chat_chunk(
+                        req, uid, created, [{"delta": {}, "index": 0, "finish_reason": None}],
+                    ))
+                continue
+            if isinstance(ev, (ContentDelta, ReasoningDelta)):
+                output_started = output_started or bool(ev.text)
+            else:
+                output_started = True
+            if isinstance(ev, ReasoningDelta):
                 yield emit(
                     _chat_chunk(
-                        req, uid,
+                        req,
+                        uid,
+                        created,
+                        [{"delta": {"reasoning_content": ev.text}, "index": 0, "finish_reason": None}],
+                    )
+                )
+            elif isinstance(ev, ContentDelta):
+                yield emit(
+                    _chat_chunk(
+                        req,
+                        uid,
+                        created,
+                        [{"delta": {"content": ev.text}, "index": 0, "finish_reason": None}],
+                    )
+                )
+            elif isinstance(ev, ToolCallStart):
+                open_tool = {
+                    "index": tool_calls_sent,
+                    "ordinal": ev.tool_index,
+                    "sent": "",
+                    "stable": ev.args_prefix_stable,
+                }
+                yield emit(
+                    _chat_chunk(
+                        req, uid, created,
                         [{
                             "delta": {"tool_calls": [{
                                 "index": open_tool["index"],
-                                "function": {"arguments": ev.fragment},
+                                "id": _tool_call_id(ev.name, open_tool["index"]),
+                                "type": "function",
+                                "function": {"name": ev.name, "arguments": ""},
                             }]},
                             "index": 0, "finish_reason": None,
                         }],
                     )
                 )
-        elif isinstance(ev, ToolCallsDelta):
-            for call in ev.calls:
-                if open_tool is not None and open_tool["ordinal"] == call.tool_index:
-                    # Close of a ToolCallStart-opened call: send whatever of the
-                    # final (authoritative) arguments wasn't streamed yet.
-                    final = call.parameters or ""
-                    remainder = (
-                        final[len(open_tool["sent"]):]
-                        if final.startswith(open_tool["sent"])
-                        else final if not open_tool["sent"] else ""
-                    )
-                    if remainder:
-                        yield emit(
-                            _chat_chunk(
-                                req, uid,
-                                [{
-                                    "delta": {"tool_calls": [{
-                                        "index": open_tool["index"],
-                                        "function": {"arguments": remainder},
-                                    }]},
-                                    "index": 0, "finish_reason": None,
-                                }],
-                            )
-                        )
-                    open_tool = None
-                    tool_calls_sent += 1
-                    continue
-                # Standalone complete call (buffered fallback path).
-                for delta in _tool_call_deltas([call], start_index=tool_calls_sent):
+            elif isinstance(ev, ToolCallArgsDelta):
+                # Clients concatenate argument fragments, so only prefix-stable
+                # fragments stream; otherwise the full arguments arrive at close.
+                if open_tool is not None and open_tool["stable"] and ev.fragment:
+                    open_tool["sent"] += ev.fragment
                     yield emit(
                         _chat_chunk(
-                            req, uid,
-                            [{"delta": {"tool_calls": [delta]}, "index": 0, "finish_reason": None}],
+                            req, uid, created,
+                            [{
+                                "delta": {"tool_calls": [{
+                                    "index": open_tool["index"],
+                                    "function": {"arguments": ev.fragment},
+                                }]},
+                                "index": 0, "finish_reason": None,
+                            }],
                         )
                     )
-                tool_calls_sent += 1
-        elif isinstance(ev, GenDone):
-            timings = ev.timings
-            done = _chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}])
-            if not include_usage and (t := timings_block(state, timings)) is not None:
-                done["timings"] = t
-            yield emit(done)
+            elif isinstance(ev, ToolCallsDelta):
+                for call in ev.calls:
+                    if open_tool is not None and open_tool["ordinal"] == call.tool_index:
+                        # Close of a ToolCallStart-opened call: send whatever of the
+                        # final (authoritative) arguments wasn't streamed yet.
+                        final = call.parameters or ""
+                        remainder = (
+                            final[len(open_tool["sent"]):]
+                            if final.startswith(open_tool["sent"])
+                            else final if not open_tool["sent"] else ""
+                        )
+                        if remainder:
+                            yield emit(
+                                _chat_chunk(
+                                    req, uid, created,
+                                    [{
+                                        "delta": {"tool_calls": [{
+                                            "index": open_tool["index"],
+                                            "function": {"arguments": remainder},
+                                        }]},
+                                        "index": 0, "finish_reason": None,
+                                    }],
+                                )
+                            )
+                        open_tool = None
+                        tool_calls_sent += 1
+                        continue
+                    # Standalone complete call (buffered fallback path).
+                    for delta in _tool_call_deltas([call], start_index=tool_calls_sent):
+                        yield emit(
+                            _chat_chunk(
+                                req, uid, created,
+                                [{"delta": {"tool_calls": [delta]}, "index": 0, "finish_reason": None}],
+                            )
+                        )
+                    tool_calls_sent += 1
+            elif isinstance(ev, GenDone):
+                timings = ev.timings
+                done = _chat_chunk(req, uid, created, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}])
+                if not include_usage and (t := timings_block(state, timings)) is not None:
+                    done["timings"] = t
+                yield emit(done)
+    finally:
+        await events.aclose()
 
     if include_usage:
         final: dict[str, Any] = {
             "id": f"chatcmpl-{uid}",
             "object": "chat.completion.chunk",
-            "created": int(time.time()),
+            "created": created,
             "model": req.model,
             "choices": [],
             "usage": _reported_usage(state, usage),
@@ -687,11 +714,13 @@ def _tool_call_id(name: str | None, index: int) -> str:
     return f"call_{prefix}_{index}_{uuid.uuid4().hex[:8]}"
 
 
-def _chat_chunk(req: ChatCompletionRequest, uid: int, choices: list[dict[str, Any]]) -> dict[str, Any]:
+def _chat_chunk(
+    req: ChatCompletionRequest, uid: int, created: int, choices: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": created,
         "model": req.model,
         "choices": choices,
     }
