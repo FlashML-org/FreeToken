@@ -11,8 +11,8 @@ contiguous cache) paths both rely on:
 * **chunked multi-threaded direct reads** -- DMA straight from disk into the (page-aligned)
   bank, bypassing the page cache, with many concurrent positional reads on one file
   (``DirectFile``: O_DIRECT on POSIX, FILE_FLAG_NO_BUFFERING on Windows), which scales to the
-  device's queue-depth ceiling even for a single file. Where the platform has neither
-  (``O_DIRECT_READS``), the same fan-out reads through one buffered handle per thread.
+  device's queue-depth ceiling even for a single file. Where the platform or the file system
+  has no direct reads, the same fan-out reads through one buffered handle per thread.
 
 The mmaps are held for the process lifetime (the banks live as long as the offload cache).
 """
@@ -39,7 +39,6 @@ from freetoken.utils.direct_io import DIRECT_ALIGN, DIRECT_READS, DirectFile, dr
 logger = init_logger(__name__)
 
 _BLK = DIRECT_ALIGN
-O_DIRECT_READS = DIRECT_READS
 # Windows mmaps have no madvise: a released pageable bank stays resident until its buffer closes.
 RELEASABLE_PAGES = hasattr(mmap, "MADV_DONTNEED")
 
@@ -493,24 +492,20 @@ def _read_chunks(read_chunk: Callable[[int], None], nbytes: int, chunk: int, wor
 
 def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
                    chunk: int = _DEFAULT_CHUNK, drop_cache: bool = True) -> int:
-    """Chunked multi-threaded O_DIRECT read of the whole file ``path`` into ``buf``
-    (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
-    size = os.path.getsize(path)
-    if drop_cache:
-        drop_page_cache(path)
-    mv = buf if isinstance(buf, memoryview) else memoryview(buf)
-    file = DirectFile(path)
+    """Chunked multi-threaded read of the whole file ``path`` into ``buf`` (:func:`read_range_into`). Returns the file size."""
+    return read_range_into(buf, path, file_offset=0, nbytes=os.path.getsize(path), workers=workers, chunk=chunk,
+                           drop_cache=drop_cache)
 
-    def rd(o):
-        want = min(chunk, len(mv) - o)
-        want = min(want, ((size - o + _BLK - 1) // _BLK) * _BLK)
-        file.pread_into(mv[o:o + want], o)
 
+def _open_direct(path: str) -> DirectFile | None:
+    """``path`` opened for direct reads, or ``None`` where the platform or the file system has none."""
+    if not DIRECT_READS:
+        return None
     try:
-        _read_chunks(rd, size, chunk, workers)
-    finally:
-        file.close()
-    return size
+        return DirectFile(path)
+    except OSError:
+        logger.warning_once("direct reads unsupported under %s; reading it buffered", os.path.dirname(os.path.abspath(path)))
+        return None
 
 
 def _preadv_all(file: DirectFile, dst: memoryview, offset: int, need: int) -> None:
@@ -528,20 +523,23 @@ def _preadv_all(file: DirectFile, dst: memoryview, offset: int, need: int) -> No
 def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int, nbytes: int,
                     dest_offset: int = 0, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
                     drop_cache: bool = True) -> int:
-    """Chunked multi-threaded read of ``path[file_offset : file_offset + nbytes]`` into ``buf`` at ``dest_offset``: direct where the platform has it (``O_DIRECT_READS``), else buffered (``_read_range_buffered``). Returns ``nbytes``.
+    """Chunked multi-threaded read of ``path[file_offset : file_offset + nbytes]`` into ``buf`` at ``dest_offset``: direct where the platform and the file system take direct reads (``DirectFile``), else buffered (``_read_range_buffered``). Returns ``nbytes``.
 
     Byte-range counterpart of :func:`read_file_into`, for one tensor inside a shard. A direct read needs the file offset AND the destination address block-aligned at the same time, which only holds when the two share their offset mod 4096 -- a safetensors data offset practically never lines up with the tensor's slot in the bank. Chunks that do line up DMA straight into ``buf``; the rest DMA into a page-aligned bounce (source window rounded out to whole blocks) and are copied into place, which also covers the unaligned head and tail.
     """
     mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
     if dest_offset + nbytes > len(mv):
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
-    if not O_DIRECT_READS:
-        return _read_range_buffered(mv, path, file_offset=file_offset, nbytes=nbytes,
-                                    dest_offset=dest_offset, workers=workers, chunk=chunk)
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
+    file = _open_direct(path)
+    if file is None:
+        _read_range_buffered(mv, path, file_offset=file_offset, nbytes=nbytes,
+                             dest_offset=dest_offset, workers=workers, chunk=chunk)
+        if drop_cache:
+            drop_page_cache(path, file_offset, nbytes)
+        return nbytes
     if drop_cache:
         drop_page_cache(path, file_offset, nbytes)
-    file = DirectFile(path)
     scratch = threading.local()
 
     def rd(i: int) -> None:

@@ -428,7 +428,7 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
 
 
 # ======================================================================================
-# read_range_into: the byte-range read the PLE table load is built on (O_DIRECT where the platform has it)
+# read_range_into: the O_DIRECT byte-range read the PLE table load is built on
 # ======================================================================================
 
 
@@ -442,11 +442,14 @@ def blob(tmp_path_factory) -> tuple[str, bytes]:
 
 @pytest.fixture(params=["platform", "buffered"])
 def range_reader(request, monkeypatch) -> str:
-    """Run each read test through the platform's reader and through the buffered one Windows always takes."""
+    """Run each read test through the platform's reader and through the buffered one a file system that refuses direct reads gets."""
     if request.param == "buffered":
         import freetoken.moe.host_banks as host_banks
 
-        monkeypatch.setattr(host_banks, "O_DIRECT_READS", False)
+        def refused(path):
+            raise OSError(f"{path}: the file system refuses direct reads")
+
+        monkeypatch.setattr(host_banks, "DirectFile", refused)
     return request.param
 
 

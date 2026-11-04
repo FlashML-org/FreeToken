@@ -36,15 +36,13 @@ _ODIRECT_BLK = 4096
 
 
 def _read_shard_parallel(path: str, workers: int, chunk: int, drop_cache: bool) -> mmap.mmap:
-    """Read a whole shard into a page-aligned anonymous mmap with CHUNKED multi-threaded reads:
-    O_DIRECT where the platform has it, buffered where it does not (``read_range_into``).
+    """Read a whole shard into a page-aligned mmap via CHUNKED multi-threaded O_DIRECT (``read_file_into``).
     Multi-threading one file scales even for single-shard checkpoints (measured ~7x at 8
     threads): the kernel issues the parallel reads at high queue depth."""
-    from freetoken.moe.host_banks import read_range_into
+    from freetoken.moe.host_banks import read_file_into
 
-    size = os.path.getsize(path)
-    buf = mmap.mmap(-1, ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK)
-    read_range_into(buf, path, file_offset=0, nbytes=size, workers=workers, chunk=chunk, drop_cache=drop_cache)
+    buf = mmap.mmap(-1, ((os.path.getsize(path) + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK)
+    read_file_into(buf, path, workers=workers, chunk=chunk, drop_cache=drop_cache)
     return buf
 
 
