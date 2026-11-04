@@ -67,9 +67,9 @@ class ChatCompletionRequest(BaseModel):
     messages: list[Message]
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
-    temperature: float | None = None
+    temperature: float | None = Field(default=None, allow_inf_nan=False)
     top_k: int | None = None
-    top_p: float | None = None
+    top_p: float | None = Field(default=None, allow_inf_nan=False)
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None
@@ -105,9 +105,9 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str] | list[int] | list[list[int]]
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
-    temperature: float | None = None
+    temperature: float | None = Field(default=None, allow_inf_nan=False)
     top_k: int | None = None
-    top_p: float | None = None
+    top_p: float | None = Field(default=None, allow_inf_nan=False)
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None

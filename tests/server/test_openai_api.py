@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken.message import TokenizeMsg, UserReply
+from freetoken.server.anthropic_api import register_anthropic_routes
 from freetoken.server.openai_api import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -519,6 +520,51 @@ def test_omitted_max_tokens_honors_server_default():
         request=None, state=fallback_state, model_sampling={},
     ))
     assert fallback_state.sent.sampling_params.max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+
+
+@pytest.mark.parametrize("path,prompt", [
+    ("/v1/chat/completions", '"messages": [{"role": "user", "content": "hi"}]'),
+    ("/v1/completions", '"prompt": "hi"'),
+])
+@pytest.mark.parametrize("field", ["temperature", "top_p"])
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e9999"])
+@pytest.mark.parametrize("with_anthropic", [False, True])
+def test_sampling_routes_refuse_non_finite_values(path, prompt, field, value, with_anthropic):
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+    if with_anthropic:
+        register_anthropic_routes(app, lambda: state, lambda: {})
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        path,
+        content=f'{{"model": "client-model", {prompt}, "{field}": {value}}}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", field]
+    assert error["type"] == "finite_number"
+    assert state.sent is None
+
+
+@pytest.mark.parametrize("path,prompt", [
+    ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+    ("/v1/completions", {"prompt": "hi"}),
+])
+def test_sampling_routes_accept_finite_values(path, prompt):
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    response = TestClient(app).post(
+        path, json={"model": "client-model", **prompt, "temperature": 0.7, "top_p": 0.9},
+    )
+
+    assert response.status_code == 200
+    assert state.sent.sampling_params.temperature == 0.7
+    assert state.sent.sampling_params.top_p == 0.9
 
 
 def test_models_route_returns_served_model_name():
