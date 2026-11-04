@@ -22,11 +22,15 @@ class SchedulerIOMixin:
         receive_msg: Function to receive messages from the tokenizer.
         send_result: Function to send results back to the tokenizer.
         sync_all_ranks: Function to synchronize all ranks on CPU side.
+
+    The links open before the engine loads and ``tp_cpu_group`` is set once the engine forms it: a port bound after
+    the load is free for all of it, and a peer that connects meanwhile can meet another socket there and give up.
     """
 
-    def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
+    tp_cpu_group: torch.distributed.ProcessGroup
+
+    def __init__(self, config: SchedulerConfig):
         tp_info = config.tp_info
-        self.tp_cpu_group: Final = tp_cpu_group
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result

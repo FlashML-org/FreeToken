@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pickle
 import re
+import socket
 
 import pytest
 import torch
@@ -46,3 +47,39 @@ def test_a_pickled_config_keeps_its_links(transport):
         config.zmq_detokenizer_addr,
         config.zmq_scheduler_broadcast_addr,
     )
+
+
+class _EngineLoading(Exception):
+    """Ends the scheduler's start inside the engine's load, once the load has looked at the links."""
+
+
+def test_the_scheduler_binds_its_links_before_the_engine_loads(monkeypatch):
+    # A port nothing holds for a whole load is a port a connecting worker can meet anything on, itself included,
+    # and a ZMQ connect that meets a socket of the wrong type disconnects and never retries.
+    import freetoken.engine
+    from freetoken.scheduler.scheduler import Scheduler
+
+    monkeypatch.setattr(zmq, "has", lambda capability: capability != "ipc")
+    config = SchedulerConfig(model_path="unused", tp_info=DistributedInfo(rank=0, size=1), dtype=torch.float16)
+    held_during_the_load: list[bool] = []
+
+    class LoadingEngine:
+        def __init__(self, _config):
+            port = int(LOOPBACK.match(config.zmq_backend_addr).group(1))
+            with socket.socket() as stranger:
+                try:
+                    stranger.bind(("127.0.0.1", port))
+                    held_during_the_load.append(False)
+                except OSError:
+                    held_during_the_load.append(True)
+            raise _EngineLoading
+
+    monkeypatch.setattr(freetoken.engine, "Engine", LoadingEngine)
+    scheduler = Scheduler.__new__(Scheduler)
+    with pytest.raises(_EngineLoading):
+        scheduler.__init__(config)
+    for link in ("_recv_from_tokenizer", "_send_into_tokenizer"):
+        queue = getattr(scheduler, link, None)
+        if queue is not None:
+            queue.stop()
+    assert held_during_the_load == [True]
