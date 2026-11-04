@@ -81,8 +81,11 @@ def _draft_entry(config) -> tuple[str, str]:
 
 
 class DFlashProposer(Proposer):
-    default_k = 7
-    max_k = 7
+    @classmethod
+    def num_steps(cls, config) -> tuple[int, int]:
+        # one forward drafts [bonus, mask x k], and the draft is trained on blocks of block_size
+        k = cls._draft_config(config).block_size - 1
+        return k, k
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
@@ -96,11 +99,6 @@ class DFlashProposer(Proposer):
         if archs[:1] != [name]:
             raise ValueError(f"{path}: expected a {name} checkpoint, got architectures {archs}")
         draft, target, arch = cls._draft_config(config), config.model_config, config.hf_config.architectures[0]
-        k = config.speculative_num_steps
-        if k + 1 > draft.block_size:
-            raise ValueError(
-                f"{path} drafts blocks of {draft.block_size} tokens, so --speculative-num-steps must be at most {draft.block_size - 1}, got {k}"
-            )
         if draft.num_target_layers != target.num_layers or max(draft.target_layer_ids) >= target.num_layers:
             raise ValueError(
                 f"{path} reads layers {list(draft.target_layer_ids)} of a {draft.num_target_layers}-layer target, but {arch} has {target.num_layers} layers"

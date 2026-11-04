@@ -52,6 +52,11 @@ class Proposer:
             )
 
     @classmethod
+    def num_steps(cls, config) -> tuple[int, int]:
+        """(default, max) draft tokens per step; called after ``adjust_config``."""
+        return cls.default_k, cls.max_k
+
+    @classmethod
     def budget(cls, config) -> tuple[int, int]:
         """(fixed bytes, draft KV bytes per target KV token), from the config alone."""
         return 0, 0

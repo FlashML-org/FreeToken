@@ -44,14 +44,15 @@ class SpecRunner:
     @classmethod
     def adjust_config(cls, config, override) -> None:
         proposer_cls = proposer_class(config)
+        proposer_cls.adjust_config(config, override)
+        default_k, max_k = proposer_cls.num_steps(config)
         if config.speculative_num_steps == 0:
-            override("speculative_num_steps", proposer_cls.default_k)
-        if not 1 <= config.speculative_num_steps <= proposer_cls.max_k:
+            override("speculative_num_steps", default_k)
+        if not 1 <= config.speculative_num_steps <= max_k:
             raise ValueError(
-                f"--speculative-num-steps must be in [1, {proposer_cls.max_k}] for "
+                f"--speculative-num-steps must be in [1, {max_k}] for "
                 f"{config.speculative_algorithm}, got {config.speculative_num_steps}"
             )
-        proposer_cls.adjust_config(config, override)
 
     @classmethod
     def budget(cls, config) -> tuple[int, int]:
