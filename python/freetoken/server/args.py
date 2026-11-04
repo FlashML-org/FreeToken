@@ -38,6 +38,7 @@ def _nvfp4_entry(value: str) -> str:
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    http_keep_alive_s: int = 360
     # kept out of repr: parse_args logs the whole ServerArgs
     api_key: str | None = field(default=None, repr=False)
     num_tokenizer: int = 0
@@ -398,6 +399,15 @@ def parse_args(
         dest="server_port",
         default=ServerArgs.server_port,
         help="The port number for the server to listen on.",
+    )
+
+    parser.add_argument(
+        "--http-keep-alive-s",
+        type=int,
+        default=ServerArgs.http_keep_alive_s,
+        help="HTTP idle keep-alive timeout in seconds (default: 360). Must exceed the "
+        "longest client pool idle timeout (e.g. Bun/opencode: 300 s), since uvicorn "
+        "does not advertise a Keep-Alive timeout or buffer the close.",
     )
 
     parser.add_argument(
