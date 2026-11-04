@@ -44,14 +44,14 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from freetoken.utils import init_logger
-from freetoken.utils.direct_io import DIRECT_ALIGN, DIRECT_READS, DirectFile
+from freetoken.utils.direct_io import DIRECT_READS, DirectFile
 
 logger = init_logger(__name__)
 
 INDEX_NAME = "freetoken_weight.json"
 FORMAT_TAG = "freetoken_weight"
 FORMAT_VERSION = 1
-ALIGN = DIRECT_ALIGN
+ALIGN = 4096  # O_DIRECT block alignment (== page size on this platform)
 DEFAULT_SHARD_LIMIT = 8 << 30  # 8 GiB; must be a multiple of ALIGN
 _SHARD_FMT = "freetoken-{:05d}.ftw"
 _DEFAULT_CHUNK = 8 << 20
@@ -269,7 +269,7 @@ class FTWReader:
                                    "FTW load", self.dir)
             self._probed = True
 
-    def _fd(self, file: str) -> DirectFile:
+    def _direct_file(self, file: str) -> DirectFile:
         opened = self._files.get(file)
         if opened is None:
             with self._lock:  # first-open only; chunk reads reuse the cached file lock-free
@@ -339,7 +339,7 @@ class FTWReader:
                 jobs.append((file, file_off + c, dest_off + c, min(chunk, rlen - c)))
 
         # Open/map each distinct shard once, single-threaded, so the pool only reuses handles.
-        touch = self._fd if self._direct else self._map
+        touch = self._direct_file if self._direct else self._map
         for file in {j[0] for j in jobs}:
             touch(file)
 
@@ -347,7 +347,7 @@ class FTWReader:
             def rd(job):
                 file, fo, do, ln = job
                 try:
-                    _pread_into(self._fd(file), dest[do:do + ln], fo)
+                    _pread_into(self._direct_file(file), dest[do:do + ln], fo)
                 except OSError as e:
                     raise OSError(f"shard {file}: {e}") from e
         else:

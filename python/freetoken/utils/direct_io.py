@@ -1,9 +1,9 @@
 """Positional reads that bypass the page cache: ``O_DIRECT`` + ``preadv`` on POSIX, ``FILE_FLAG_NO_BUFFERING`` on Windows.
 
-Either way the file offset, the length and the destination address of a read are multiples of :data:`DIRECT_ALIGN`,
-and a read that reaches the end of the file returns the bytes up to it. On Windows the handle is overlapped, so the
-threads of one reader read the same handle concurrently; a synchronous handle would serialize them. Read through
-the file cache, a process at very low I/O priority moves a small fraction of what the same reads move unbuffered.
+A read's file offset, length and destination address are multiples of :data:`DIRECT_ALIGN`, and a read that reaches
+the end of the file returns the bytes up to it. Windows reads unbuffered too because a process at very low I/O
+priority reads a fraction of the disk's rate through the file cache; its handle is overlapped so that the threads
+sharing it are not serialized.
 """
 
 from __future__ import annotations
@@ -71,9 +71,9 @@ if sys.platform == "win32":
     _kernel32.GetFileInformationByHandleEx.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
     _kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
 
-    def _windows_error(what: str, path: str) -> OSError:
-        code = ctypes.get_last_error()
-        return OSError(code, f"{what} {path}: {ctypes.FormatError(code).strip()}")
+    def _windows_error(what: str, code: int | None = None) -> OSError:
+        code = ctypes.get_last_error() if code is None else code
+        return ctypes.WinError(code, f"{what}: {ctypes.FormatError(code).strip()}")
 
 
 def _address_of(view: memoryview) -> int:
@@ -91,7 +91,7 @@ class DirectFile:
                 _FILE_FLAG_NO_BUFFERING | _FILE_FLAG_OVERLAPPED, None,
             )
             if handle in (None, _INVALID_HANDLE):
-                raise _windows_error("cannot open unbuffered", path)
+                raise _windows_error(f"cannot open {path} unbuffered")
             self._handle = handle
             try:
                 self._check_sector_size()
@@ -106,7 +106,7 @@ class DirectFile:
         if not _kernel32.GetFileInformationByHandleEx(
             self._handle, _FILE_STORAGE_INFO_CLASS, ctypes.byref(info), ctypes.sizeof(info),
         ):
-            raise _windows_error("cannot read the sector size of", self.path)
+            raise _windows_error(f"cannot read the sector size of {self.path}")
         sector = info.LogicalBytesPerSector
         if sector == 0 or DIRECT_ALIGN % sector:
             raise OSError(f"{self.path}: {sector}-byte sectors do not divide the {DIRECT_ALIGN}-byte alignment")
@@ -133,7 +133,7 @@ class DirectFile:
     def _read_once(self, address: int, length: int, offset: int) -> int:
         event = _kernel32.CreateEventW(None, True, False, None)
         if not event:
-            raise _windows_error("cannot create a read event for", self.path)
+            raise _windows_error(f"cannot create a read event for {self.path}")
         try:
             overlapped = _Overlapped(Offset=offset & 0xFFFFFFFF, OffsetHigh=offset >> 32, hEvent=event)
             if not _kernel32.ReadFile(self._handle, address, length, None, ctypes.byref(overlapped)):
@@ -141,13 +141,13 @@ class DirectFile:
                 if code == _ERROR_HANDLE_EOF:
                     return 0
                 if code != _ERROR_IO_PENDING:
-                    raise OSError(code, f"read {length} bytes at {offset} of {self.path}: {ctypes.FormatError(code).strip()}")
+                    raise _windows_error(f"read {length} bytes at {offset} of {self.path}", code)
             transferred = wintypes.DWORD(0)
             if not _kernel32.GetOverlappedResult(self._handle, ctypes.byref(overlapped), ctypes.byref(transferred), True):
                 code = ctypes.get_last_error()
                 if code == _ERROR_HANDLE_EOF:
                     return 0
-                raise OSError(code, f"read {length} bytes at {offset} of {self.path}: {ctypes.FormatError(code).strip()}")
+                raise _windows_error(f"read {length} bytes at {offset} of {self.path}", code)
             return transferred.value
         finally:
             _kernel32.CloseHandle(event)
