@@ -63,7 +63,7 @@ class Proposer:
 
     @classmethod
     def slot_states(cls, config) -> tuple[SlotStateSpec, ...]:
-        """Per-request draft state that rides the target's GDN slots, snapshot and restored with them; from the config alone."""
+        """Per-request draft state that rides the target's GDN slots and is copied and restored with them; from the config alone. The proposer writes its own prefill track snapshot."""
         return ()
 
     def __init__(self, config, target_model) -> None:

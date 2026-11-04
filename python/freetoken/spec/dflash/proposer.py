@@ -340,5 +340,5 @@ class DFlashProposer(Proposer):
         window.write(ctx, positions, make_device_tensor(slots, torch.int64, self.device))
         fla = batch.fla_metadata
         if fla is not None and fla.track_dst is not None:
-            # the snapshot at the tracked boundary b holds [b-W, b): within this chunk's rows, since e - b <= R - W
+            # the snapshot at the tracked boundary b holds [b-W, b): inside the live window [e-R, e), since e - b <= R - W
             window.tensor[fla.track_dst] = window.tensor[fla.track_src]

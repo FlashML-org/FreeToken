@@ -41,8 +41,7 @@ class LinearStatePool:
 
     A model (``ModelConfig.slot_states``) or a proposer (``Proposer.slot_states``) can declare
     extra per-request tensors on the same slots; the pool gets both as ``EngineConfig.slot_states``
-    (see ``SlotStateSpec``). They advance, snapshot, COW and
-    rebuild with the GDN state and are read back through ``slot_state(name, layer_id)``.
+    (see ``SlotStateSpec``). ``copy_from``, ``reset`` and ``rebuild`` cover them with the GDN state; their owner writes their prefill track snapshot. They are read back through ``slot_state(name, layer_id)``.
     Consumers must re-read them each forward: ``rebuild`` replaces the tensors.
     """
 

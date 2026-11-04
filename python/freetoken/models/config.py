@@ -269,9 +269,7 @@ class SlotVerify(Protocol):
 class SlotStateSpec:
     """One extra per-request tensor riding the LinearStatePool slots.
 
-    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]`` and advanced, snapshot,
-    COW'd and rebuilt with the GDN state; the owner reads it back through
-    ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
+    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]``; ``copy_from``, ``reset`` and ``rebuild`` cover it with the GDN state. The owner advances it in the forward and writes its own prefill track snapshot into ``fla_metadata.track_dst``, after the chunk's rows; it reads the state back through ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
     """
 
     name: str
