@@ -151,7 +151,8 @@ def test_cache_rebuild_resizes_a_live_engine_and_keeps_serving(tmp_path):
         baseline = _generate(base)  # before anything is torn down; every rebuilt engine must repeat it
         assert baseline
         # hybrid MoE runs cache misses on the CPU and a rebuild empties the cache, so a near tie may flip
-        exact = "hybrid" not in os.environ.get("FREETOKEN_REBUILD_EXTRA_ARGS", "")
+        flags = [part for arg in shlex.split(os.environ.get("FREETOKEN_REBUILD_EXTRA_ARGS", "")) for part in arg.split("=", 1)]
+        exact = not any(flag in ("--moe-strategy", "--moe-backend") and value == "hybrid" for flag, value in zip(flags, flags[1:]))
 
         # 0. Flush the prefix cache. Long enough for a hybrid model to snapshot a reusable prefix.
         chat = {
