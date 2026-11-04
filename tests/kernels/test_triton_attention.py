@@ -52,7 +52,8 @@ def _reference_paged_attention(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs a GPU")
 @pytest.mark.parametrize("path", ["paged", "decode", "extend", "split_extend"])
 @pytest.mark.parametrize("offset_bits", [31, 32])
-def test_triton_attention_high_physical_slots(path: str, offset_bits: int):
+@pytest.mark.parametrize("kv_quant", ["bf16", "fp8"])
+def test_triton_attention_high_physical_slots(path: str, offset_bits: int, kv_quant: str):
     from freetoken.kernel.triton.attention import (
         decode_paged_attention,
         extend_paged_attention,
@@ -61,11 +62,11 @@ def test_triton_attention_high_physical_slots(path: str, offset_bits: int):
 
     torch.manual_seed(1347)
     device = torch.device("cuda")
-    head_dim, num_kv_heads, num_q_heads = 64, 2, 4
+    head_dim, num_kv_heads, num_q_heads = (128, 2, 8) if kv_quant == "fp8" else (64, 2, 4)
     stride = num_kv_heads * head_dim
     low, count = 128, 66
     high = (1 << 32) // stride + low
-    required = (high + count) * stride * 2
+    required = (high + count) * (stride * (1 if kv_quant == "fp8" else 2) + num_kv_heads * 4)
     if torch.cuda.mem_get_info()[0] < required + (1 << 30):
         # Release inactive cached blocks before deciding this case cannot fit.
         torch.cuda.empty_cache()
@@ -74,38 +75,55 @@ def test_triton_attention_high_physical_slots(path: str, offset_bits: int):
 
     # Share K/V storage to keep the real allocation near 8 GiB. Int32 overflow
     # aliases initialized low rows, so a regression fails numerically, not by OOB.
-    cache = torch.empty(high + count, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
-    cache[low : low + count].fill_(-2)
-    cache[high : high + count].normal_(mean=3, std=2)
+    dtype = torch.uint8 if kv_quant == "fp8" else torch.bfloat16
+    cache = torch.empty(high + count, num_kv_heads, head_dim, device=device, dtype=dtype)
+    scales = None
+    if kv_quant == "fp8":
+        from freetoken.kernel.triton.kv_quant import quantize_kv_to_cache
+
+        scales = torch.empty(high + count, num_kv_heads, device=device, dtype=torch.float32)
+        cache[low : low + count].fill_(0)
+        values = torch.randn(count, stride, device=device, dtype=torch.bfloat16) * 2 + 3
+        slots = torch.arange(high, high + count, device=device, dtype=torch.int32)
+        quantize_kv_to_cache(values, values, slots, cache, cache, scales, scales)
+    else:
+        cache[low : low + count].fill_(-2)
+        cache[high : high + count].normal_(mean=3, std=2)
     if offset_bits == 31:
         # Keep the old negative offset inside allocated guard storage too.
         guard = (1 << 31) // stride
         cache = cache[guard:]
+        if scales is not None:
+            scales = scales[guard:]
         high -= guard
-    q = torch.randn(1, num_q_heads, head_dim, device=device, dtype=cache.dtype)
+    q = torch.randn(1, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
     indices = torch.arange(high, high + count, device=device, dtype=torch.int32)
     indptr = torch.tensor([0, count], device=device, dtype=torch.int32)
     q_to_req = torch.zeros(1, device=device, dtype=torch.int32)
     q_positions = torch.tensor([count - 1], device=device, dtype=torch.int64)
     sm_scale = head_dim**-0.5
+    selected = cache[indices.long()]
+    if scales is not None:
+        selected = selected.view(torch.float8_e4m3fn).float() * scales[indices.long(), :, None]
     expected = _reference_paged_attention(
-        q, cache, cache, indptr, indices, q_to_req, q_positions, sm_scale, None,
+        q, selected, selected, indptr, torch.arange(count, device=device), q_to_req, q_positions, sm_scale, None,
     )
+    scale_args = {"k_scale": scales, "v_scale": scales}
 
     if path == "paged":
-        actual = paged_attention(q, cache, cache, indptr, indices, q_to_req, q_positions, sm_scale)
+        actual = paged_attention(q, cache, cache, indptr, indices, q_to_req, q_positions, sm_scale, **scale_args)
     elif path == "decode":
         mid = torch.empty(1, num_q_heads, 64, head_dim, device=device, dtype=torch.float32)
         lse = torch.empty(1, num_q_heads, 64, device=device, dtype=torch.float32)
-        actual = decode_paged_attention(q, cache, cache, indptr, indices, q_positions, mid, lse, sm_scale)
+        actual = decode_paged_attention(q, cache, cache, indptr, indices, q_positions, mid, lse, sm_scale, **scale_args)
     else:
         qo_indptr = torch.tensor([0, 1], device=device, dtype=torch.int32)
         prefix_lens = torch.tensor([count - 1], device=device, dtype=torch.int32)
         # 65 cached tokens cover both the full-tile and masked split-prefix loads.
-        extend = cache[high + count - 1 : high + count] if path == "split_extend" else None
+        extend = selected[-1:].to(q.dtype) if path == "split_extend" else None
         actual = extend_paged_attention(
             q, cache, cache, qo_indptr, indptr, indices, prefix_lens, 1, sm_scale,
-            k_extend=extend, v_extend=extend,
+            k_extend=extend, v_extend=extend, **scale_args,
         )
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)

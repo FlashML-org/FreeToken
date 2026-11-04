@@ -73,11 +73,11 @@ _MAX_KV_SPLITS = 64
 _STAGE2_TILE_ELEMS = 8192
 
 
-def _kv_offset_dtype(k_cache: torch.Tensor, v_cache: torch.Tensor):
+def _kv_offset_dtype(*caches: torch.Tensor | None):
     # Bound physical offsets, not request lengths.
     max_offset = max(
         sum((size - 1) * stride for size, stride in zip(cache.shape, cache.stride()))
-        for cache in (k_cache, v_cache)
+        for cache in caches if cache is not None
     )
     return tl.int32 if max_offset < 1 << 31 else tl.int64
 
@@ -658,7 +658,7 @@ def decode_paged_attention(
         attn_lse.stride(0),
         attn_lse.stride(1),
         attn_lse.stride(2),
-        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
+        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache, k_scale, v_scale),
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
@@ -1152,7 +1152,7 @@ def extend_paged_attention(
             v_scale_arg.stride(0),
             o.stride(0),
             o.stride(1),
-            KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
+            KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache, k_scale, v_scale),
             GROUP=num_q_heads // num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,
@@ -1192,7 +1192,7 @@ def extend_paged_attention(
         v_scale_arg.stride(0),
         o.stride(0),
         o.stride(1),
-        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
+        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache, k_scale, v_scale),
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,
@@ -1283,7 +1283,7 @@ def paged_attention(
         v_scale_arg.stride(0),
         o.stride(0),
         o.stride(1),
-        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
+        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache, k_scale, v_scale),
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,

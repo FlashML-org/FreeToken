@@ -318,3 +318,38 @@ def test_fp8_workspace_reuse_rebuild_and_graph(page_size, query, q_heads, dim):
         del graph, out
         if capacity == 256:
             assert pointer == original_pointer
+
+
+@pytest.mark.parametrize("path", ["paged", "decode", "extend", "split-extend"])
+def test_fp8_attention_large_scale_pitch(path):
+    # An int32 scale offset wraps to initialized row zero, yielding a numerical
+    # failure rather than an invalid access. Code offsets themselves fit int32.
+    torch.cuda.empty_cache()
+    if torch.cuda.mem_get_info()[0] < 18 * 2**30:
+        pytest.skip("Large scale-pitch regression needs 18 GiB of free GPU memory")
+    torch.manual_seed(1347)
+    heads, dim, count = 2, 128, 66
+    scales = torch.empty_strided((65, heads), (1 << 26, 1), device="cuda", dtype=torch.float32)
+    scales[0].fill_(0.01)
+    scales[64].copy_(torch.tensor([0.25, 0.5], device="cuda"))
+    codes = torch.zeros(65, heads, dim, device="cuda", dtype=torch.uint8)
+    codes[64].copy_(torch.randn(heads, dim, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8))
+    slots = torch.full((count,), 64, device="cuda", dtype=torch.int32)
+    indptr = torch.tensor([0, count], device="cuda", dtype=torch.int32)
+    pos = torch.tensor([count-1], device="cuda", dtype=torch.int32)
+    q = torch.randn(1, 8, dim, device="cuda", dtype=torch.bfloat16)
+    selected = codes[64].view(torch.float8_e4m3fn).float() * scales[64, :, None]
+    reference = selected.repeat_interleave(4, dim=0)[None]
+    kwargs = {"k_scale": scales, "v_scale": scales}
+    if path == "paged":
+        out = paged_attention(q, codes, codes, indptr, slots, torch.zeros_like(pos), pos, dim**-0.5, **kwargs)
+    elif path == "decode":
+        out = decode_paged_attention(q, codes, codes, indptr, slots, pos,
+                                    torch.empty(1, 8, 64, dim, device="cuda"),
+                                    torch.empty(1, 8, 64, device="cuda"), dim**-0.5, **kwargs)
+    else:
+        live = selected[None].to(q.dtype) if path == "split-extend" else None
+        out = extend_paged_attention(q, codes, codes, torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                                    indptr, slots, pos, 1, dim**-0.5,
+                                    k_extend=live, v_extend=live, **kwargs)
+    torch.testing.assert_close(out.float(), reference, atol=0.003, rtol=0.03)
