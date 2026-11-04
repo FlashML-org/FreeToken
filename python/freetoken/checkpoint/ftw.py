@@ -238,7 +238,7 @@ class FTWReader:
         # Direct reads (DMA straight from disk, bypassing the page cache: O_DIRECT, or
         # FILE_FLAG_NO_BUFFERING on Windows) are the fast path but a perf choice, not a correctness
         # one. Some filesystems reject them at open (tmpfs, many overlay/network mounts); then we
-        # fall back to mmap (below), NOT to chunked buffered preadv -- a whole-shard mapping +
+        # fall back to mmap (below), NOT to chunked buffered preadv -- on Linux a whole-shard mapping +
         # kernel readahead copies far faster than per-chunk page-cache reads.
         self._direct = DIRECT_READS
         self._probed = False

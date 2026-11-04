@@ -37,10 +37,10 @@ def test_keep_drops_entries_before_their_bytes_are_read(tmp_path, monkeypatch):
 
 
 def test_the_mmap_path_reads_what_was_written(tmp_path, monkeypatch):
-    # the reader maps the shards where there is no O_DIRECT (Windows) or the filesystem refuses it
+    # the reader maps the shards where the platform has no direct reads or the filesystem refuses them
     tensors = _write_ftw(tmp_path, ["model.a.weight", "model.b.weight"])
     reader = FTWReader(str(tmp_path))
-    monkeypatch.setattr(reader, "_direct", 0)
+    monkeypatch.setattr(reader, "_direct", False)
     for entry in reader.entries("weight"):
         dest = bytearray(math.ceil(entry["nbytes"] / ALIGN) * ALIGN)
         reader.read_into(memoryview(dest), entry)
