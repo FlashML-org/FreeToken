@@ -8,10 +8,11 @@ contiguous cache) paths both rely on:
   Registering already-resident pages just page-locks them; registering a lazy mmap first
   faults+zero-fills every page (~137 GiB -> ~47 s for DSV4) and that zero-fill is then
   immediately overwritten by the read. So pin-after-fill removes a whole redundant pass.
-* **chunked multi-threaded O_DIRECT** -- DMA straight from disk into the (page-aligned)
-  bank, bypassing the page cache, with many concurrent ``preadv`` on one fd (scales to the
-  device's queue-depth ceiling even for a single file). Where the platform has no O_DIRECT
-  (``O_DIRECT_READS``), the same fan-out reads through one unbuffered handle per thread.
+* **chunked multi-threaded direct reads** -- DMA straight from disk into the (page-aligned)
+  bank, bypassing the page cache, with many concurrent positional reads on one file
+  (``DirectFile``: O_DIRECT on POSIX, FILE_FLAG_NO_BUFFERING on Windows), which scales to the
+  device's queue-depth ceiling even for a single file. Where the platform has neither
+  (``O_DIRECT_READS``), the same fan-out reads through one buffered handle per thread.
 
 The mmaps are held for the process lifetime (the banks live as long as the offload cache).
 """
@@ -33,12 +34,12 @@ from typing import Callable
 import torch
 
 from freetoken.utils import init_logger
+from freetoken.utils.direct_io import DIRECT_ALIGN, DIRECT_READS, DirectFile
 
 logger = init_logger(__name__)
 
-_BLK = 4096  # O_DIRECT alignment (page size)
-# Windows has neither, and reads through the file cache instead.
-O_DIRECT_READS = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+_BLK = DIRECT_ALIGN
+O_DIRECT_READS = DIRECT_READS
 # Windows mmaps have no madvise: a released pageable bank stays resident until its buffer closes.
 RELEASABLE_PAGES = hasattr(mmap, "MADV_DONTNEED")
 
@@ -496,45 +497,54 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
+        _drop_cached_pages(path, 0, 0)
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    file = DirectFile(path)
 
     def rd(o):
         want = min(chunk, len(mv) - o)
         want = min(want, ((size - o + _BLK - 1) // _BLK) * _BLK)
-        os.preadv(fd, [mv[o:o + want]], o)
+        file.pread_into(mv[o:o + want], o)
 
     try:
         _read_chunks(rd, size, chunk, workers)
     finally:
-        os.close(fd)
+        file.close()
     return size
 
 
-def _preadv_all(fd: int, dst: memoryview, offset: int, need: int) -> None:
-    """preadv into ``dst`` until ``need`` bytes have landed; O_DIRECT may return a short count."""
+def _drop_cached_pages(path: str, offset: int, nbytes: int) -> None:
+    """Evict ``path``'s cached pages where the platform can; Windows has no fadvise, and its unbuffered open flushes them."""
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, offset, nbytes, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _preadv_all(file: DirectFile, dst: memoryview, offset: int, need: int) -> None:
+    """Direct reads into ``dst`` until ``need`` bytes have landed; a direct read may return a short count."""
     done = 0
     while done < need:
         if done % _BLK:  # a continuation read has to stay block-aligned on both sides
-            raise OSError(f"unaligned short O_DIRECT read: {done} of {need} bytes at {offset}")
-        got = os.preadv(fd, [dst[done:]], offset + done)
+            raise OSError(f"unaligned short direct read: {done} of {need} bytes at {offset}")
+        got = file.pread_into(dst[done:], offset + done)
         if got <= 0:
-            raise OSError(f"short O_DIRECT read: {done} of {need} bytes at {offset}")
+            raise OSError(f"short direct read: {done} of {need} bytes at {offset}")
         done += got
 
 
 def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int, nbytes: int,
                     dest_offset: int = 0, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
                     drop_cache: bool = True) -> int:
-    """Chunked multi-threaded read of ``path[file_offset : file_offset + nbytes]`` into ``buf`` at ``dest_offset``: O_DIRECT where the platform has it (``O_DIRECT_READS``), else buffered (``_read_range_buffered``). Returns ``nbytes``.
+    """Chunked multi-threaded read of ``path[file_offset : file_offset + nbytes]`` into ``buf`` at ``dest_offset``: direct where the platform has it (``O_DIRECT_READS``), else buffered (``_read_range_buffered``). Returns ``nbytes``.
 
-    Byte-range counterpart of :func:`read_file_into`, for one tensor inside a shard. O_DIRECT needs the file offset AND the destination address block-aligned at the same time, which only holds when the two share their offset mod 4096 -- a safetensors data offset practically never lines up with the tensor's slot in the bank. Chunks that do line up DMA straight into ``buf``; the rest DMA into a page-aligned bounce (source window rounded out to whole blocks) and are copied into place, which also covers the unaligned head and tail.
+    Byte-range counterpart of :func:`read_file_into`, for one tensor inside a shard. A direct read needs the file offset AND the destination address block-aligned at the same time, which only holds when the two share their offset mod 4096 -- a safetensors data offset practically never lines up with the tensor's slot in the bank. Chunks that do line up DMA straight into ``buf``; the rest DMA into a page-aligned bounce (source window rounded out to whole blocks) and are copied into place, which also covers the unaligned head and tail.
     """
     mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
     if dest_offset + nbytes > len(mv):
@@ -544,20 +554,15 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
                                     dest_offset=dest_offset, workers=workers, chunk=chunk)
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, file_offset, nbytes, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        _drop_cached_pages(path, file_offset, nbytes)
+    file = DirectFile(path)
     scratch = threading.local()
 
     def rd(i: int) -> None:
         n = min(chunk, nbytes - i)
         src, dst = file_offset + i, dest_offset + i
         if src % _BLK == 0 and (base + dst) % _BLK == 0 and n % _BLK == 0:
-            _preadv_all(fd, mv[dst:dst + n], src, n)
+            _preadv_all(file, mv[dst:dst + n], src, n)
             return
         head = src % _BLK
         span = ((head + n + _BLK - 1) // _BLK) * _BLK
@@ -565,19 +570,19 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
         if bounce is None or len(bounce) < span:
             bounce = scratch.buf = mmap.mmap(-1, span)  # anonymous mmaps are page-aligned
         bmv = memoryview(bounce)
-        _preadv_all(fd, bmv[:span], src - head, head + n)
+        _preadv_all(file, bmv[:span], src - head, head + n)
         mv[dst:dst + n] = bmv[head:head + n]
 
     try:
         _read_chunks(rd, nbytes, chunk, workers)
     finally:
-        os.close(fd)
+        file.close()
     return nbytes
 
 
 def _read_range_buffered(mv: memoryview, path: str, *, file_offset: int, nbytes: int,
                          dest_offset: int, workers: int, chunk: int) -> int:
-    """:func:`read_range_into` without O_DIRECT: the same chunked fan-out, one unbuffered handle per thread."""
+    """:func:`read_range_into` without direct reads: the same chunked fan-out, one buffered handle per thread."""
     local = threading.local()
     handles: list = []
     handles_lock = threading.Lock()

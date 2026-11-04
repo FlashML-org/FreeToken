@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -454,6 +455,9 @@ def range_reader(request, monkeypatch) -> str:
     (2239, 1_000_000, 0),         # the real checkpoint's header-end phase
     (4095, 4097, 1),              # straddles two block boundaries
     (4_999_000, 1003, 123_456),   # runs to EOF
+    (0, 5_000_003, 0),            # the whole file, its length off a block
+    (4096, 8192, 4096),           # source and destination aligned alike: read straight into the bank
+    (12_345, 3_000_000, 777),     # many chunks, every one of them off a block on both sides
 ])
 def test_read_range_into_matches_the_file(blob, range_reader, file_offset, nbytes, dest_offset):
     path, data = blob
@@ -471,6 +475,22 @@ def test_read_range_into_is_chunk_and_thread_safe(blob, range_reader):
     view = bank.memoryview()
     read_range_into(view, path, file_offset=2239, nbytes=4_000_000, dest_offset=1024,
                     workers=8, chunk=64 << 10)
+    assert bytes(view[1024:1024 + 4_000_000]) == data[2239:2239 + 4_000_000]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="which reader Windows takes")
+def test_windows_reads_a_range_unbuffered(blob, monkeypatch):
+    # through the file cache a reader at very low I/O priority crawls; unbuffered it keeps the disk's pace
+    import freetoken.moe.host_banks as host_banks
+
+    def through_the_cache(*args, **kwargs):
+        raise AssertionError("read the range through the file cache")
+
+    monkeypatch.setattr(host_banks, "_read_range_buffered", through_the_cache)
+    path, data = blob
+    bank = HostBank((6_000_000,), torch.uint8)
+    view = bank.memoryview()
+    read_range_into(view, path, file_offset=2239, nbytes=4_000_000, dest_offset=1024, chunk=1 << 20)
     assert bytes(view[1024:1024 + 4_000_000]) == data[2239:2239 + 4_000_000]
 
 

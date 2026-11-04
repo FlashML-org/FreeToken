@@ -44,13 +44,14 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from freetoken.utils import init_logger
+from freetoken.utils.direct_io import DIRECT_ALIGN, DIRECT_READS, DirectFile
 
 logger = init_logger(__name__)
 
 INDEX_NAME = "freetoken_weight.json"
 FORMAT_TAG = "freetoken_weight"
 FORMAT_VERSION = 1
-ALIGN = 4096  # O_DIRECT block alignment (== page size on this platform)
+ALIGN = DIRECT_ALIGN
 DEFAULT_SHARD_LIMIT = 8 << 30  # 8 GiB; must be a multiple of ALIGN
 _SHARD_FMT = "freetoken-{:05d}.ftw"
 _DEFAULT_CHUNK = 8 << 20
@@ -67,10 +68,10 @@ def layer_bank_entry_name(bank_name: str, layer_id: int) -> str:
     return f"{bank_name}#L{layer_id:05d}"
 
 
-def _pread_into(fd: int, mv: memoryview, offset: int) -> None:
-    """POSIX positional read into ``mv`` at ``offset``, looping over any short preadv.
+def _pread_into(file: DirectFile, mv: memoryview, offset: int) -> None:
+    """Direct positional read into ``mv`` at ``offset``, looping over any short read.
 
-    preadv may return short (a signal, or the EOF-adjacent tail); the loop resumes
+    A read may return short (a signal, or the EOF-adjacent tail); the loop resumes
     at the running offset, which stays O_DIRECT-legal: the writer pads every tensor
     to ALIGN and cuts shards at ALIGN boundaries, so direct-IO short reads land on
     block boundaries. EOF before the buffer is filled raises ``OSError`` — a
@@ -78,7 +79,7 @@ def _pread_into(fd: int, mv: memoryview, offset: int) -> None:
     done = 0
     total = len(mv)
     while done < total:
-        n = os.preadv(fd, [mv[done:]], offset + done)
+        n = file.pread_into(mv[done:], offset + done)
         if n == 0:
             raise OSError(
                 f"unexpected EOF reading FTW: got {done}/{total} bytes at offset {offset}"
@@ -232,15 +233,14 @@ class FTWReader:
                 f"{path!r} stores NVFP4 global scales as fp16 (e.g. {fp16_globals[0]!r}) but FreeToken reads them as fp32; "
                 "reconvert it from the source checkpoint with `ft checkpoint`"
             )
-        self._fds: dict[str, int] = {}
+        self._files: dict[str, DirectFile] = {}
         self._maps: dict[str, tuple[mmap.mmap, memoryview]] = {}
-        # O_DIRECT (DMA straight from disk, bypassing the page cache) is the fast path but a
-        # perf choice, not a correctness one. Some filesystems reject it at open with EINVAL
-        # (tmpfs, many overlay/network mounts) and the flag is Linux-only; when it's absent
-        # we fall back to mmap (below), NOT to chunked buffered preadv -- a whole-shard
-        # mapping + kernel readahead copies far faster than per-chunk page-cache reads.
-        # 0 here means "O_DIRECT unavailable -> use the mmap path".
-        self._direct = getattr(os, "O_DIRECT", 0)
+        # Direct reads (DMA straight from disk, bypassing the page cache: O_DIRECT, or
+        # FILE_FLAG_NO_BUFFERING on Windows) are the fast path but a perf choice, not a correctness
+        # one. Some filesystems reject them at open (tmpfs, many overlay/network mounts); then we
+        # fall back to mmap (below), NOT to chunked buffered preadv -- a whole-shard mapping +
+        # kernel readahead copies far faster than per-chunk page-cache reads.
+        self._direct = DIRECT_READS
         self._probed = False
         self._lock = threading.Lock()  # load_ftw_banks calls read_into concurrently
 
@@ -252,7 +252,7 @@ class FTWReader:
         return [t for t in self.index["tensors"] if not keep or t["kind"] in keep]
 
     def _ensure_mode(self) -> None:
-        """Resolve the read backend once: keep O_DIRECT if the filesystem accepts it, else
+        """Resolve the read backend once: keep direct reads if the filesystem accepts them, else
         drop to the mmap fallback. Thread-safe -- ``_probed`` is published only after
         ``_direct`` is final, so a concurrent reader never races onto a stale direct path."""
         if self._probed:
@@ -262,23 +262,22 @@ class FTWReader:
                 return
             if self._direct and self.shards:
                 try:
-                    os.close(os.open(os.path.join(self.dir, self.shards[0]["file"]),
-                                     os.O_RDONLY | self._direct))
+                    DirectFile(os.path.join(self.dir, self.shards[0]["file"])).close()
                 except OSError:
-                    self._direct = 0
-                    logger.warning("O_DIRECT unsupported on %s; using mmap fallback for "
+                    self._direct = False
+                    logger.warning("direct reads unsupported on %s; using mmap fallback for "
                                    "FTW load", self.dir)
             self._probed = True
 
-    def _fd(self, file: str) -> int:
-        fd = self._fds.get(file)
-        if fd is None:
-            with self._lock:  # first-open only; chunk reads reuse the cached fd lock-free
-                fd = self._fds.get(file)
-                if fd is None:
-                    fd = os.open(os.path.join(self.dir, file), os.O_RDONLY | self._direct)
-                    self._fds[file] = fd
-        return fd
+    def _fd(self, file: str) -> DirectFile:
+        opened = self._files.get(file)
+        if opened is None:
+            with self._lock:  # first-open only; chunk reads reuse the cached file lock-free
+                opened = self._files.get(file)
+                if opened is None:
+                    opened = DirectFile(os.path.join(self.dir, file))
+                    self._files[file] = opened
+        return opened
 
     def _map(self, file: str) -> memoryview:
         entry = self._maps.get(file)
@@ -301,9 +300,9 @@ class FTWReader:
         return entry[1]
 
     def close(self) -> None:
-        for fd in self._fds.values():
-            os.close(fd)
-        self._fds.clear()
+        for opened in self._files.values():
+            opened.close()
+        self._files.clear()
         for m, mv in self._maps.values():
             mv.release()
             m.close()
