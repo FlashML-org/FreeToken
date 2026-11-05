@@ -16,6 +16,7 @@ from pathlib import Path
 # container may expose a synthetic or partially mounted cgroup tree; admission
 # must not turn an unexpected file into an unbounded read or traversal.
 _CGROUP_VALUE_MAX_BYTES = 128
+_CGROUP_STAT_MAX_BYTES = 64 * 1024
 _CGROUP_MEMBERSHIP_MAX_BYTES = 64 * 1024
 _CGROUP_MAX_ANCESTORS = 64
 _MEMINFO_MAX_BYTES = 256 * 1024
@@ -81,6 +82,33 @@ def _host_memory_available(meminfo_path: Path) -> int | None:
     return kib * 1024
 
 
+def _cgroup_file_cache(directory: Path, *, v1: bool = False) -> int:
+    """Return file-LRU bytes, or zero if optional statistics cannot be trusted."""
+    try:
+        _, text = _read_bounded_ascii(
+            Path(directory) / "memory.stat", _CGROUP_STAT_MAX_BYTES
+        )
+        if text is None:
+            return 0
+        counters: dict[str, int] = {}
+        for line in text.removesuffix("\n").split("\n"):
+            key, separator, counter = line.partition(" ")
+            if not separator or re.fullmatch(r"[A-Za-z0-9_]+", key) is None:
+                return 0
+            value = _parse_u64_counter(counter)
+            if value is None or key in counters:
+                return 0
+            counters[key] = value
+    except ValueError:
+        return 0
+
+    # v1 totals match hierarchical usage. Unlike `file`, file LRU lists exclude shmem.
+    prefix = "total_" if v1 else ""
+    return counters.get(prefix + "inactive_file", 0) + counters.get(
+        prefix + "active_file", 0
+    )
+
+
 def _cgroup_pair_remaining(
     directory: Path,
     limit_name: str,
@@ -111,7 +139,8 @@ def _cgroup_pair_remaining(
     current = _parse_u64_counter(current_text)
     if current is None:
         raise ValueError(f"malformed cgroup memory usage: {current_path}")
-    return True, max(0, limit - current)
+    working_set = max(0, current - _cgroup_file_cache(directory, v1=v1))
+    return True, max(0, limit - working_set)
 
 
 def _read_cgroup_memberships(proc_cgroup_path: Path) -> tuple[str | None, str | None]:
@@ -234,7 +263,8 @@ def _cgroup_memory_remaining(
     Cgroup v2 is authoritative whenever its memory controller is visible.
     ``max`` is a known-unlimited value.  Only when v2 is absent do we try the
     conventional, bounded v1 controller roots; no filesystem scan is used.
-    Malformed, overflowing, or unreadable visible controls raise ``ValueError``.
+    Malformed, overflowing, or unreadable limits or usage raise ``ValueError``.
+    Optional file-cache statistics that cannot be parsed subtract nothing.
     """
     root = Path(cgroup_root)
     v2_path, v1_path = _read_cgroup_memberships(proc_cgroup_path)
@@ -275,6 +305,7 @@ def effective_memory_available(
     A *present* but malformed, overflowing, or permission-denied control file
     is an authoritative signal that the budget cannot be trusted, so it fails
     closed to ``0`` rather than being mistaken for an unlimited controller.
+    Optional ``memory.stat`` failures only disable the file-cache subtraction.
     """
     try:
         host_available = _host_memory_available(Path(meminfo_path))

@@ -66,6 +66,220 @@ def memory_files(tmp_path: Path) -> FakeMemoryFiles:
     return FakeMemoryFiles(tmp_path)
 
 
+@pytest.fixture(params=[False, True], ids=["v2", "v1"])
+def file_cache_cgroup(
+    memory_files: FakeMemoryFiles, request: pytest.FixtureRequest
+) -> tuple[Path, str]:
+    v1 = request.param
+    memory_files.membership("7:memory:/" if v1 else "0::/")
+    directory = memory_files.root / "memory" if v1 else memory_files.root
+    write = memory_files.v1 if v1 else memory_files.v2
+    write(directory, 24 << 30, 20 << 30)
+    memory_files.meminfo.write_text("MemAvailable: 33554432 kB\n", encoding="ascii")
+    return directory, "total_" if v1 else ""
+
+
+@pytest.mark.parametrize(
+    "current,inactive,active,remaining",
+    [
+        (20, 8, 6, 18),
+        (20, 14, 0, 18),
+        (20, 0, 14, 18),
+        (20, 10, 11, 24),
+        (26, 1, 0, 0),
+        (26, 4, 0, 2),
+        (24, 0, 0, 0),
+    ],
+)
+def test_file_cache_counts_as_room(
+    memory_files: FakeMemoryFiles,
+    file_cache_cgroup,
+    current: int,
+    inactive: int,
+    active: int,
+    remaining: int,
+):
+    directory, prefix = file_cache_cgroup
+    current_name = "memory.usage_in_bytes" if prefix else "memory.current"
+    (directory / current_name).write_text(f"{current << 30}\n", encoding="ascii")
+    (directory / "memory.stat").write_text(
+        f"{prefix}inactive_file {inactive << 30}\n"
+        f"{prefix}active_file {active << 30}\n",
+        encoding="ascii",
+    )
+
+    assert memory_files.remaining() == remaining << 30
+    assert memory_files.effective() == remaining << 30
+
+
+@pytest.mark.parametrize("key", ["inactive_file", "active_file"])
+def test_file_cache_missing_one_key_uses_the_other(
+    memory_files: FakeMemoryFiles, file_cache_cgroup, key: str
+):
+    directory, prefix = file_cache_cgroup
+    (directory / "memory.stat").write_text(
+        f"{prefix}{key} {14 << 30}\n", encoding="ascii"
+    )
+
+    assert memory_files.remaining() == 18 << 30
+
+
+def test_file_cache_uses_only_matching_file_lists(
+    memory_files: FakeMemoryFiles, file_cache_cgroup
+):
+    directory, prefix = file_cache_cgroup
+    other_prefix = "" if prefix else "total_"
+    (directory / "memory.stat").write_text(
+        f"file {20 << 30}\nshmem {10 << 30}\ncache {20 << 30}\n"
+        f"{other_prefix}inactive_file {8 << 30}\n"
+        f"{other_prefix}active_file {6 << 30}\n",
+        encoding="ascii",
+    )
+
+    assert memory_files.remaining() == 4 << 30
+
+
+@pytest.mark.parametrize(
+    "stat_text",
+    [
+        None,
+        "",
+        "anon 1\n",
+        "{prefix}active_file x\n",
+        "{prefix}active_file -1\n",
+        "{prefix}active_file +1\n",
+        "{prefix}active_file 1.5\n",
+        "{prefix}active_file 1 2\n",
+        "{prefix}active_file 1 \n",
+        "{prefix}active_file 1\r\n",
+        "{prefix}active_file {overflow}\n",
+        "{prefix}inactive_file 1\n{prefix}inactive_file 2\n",
+        "{prefix}active_file 1\n{prefix}active_file 2\n",
+        "{prefix}inactive_file 8589934592\n{prefix}active_file x\n",
+        "{prefix}inactive_file 8589934592\nbad line here\n",
+        "{prefix}inactive_file 8589934592\nanon {overflow}\n",
+        "{prefix}inactive_file 8589934592\nanon 1\nanon 2\n",
+        "{prefix}inactive_file 8589934592\n{prefix}active_file " + "9" * 5000 + "\n",
+        "{prefix}inactive_file 8589934592\n\n",
+    ],
+    ids=[
+        "absent",
+        "empty",
+        "missing-keys",
+        "non-numeric",
+        "negative",
+        "signed",
+        "fractional",
+        "extra-field",
+        "trailing-space",
+        "carriage-return",
+        "overflow",
+        "duplicate-inactive",
+        "duplicate-active",
+        "partial-cache",
+        "malformed-line",
+        "unrelated-overflow",
+        "unrelated-duplicate",
+        "oversized-counter",
+        "blank-line",
+    ],
+)
+def test_unusable_file_cache_subtracts_nothing(
+    memory_files: FakeMemoryFiles, file_cache_cgroup, stat_text: str | None
+):
+    directory, prefix = file_cache_cgroup
+    if stat_text is not None:
+        (directory / "memory.stat").write_text(
+            stat_text.format(prefix=prefix, overflow=_UINT64_MAX + 1), encoding="ascii"
+        )
+
+    assert memory_files.remaining() == 4 << 30
+    assert memory_files.effective() == 4 << 30
+
+
+@pytest.mark.parametrize(
+    "suffix", [b"\xff", b"x" * (65 * 1024)], ids=["non-ascii", "oversized"]
+)
+def test_non_ascii_or_oversized_file_cache_subtracts_nothing(
+    memory_files: FakeMemoryFiles, file_cache_cgroup, suffix: bytes
+):
+    directory, prefix = file_cache_cgroup
+    (directory / "memory.stat").write_bytes(
+        f"{prefix}inactive_file {14 << 30}\n".encode("ascii") + suffix
+    )
+
+    assert memory_files.remaining() == 4 << 30
+
+
+def test_unreadable_file_cache_subtracts_nothing(
+    memory_files: FakeMemoryFiles, file_cache_cgroup, monkeypatch: pytest.MonkeyPatch
+):
+    directory, _ = file_cache_cgroup
+    denied = directory / "memory.stat"
+    original_open = Path.open
+
+    def deny_stat(path: Path, *args, **kwargs):
+        if path == denied:
+            raise PermissionError("fixture denied memory.stat")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_stat)
+    assert memory_files.remaining() == 4 << 30
+    assert memory_files.effective() == 4 << 30
+
+
+@pytest.mark.parametrize("leaf_current,remaining", [(20, 6), (4, 18)])
+def test_file_cache_is_adjusted_at_each_ancestor(
+    memory_files: FakeMemoryFiles, file_cache_cgroup, leaf_current: int, remaining: int
+):
+    directory, prefix = file_cache_cgroup
+    memory_files.membership("7:memory:/job" if prefix else "0::/job")
+    write = memory_files.v1 if prefix else memory_files.v2
+    write(directory / "job", 24 << 30, leaf_current << 30)
+    for level, inactive, active in [(directory, 8, 6), (directory / "job", 1, 1)]:
+        (level / "memory.stat").write_text(
+            f"{prefix}inactive_file {inactive << 30}\n"
+            f"{prefix}active_file {active << 30}\n",
+            encoding="ascii",
+        )
+
+    assert memory_files.remaining() == remaining << 30
+
+
+def test_file_cache_room_is_still_clamped_by_host(
+    memory_files: FakeMemoryFiles, file_cache_cgroup
+):
+    directory, prefix = file_cache_cgroup
+    memory_files.meminfo.write_text("MemAvailable: 8388608 kB\n", encoding="ascii")
+    (directory / "memory.stat").write_text(
+        f"{prefix}inactive_file {14 << 30}\n", encoding="ascii"
+    )
+
+    assert memory_files.remaining() == 18 << 30
+    assert memory_files.effective() == 8 << 30
+
+
+@pytest.mark.parametrize("control", ["limit", "usage"])
+def test_file_cache_does_not_mask_malformed_controls(
+    memory_files: FakeMemoryFiles, file_cache_cgroup, control: str
+):
+    directory, prefix = file_cache_cgroup
+    limit_name, current_name = (
+        ("memory.limit_in_bytes", "memory.usage_in_bytes")
+        if prefix
+        else ("memory.max", "memory.current")
+    )
+    name = current_name if control == "usage" else limit_name
+    (directory / name).write_text("bad\n", encoding="ascii")
+    (directory / "memory.stat").write_text(
+        f"{prefix}inactive_file {14 << 30}\n", encoding="ascii"
+    )
+
+    with pytest.raises(ValueError, match=f"malformed cgroup memory {control}"):
+        memory_files.remaining()
+    assert memory_files.effective() == 0
+
+
 def test_v2_finite_budget_clamps_host_memavailable(memory_files: FakeMemoryFiles):
     memory_files.membership("0::/tenant/job")
     memory_files.v2(memory_files.root / "tenant" / "job", 12_000_000, 3_000_000)
