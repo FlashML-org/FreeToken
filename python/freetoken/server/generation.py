@@ -604,7 +604,9 @@ async def generate_events(
     first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state, usage or GenUsage()):
+        async for ev in _generate_events_impl(
+            uid, spec, state, usage if usage is not None else GenUsage()
+        ):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
