@@ -1,0 +1,49 @@
+{
+  "_environment": {
+    "torch": "2.14.0+rocm10.1.0",
+    "triton": "3.8.0",
+    "hip": "7.16.26385",
+    "gpu_name": "AMD Radeon AI PRO R9700",
+    "arch": "gfx1201",
+    "source_sha256": "27b45edd3f1fd2aa950ff6a6f1c714020e78f525f8c022b5ff46f727f896cf6b",
+    "device_count": 1,
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "compiler_sha256": "449f6779a4041275d18d801246d0c2c09ffb453a48093d4bebbbd82803954205",
+    "baseline_sha256": "9815bbdde6aa7c596020f7c1ec5c6e5ea3b363697877a6a052c833e34d74b3af"
+  },
+  "_rules": {
+    "eager_min_speedup": 1.05,
+    "each_repeat_faster": true
+  },
+  "_scope": "Eager decode only; Graph entries stay empty pending separate model qualification.",
+  "dense_fp8_decode": {
+    "eager": {
+      "1,5120,2048": {
+        "speedup": 2.8881421083394208,
+        "min_paired_speedup": 2.258698800667121
+      },
+      "1,2048,4096": {
+        "speedup": 2.7925056711471514,
+        "min_paired_speedup": 2.7456354563614886
+      },
+      "1,151936,2048": {
+        "speedup": 1.1631544640714144,
+        "min_paired_speedup": 1.1601689528473773
+      }
+    },
+    "graph": {}
+  },
+  "moe_decode_fp8": {
+    "eager": {
+      "1,2048,768,32,8": {
+        "speedup": 2.149956471331526,
+        "min_paired_speedup": 2.097327574739232
+      },
+      "1,2048,768,4550,8": {
+        "speedup": 2.6720033324525043,
+        "min_paired_speedup": 2.6453511021618126
+      }
+    },
+    "graph": {}
+  }
+}

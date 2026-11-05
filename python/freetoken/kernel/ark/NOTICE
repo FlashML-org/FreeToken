@@ -1,0 +1,5 @@
+HIP kernels and adapter contracts adapted from Radeon Operator Library (ARK),
+revision 975e8cd9918ec1365d3f275d1259d215315f505a, and its FreeToken P0 experiments.
+The source project declares Apache-2.0 in its pyproject.toml.
+Original project: https://github.com/AMD-AIM/amd_radeon_kernels
+FreeToken integration retains source comments and the adapted C ABI.
