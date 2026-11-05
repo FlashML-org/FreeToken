@@ -229,12 +229,14 @@ class ShellStats:
         self.completion_tokens = 0
         self.started_at = None
         self.first_token_at = None
+        self.first_token_count = 0
         self.finished_at = None
 
     def mark_started(self, now: float | None = None) -> None:
         self.status = "prefill"
         self.started_at = time.time() if now is None else now
         self.first_token_at = None
+        self.first_token_count = 0
         self.finished_at = None
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -246,8 +248,8 @@ class ShellStats:
         self.prompt_tokens = max(self.prompt_tokens, count)
 
     def count_delta(self, completion_tokens: int | None, now: float | None = None) -> None:
-        """Count one streamed delta: move to the running total it carries, or add one when the server sends no running usage."""
-        count = self.completion_tokens + 1 if completion_tokens is None else completion_tokens
+        """Count one streamed delta: move to the running total it carries, or add one when it carries no total (None or 0)."""
+        count = completion_tokens if completion_tokens else self.completion_tokens + 1
         if count <= self.completion_tokens:
             return
         current_time = time.time() if now is None else now
