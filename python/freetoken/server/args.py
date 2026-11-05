@@ -714,9 +714,9 @@ def parse_args(
         default=ServerArgs.embed_weights,
         choices=["gpu", "host"],
         help=(
-            "Where the input token embedding table lives. 'gpu' (default) keeps it in VRAM; 'host' keeps it in "
-            "pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. "
-            "Not for a table tied to the LM head."
+            "Where the input token embedding tables live. 'gpu' (default) keeps them in VRAM; 'host' keeps them in "
+            "pinned host RAM and each lookup reads its rows over PCIe, so their VRAM goes to the expert cache and KV. "
+            "A table tied to the LM head stays on the GPU; Gemma-4 E2B / E4B's per-layer table is the one that moves."
         ),
     )
 
