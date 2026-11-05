@@ -132,6 +132,9 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> p2_next{0};
   std::atomic<int64_t> prt_next{0};  // intermediate-row prep phase (prep_inter)
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
+  // Hybrid hands the CPU a few routes of a step: only these get work items, since a claim that finds nothing still costs a contended atomic.
+  std::vector<int64_t> active_routes;  // intermediate rows tok * top_k + k whose route names an expert
+  std::vector<int> active_tokens;      // tokens with at least one such route
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -174,6 +177,8 @@ struct CpuMoeExecutor {
     n_iblk = (params.I + kRowBlock - 1) / kRowBlock;
     n_hblk = (params.H + kRowBlock - 1) / kRowBlock;
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
+    active_routes.reserve(static_cast<size_t>(params.max_tokens) * params.top_k);
+    active_tokens.reserve(params.max_tokens);
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -212,7 +217,7 @@ struct CpuMoeExecutor {
 
   const MoeFormat& format_of(const MoeTask& t) const { return *fmts[layer_fmt[t.layer]]; }
 
-  // Whether any route of the task names an expert; do_pass1 and do_pass2 skip the others.
+  // Whether any route of the task names an expert; submit gives the others no work.
   bool has_routes(const MoeTask& t) const {
     const int64_t n = static_cast<int64_t>(t.num_tokens) * params.top_k;
     for (int64_t i = 0; i < n; ++i)
@@ -230,15 +235,14 @@ struct CpuMoeExecutor {
     }
   }
 
-  // Pass 1 item p = one kRowBlock block of one (token, route)'s intermediate row.
+  // Pass 1 item p = one kRowBlock block of one active route's intermediate row.
   void do_pass1(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
+    const int64_t tk = active_routes[p / n_iblk];
     const int k = static_cast<int>(tk % top_k);
     const int tok = static_cast<int>(tk / top_k);
     const int e = io_ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
     const float w_in = apply_on_input ? io_w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
     const int i0 = static_cast<int>(ib) * kRowBlock;
     const int i1 = std::min(I, i0 + kRowBlock);
@@ -246,11 +250,11 @@ struct CpuMoeExecutor {
                          g_scratch.data() + ((size_t)tok * top_k + k) * I);
   }
 
-  // Pass 2 item p = one kRowBlock block of one token's output row, summed over its routes.
+  // Pass 2 item p = one kRowBlock block of one active token's output row, summed over its routes.
   void do_pass2(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t hb = p % n_hblk;
-    const int tok = static_cast<int>(p / n_hblk);
+    const int tok = active_tokens[p / n_hblk];
     const int h0 = static_cast<int>(hb) * kRowBlock;
     const int h1 = std::min(H, h0 + kRowBlock);
     DownRoute routes[kMaxTopK];
@@ -292,8 +296,9 @@ struct CpuMoeExecutor {
     if (prt_total > 0) {
       MoeFormat& f = *fmts[layer_fmt[t.layer]];
       for (;;) {
-        int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
-        if (r >= prt_total) break;
+        const int64_t i = prt_next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= prt_total) break;
+        const int64_t r = active_routes[i];
         f.prep_inter(r, g_scratch.data() + (size_t)r * params.I);
       }
       barrier(local_sense);
@@ -345,9 +350,22 @@ struct CpuMoeExecutor {
   void submit(MoeTask t) {
     const int num_tokens = static_cast<int>(t.num_tokens);
     MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
-    p1_total = static_cast<int64_t>(num_tokens) * params.top_k * n_iblk;
-    p2_total = static_cast<int64_t>(num_tokens) * n_hblk;
-    prt_total = fmt.preps_inter() ? static_cast<int64_t>(num_tokens) * params.top_k : 0;
+    active_routes.clear();
+    active_tokens.clear();
+    for (int tok = 0; tok < num_tokens; ++tok) {
+      const size_t before = active_routes.size();
+      for (int k = 0; k < params.top_k; ++k) {
+        const int64_t r = static_cast<int64_t>(tok) * params.top_k + k;
+        if (io_ids[r] >= 0 && io_ids[r] < num_experts) active_routes.push_back(r);
+      }
+      if (active_routes.size() > before)
+        active_tokens.push_back(tok);
+      else
+        std::memset(io_y + static_cast<size_t>(tok) * params.H, 0, sizeof(bf16_t) * params.H);
+    }
+    p1_total = static_cast<int64_t>(active_routes.size()) * n_iblk;
+    p2_total = static_cast<int64_t>(active_tokens.size()) * n_hblk;
+    prt_total = fmt.preps_inter() ? static_cast<int64_t>(active_routes.size()) : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -356,7 +374,7 @@ struct CpuMoeExecutor {
     bar_sense.store(0, std::memory_order_relaxed);
     // Prepare the per-token input once, up front.
     // Single-threaded: tiny for decode, and done before the workers are woken below.
-    for (int tok = 0; tok < num_tokens; ++tok) fmt.prep_input(tok, io_x + (size_t)tok * params.H);
+    for (const int tok : active_tokens) fmt.prep_input(tok, io_x + (size_t)tok * params.H);
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       cur_task = t;

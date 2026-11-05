@@ -230,6 +230,39 @@ def test_cpu_decode_nvfp4_swigluoai_matches_dequant_reference(bs):
     assert rel < 3e-2, f"nvfp4 swigluoai bs={bs} rel err {rel.item()}"
 
 
+@pytest.mark.parametrize("make_cache", [_make_cache, _make_nvfp4_cache], ids=["bf16", "nvfp4"])
+def test_cpu_moe_gpu_routes_match_zero_weight_routes(make_cache):
+    """A route the GPU computes (-1) adds what a zero-weight route adds, wherever the routes the CPU computes sit in the batch.
+
+    Goes red if the work split indexes a route's scratch or a token's output by its place among the active ones,
+    or leaves the output row of a token with no CPU route stale.
+    """
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(7)
+    L, E, H, I, top_k, bs = 2, 16, 256, 128, 4, 3
+    ex = CpuMoeExecutor(make_cache(L, E, H, I), top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+                        num_threads=4, max_tokens=bs, device=torch.device("cuda"))
+    io = ex._io
+    io["x"].copy_(torch.randn(bs, H, dtype=torch.bfloat16) * 0.1)
+    routes = torch.randint(0, E, (bs, top_k), dtype=torch.int32)
+    w = torch.rand(bs, top_k, dtype=torch.float32)
+    active = torch.tensor([[0, 0, 0, 0], [1, 0, 1, 0], [0, 0, 0, 1]], dtype=torch.bool)
+
+    def run(ids, weights):
+        io["ids"].copy_(ids)
+        io["w"].copy_(weights)
+        io["y"].fill_(float("nan"))
+        ex._ext.run(1, bs)
+        return io["y"][:bs].to(torch.float32)
+
+    run((routes + 1) % E, w)  # every route's scratch now holds some other expert's numbers
+    actual = run(routes.masked_fill(~active, -1), w)
+    expected = run(routes, w * active)
+    assert torch.equal(actual, expected)
+    assert actual[0].eq(0).all() and actual[1:].ne(0).any(dim=1).all()
+
+
 def test_stale_extension_rejected_for_swigluoai(monkeypatch):
     """A prebuilt _cpu_moe.so from before ACT_SWIGLUOAI accepts act id 3 without
     error and silently computes the wrong activation in the generic epilogue.
