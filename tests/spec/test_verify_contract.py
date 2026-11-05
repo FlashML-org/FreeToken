@@ -152,8 +152,9 @@ class NoopVerify:
 
 
 class OracleProposer(Proposer):
-    default_k = 3
-    max_k = 8
+    @classmethod
+    def num_steps(cls, config):
+        return 3, 8
 
     @classmethod
     def slot_states(cls, config):

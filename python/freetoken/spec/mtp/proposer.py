@@ -107,9 +107,11 @@ class _VerifySink:
 
 
 class MTPProposer(Proposer):
-    default_k = 3
-    max_k = 8
     radix_lookahead = True
+
+    @classmethod
+    def num_steps(cls, config) -> tuple[int, int]:
+        return 3, 8
 
     @classmethod
     def adjust_config(cls, config, override) -> None:

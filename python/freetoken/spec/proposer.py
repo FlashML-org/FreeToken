@@ -37,8 +37,6 @@ class DraftContext(NamedTuple):
 class Proposer:
     """Draft side of one speculative method; holds no engine reference."""
 
-    default_k: ClassVar[int]
-    max_k: ClassVar[int]
     # True: the draft's KV slot i depends on token i+1, so the prefix cache keys position i by (t_i, t_{i+1})
     radix_lookahead: ClassVar[bool] = False
 
@@ -54,7 +52,7 @@ class Proposer:
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
         """(default, max) draft tokens per step; called after ``adjust_config``."""
-        return cls.default_k, cls.max_k
+        raise NotImplementedError
 
     @classmethod
     def budget(cls, config) -> tuple[int, int]:
