@@ -197,6 +197,38 @@ def test_modelopt_checkpoint_fills_the_model_the_quant_config_builds(tmp_path, m
     assert got[f"{mlp}.input_scale"].item() == 1.0
 
 
+def _gguf_shim(monkeypatch, clamp):
+    import freetoken.models.ricursive.gguf as ricursive_gguf
+    from freetoken.models.gguf.config import GgufConfigShim
+
+    monkeypatch.setattr(ricursive_gguf, "check_scales", lambda path: None)
+    md = {f"ricursive.{k}": v for k, v in {
+        "block_count": len(LAYER_TYPES), "embedding_length": H, "feed_forward_length": INTER,
+        "attention.head_count": HEADS, "attention.head_count_kv": KV_HEADS, "attention.key_length": HEAD_DIM,
+        "context_length": 2097152, "attention.layer_norm_rms_epsilon": EPS, "rope.freq_base": 10000.0,
+        "attention.sliding_window_pattern": [kind == "sliding_attention" for kind in LAYER_TYPES],
+        "attention.sliding_window": WINDOW, "embedding_scale": SCALE, "swiglu_clamp": clamp,
+    }.items()}
+    return GgufConfigShim(architectures=["RicursiveGGUFForCausalLM"], model_path="", model_type="ricursive",
+                          metadata=md, vocab_size=VOCAB, tie_word_embeddings=False)
+
+
+# the first community GGUFs store one clamp, llama.cpp's converter one per layer
+@pytest.mark.parametrize("clamp", [CLAMP, [CLAMP] * len(LAYER_TYPES)])
+def test_gguf_config_matches_the_checkpoint_config(monkeypatch, clamp):
+    from freetoken.models.ricursive.gguf import parse_gguf_config
+
+    want = replace(parse_config(SimpleNamespace(**_hf_dict())), architectures=["RicursiveGGUFForCausalLM"])
+    assert parse_gguf_config(_gguf_shim(monkeypatch, clamp)) == want
+
+
+def test_gguf_refuses_per_layer_clamps_that_differ(monkeypatch):
+    from freetoken.models.ricursive.gguf import parse_gguf_config
+
+    with pytest.raises(NotImplementedError, match="swiglu_clamp"):
+        parse_gguf_config(_gguf_shim(monkeypatch, [CLAMP, CLAMP, 2 * CLAMP]))
+
+
 @pytest.mark.needs_weights
 def test_gguf_matches_the_checkpoint_tokenizer_and_config():
     from transformers import AutoTokenizer

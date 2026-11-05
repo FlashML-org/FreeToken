@@ -31,6 +31,14 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     return (f"blk.{match[1]}.{leaf}",) if leaf else ()
 
 
+def _clamp(value) -> float:
+    # llama.cpp's converter writes one clamp per layer; the first community GGUFs carry a scalar
+    values = set(value) if isinstance(value, list) else {value}
+    if len(values) != 1:
+        raise NotImplementedError("Ricursive GGUF per-layer swiglu_clamp values must all match")
+    return float(values.pop())
+
+
 def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
     md = shim.metadata
 
@@ -49,7 +57,7 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
         rms_norm_eps=float(kv("attention.layer_norm_rms_epsilon")), rope_theta=float(kv("rope.freq_base")),
         layer_types=["sliding_attention" if v else "full_attention" for v in kv("attention.sliding_window_pattern")],
         sliding_window=int(kv("attention.sliding_window")), embed_scale=float(kv("embedding_scale")),
-        ffn_clamp_threshold=float(kv("swiglu_clamp")), tie_word_embeddings=shim.tie_word_embeddings,
+        ffn_clamp_threshold=_clamp(kv("swiglu_clamp")), tie_word_embeddings=shim.tie_word_embeddings,
         hidden_act="silu", use_gated_attention=True, gate_full_precision=True, use_valres=True,
     )
 
