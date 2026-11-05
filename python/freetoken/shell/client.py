@@ -45,14 +45,17 @@ class ShellClientError(Exception):
         self.status = status
 
 
+# completion_tokens: the turn's running total sent with the chunk; None when the server sends usage only at the end
 @dataclass(frozen=True)
 class ReasoningDelta:
     text: str
+    completion_tokens: int | None = None
 
 
 @dataclass(frozen=True)
 class ContentDelta:
     text: str
+    completion_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -274,7 +277,7 @@ class ShellClient:
             "model": model,
             "messages": messages,
             "stream": True,
-            "stream_options": {"include_usage": True},
+            "stream_options": {"include_usage": True, "continuous_usage_stats": True},
         }
         if sampling.max_tokens is not None:
             request["max_tokens"] = sampling.max_tokens
@@ -303,6 +306,7 @@ class ShellClient:
                 if usage is not None:
                     prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
                     completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                running = completion_tokens if usage is not None else None
                 for choice in chunk.choices or []:
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
@@ -313,9 +317,9 @@ class ShellClient:
                     # SDK keeps unknown fields, so read it off the model as an extra.
                     reasoning = getattr(delta, "reasoning_content", None)
                     if reasoning:
-                        yield ReasoningDelta(reasoning)
+                        yield ReasoningDelta(reasoning, running)
                     if delta.content:
-                        yield ContentDelta(delta.content)
+                        yield ContentDelta(delta.content, running)
         except openai.APIError as exc:
             raise ShellClientError(f"stream failed: {exc}") from exc
         finally:
