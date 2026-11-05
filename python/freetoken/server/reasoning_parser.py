@@ -898,6 +898,7 @@ class ReasoningParser:
 
     ReasoningParserEnum: Dict[str, Type[BaseReasoningParser]] = {
         "flint": ThinkReasoningParser,
+        "ricursive": Qwen3ReasoningParser,
         "deepseekv32": DeepSeekV32ReasoningParser,
         "gpt_oss": GptOssHarmonyReasoningParser,
         "qwen3": Qwen3ReasoningParser,

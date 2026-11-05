@@ -71,6 +71,7 @@ checkpoint is set:
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — local checkpoint directory or GGUF file; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
 | `FREETOKEN_REBUILD_EXTRA_ARGS` | `e2e/test_cache_rebuild.py` — extra server flags, e.g. `--moe-strategy hybrid --moe-cache-size 1024 --max-running-requests 1` for offloaded MoE |
+| `FREETOKEN_RIPPLE_MODEL`, `FREETOKEN_RIPPLE_GGUF` | `models/ricursive/test_ricursive.py` — local Ripple-65B checkpoint and a GGUF of it (tokenizer, template and config parity) |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
 | `FREETOKEN_TEST_MODELS_ROOT` | `models/test_quant_config.py` — directory whose checkpoints the stored-tensor scheme scan checks (default `/mnt/nvme/models`) |
 | `FREETOKEN_DSV4_VL_MODEL` | `tokenizer/test_mm_tokenize.py` - local DeepSeek-V4 vision checkpoint |

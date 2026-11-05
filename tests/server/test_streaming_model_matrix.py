@@ -127,6 +127,7 @@ MARKUP_MARKERS = {
 # opens the block implicitly (model emits only the closing marker).
 REASONING_FAMILIES = {
     "flint": ("glm47", "flint", "<think>", "</think>"),
+    "ricursive": ("qwen25", "ricursive", "<think>", "</think>"),
     "dsv4": ("deepseekv32", "deepseekv32", "", "</think>"),
     "dsv4.1": ("deepseekv41", "deepseekv32", "", "</think>"),
     "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),

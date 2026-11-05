@@ -108,3 +108,7 @@ def test_an_explicit_choice_beats_inference():
 def test_flint_uses_optional_reasoning_and_xml_tool_calls():
     assert _inferred("FlintForCausalLM") == ("glm47", "flint")
     assert _inferred("FlintGGUFForCausalLM") == ("glm47", "flint")
+
+
+def test_ricursive_uses_optional_reasoning_and_hermes_tool_calls():
+    assert _inferred("RicursiveForCausalLM") == ("qwen25", "ricursive")
