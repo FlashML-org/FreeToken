@@ -277,7 +277,7 @@ class SlotStateSpec:
     layer_ids: Tuple[int, ...] = ()
     dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
     fill_value: float = 0.0
-    # None: speculative decoding cannot serve a model carrying this state
+    # None on a model's own state: speculative decoding cannot serve the model; a proposer's state may leave it None and keep itself right in post_verify
     verify: type[SlotVerify] | None = None
 
 

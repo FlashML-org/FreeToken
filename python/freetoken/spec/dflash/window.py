@@ -7,23 +7,6 @@ import torch
 from freetoken.models.config import SlotStateSpec
 
 
-class DFlashWindowVerify:
-    """Verify handler of the window: nothing to stage, nothing to commit.
-
-    A verify writes all k+1 rows of positions C..C+k into the live window before the drain decides how many stand. The window is only ever read as the positions [L-W, L) of a committed length L <= C+n: the rows past the accepted ones lie above L, and the slots they took held positions <= C+k-R < L-W. The next block overwrites them before L reaches them, so the commit has nothing to undo.
-    """
-
-    def __init__(self, spec: SlotStateSpec, max_bs: int, rows_per_req: int, device: torch.device, dtype: torch.dtype) -> None:
-        pass
-
-    @staticmethod
-    def nbytes(spec: SlotStateSpec, max_bs: int, rows_per_req: int, dtype: torch.dtype) -> int:
-        return 0
-
-    def commit(self, pool, slots: torch.Tensor, counts: torch.Tensor) -> None:
-        pass
-
-
 class DFlashWindow:
     """Context rows of positions ``p`` at row ``p % R`` of each GDN slot; ``fmt="unquantized"`` keeps them in the activation dtype, one ``[R, H]`` tensor per slot."""
 
@@ -40,7 +23,7 @@ class DFlashWindow:
     @classmethod
     def slot_specs(cls, R: int, H: int, fmt: str = "unquantized") -> tuple[SlotStateSpec, ...]:
         cls._check(fmt)
-        return (SlotStateSpec(name=cls.NAME, shape=(R, H), verify=DFlashWindowVerify),)
+        return (SlotStateSpec(name=cls.NAME, shape=(R, H)),)
 
     @classmethod
     def _check(cls, fmt: str) -> None:
