@@ -50,6 +50,8 @@ uv run pytest tests/ -m "not slow"
 
 CUDA kernels are JIT-compiled with `nvcc` on first use unless the prebuilt `freetoken-kernel-cache` wheel is installed. The C++ extensions under `python/freetoken/kernel/csrc/` are built by `setup.py`; after changing them run `python setup.py build_ext --inplace`.
 
+The ggml kernels under `python/freetoken/kernel/csrc/ggml/` are copied from llama.cpp and edited in place. See `docs/ggml-kernels.md` before changing or updating them.
+
 Performance changes come with A/B numbers against `main`.
 
 ## Tests

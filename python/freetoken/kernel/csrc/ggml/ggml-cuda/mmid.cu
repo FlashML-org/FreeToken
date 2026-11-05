@@ -195,7 +195,9 @@ int64_t ggml_cuda_mm_ids_helper_scratch_size(const int n_experts, const int n_to
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
-// FreeToken: a counting sort over blocks of routes; within an expert the blocks keep token order, the routes inside one block do not.
+// FreeToken: a counting sort over blocks of routes. One warp per expert over every route costs n_experts x n_tokens and bounds n_tokens by shared memory.
+// Within an expert the blocks keep token order, the routes inside one block do not.
+// The flat MoE grid does not see that order (one tile per CUDA block), but a stream-k regular grid (ncols_max > 0) would, in its fp32 summation order.
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         int32_t * __restrict__ scratch, int2 * __restrict__ tile_map, const int J, const int ntiles, const int jt_none,

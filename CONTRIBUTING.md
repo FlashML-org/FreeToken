@@ -48,6 +48,8 @@ uv pip install -e ".[accel]"
 
 See [docs/install.md](docs/install.md) for requirements. CUDA kernels are JIT-compiled on first use and need a CUDA 13 toolkit with `nvcc` on `PATH`.
 
+The ggml kernels are copied from llama.cpp and edited in place. See [docs/ggml-kernels.md](docs/ggml-kernels.md) before changing them.
+
 Run the tests with `pytest`. Most tests need an NVIDIA GPU. `-m "not slow"` skips the long kernel sweeps; tests marked `needs_weights` are off unless you point them at a local checkpoint (see [tests/README.md](tests/README.md)).
 
 ## Commit messages

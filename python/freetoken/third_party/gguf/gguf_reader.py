@@ -21,6 +21,7 @@ if __name__ == "__main__":
     # Allow running file in package as a script.
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# FreeToken: a relative import, so an installed gguf package is never picked up
 from .constants import (
     GGML_MAX_DIMS,
     GGML_QUANT_SIZES,
