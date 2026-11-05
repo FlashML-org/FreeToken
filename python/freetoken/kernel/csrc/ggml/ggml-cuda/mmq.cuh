@@ -992,7 +992,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 }
 
 
-// A flat MoE grid runs only the (expert, column tile) pairs listed in tile_map, see ggml_cuda_launch_mm_ids_tile_map.
+// A flat MoE grid runs only the (expert, column tile) pairs listed in tile_map, see ggml_cuda_launch_mm_ids_helper.
 static __device__ __forceinline__ void mmq_flat_tile(const int2 * __restrict__ tile_map, int & zt, int & jt) {
     if (tile_map) {
         const int2 t = tile_map[jt];
@@ -1683,7 +1683,7 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
-// FreeToken: under ids, ncols_max > 0 bounds the tokens any one expert gets and sizes the tile grid; otherwise the grid is flat, see ggml_cuda_launch_mm_ids_tile_map
+// FreeToken: under ids, ncols_max > 0 bounds the tokens any one expert gets and sizes the tile grid; otherwise the grid is flat, see ggml_cuda_launch_mm_ids_helper
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         int64_t ncols_max = -1, bool inactive_ids = false);

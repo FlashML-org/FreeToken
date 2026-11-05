@@ -67,79 +67,386 @@
      }
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
-@@ -49,7 +49,7 @@
-             int iex_used = -1; // The index at which the expert is used, if any.
-             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
-                 const int expert_used = ids[it*si1 + iex];
--                nex_prev += expert_used < expert;
-+                nex_prev += (unsigned) expert_used < (unsigned) expert; // FreeToken: unsigned, so an inactive route (negative id) sorts after every expert
-                 if (expert_used == expert) {
-                     iex_used = iex;
-                 }
-@@ -75,7 +75,7 @@
-             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
-                 ids[it*si1 + iex] : INT_MAX;
-             const int iex_used = expert_used == expert ? iex : -1;
--            nex_prev += expert_used < expert;
-+            nex_prev += (unsigned) expert_used < (unsigned) expert; // FreeToken: unsigned, so an inactive route (negative id) sorts after every expert
+@@ -1,179 +1,218 @@
+ #include "common.cuh"
+ #include "mmid.cuh"
  
-             // Whether the threads at this token position have used the expert:
-             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
-@@ -177,3 +177,45 @@
-             break;
-     }
- }
+-// To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
+-struct mm_ids_helper_store {
+-    uint32_t data;
++static constexpr int mm_ids_nthreads         = 256;
++static constexpr int mm_ids_routes_per_block = 8*mm_ids_nthreads;
++static constexpr int mm_ids_one_block_routes = 4096; // one block beats the three launches up to here (RTX PRO 6000 sweep)
 +
-+// Lists the (expert, column tile) pairs that hold columns for a flat MoE grid, in expert order.
-+// The other ntiles grid columns get tile jt_none of expert 0, which starts past its columns, so mul_mat_q skips them.
-+template <int nthreads>
-+__launch_bounds__(nthreads, 1)
-+static __global__ void mm_ids_tile_map(
-+        const int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_map, const int n_experts, const int J, const int ntiles, const int jt_none) {
-+    __shared__ int scan[nthreads];
-+
-+    int start = 0; // First tile of the current chunk of experts.
-+    for (int e0 = 0; e0 < n_experts; e0 += nthreads) {
-+        const int e = e0 + threadIdx.x;
-+        const int n = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
-+
-+        scan[threadIdx.x] = n;
-+        __syncthreads();
++// Route r is slot r % n_expert_used of token r / n_expert_used. A negative (inactive) id is >= n_experts as unsigned, so it gets no compact row.
++static __device__ __forceinline__ int mm_ids_route_expert(
++        const int32_t * __restrict__ ids, const int r, const int n_expert_used, const int si1, const int n_experts) {
++    const int expert = ids[(r / n_expert_used)*si1 + r % n_expert_used];
++    return (unsigned) expert < (unsigned) n_experts ? expert : -1;
++}
+ 
+-    __device__ mm_ids_helper_store(const uint32_t it, const uint32_t iex_used) {
+-        data = (it & 0x003FFFFF) | (iex_used << 22);
+-    }
++// Exclusive prefix sum of v over the block, with the block total in total. Every thread must call it.
++static __device__ __forceinline__ int mm_ids_block_scan(const int v, int & total) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int nwarps    = mm_ids_nthreads/warp_size;
++    __shared__ int warp_sums[nwarps];
+ 
+-    __device__ uint32_t it() const {
+-        return data & 0x003FFFFF;
++    const int x = warp_prefix_inclusive_sum<int, warp_size>(v);
++    if (threadIdx.x % warp_size == warp_size - 1) {
++        warp_sums[threadIdx.x / warp_size] = x;
++    }
++    __syncthreads();
++    int before = 0;
++    total = 0;
 +#pragma unroll
-+        for (int offset = 1; offset < nthreads; offset *= 2) {
-+            const int add = threadIdx.x >= offset ? scan[threadIdx.x - offset] : 0;
-+            __syncthreads();
-+            scan[threadIdx.x] += add;
-+            __syncthreads();
++    for (int w = 0; w < nwarps; ++w) {
++        before += w < (int) threadIdx.x / warp_size ? warp_sums[w] : 0;
++        total  += warp_sums[w];
+     }
++    __syncthreads();
++    return before + x - v;
++}
+ 
+-    __device__ uint32_t iex_used() const {
+-        return data >> 22;
++// count[e] += the routes in [r0, r1) that go to expert e
++static __device__ __forceinline__ void mm_ids_count_routes(
++        const int32_t * __restrict__ ids, int * count, const int r0, const int r1, const int n_experts, const int n_expert_used, const int si1) {
++    for (int r = r0 + threadIdx.x; r < r1; r += mm_ids_nthreads) {
++        const int expert = mm_ids_route_expert(ids, r, n_expert_used, si1, n_experts);
++        if (expert >= 0) {
++            atomicAdd(&count[expert], 1);
 +        }
-+
-+        const int first = start + scan[threadIdx.x] - n;
-+        for (int jt = 0; jt < n; ++jt) {
-+            tile_map[first + jt] = make_int2(e, jt);
+     }
+-};
+-static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
+-
+-// the generic path passes 0, which needs no padding since it never groups lanes by token
+-template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
+-template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
+-template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
+-
+-// Helper function for mul_mat_id, converts ids to a more convenient format.
+-// ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
+-// ids_dst describes the same mapping but for the dst tensor.
+-// The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
+-template <int n_expert_used_template>
+-__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+-static __global__ void mm_ids_helper(
+-        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+-        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+-    const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+-    const int expert = blockIdx.x;
+-
+-    extern __shared__ char data_mm_ids_helper[];
+-    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
+-
+-    int nex_prev   = 0; // Number of columns for experts with a lower index.
+-    int it_compact = 0; // Running index for the compact slice of this expert.
+-
+-    if constexpr (n_expert_used_template == 0) {
+-        // Generic implementation:
+-        for (int it = 0; it < n_tokens; ++it) {
+-            int iex_used = -1; // The index at which the expert is used, if any.
+-            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+-                const int expert_used = ids[it*si1 + iex];
+-                nex_prev += expert_used < expert;
+-                if (expert_used == expert) {
+-                    iex_used = iex;
+-                }
+-            }
+-
+-            if (iex_used != -1) {
+-                store[it_compact] = mm_ids_helper_store(it, iex_used);
+-            }
++}
+ 
+-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
+-                it_compact++;
+-            }
++// Turns the route count per expert into the expert's first row and writes expert_bounds.
++// With tile_map it also lists the (expert, column tile) pairs that hold columns for a flat MoE grid, in expert order.
++// The other ntiles grid columns get tile jt_none of expert 0, which starts past its columns, so mul_mat_q skips them.
++static __device__ __forceinline__ void mm_ids_first_rows(
++        int * count, int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_map, const int J, const int ntiles, const int jt_none,
++        const int n_experts) {
++    int start      = 0;
++    int start_tile = 0;
++    for (int e0 = 0; e0 < n_experts; e0 += mm_ids_nthreads) {
++        const int e = e0 + threadIdx.x;
++        const int n = e < n_experts ? count[e] : 0;
++        int total;
++        const int prefix = mm_ids_block_scan(n, total);
++        if (e < n_experts) {
++            count[e]         = start + prefix;
++            expert_bounds[e] = start + prefix;
+         }
+-    } else {
+-        // Implementation optimized for specific numbers of experts used:
+-        // a warp holds a whole number of token slots, so the slot count is padded to a power of 2
+-        constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
+-        static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
+-        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
+-            const int it = it0 + threadIdx.x / neu_padded;
+-
+-            const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
+-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
+-                ids[it*si1 + iex] : INT_MAX;
+-            const int iex_used = expert_used == expert ? iex : -1;
+-            nex_prev += expert_used < expert;
+-
+-            // Whether the threads at this token position have used the expert:
+-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+-
+-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
+-            int it_compact_add_lower = 0;
+-#pragma unroll
+-            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+-                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+-                    it_compact_add_lower += tmp;
+-                }
+-            }
+-
+-            if (iex_used != -1) {
+-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
++        start += total;
++        if (tile_map) {
++            const int ntile = (n + J - 1) / J;
++            int total_tiles;
++            const int first = start_tile + mm_ids_block_scan(ntile, total_tiles);
++            for (int jt = 0; jt < ntile; ++jt) {
++                tile_map[first + jt] = make_int2(e, jt);
+             }
+-
+-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
+-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
++            start_tile += total_tiles;
 +        }
-+        start += scan[nthreads - 1];
-+        __syncthreads();
 +    }
-+
-+    for (int t = start + threadIdx.x; t < ntiles; t += nthreads) {
-+        tile_map[t] = make_int2(0, jt_none);
++    if (threadIdx.x == 0) {
++        expert_bounds[n_experts] = start;
++    }
++    if (tile_map) {
++        for (int t = start_tile + threadIdx.x; t < ntiles; t += mm_ids_nthreads) {
++            tile_map[t] = make_int2(0, jt_none);
+         }
+     }
+-    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
+-    ggml_cuda_syncwarp();
++    __syncthreads();
++}
+ 
+-    for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
+-        const mm_ids_helper_store store_it = store[itc];
+-        const int it       = store_it.it();
+-        const int iex_used = store_it.iex_used();
+-        ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
++// Puts each route in [r0, r1) at the next free row of its expert, taken from next_row.
++static __device__ __forceinline__ void mm_ids_scatter_routes(
++        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int * next_row,
++        const int r0, const int r1, const int n_experts, const int n_expert_used, const int nchannels_y, const int si1, const int sis1,
++        const bool write_inverse) {
++    for (int r = r0 + threadIdx.x; r < r1; r += mm_ids_nthreads) {
++        const int expert = mm_ids_route_expert(ids, r, n_expert_used, si1, n_experts);
++        if (expert < 0) {
++            continue;
++        }
++        const int row = atomicAdd(&next_row[expert], 1);
++        ids_dst[row] = r;
+         // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
+         if (write_inverse) {
+-            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
++            ids_src1[r] = row;
+         } else {
+-            ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
++            ids_src1[row] = (r / n_expert_used)*sis1 + (r % n_expert_used) % nchannels_y;
+         }
+     }
++}
+ 
+-    if (threadIdx.x != 0) {
+-        return;
+-    }
++// The whole sort in one block, so a small batch takes a single launch.
++static __global__ void mm_ids_sort_one_block(
++        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
++        int2 * __restrict__ tile_map, const int J, const int ntiles, const int jt_none,
++        const int n_routes, const int n_experts, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
++    extern __shared__ int data_mm_ids[];
++    for (int e = threadIdx.x; e < n_experts; e += mm_ids_nthreads) {
++        data_mm_ids[e] = 0;
++    }
++    __syncthreads();
++    mm_ids_count_routes(ids, data_mm_ids, 0, n_routes, n_experts, n_expert_used, si1);
++    __syncthreads();
++    mm_ids_first_rows(data_mm_ids, expert_bounds, tile_map, J, ntiles, jt_none, n_experts);
++    mm_ids_scatter_routes(ids, ids_src1, ids_dst, data_mm_ids, 0, n_routes, n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
++}
+ 
+-    expert_bounds[expert] = nex_prev;
++// counts[b*n_experts + e]: the routes of block b that go to expert e
++static __global__ void mm_ids_count(
++        const int32_t * __restrict__ ids, int32_t * __restrict__ counts, const int n_routes, const int n_experts, const int n_expert_used, const int si1) {
++    extern __shared__ int data_mm_ids[];
++    for (int e = threadIdx.x; e < n_experts; e += mm_ids_nthreads) {
++        data_mm_ids[e] = 0;
++    }
++    __syncthreads();
++    const int r0 = blockIdx.x*mm_ids_routes_per_block;
++    mm_ids_count_routes(ids, data_mm_ids, r0, min(r0 + mm_ids_routes_per_block, n_routes), n_experts, n_expert_used, si1);
++    __syncthreads();
++    for (int e = threadIdx.x; e < n_experts; e += mm_ids_nthreads) {
++        counts[(int64_t) blockIdx.x*n_experts + e] = data_mm_ids[e];
 +    }
 +}
-+
-+void ggml_cuda_launch_mm_ids_tile_map(
-+        const int32_t * expert_bounds, int2 * tile_map, const int n_experts, const int J, const int ntiles, const int jt_none, cudaStream_t stream) {
-+    constexpr int nthreads = 512;
-+    mm_ids_tile_map<nthreads><<<1, nthreads, 0, stream>>>(expert_bounds, tile_map, n_experts, J, ntiles, jt_none);
+ 
+-    if (expert < static_cast<int>(gridDim.x) - 1) {
+-        return;
++// Turns counts[b][e] into the number of expert e's rows taken by blocks before b, so each expert's rows follow token order block by block.
++static __global__ void mm_ids_bounds(
++        int32_t * __restrict__ counts, int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_map, const int J, const int ntiles,
++        const int jt_none, const int n_experts, const int nblocks) {
++    constexpr int nload = 8; // loads in flight per expert
++    extern __shared__ int data_mm_ids[];
++    for (int e = threadIdx.x; e < n_experts; e += mm_ids_nthreads) {
++        int n = 0;
++        for (int b0 = 0; b0 < nblocks; b0 += nload) {
++            int c[nload];
++#pragma unroll
++            for (int i = 0; i < nload; ++i) {
++                c[i] = b0 + i < nblocks ? counts[(int64_t) (b0 + i)*n_experts + e] : 0;
++            }
++#pragma unroll
++            for (int i = 0; i < nload; ++i) {
++                if (b0 + i < nblocks) {
++                    counts[(int64_t) (b0 + i)*n_experts + e] = n;
++                }
++                n += c[i];
++            }
++        }
++        data_mm_ids[e] = n;
+     }
++    __syncthreads();
++    mm_ids_first_rows(data_mm_ids, expert_bounds, tile_map, J, ntiles, jt_none, n_experts);
 +}
+ 
+-    expert_bounds[gridDim.x] = nex_prev + it_compact;
++static __global__ void mm_ids_scatter(
++        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
++        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ counts, const int n_routes, const int n_experts,
++        const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
++    extern __shared__ int data_mm_ids[];
++    for (int e = threadIdx.x; e < n_experts; e += mm_ids_nthreads) {
++        data_mm_ids[e] = expert_bounds[e] + counts[(int64_t) blockIdx.x*n_experts + e];
++    }
++    __syncthreads();
++    const int r0 = blockIdx.x*mm_ids_routes_per_block;
++    mm_ids_scatter_routes(ids, ids_src1, ids_dst, data_mm_ids, r0, min(r0 + mm_ids_routes_per_block, n_routes),
++        n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
+ }
+ 
+-template <int n_expert_used_template>
+-static void launch_mm_ids_helper(
+-        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+-        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+-    GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
+-    GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+-
+-    const int id = ggml_cuda_get_device();
+-    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
+-
+-    const dim3 num_blocks(n_experts, 1, 1);
+-    const dim3 block_size(warp_size, 1, 1);
+-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+-    GGML_ASSERT(nbytes_shared <= smpbo);
+-    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
+-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
++static int mm_ids_nblocks(const int n_tokens, const int n_expert_used) {
++    const int64_t n_routes = (int64_t) n_tokens*n_expert_used;
++    // the last block's route indices must stay below INT_MAX
++    GGML_ASSERT(n_routes <= INT_MAX - mm_ids_routes_per_block);
++    return n_routes <= mm_ids_one_block_routes ? 1 : (n_routes + mm_ids_routes_per_block - 1) / mm_ids_routes_per_block;
+ }
+ 
++int64_t ggml_cuda_mm_ids_helper_scratch_size(const int n_experts, const int n_tokens, const int n_expert_used) {
++    const int nblocks = mm_ids_nblocks(n_tokens, n_expert_used);
++    return nblocks > 1 ? (int64_t) nblocks*n_experts : 0;
++}
++
++// Helper function for mul_mat_id, converts ids to a more convenient format.
++// ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
++// ids_dst describes the same mapping but for the dst tensor.
++// The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
++// FreeToken: a counting sort over blocks of routes; within an expert the blocks keep token order, the routes inside one block do not.
+ void ggml_cuda_launch_mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+-    switch (n_expert_used) {
+-        case  2:
+-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
+-        case  4:
+-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
+-        case  6:
+-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
+-        case  8:
+-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
+-        case 10:
+-            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
+-        case 16:
+-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
+-        case 32:
+-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
+-        default:
+-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+-            break;
++        int32_t * __restrict__ scratch, int2 * __restrict__ tile_map, const int J, const int ntiles, const int jt_none,
++        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y,
++        const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
++    const int nblocks  = mm_ids_nblocks(n_tokens, n_expert_used);
++    const int n_routes = n_tokens*n_expert_used;
++    const size_t nbytes_shared = n_experts*sizeof(int);
++    GGML_ASSERT(nbytes_shared <= 32*1024 && "mm_ids_helper keeps one int per expert in shared memory");
++
++    if (nblocks == 1) {
++        mm_ids_sort_one_block<<<1, mm_ids_nthreads, nbytes_shared, stream>>>(
++            ids, ids_src1, ids_dst, expert_bounds, tile_map, J, ntiles, jt_none, n_routes, n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
++        return;
+     }
++    mm_ids_count<<<nblocks, mm_ids_nthreads, nbytes_shared, stream>>>(ids, scratch, n_routes, n_experts, n_expert_used, si1);
++    mm_ids_bounds<<<1, mm_ids_nthreads, nbytes_shared, stream>>>(scratch, expert_bounds, tile_map, J, ntiles, jt_none, n_experts, nblocks);
++    mm_ids_scatter<<<nblocks, mm_ids_nthreads, nbytes_shared, stream>>>(
++        ids, ids_src1, ids_dst, expert_bounds, scratch, n_routes, n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
+ }
 --- a/ggml/src/ggml-cuda/mmid.cuh
 +++ b/ggml/src/ggml-cuda/mmid.cuh
-@@ -3,3 +3,6 @@
- void ggml_cuda_launch_mm_ids_helper(
-         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
-         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream);
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++// int32 entries of the scratch that ggml_cuda_launch_mm_ids_helper needs
++int64_t ggml_cuda_mm_ids_helper_scratch_size(int n_experts, int n_tokens, int n_expert_used);
 +
-+void ggml_cuda_launch_mm_ids_tile_map(
-+        const int32_t * expert_bounds, int2 * tile_map, int n_experts, int J, int ntiles, int jt_none, cudaStream_t stream);
++// tile_map (ntiles entries of a flat MoE grid of J-column tiles) may be null for the regular grid
+ void ggml_cuda_launch_mm_ids_helper(
+-        const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
++        const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds, int32_t * scratch,
++        int2 * tile_map, int J, int ntiles, int jt_none,
+         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream);
 --- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
 +++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
 @@ -1095,6 +1095,76 @@
@@ -288,10 +595,11 @@
              } else {
                  quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-@@ -284,6 +299,10 @@
+@@ -284,18 +299,33 @@
      ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
      ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
      ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
++    ggml_cuda_pool_alloc<int32_t> ids_scratch(ctx.pool(), ggml_cuda_mm_ids_helper_scratch_size(ne02, ne12, n_expert_used));
 +    // FreeToken: inactive routes (negative ids, only with inactive_ids) get no compact row, so their ids_src1 entries stay -1
 +    if (inactive_ids) {
 +        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
@@ -299,24 +607,30 @@
  
      // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
      // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
-@@ -299,6 +318,17 @@
-         CUDA_CHECK(cudaGetLastError());
-     }
+     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
  
 +    // Every expert's column tiles fit in ntx_flat grid columns, so a flat grid needs no host sync to size it.
 +    ggml_cuda_pool_alloc<int2> tile_map(ctx.pool());
 +    int ntx_flat = 0;
++    int jt_none  = 0;
 +    if (ncols_max <= 0) {
-+        const int jt_none = (ne_get_rows + J_best - 1) / J_best;
++        jt_none  = (ne_get_rows + J_best - 1) / J_best;
 +        ntx_flat = jt_none + std::min<int64_t>(ne02, ne_get_rows);
 +        tile_map.alloc(ntx_flat);
-+        ggml_cuda_launch_mm_ids_tile_map(expert_bounds.get(), tile_map.get(), ne02, J_best, ntx_flat, jt_none, stream);
-+        CUDA_CHECK(cudaGetLastError());
 +    }
 +
-     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
-     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+     {
+         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+         const int si1  = ids->nb[1] / ggml_element_size(ids);
+         const int sis1 = nb12 / nb11;
+ 
+-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
++        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(), ids_scratch.get(),
++            tile_map.get(), J_best, ntx_flat, jt_none, ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
 @@ -325,9 +355,21 @@
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
@@ -529,7 +843,7 @@
  }
  
  
-+// A flat MoE grid runs only the (expert, column tile) pairs listed in tile_map, see ggml_cuda_launch_mm_ids_tile_map.
++// A flat MoE grid runs only the (expert, column tile) pairs listed in tile_map, see ggml_cuda_launch_mm_ids_helper.
 +static __device__ __forceinline__ void mmq_flat_tile(const int2 * __restrict__ tile_map, int & zt, int & jt) {
 +    if (tile_map) {
 +        const int2 t = tile_map[jt];
@@ -769,7 +1083,7 @@
  
  // -------------------------------------------------------------------------------------------------------------------------
  
-+// FreeToken: under ids, ncols_max > 0 bounds the tokens any one expert gets and sizes the tile grid; otherwise the grid is flat, see ggml_cuda_launch_mm_ids_tile_map
++// FreeToken: under ids, ncols_max > 0 bounds the tokens any one expert gets and sizes the tile grid; otherwise the grid is flat, see ggml_cuda_launch_mm_ids_helper
  void ggml_cuda_mul_mat_q(
 -        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 +        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
