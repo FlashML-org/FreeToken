@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
+from freetoken.kernel.backend import is_flashinfer_installed
 from freetoken.kernel.triton.dflash import RingAttention, grouped_conv, norm_rope_store, selector_walk
 from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
 from freetoken.layers.base import BaseOP
@@ -194,11 +195,6 @@ class DFlash2DraftModel(BaseOP):
 
     # ---------------------------------------------------------------- selector
 
-    def candidates(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Top-K token ids ``[n, K]`` and their fp32 logits of the target head over ``hidden [n, hidden]``, best first."""
-        vals, idx = _top_k(self._lm_head.logits(hidden), self.config.selector_top_k)
-        return idx.long(), vals.float()
-
     def propose(self, hidden: torch.Tensor, anchor: torch.Tensor, temperature: torch.Tensor, greedy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Walk one selector path over the block's draft slots: argmax on ``greedy`` rows, else drawn from softmax(scores / temperature).
 
@@ -207,7 +203,15 @@ class DFlash2DraftModel(BaseOP):
         bs = anchor.shape[0]
         pred = hidden.view(bs, -1, self.config.hidden_size)[:, 1:]
         slots, top_k = pred.shape[1], self.config.selector_top_k
-        ids, unary = self.candidates(pred.reshape(-1, self.config.hidden_size))
+        logits = self._lm_head.logits(pred.reshape(-1, self.config.hidden_size))
+        # the target head's top-K candidates per slot, best first: a tie in the walk takes the first
+        if is_flashinfer_installed():
+            from flashinfer import top_k as flashinfer_top_k
+
+            unary, ids = flashinfer_top_k(logits, top_k, sorted=True, deterministic=True)
+        else:
+            unary, ids = torch.topk(logits, top_k, dim=-1)
+        ids, unary = ids.long(), unary.float()
         selector = self.candidate_selector
         tokens, q = selector_walk(
             ids.view(bs, slots, top_k), unary.view(bs, slots, top_k), selector.hidden_projection.forward(pred), anchor,
@@ -215,13 +219,3 @@ class DFlash2DraftModel(BaseOP):
             torch.rand(bs, slots, device=hidden.device),
         )
         return tokens, ids.view(bs, slots, top_k), q
-
-
-def _top_k(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    from freetoken.kernel.backend import is_flashinfer_installed
-
-    if is_flashinfer_installed():
-        from flashinfer import top_k
-
-        return top_k(logits, k, sorted=True, deterministic=True)
-    return torch.topk(logits, k, dim=-1)
