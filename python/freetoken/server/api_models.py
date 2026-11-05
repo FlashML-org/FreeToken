@@ -35,6 +35,8 @@ class ToolChoiceObject(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: bool = False
+    # with include_usage, the chunks after the role chunk also carry the usage so far
+    continuous_usage_stats: bool | None = False
 
 
 class FunctionCall(BaseModel):
