@@ -8,7 +8,7 @@ Assumes FreeToken is installed — see [install.md](install.md).
 ft serve --model ~/models/Qwen3.6-35B-A3B
 ```
 
-`--model` also takes a Hugging Face repo id. Everything else — dtype, attention
+`--model` also takes a Hugging Face repo id or a local `.gguf` file ([GGUF](models.md#gguf)). Everything else — dtype, attention
 and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.

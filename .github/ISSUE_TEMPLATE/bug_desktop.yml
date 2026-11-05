@@ -71,8 +71,8 @@ body:
     id: model
     attributes:
       label: Checkpoint
-      description: The exact Hugging Face or ModelScope ID, not just the model name.
-      placeholder: Qwen/Qwen3.6-35B-A3B-FP8
+      description: Link to the exact checkpoint on Hugging Face or ModelScope, not just the model name.
+      placeholder: https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8
     validations:
       required: true
   - type: textarea
