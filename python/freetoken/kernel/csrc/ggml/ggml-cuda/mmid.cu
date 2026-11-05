@@ -46,20 +46,40 @@ static __device__ __forceinline__ void mm_ids_count_routes(
 }
 
 // Turns the route count per expert into the expert's first row and writes expert_bounds.
-static __device__ __forceinline__ void mm_ids_first_rows(int * count, int32_t * __restrict__ expert_bounds, const int n_experts) {
-    int start = 0;
+// With tile_map it also lists the (expert, column tile) pairs that hold columns for a flat MoE grid, in expert order.
+// The other ntiles grid columns get tile jt_none of expert 0, which starts past its columns, so mul_mat_q skips them.
+static __device__ __forceinline__ void mm_ids_first_rows(
+        int * count, int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_map, const int J, const int ntiles, const int jt_none,
+        const int n_experts) {
+    int start      = 0;
+    int start_tile = 0;
     for (int e0 = 0; e0 < n_experts; e0 += mm_ids_nthreads) {
         const int e = e0 + threadIdx.x;
+        const int n = e < n_experts ? count[e] : 0;
         int total;
-        const int prefix = mm_ids_block_scan(e < n_experts ? count[e] : 0, total);
+        const int prefix = mm_ids_block_scan(n, total);
         if (e < n_experts) {
             count[e]         = start + prefix;
             expert_bounds[e] = start + prefix;
         }
         start += total;
+        if (tile_map) {
+            const int ntile = (n + J - 1) / J;
+            int total_tiles;
+            const int first = start_tile + mm_ids_block_scan(ntile, total_tiles);
+            for (int jt = 0; jt < ntile; ++jt) {
+                tile_map[first + jt] = make_int2(e, jt);
+            }
+            start_tile += total_tiles;
+        }
     }
     if (threadIdx.x == 0) {
         expert_bounds[n_experts] = start;
+    }
+    if (tile_map) {
+        for (int t = start_tile + threadIdx.x; t < ntiles; t += mm_ids_nthreads) {
+            tile_map[t] = make_int2(0, jt_none);
+        }
     }
     __syncthreads();
 }
@@ -88,6 +108,7 @@ static __device__ __forceinline__ void mm_ids_scatter_routes(
 // The whole sort in one block, so a small batch takes a single launch.
 static __global__ void mm_ids_sort_one_block(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        int2 * __restrict__ tile_map, const int J, const int ntiles, const int jt_none,
         const int n_routes, const int n_experts, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
     extern __shared__ int data_mm_ids[];
     for (int e = threadIdx.x; e < n_experts; e += mm_ids_nthreads) {
@@ -96,7 +117,7 @@ static __global__ void mm_ids_sort_one_block(
     __syncthreads();
     mm_ids_count_routes(ids, data_mm_ids, 0, n_routes, n_experts, n_expert_used, si1);
     __syncthreads();
-    mm_ids_first_rows(data_mm_ids, expert_bounds, n_experts);
+    mm_ids_first_rows(data_mm_ids, expert_bounds, tile_map, J, ntiles, jt_none, n_experts);
     mm_ids_scatter_routes(ids, ids_src1, ids_dst, data_mm_ids, 0, n_routes, n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
 }
 
@@ -117,7 +138,9 @@ static __global__ void mm_ids_count(
 }
 
 // Turns counts[b][e] into the number of expert e's rows taken by blocks before b, so each expert's rows follow token order block by block.
-static __global__ void mm_ids_bounds(int32_t * __restrict__ counts, int32_t * __restrict__ expert_bounds, const int n_experts, const int nblocks) {
+static __global__ void mm_ids_bounds(
+        int32_t * __restrict__ counts, int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_map, const int J, const int ntiles,
+        const int jt_none, const int n_experts, const int nblocks) {
     constexpr int nload = 8; // loads in flight per expert
     extern __shared__ int data_mm_ids[];
     for (int e = threadIdx.x; e < n_experts; e += mm_ids_nthreads) {
@@ -139,7 +162,7 @@ static __global__ void mm_ids_bounds(int32_t * __restrict__ counts, int32_t * __
         data_mm_ids[e] = n;
     }
     __syncthreads();
-    mm_ids_first_rows(data_mm_ids, expert_bounds, n_experts);
+    mm_ids_first_rows(data_mm_ids, expert_bounds, tile_map, J, ntiles, jt_none, n_experts);
 }
 
 static __global__ void mm_ids_scatter(
@@ -175,7 +198,8 @@ int64_t ggml_cuda_mm_ids_helper_scratch_size(const int n_experts, const int n_to
 // FreeToken: a counting sort over blocks of routes; within an expert the blocks keep token order, the routes inside one block do not.
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        int32_t * __restrict__ scratch, const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y,
+        int32_t * __restrict__ scratch, int2 * __restrict__ tile_map, const int J, const int ntiles, const int jt_none,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y,
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     const int nblocks  = mm_ids_nblocks(n_tokens, n_expert_used);
     const int n_routes = n_tokens*n_expert_used;
@@ -184,53 +208,11 @@ void ggml_cuda_launch_mm_ids_helper(
 
     if (nblocks == 1) {
         mm_ids_sort_one_block<<<1, mm_ids_nthreads, nbytes_shared, stream>>>(
-            ids, ids_src1, ids_dst, expert_bounds, n_routes, n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
+            ids, ids_src1, ids_dst, expert_bounds, tile_map, J, ntiles, jt_none, n_routes, n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
         return;
     }
     mm_ids_count<<<nblocks, mm_ids_nthreads, nbytes_shared, stream>>>(ids, scratch, n_routes, n_experts, n_expert_used, si1);
-    mm_ids_bounds<<<1, mm_ids_nthreads, nbytes_shared, stream>>>(scratch, expert_bounds, n_experts, nblocks);
+    mm_ids_bounds<<<1, mm_ids_nthreads, nbytes_shared, stream>>>(scratch, expert_bounds, tile_map, J, ntiles, jt_none, n_experts, nblocks);
     mm_ids_scatter<<<nblocks, mm_ids_nthreads, nbytes_shared, stream>>>(
         ids, ids_src1, ids_dst, expert_bounds, scratch, n_routes, n_experts, n_expert_used, nchannels_y, si1, sis1, write_inverse);
-}
-
-// Lists the (expert, column tile) pairs that hold columns for a flat MoE grid, in expert order.
-// The other ntiles grid columns get tile jt_none of expert 0, which starts past its columns, so mul_mat_q skips them.
-template <int nthreads>
-__launch_bounds__(nthreads, 1)
-static __global__ void mm_ids_tile_map(
-        const int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_map, const int n_experts, const int J, const int ntiles, const int jt_none) {
-    __shared__ int scan[nthreads];
-
-    int start = 0; // First tile of the current chunk of experts.
-    for (int e0 = 0; e0 < n_experts; e0 += nthreads) {
-        const int e = e0 + threadIdx.x;
-        const int n = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
-
-        scan[threadIdx.x] = n;
-        __syncthreads();
-#pragma unroll
-        for (int offset = 1; offset < nthreads; offset *= 2) {
-            const int add = threadIdx.x >= offset ? scan[threadIdx.x - offset] : 0;
-            __syncthreads();
-            scan[threadIdx.x] += add;
-            __syncthreads();
-        }
-
-        const int first = start + scan[threadIdx.x] - n;
-        for (int jt = 0; jt < n; ++jt) {
-            tile_map[first + jt] = make_int2(e, jt);
-        }
-        start += scan[nthreads - 1];
-        __syncthreads();
-    }
-
-    for (int t = start + threadIdx.x; t < ntiles; t += nthreads) {
-        tile_map[t] = make_int2(0, jt_none);
-    }
-}
-
-void ggml_cuda_launch_mm_ids_tile_map(
-        const int32_t * expert_bounds, int2 * tile_map, const int n_experts, const int J, const int ntiles, const int jt_none, cudaStream_t stream) {
-    constexpr int nthreads = 512;
-    mm_ids_tile_map<nthreads><<<1, nthreads, 0, stream>>>(expert_bounds, tile_map, n_experts, J, ntiles, jt_none);
 }
