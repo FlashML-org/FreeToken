@@ -100,8 +100,10 @@ class SpecRunner:
         batch.features = self.feature_sink(batch)
         logits = engine.forward_logits(batch)[: bs * width]
         proposal = self._proposal
-        if proposal.draft_probs is not None:
-            out, emitted = reject_with_draft_probs(logits, drafts, proposal.draft_probs, sample_args, engine.sampler)
+        if proposal.draft_support_probs is not None:
+            out, emitted = reject_with_draft_probs(
+                logits, drafts, proposal.draft_support_ids, proposal.draft_support_probs, sample_args, engine.sampler,
+            )
         else:
             out, emitted = reject(logits, drafts, sample_args, engine.sampler)
         host = self._host[:bs]

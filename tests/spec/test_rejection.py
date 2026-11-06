@@ -105,18 +105,19 @@ def test_reject_with_draft_probs_commits_the_target_distribution():
     vocab, K, k, n = 6, 3, 2, 6_000_000
     p = torch.softmax(torch.randn(k + 1, vocab, device=device) * 1.5, dim=-1)
     cand = torch.tensor([[0, 2, 5], [1, 2, 3]], device=device)
-    q = torch.zeros(k, vocab, device=device).scatter_(1, cand, torch.softmax(torch.randn(k, K, device=device), dim=-1))
-    drafts = torch.stack([torch.multinomial(q[j], n, replacement=True) for j in range(k)], dim=1)
+    q = torch.softmax(torch.randn(k, K, device=device), dim=-1)
+    picks = torch.stack([torch.multinomial(q[j], n, replacement=True) for j in range(k)], dim=1)
+    drafts = cand.gather(1, picks.T).T
     # rows cycle through: q trusted, q unusable (a NaN or a total of 2), greedy
     kind = torch.arange(n, device=device) % 3
-    q_rows = q.expand(n, k, vocab).clone()
+    q_rows = q.expand(n, k, K).clone()
     unusable = (kind == 1).nonzero().squeeze(1)
     q_rows[unusable[::2], 0, 0] = float("nan")
     q_rows[unusable[1::2], 0] *= 2
     # softmax(log p) at T=1 hands the verify exactly p on every row
     logits = p.log().repeat(n, 1)
     args = BatchSamplingArgs(temperatures=torch.ones(n, device=device), greedy_mask=kind == 2)
-    out, emitted = reject_with_draft_probs(logits, drafts, q_rows, args, _sampler(device, vocab))
+    out, emitted = reject_with_draft_probs(logits, drafts, cand.expand(n, k, K).contiguous(), q_rows, args, _sampler(device, vocab))
 
     def marginal(tokens):
         return torch.bincount(tokens, minlength=vocab).float() / tokens.numel()
