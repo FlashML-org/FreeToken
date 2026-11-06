@@ -10,7 +10,7 @@ from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecForwardOutput
 
 from .proposer import DraftContext, Proposer, SpecProposal
-from .rejection import reject, sparse_q_rejection
+from .rejection import reject, reject_with_draft_probs
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
@@ -90,7 +90,7 @@ class SpecRunner:
         cols = make_device_tensor([r.cached_len for r in reqs], torch.int64, self.device)
         self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
         cols = cols.unsqueeze(1) + 1 + torch.arange(self.k, device=self.device)
-        token_pool[rows.unsqueeze(1), cols] = self._proposal.tokens.to(token_pool.dtype)
+        token_pool[rows.unsqueeze(1), cols] = self._proposal.draft_token_ids.to(token_pool.dtype)
 
     def verify_step(self, batch: Batch, sample_args: BatchSamplingArgs) -> SpecForwardOutput:
         engine = self.engine
@@ -100,8 +100,8 @@ class SpecRunner:
         batch.features = self.feature_sink(batch)
         logits = engine.forward_logits(batch)[: bs * width]
         proposal = self._proposal
-        if proposal.q is not None:
-            out, emitted = sparse_q_rejection(logits, drafts, proposal.cand, proposal.q, sample_args, engine.sampler)
+        if proposal.draft_probs is not None:
+            out, emitted = reject_with_draft_probs(logits, drafts, proposal.draft_probs, sample_args, engine.sampler)
         else:
             out, emitted = reject(logits, drafts, sample_args, engine.sampler)
         host = self._host[:bs]

@@ -266,7 +266,11 @@ class DFlashProposer(Proposer):
             g_flags[:padded].copy_(flags, non_blocking=True)
             self._graphs[padded].replay()
             tokens, cand, q = (t[:bs] for t in self._out)
-        return SpecProposal(tokens) if all(greedy) else SpecProposal(tokens, cand, q)
+        if all(greedy):
+            return SpecProposal(tokens)
+        # the selector's q covers its top-K candidates only
+        draft_probs = torch.zeros(bs, self.k, self.draft_config.vocab_size, dtype=torch.float32, device=self.device)
+        return SpecProposal(tokens, draft_probs.scatter_(2, cand, q))
 
     # ------------------------------------------------------------------ target features
 

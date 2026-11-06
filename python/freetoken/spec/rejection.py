@@ -28,11 +28,10 @@ def reject(
     return target, emitted
 
 
-def sparse_q_rejection(
+def reject_with_draft_probs(
     logits: torch.Tensor,   # [bs*(k+1), V]
     drafts: torch.Tensor,   # [bs, k] int64, slot j drawn from q[:, j]
-    cand: torch.Tensor,     # [bs, k, K] the support of q
-    q: torch.Tensor,        # [bs, k, K] q over cand
+    q: torch.Tensor,        # [bs, k, V] fp32 draft distribution
     args: BatchSamplingArgs,
     sampler: Sampler,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -48,11 +47,11 @@ def sparse_q_rejection(
     ok = torch.isfinite(q).flatten(1).all(dim=1) & ((q.sum(dim=-1) - 1.0).abs() < 1e-3).all(dim=1)
     if args.greedy_mask is not None:
         ok &= ~args.greedy_mask
-    q = torch.where(ok.view(-1, 1, 1), q, torch.zeros_like(q))
+    ok = ok.view(-1, 1)
     d = drafts.unsqueeze(-1)
     p_d = p[:, :k].gather(2, d).squeeze(-1)
     # a row without a usable q verifies with q one-hot at its draft, which is ``reject``: accept with p(d), else sample p without d; a greedy row's p is one-hot at its argmax
-    q_d = torch.where(ok.view(-1, 1), (q * (cand == d)).sum(dim=-1), 1.0)
+    q_d = torch.where(ok, q.gather(2, d).squeeze(-1), 1.0)
     accept = torch.rand_like(p_d) * q_d < p_d
     emitted = accept.to(torch.int64).cumprod(dim=1).sum(dim=1)
     rows = torch.arange(bs, device=p.device)
@@ -60,8 +59,8 @@ def sparse_q_rejection(
     rejected = (emitted < k).view(-1, 1)
     # the residual max(0, p - q) at the first rejected slot; the bonus row is p itself
     pick = p[rows, emitted]
-    pick.scatter_add_(1, cand[rows, slot], -q[rows, slot] * rejected)
-    pick.scatter_add_(1, drafts[rows, slot].view(-1, 1), -(rejected & ~ok.view(-1, 1)).float())
+    pick -= torch.where(rejected & ok, q[rows, slot], 0.0)
+    pick.scatter_add_(1, drafts[rows, slot].view(-1, 1), -(rejected & ~ok).float())
     pick.clamp_(min=0.0)
     total = pick.sum(dim=-1, keepdim=True)
     pick = torch.where(total > 0, pick / total.clamp_min(1e-30), p[rows, emitted])

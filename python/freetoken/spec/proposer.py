@@ -21,11 +21,10 @@ def check_draft_path(path: str) -> None:
 
 
 class SpecProposal(NamedTuple):
-    """One step's drafts; ``cand``/``q`` carry the draft distribution of each slot when the drafts were sampled, None when they are argmaxes."""
+    """One step's drafts; ``draft_probs`` is the distribution each draft was sampled from, None when the drafts are argmaxes."""
 
-    tokens: torch.Tensor                 # [bs, k] int64 target-vocab ids
-    cand: torch.Tensor | None = None     # [bs, k, K] the support of q
-    q: torch.Tensor | None = None        # [bs, k, K] fp32, each slot's q over cand
+    draft_token_ids: torch.Tensor                # [bs, k] int64 target-vocab ids
+    draft_probs: torch.Tensor | None = None      # [bs, k, V] fp32 over the target vocab
 
 
 class DraftContext(NamedTuple):
