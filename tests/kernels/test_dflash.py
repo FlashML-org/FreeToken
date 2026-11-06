@@ -35,7 +35,7 @@ def _ref_ring_attention(q, ring_k, ring_v, layer, rows, starts, block, scale):
 @pytest.mark.parametrize("starts, rows", [([5000, 3], [2, 0]), ([10, 2500], [1, 2]), ([70000], [0])])
 def test_ring_attention_matches_gathered_reference(block, starts, rows):
     """Sequences shorter than the window, wrapped rings and a block at the very start all see the same keys as the reference."""
-    from freetoken.kernel.triton.dflash import RingAttention
+    from freetoken.kernel.triton.dflash import ring_attention, ring_attention_workspace
 
     torch.manual_seed(0)
     layers, num_rows = 2, 3
@@ -46,14 +46,12 @@ def test_ring_attention_matches_gathered_reference(block, starts, rows):
         outside = max(start - WINDOW, -1)
         ring_v[1, rows[b], outside % RING] = 1e3
         ring_v[1, rows[b], (outside + 1) % RING] = -1e3
-    attention = RingAttention(
-        max_bs=num_rows, block=block, num_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=HEAD_DIM, ring=RING, window=WINDOW, device=DEV,
-    )
+    workspace = ring_attention_workspace(num_rows, block, HEADS, KV_HEADS, HEAD_DIM, RING, DEV)
     starts_t, rows_t = torch.tensor(starts, device=DEV), torch.tensor(rows, device=DEV)
     q = torch.randn(len(starts) * block, HEADS * HEAD_DIM, device=DEV, dtype=torch.bfloat16)
     scale = HEAD_DIM**-0.5
 
-    got = attention(q, ring_k, ring_v, 1, rows_t, starts_t, scale)
+    got = ring_attention(q, ring_k, ring_v, 1, rows_t, starts_t, WINDOW, scale, workspace)
     want = _ref_ring_attention(q, ring_k, ring_v, 1, rows_t, starts_t, block, scale)
 
     assert got.dtype == q.dtype

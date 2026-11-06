@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 
 from freetoken.kernel.backend import is_flashinfer_installed
-from freetoken.kernel.triton.dflash import RingAttention, grouped_conv, norm_rope_store, selector_walk
+from freetoken.kernel.triton.dflash import grouped_conv, norm_rope_store, ring_attention, ring_attention_workspace, selector_walk
 from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
 from freetoken.layers.base import BaseOP
 from freetoken.layers.quantization import NoQuantConfig, QuantConfig, finalize_quant
@@ -24,11 +24,12 @@ from .weight import iter_weights
 
 @dataclass
 class DFlashRing:
-    """The draft K/V of one request per table row, position ``p`` at slot ``p % ring``, with the attention and rope table over those positions; built by ``DFlash2DraftModel.make_ring`` and owned by the proposer."""
+    """The draft K/V of one request per table row, position ``p`` at slot ``p % ring``, with the attention workspace and rope table for blocks of ``block`` tokens; built by ``DFlash2DraftModel.make_ring`` and owned by the proposer."""
 
     k: torch.Tensor  # [layers, rows, ring, kv_heads, head_dim]
     v: torch.Tensor
-    attention: RingAttention
+    block: int
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     cos_sin: torch.Tensor  # [max_position, head_dim] fp32
 
 
@@ -136,14 +137,11 @@ class DFlash2DraftModel(BaseOP):
         c = self.config
         assert ring >= c.window + block, f"a ring of {ring} cannot hold the window {c.window} plus the block {block}"
         k = torch.zeros(c.num_layers, max_rows, ring, c.num_kv_heads, c.head_dim, dtype=self._kv_all.dtype, device=device)
-        attention = RingAttention(
-            max_bs=max_rows, block=block, num_heads=c.num_heads, num_kv_heads=c.num_kv_heads, head_dim=c.head_dim,
-            ring=ring, window=c.window, device=device,
-        )
+        workspace = ring_attention_workspace(max_rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring, device)
         # not the cached get_rope: max_position follows the page table, so each rebuild would cache one more table
         inv_freq = 1.0 / (c.rope_theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float, device=device) / c.head_dim))
         freqs = torch.arange(max_position, dtype=torch.float, device=device)[:, None] * inv_freq[None, :]
-        return DFlashRing(k, torch.zeros_like(k), attention, torch.cat((freqs.cos(), freqs.sin()), dim=-1))
+        return DFlashRing(k, torch.zeros_like(k), block, workspace, torch.cat((freqs.cos(), freqs.sin()), dim=-1))
 
     # ---------------------------------------------------------------- context KV
 
@@ -167,7 +165,7 @@ class DFlash2DraftModel(BaseOP):
     def forward_block(self, bonus: torch.Tensor, starts: torch.Tensor, rows: torch.Tensor, ring: DFlashRing) -> torch.Tensor:
         """Final hidden ``[bs*block, hidden]`` of the block ``[bonus, mask x (block-1)]`` at positions ``starts + j`` of ring rows ``rows``."""
         c = self.config
-        bs, block = bonus.shape[0], ring.attention.block
+        bs, block = bonus.shape[0], ring.block
         x = self._mask_embedding.expand(bs, block, -1).clone()
         x[:, 0] = self._embed_tokens.forward(bonus)
         x = x.view(bs * block, -1)
@@ -186,7 +184,7 @@ class DFlash2DraftModel(BaseOP):
                 k_norms=self._k_norms, cos_sin=ring.cos_sin, positions=positions, rows=token_rows,
                 ring_k=ring.k, ring_v=ring.v, layer0=i, eps=c.rms_norm_eps,
             )
-            o = attn.o_proj.forward(ring.attention(q, ring.k, ring.v, i, rows, starts, scale))
+            o = attn.o_proj.forward(ring_attention(q, ring.k, ring.v, i, rows, starts, c.window, scale, ring.workspace))
             o = layer.attention_conv.finish(o, conv, block)
             h, residual = layer.post_attention_layernorm.forward(o, residual)
             h, conv = layer.mlp_conv.prepare(h, block)

@@ -12,7 +12,7 @@ import torch
 from freetoken.attention.linear import gdn_slot
 from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecProposal
-from freetoken.kernel.triton.dflash import RingAttention
+from freetoken.kernel.triton.dflash import ring_attention_workspace
 from freetoken.spec.dflash.window import DFlashWindow
 from freetoken.spec.proposer import DraftContext, Proposer, check_draft_path
 from freetoken.utils import cached_load_hf_config, init_logger
@@ -127,7 +127,7 @@ class DFlashProposer(Proposer):
         block, rows, item = config.speculative_num_steps + 1, config.max_running_req + 1, config.dtype.itemsize
         ring = DFlashWindow.length(c.window, block)
         kv = 2 * c.num_layers * rows * ring * c.num_kv_heads * c.head_dim * item
-        scratch = RingAttention.scratch_bytes(max_bs=rows, block=block, num_heads=c.num_heads, num_kv_heads=c.num_kv_heads, head_dim=c.head_dim, ring=ring)
+        scratch = sum(t.nbytes for t in ring_attention_workspace(rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring, torch.device("meta")))
         aux = config.max_running_req * block * len(c.target_layer_ids) * c.hidden_size * item
         # the rope table is sized by the page table at attach; max_seq_len bounds its width
         rope = config.max_seq_len * c.head_dim * 4

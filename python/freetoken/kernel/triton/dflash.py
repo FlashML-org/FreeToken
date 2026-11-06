@@ -86,47 +86,44 @@ def _ring_attn_merge_kernel(
     tl.store(out_ptr + out_off + d, acc.to(out_ptr.dtype.element_ty))
 
 
-class RingAttention:
+_KEYS_PER_SPLIT = 128
+_BLOCK_N = 64
+
+
+def _block_m(group: int, block: int) -> int:
+    return max(16, triton.next_power_of_2(group * block))
+
+
+def ring_attention_workspace(max_bs: int, block: int, num_heads: int, num_kv_heads: int, head_dim: int, ring: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The fp32 split partials (out, max, sum) ``ring_attention`` needs for up to ``max_bs`` requests; on the meta device they only size the budget."""
+    parts = max_bs * num_kv_heads * triton.cdiv(ring, _KEYS_PER_SPLIT) * _block_m(num_heads // num_kv_heads, block)
+    f32 = dict(dtype=torch.float32, device=device)
+    return torch.empty(parts, head_dim, **f32), torch.empty(parts, **f32), torch.empty(parts, **f32)
+
+
+def ring_attention(q, ring_k, ring_v, layer: int, rows, starts, window: int, scale: float, workspace) -> torch.Tensor:
     """Non-causal block attention of ``[bs*block, heads*head_dim]`` queries over a ``[layers, rows, ring, kv_heads, head_dim]`` KV ring.
 
     The ring holds position ``p`` at slot ``p % ring``; the block occupies ``start .. start+block-1`` and the window behind it the rest.
     """
-
-    KEYS_PER_SPLIT = 128
-    BLOCK_N = 64
-
-    @classmethod
-    def scratch_bytes(cls, *, max_bs: int, block: int, num_heads: int, num_kv_heads: int, head_dim: int, ring: int) -> int:
-        """Bytes of the split partials an instance of this geometry allocates."""
-        block_m = max(16, triton.next_power_of_2(num_heads // num_kv_heads * block))
-        return max_bs * num_kv_heads * triton.cdiv(ring, cls.KEYS_PER_SPLIT) * block_m * (head_dim + 2) * 4
-
-    def __init__(self, *, max_bs: int, block: int, num_heads: int, num_kv_heads: int, head_dim: int, ring: int, window: int, device: torch.device) -> None:
-        self.block, self.num_kv_heads, self.head_dim, self.ring, self.window = block, num_kv_heads, head_dim, ring, window
-        self.group = num_heads // num_kv_heads
-        self.block_m = max(16, triton.next_power_of_2(self.group * block))
-        self.num_splits = triton.cdiv(ring, self.KEYS_PER_SPLIT)
-        parts = max_bs * num_kv_heads * self.num_splits * self.block_m
-        self._o = torch.empty(parts, head_dim, dtype=torch.float32, device=device)
-        self._m = torch.empty(parts, dtype=torch.float32, device=device)
-        self._l = torch.empty(parts, dtype=torch.float32, device=device)
-
-    def __call__(self, q, ring_k, ring_v, layer: int, rows, starts, scale: float) -> torch.Tensor:
-        bs = starts.shape[0]
-        out = torch.empty_like(q)
-        grid = (bs * self.num_kv_heads, self.num_splits)
-        _ring_attn_split_kernel[grid](
-            q, ring_k, ring_v, rows, starts, self._o, self._m, self._l,
-            layer, ring_k.shape[1], self.ring, self.window, scale,
-            NUM_KV_HEADS=self.num_kv_heads, GROUP=self.group, BLOCK=self.block, HEAD_DIM=self.head_dim,
-            BLOCK_M=self.block_m, BLOCK_N=self.BLOCK_N, KEYS_PER_SPLIT=self.KEYS_PER_SPLIT, num_warps=4,
-        )
-        _ring_attn_merge_kernel[(bs * self.num_kv_heads, self.group * self.block)](
-            self._o, self._m, self._l, out, self.num_splits,
-            NUM_KV_HEADS=self.num_kv_heads, GROUP=self.group, BLOCK=self.block, HEAD_DIM=self.head_dim,
-            BLOCK_M=self.block_m, MAX_SPLITS=triton.next_power_of_2(self.num_splits), num_warps=4,
-        )
-        return out
+    ring, num_kv_heads, head_dim = ring_k.shape[2:]
+    bs = starts.shape[0]
+    block, group = q.shape[0] // bs, q.shape[1] // (num_kv_heads * head_dim)
+    block_m, num_splits = _block_m(group, block), triton.cdiv(ring, _KEYS_PER_SPLIT)
+    part_o, part_m, part_l = workspace
+    out = torch.empty_like(q)
+    _ring_attn_split_kernel[(bs * num_kv_heads, num_splits)](
+        q, ring_k, ring_v, rows, starts, part_o, part_m, part_l,
+        layer, ring_k.shape[1], ring, window, scale,
+        NUM_KV_HEADS=num_kv_heads, GROUP=group, BLOCK=block, HEAD_DIM=head_dim,
+        BLOCK_M=block_m, BLOCK_N=_BLOCK_N, KEYS_PER_SPLIT=_KEYS_PER_SPLIT, num_warps=4,
+    )
+    _ring_attn_merge_kernel[(bs * num_kv_heads, group * block)](
+        part_o, part_m, part_l, out, num_splits,
+        NUM_KV_HEADS=num_kv_heads, GROUP=group, BLOCK=block, HEAD_DIM=head_dim,
+        BLOCK_M=block_m, MAX_SPLITS=triton.next_power_of_2(num_splits), num_warps=4,
+    )
+    return out
 
 
 @triton.jit
