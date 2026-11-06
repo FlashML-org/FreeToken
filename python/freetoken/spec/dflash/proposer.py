@@ -37,7 +37,7 @@ def _write_tap(dst: torch.Tensor, col: int, x: torch.Tensor, residual: torch.Ten
         torch.add(x, residual, out=out)
 
 
-class _PrefillSink:
+class DFlashPrefillSink:
     """The tapped layers' outputs of each request's last ``m`` chunk rows, side by side in one feature block; ``spans`` holds each request's (cached_len, device_len, m) when the batch was formed."""
 
     def __init__(self, taps: tuple[int, ...], rows_idx: torch.Tensor, aux: torch.Tensor, hidden: int, spans: List[tuple[int, int, int]]) -> None:
@@ -55,7 +55,7 @@ class _PrefillSink:
         _write_tap(self.aux, self.cols[layer_id], x.index_select(0, self.rows_idx), kept, num_streams, self.hidden)
 
 
-class _VerifySink:
+class DFlashVerifySink:
     """Every verify row's tapped outputs into the persistent feature buffer, so a captured verify graph writes it too."""
 
     def __init__(self, taps: tuple[int, ...], buffer: torch.Tensor, hidden: int) -> None:
@@ -153,7 +153,7 @@ class DFlashProposer(Proposer):
         self.taps, self.hidden, self.block = c.target_layer_ids, c.hidden_size, self.k + 1
         self.ring_len = DFlashWindow.length(c.window, self.block)
         self._seen: Dict[int, int] = {}  # table row -> uid of the request whose chunks its ring holds
-        self._prefill_sink: _PrefillSink | None = None
+        self._prefill_sink: DFlashPrefillSink | None = None
         self.dflash_ring = self.window = self.aux_buf = None
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._inject_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
@@ -275,9 +275,9 @@ class DFlashProposer(Proposer):
 
     # ------------------------------------------------------------------ target features
 
-    def feature_sink(self, batch: Batch) -> _PrefillSink | _VerifySink:
+    def feature_sink(self, batch: Batch) -> DFlashPrefillSink | DFlashVerifySink:
         if batch.phase == "verify":
-            return _VerifySink(self.taps, self.aux_buf, self.hidden)
+            return DFlashVerifySink(self.taps, self.aux_buf, self.hidden)
         # a later block reads at most the ring's length of rows behind it
         idx, spans, off = [], [], 0
         for req in batch.reqs:
@@ -287,7 +287,7 @@ class DFlashProposer(Proposer):
             spans.append((s, e, m))
             off += e - s
         aux = torch.empty(len(idx), len(self.taps) * self.hidden, dtype=self.dtype, device=self.device)
-        self._prefill_sink = _PrefillSink(self.taps, make_device_tensor(idx, torch.int64, self.device), aux, self.hidden, spans)
+        self._prefill_sink = DFlashPrefillSink(self.taps, make_device_tensor(idx, torch.int64, self.device), aux, self.hidden, spans)
         return self._prefill_sink
 
     def post_verify(self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor) -> None:

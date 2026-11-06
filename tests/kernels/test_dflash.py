@@ -1,4 +1,4 @@
-"""The DFlash 2 ring attention against a gathered torch reference, and the selector walk on a cdf that ends below 1; the other kernels are checked through the draft forward in tests/spec/test_dflash_draft.py."""
+"""The DFlash 2 ring attention against a gathered torch reference, and the selector walk on a cdf that ends below 1; the other kernels are checked through the draft forward in tests/models/dflash/test_draft.py."""
 
 from __future__ import annotations
 
