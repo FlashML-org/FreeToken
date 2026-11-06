@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -13,6 +13,8 @@ class EncoderSpec:
     kind: str  # "vision" | "audio", the name --mm-disable takes
     config_key: str  # the checkpoint config section that builds the tower
     modalities: tuple[str, ...]  # inputs it serves, as implemented
+    # why a checkpoint's section builds no tower although the family registers one, or None; such a checkpoint serves the other modalities
+    unserved: Callable[[Any], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -84,7 +86,13 @@ _GEMMA4_SEGMENTS = (
 _GEMMA4_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
-_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+
+
+def _gemma4_vision_unserved(section: Any) -> str | None:
+    return "the tower does not apply clipped linears" if getattr(section, "use_clipped_linears", False) else None
+
+
+_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",), unserved=_gemma4_vision_unserved),)
 _MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
 _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
