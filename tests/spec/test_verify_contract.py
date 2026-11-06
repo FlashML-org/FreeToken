@@ -27,13 +27,12 @@ _SCRIPT = """
 import json, os, sys, torch
 from freetoken.core import SamplingParams
 from freetoken.engine import engine as E, sample as S
-from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.llm import LLM
 from freetoken.models.config import SlotStateSpec
 from freetoken.scheduler.prefill import ChunkedReq
 from freetoken.spec import PROPOSERS
 from freetoken.spec import runner as R
-from freetoken.spec.proposer import Proposer
+from freetoken.spec.proposer import Proposer, SpecProposal
 
 model, out, reference, kwargs = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
 TAPS, H = (1, 2), 256

@@ -9,7 +9,6 @@ import torch
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
-    from freetoken.engine.spec_protocol import SpecProposal
     from freetoken.models.blocks import FeatureSink
     from freetoken.models.config import SlotStateSpec
 
@@ -19,6 +18,14 @@ def check_draft_path(path: str) -> None:
     local = os.path.isabs(path) or path.startswith(".") or path.count("/") > 1 or path.endswith(".gguf")
     if local and not os.path.exists(path):
         raise ValueError(f"--speculative-draft-model-path {path} does not exist")
+
+
+class SpecProposal(NamedTuple):
+    """One step's drafts; ``cand``/``q`` carry the draft distribution of each slot when the drafts were sampled, None when they are argmaxes."""
+
+    tokens: torch.Tensor                 # [bs, k] int64 target-vocab ids
+    cand: torch.Tensor | None = None     # [bs, k, K] the support of q
+    q: torch.Tensor | None = None        # [bs, k, K] fp32, each slot's q over cand
 
 
 class DraftContext(NamedTuple):

@@ -10,9 +10,8 @@ import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
-from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.models.blocks import embed_input_ids
-from freetoken.spec.proposer import DraftContext, Proposer, check_draft_path
+from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
 
 if TYPE_CHECKING:

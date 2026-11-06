@@ -9,13 +9,12 @@ import torch
 from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecForwardOutput
 
-from .proposer import DraftContext, Proposer
+from .proposer import DraftContext, Proposer, SpecProposal
 from .rejection import reject, sparse_q_rejection
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.engine.sample import BatchSamplingArgs
-    from freetoken.engine.spec_protocol import SpecProposal
     from freetoken.models.blocks import FeatureSink
     from freetoken.models.config import SlotStateSpec
 

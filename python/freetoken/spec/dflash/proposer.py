@@ -11,10 +11,9 @@ import torch
 
 from freetoken.attention.linear import gdn_slot
 from freetoken.engine.sample import make_device_tensor
-from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.kernel.triton.dflash import ring_attention_workspace
 from freetoken.spec.dflash.window import DFlashWindow
-from freetoken.spec.proposer import DraftContext, Proposer, check_draft_path
+from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
