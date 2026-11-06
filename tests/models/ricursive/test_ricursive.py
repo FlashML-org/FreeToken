@@ -57,7 +57,7 @@ def _attend(q, k, v, window):
     return out.transpose(0, 1)
 
 
-def _reference_logits(sd: dict, lambdas: list[torch.Tensor], ids: torch.Tensor) -> torch.Tensor:
+def _reference_logits(sd: dict, lambdas: list[torch.Tensor], ids: torch.Tensor, clamp: float) -> torch.Tensor:
     """RicursiveForCausalLM.forward with q, k, v, g and gate, up as the checkpoint stores them."""
     x = sd["model.embed_tokens.weight"][ids] * SCALE
     value_residual = x
@@ -82,7 +82,9 @@ def _reference_logits(sd: dict, lambdas: list[torch.Tensor], ids: torch.Tensor) 
         x = x + _rms(gated @ sd[f"{a}.o_proj.weight"].T, sd[f"{p}.post_attention_layernorm.weight"])
         normed = _rms(x, sd[f"{p}.pre_feedforward_layernorm.weight"])
         gate, up = (normed @ sd[f"{p}.mlp.gate_up_proj.weight"].T).chunk(2, dim=-1)
-        ff = F.silu(gate.clamp(max=CLAMP)) * up.clamp(-CLAMP, CLAMP)
+        if clamp:
+            gate, up = gate.clamp(max=clamp), up.clamp(-clamp, clamp)
+        ff = F.silu(gate) * up
         x = x + _rms(ff @ sd[f"{p}.mlp.down_proj.weight"].T, sd[f"{p}.post_feedforward_layernorm.weight"])
     return _rms(x, sd["model.norm.weight"]) @ sd["lm_head.weight"].T
 
@@ -94,7 +96,8 @@ class _SDPABackend:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused CUDA norm and activation kernels")
-def test_model_matches_the_reference_on_every_row(monkeypatch):
+@pytest.mark.parametrize("clamp", [CLAMP, 0])  # the reference skips a zero clamp
+def test_model_matches_the_reference_on_every_row(monkeypatch, clamp):
     from freetoken.distributed import info
 
     monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank=0, size=1))
@@ -102,7 +105,7 @@ def test_model_matches_the_reference_on_every_row(monkeypatch):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     try:
-        model = RicursiveForCausalLM(parse_config(SimpleNamespace(**_hf_dict())))
+        model = RicursiveForCausalLM(parse_config(SimpleNamespace(**_hf_dict(ffn_clamp_threshold=clamp))))
         torch.manual_seed(0)
         sd = {k: (torch.randn(v.shape, device="cuda") * 0.1).to(v.dtype) for k, v in model.state_dict().items()}
         lambdas = [torch.randn(1, device="cuda").to(torch.bfloat16) for _ in LAYER_TYPES]
@@ -123,7 +126,7 @@ def test_model_matches_the_reference_on_every_row(monkeypatch):
         monkeypatch.setattr("freetoken.layers.embedding.get_global_ctx", lambda: ctx)
         got = model.forward().float()
         torch.set_default_dtype(torch.float32)
-        want = _reference_logits({k: v.float() for k, v in sd.items()}, [lam.float() for lam in lambdas], ids)
+        want = _reference_logits({k: v.float() for k, v in sd.items()}, [lam.float() for lam in lambdas], ids, clamp)
     finally:
         torch.set_default_dtype(prev_dtype)
         torch.set_default_device(prev_device)
@@ -197,16 +200,16 @@ def test_modelopt_checkpoint_fills_the_model_the_quant_config_builds(tmp_path, m
     assert got[f"{mlp}.input_scale"].item() == 1.0
 
 
-def _gguf_shim(monkeypatch, clamp):
+def _gguf_shim(monkeypatch, clamp, layer_types=LAYER_TYPES):
     import freetoken.models.ricursive.gguf as ricursive_gguf
     from freetoken.models.gguf.config import GgufConfigShim
 
     monkeypatch.setattr(ricursive_gguf, "check_scales", lambda path: None)
     md = {f"ricursive.{k}": v for k, v in {
-        "block_count": len(LAYER_TYPES), "embedding_length": H, "feed_forward_length": INTER,
+        "block_count": len(layer_types), "embedding_length": H, "feed_forward_length": INTER,
         "attention.head_count": HEADS, "attention.head_count_kv": KV_HEADS, "attention.key_length": HEAD_DIM,
         "context_length": 2097152, "attention.layer_norm_rms_epsilon": EPS, "rope.freq_base": 10000.0,
-        "attention.sliding_window_pattern": [kind == "sliding_attention" for kind in LAYER_TYPES],
+        "attention.sliding_window_pattern": [kind == "sliding_attention" for kind in layer_types],
         "attention.sliding_window": WINDOW, "embedding_scale": SCALE, "swiglu_clamp": clamp,
     }.items()}
     return GgufConfigShim(architectures=["RicursiveGGUFForCausalLM"], model_path="", model_type="ricursive",
@@ -214,12 +217,24 @@ def _gguf_shim(monkeypatch, clamp):
 
 
 # the first community GGUFs store one clamp, llama.cpp's converter one per layer
-@pytest.mark.parametrize("clamp", [CLAMP, [CLAMP] * len(LAYER_TYPES)])
-def test_gguf_config_matches_the_checkpoint_config(monkeypatch, clamp):
+@pytest.mark.parametrize("clamp, hf_clamp", [(CLAMP, CLAMP), ([CLAMP] * len(LAYER_TYPES), CLAMP), ([0.0] * len(LAYER_TYPES), 0)])
+def test_gguf_config_matches_the_checkpoint_config(monkeypatch, clamp, hf_clamp):
     from freetoken.models.ricursive.gguf import parse_gguf_config
 
-    want = replace(parse_config(SimpleNamespace(**_hf_dict())), architectures=["RicursiveGGUFForCausalLM"])
+    want = replace(parse_config(SimpleNamespace(**_hf_dict(ffn_clamp_threshold=hf_clamp))), architectures=["RicursiveGGUFForCausalLM"])
     assert parse_gguf_config(_gguf_shim(monkeypatch, clamp)) == want
+
+
+def test_gguf_reads_the_keys_llama_cpp_treats_as_optional(monkeypatch):
+    """Absent: no clamp, no embedding scale, and every fifth layer global, as llama.cpp loads such a file."""
+    from freetoken.models.ricursive.gguf import parse_gguf_config
+
+    types = ["sliding_attention"] * 4 + ["full_attention"]
+    shim = _gguf_shim(monkeypatch, CLAMP, types)
+    for key in ("swiglu_clamp", "embedding_scale", "attention.sliding_window_pattern"):
+        del shim.metadata[f"ricursive.{key}"]
+    hf = _hf_dict(num_hidden_layers=len(types), layer_types=types, ffn_clamp_threshold=None, embed_scale=None)
+    assert parse_gguf_config(shim) == replace(parse_config(SimpleNamespace(**hf)), architectures=["RicursiveGGUFForCausalLM"])
 
 
 def test_gguf_refuses_per_layer_clamps_that_differ(monkeypatch):
@@ -257,3 +272,71 @@ def test_gguf_matches_the_checkpoint_tokenizer_and_config():
         assert getattr(got, name) == getattr(want, name), name
     assert got.rms_norm_eps == pytest.approx(want.rms_norm_eps)
     assert got.embedding_scale == pytest.approx(want.embedding_scale)
+
+
+_CALL = '<tool_call>\n{"name": "read", "arguments": {"path": "a.py"}}\n</tool_call>'
+# Ripple's output in the layout chat_template.jinja renders an assistant turn back to
+_TURNS = (
+    "Wrap it in a <think> tag.",
+    "<think>\nOne line.\n</think>\nUse <think> here.",
+    "<think>\nline one\n\nline two\n</think>\nDone.\n\nBye.",
+    "<think>\nRead it first.\n</think>\n\n" + _CALL,
+    "<think>\nCheck.\n</think>\nLet me check.\n" + _CALL,
+    "<think>\nRead both.\n</think>\n\n" + _CALL + "\n" + _CALL.replace("a.py", "b.py"),
+)
+
+
+def _serve(text: str, tools: list, chunk: int | None):
+    """(reasoning, content, calls) the server returns for ``text``, streamed in ``chunk``-char deltas or not."""
+    import asyncio
+
+    from freetoken.message.frontend import UserReply
+    from freetoken.server.generation import (
+        ContentDelta, GenSpec, ReasoningDelta, ToolCallsDelta, generate_events, generate_full,
+    )
+
+    pieces = [text] if chunk is None else [text[i:i + chunk] for i in range(0, len(text), chunk)]
+
+    class State:
+        config = SimpleNamespace(tool_call_parser="ricursive", reasoning_parser="ricursive")
+
+        async def wait_for_ack(self, uid):
+            for i, piece in enumerate(pieces):
+                yield UserReply(uid=uid, incremental_output=piece, finished=i == len(pieces) - 1, finish_reason=None,
+                                prompt_tokens_delta=0, completion_tokens_delta=1)
+
+    spec = GenSpec(messages=[], sampling_params=None, parser_tools=tools, template_tools=tools)
+    if chunk is None:
+        r = asyncio.run(generate_full(0, spec, State()))
+        return r.reasoning, r.content, [(c.name, c.parameters) for c in r.tool_calls]
+
+    async def events():
+        return [ev async for ev in generate_events(0, spec, State())]
+
+    evs = asyncio.run(events())
+    return (
+        "".join(ev.text for ev in evs if isinstance(ev, ReasoningDelta)),
+        "".join(ev.text for ev in evs if isinstance(ev, ContentDelta)),
+        [(c.name, c.parameters) for ev in evs if isinstance(ev, ToolCallsDelta) for c in ev.calls],
+    )
+
+
+@pytest.mark.needs_weights
+@pytest.mark.parametrize("chunk", [None, 1, 3])
+def test_a_parsed_turn_sent_back_renders_to_the_generated_text(chunk):
+    """Each extra separator newline the parsers keep comes back once per turn and accumulates in a long conversation."""
+    from transformers import AutoTokenizer
+
+    from freetoken.server.generation import render_messages
+
+    model = os.environ.get("FREETOKEN_RIPPLE_MODEL")
+    if not model:
+        pytest.skip("set FREETOKEN_RIPPLE_MODEL")
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+    for text in _TURNS:
+        reasoning, content, calls = _serve(text, tools, chunk)
+        turn = {"role": "assistant", "content": content, "reasoning_content": reasoning or None,
+                "tool_calls": [{"type": "function", "function": {"name": n, "arguments": a}} for n, a in calls] or None}
+        rendered = tokenizer.apply_chat_template(render_messages([{"role": "user", "content": "Hi."}, turn]), tools=tools, tokenize=False)
+        assert rendered.endswith(f"<|im_start|>assistant\n{text}<|im_end|>\n"), (text, reasoning, content)

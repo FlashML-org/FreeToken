@@ -210,10 +210,11 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        # off the checkpoint only: the HF org name ricursiveAI would match other models' paths
+        if "ricursive" in " ".join(candidates[1:]).lower():
+            return "ricursive"
         if "flint" in marker:
             return "glm47"
-        if "ricursive" in marker:
-            return "qwen25"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         # M3 first: its marker also contains the bare "minimax" substring, but the
@@ -265,10 +266,10 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        if "ricursive" in " ".join(candidates[1:]).lower():
+            return "ricursive"
         if "flint" in marker:
             return "flint"
-        if "ricursive" in marker:
-            return "ricursive"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         if "deepseek" in marker and any(
@@ -642,6 +643,7 @@ def parse_args(
             "qwen",
             "qwen25",
             "qwen3_coder",
+            "ricursive",
             "mistral",
             "deepseekv32",
             "deepseekv41",

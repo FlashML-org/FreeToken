@@ -1005,6 +1005,44 @@ class Qwen25Detector(BaseFormatDetector):
         return held + residual
 
 
+class RippleDetector(Qwen25Detector):
+    """Qwen 2.5 calls in Ripple's layout, as the checkpoint's ``inference/server/ripple_format.py`` parses them.
+
+    Text before the first call keeps its whitespace except the one newline ``chat_template.jinja``
+    writes before ``<tool_call>``, streamed or not, so a streamed turn re-renders to the generated tokens.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._held_newline = ""
+        self._calls_started = False
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        result = super().detect_and_parse(text, tools)
+        idx = text.find(self.bot_token)
+        if idx != -1:
+            prefix = text[:idx]
+            result.normal_text = prefix[:-1] if prefix.endswith("\n") else prefix
+        return result
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        result = super().parse_streaming_increment(new_text, tools)
+        if self._calls_started:
+            return result
+        text, self._held_newline = self._held_newline + result.normal_text, ""
+        self._calls_started = bool(result.calls) or self.current_tool_id >= 0 or self._buffer.startswith(self.bot_token)
+        if self._calls_started:
+            text = text[:-1] if text.endswith("\n") else text
+        elif text.endswith("\n"):  # undecided until the next text arrives
+            text, self._held_newline = text[:-1], "\n"
+        result.normal_text = text
+        return result
+
+    def finish_streaming(self) -> str:
+        held, self._held_newline = self._held_newline, ""
+        return held + super().finish_streaming()
+
+
 class MistralDetector(BaseFormatDetector):
     """
     Detector for Mistral model function call format.
@@ -3556,6 +3594,7 @@ class FunctionCallParser:
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
+        "ricursive": RippleDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str, turn_starts_open: bool = False):

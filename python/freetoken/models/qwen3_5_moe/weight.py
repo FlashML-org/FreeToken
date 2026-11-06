@@ -37,7 +37,7 @@ _BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_globa
 
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
 _LINEAR_LEAVES = frozenset({
-    "q_proj", "k_proj", "v_proj", "o_proj", "g_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+    "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
     "gate_proj", "up_proj", "down_proj", "gate", "shared_expert_gate", "lm_head", "fc",
 })
 # activation scales of modules whose scheme carries no input_scale role

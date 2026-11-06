@@ -33,7 +33,7 @@ def parse_config(hf: Any) -> ModelConfig:
         rms_norm_eps=float(hf.rms_norm_eps), tie_word_embeddings=bool(hf.tie_word_embeddings),
         rotary_config=rope, num_experts=0, num_experts_per_tok=0, moe_intermediate_size=0,
         norm_topk_prob=False, model_type="ricursive", architectures=list(hf.architectures),
-        use_qk_norm=True, embedding_scale=hf.embed_scale, swiglu_limit=float(hf.ffn_clamp_threshold),
+        use_qk_norm=True, embedding_scale=hf.embed_scale, swiglu_limit=float(hf.ffn_clamp_threshold or 0) or None,
         attention_groups=(
             SWAAttentionGroupConfig(
                 name="swa", layer_ids=tuple(i for i, kind in enumerate(types) if kind == "sliding_attention"),

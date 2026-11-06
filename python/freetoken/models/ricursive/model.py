@@ -13,6 +13,7 @@ from freetoken.layers import (
     RMSNorm,
     RMSNormFused,
     VocabParallelEmbedding,
+    silu_and_mul,
     swiglu_clamp_and_mul,
 )
 from freetoken.models.blocks import BaseLLMModel
@@ -36,7 +37,10 @@ class RicursiveMLP(BaseOP):
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(swiglu_clamp_and_mul(self.gate_up_proj.forward(x), alpha=1.0, limit=self.limit))
+        gate_up = self.gate_up_proj.forward(x)
+        if self.limit is None:
+            return self.down_proj.forward(silu_and_mul(gate_up))
+        return self.down_proj.forward(swiglu_clamp_and_mul(gate_up, alpha=1.0, limit=self.limit))
 
 
 class RicursiveDecoderLayer(BaseOP):

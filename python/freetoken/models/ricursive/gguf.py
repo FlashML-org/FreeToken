@@ -32,7 +32,7 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
 
 
 def _clamp(value) -> float:
-    # llama.cpp's converter writes one clamp per layer; the first community GGUFs carry a scalar
+    # llama.cpp's converter writes one clamp per layer; the first community GGUFs carry a scalar; absent or 0 is no clamp
     values = set(value) if isinstance(value, list) else {value}
     if len(values) != 1:
         raise NotImplementedError("Ricursive GGUF per-layer swiglu_clamp values must all match")
@@ -48,16 +48,22 @@ def _hf_config(shim: GgufConfigShim) -> SimpleNamespace:
     if md.get("ricursive.rope.scaling.type", "none") != "none":
         raise NotImplementedError("Ricursive GGUF RoPE scaling is not supported")
     check_scales(shim.model_path)
+    layers = int(kv("block_count"))
+    # llama.cpp's default when the pattern is absent: every fifth layer is global, as in the checkpoint config
+    pattern = md.get("ricursive.attention.sliding_window_pattern")
+    if pattern is None:
+        pattern = [i % 5 != 4 for i in range(layers)]
+    scale = md.get("ricursive.embedding_scale")
     return SimpleNamespace(
-        architectures=list(shim.architectures), num_hidden_layers=int(kv("block_count")),
+        architectures=list(shim.architectures), num_hidden_layers=layers,
         hidden_size=int(kv("embedding_length")), intermediate_size=int(kv("feed_forward_length")),
         num_attention_heads=int(kv("attention.head_count")), num_key_value_heads=int(kv("attention.head_count_kv")),
         head_dim=int(kv("attention.key_length")), vocab_size=shim.vocab_size,
         max_position_embeddings=int(kv("context_length")),
         rms_norm_eps=float(kv("attention.layer_norm_rms_epsilon")), rope_theta=float(kv("rope.freq_base")),
-        layer_types=["sliding_attention" if v else "full_attention" for v in kv("attention.sliding_window_pattern")],
-        sliding_window=int(kv("attention.sliding_window")), embed_scale=float(kv("embedding_scale")),
-        ffn_clamp_threshold=_clamp(kv("swiglu_clamp")), tie_word_embeddings=shim.tie_word_embeddings,
+        layer_types=["sliding_attention" if v else "full_attention" for v in pattern],
+        sliding_window=int(kv("attention.sliding_window")), embed_scale=float(scale) if scale else None,
+        ffn_clamp_threshold=_clamp(md.get("ricursive.swiglu_clamp", 0.0)), tie_word_embeddings=shim.tie_word_embeddings,
         hidden_act="silu", use_gated_attention=True, gate_full_precision=True, use_valres=True,
     )
 
