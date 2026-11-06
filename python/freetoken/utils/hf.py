@@ -84,7 +84,10 @@ def load_eos_token_ids(
     if tokenizer.eos_token_id is not None:
         ids.add(int(tokenizer.eos_token_id))
     try:
-        gen_eos = GenerationConfig.from_pretrained(model_path).eos_token_id
+        try:
+            gen_eos = GenerationConfig.from_pretrained(model_path).eos_token_id
+        except OSError:  # no generation_config.json, config.json can still list the stop ids
+            gen_eos = getattr(_load_hf_config(model_path), "eos_token_id", None)
     except Exception:
         gen_eos = None
     if isinstance(gen_eos, int):
