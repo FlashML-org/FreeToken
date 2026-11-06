@@ -11,7 +11,7 @@ import triton.language as tl
 def _ring_attn_split_kernel(
     q_ptr, k_ptr, v_ptr, rows_ptr, starts_ptr,
     o_ptr, m_ptr, l_ptr,
-    layer, num_rows, ring, window, scale,
+    layer, num_rows, ring_len, window, scale,
     NUM_KV_HEADS: tl.constexpr, GROUP: tl.constexpr, BLOCK: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KEYS_PER_SPLIT: tl.constexpr,
 ):
@@ -34,15 +34,15 @@ def _ring_attn_split_kernel(
     top = start + BLOCK - 1
     # a query at start+j sees positions > start+j-window (sliding window), and only ones that hold context
     lo = tl.maximum(start + j - window + 1, 0)
-    base = (layer * num_rows + row) * ring
+    base = (layer * num_rows + row) * ring_len
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     m_i = tl.full([BLOCK_M], -1.0e30, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     for n0 in range(0, KEYS_PER_SPLIT, BLOCK_N):
         slot = split * KEYS_PER_SPLIT + n0 + tl.arange(0, BLOCK_N)
-        s_ok = slot < ring
+        s_ok = slot < ring_len
         # % keeps the dividend's sign; slots past top give a negative dividend early in a sequence
-        pos = top - ((top - slot) % ring + ring) % ring
+        pos = top - ((top - slot) % ring_len + ring_len) % ring_len
         kv_off = ((base + slot) * NUM_KV_HEADS + kvh) * HEAD_DIM
         k = tl.load(k_ptr + kv_off[:, None] + d[None, :], mask=s_ok[:, None], other=0.0)
         qk = tl.dot(q, tl.trans(k)) * scale
@@ -94,27 +94,27 @@ def _block_m(group: int, block: int) -> int:
     return max(16, triton.next_power_of_2(group * block))
 
 
-def ring_attention_workspace(max_bs: int, block: int, num_heads: int, num_kv_heads: int, head_dim: int, ring: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def ring_attention_workspace(max_bs: int, block: int, num_heads: int, num_kv_heads: int, head_dim: int, ring_len: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The fp32 split partials (out, max, sum) ``ring_attention`` needs for up to ``max_bs`` requests; on the meta device they only size the budget."""
-    parts = max_bs * num_kv_heads * triton.cdiv(ring, _KEYS_PER_SPLIT) * _block_m(num_heads // num_kv_heads, block)
+    parts = max_bs * num_kv_heads * triton.cdiv(ring_len, _KEYS_PER_SPLIT) * _block_m(num_heads // num_kv_heads, block)
     f32 = dict(dtype=torch.float32, device=device)
     return torch.empty(parts, head_dim, **f32), torch.empty(parts, **f32), torch.empty(parts, **f32)
 
 
 def ring_attention(q, ring_k, ring_v, layer: int, rows, starts, window: int, scale: float, workspace) -> torch.Tensor:
-    """Non-causal block attention of ``[bs*block, heads*head_dim]`` queries over a ``[layers, rows, ring, kv_heads, head_dim]`` KV ring.
+    """Non-causal block attention of ``[bs*block, heads*head_dim]`` queries over a ``[layers, rows, ring_len, kv_heads, head_dim]`` KV ring.
 
-    The ring holds position ``p`` at slot ``p % ring``; the block occupies ``start .. start+block-1`` and the window behind it the rest.
+    The ring holds position ``p`` at slot ``p % ring_len``; the block occupies ``start .. start+block-1`` and the window behind it the rest.
     """
-    ring, num_kv_heads, head_dim = ring_k.shape[2:]
+    ring_len, num_kv_heads, head_dim = ring_k.shape[2:]
     bs = starts.shape[0]
     block, group = q.shape[0] // bs, q.shape[1] // (num_kv_heads * head_dim)
-    block_m, num_splits = _block_m(group, block), triton.cdiv(ring, _KEYS_PER_SPLIT)
+    block_m, num_splits = _block_m(group, block), triton.cdiv(ring_len, _KEYS_PER_SPLIT)
     part_o, part_m, part_l = workspace
     out = torch.empty_like(q)
     _ring_attn_split_kernel[(bs * num_kv_heads, num_splits)](
         q, ring_k, ring_v, rows, starts, part_o, part_m, part_l,
-        layer, ring_k.shape[1], ring, window, scale,
+        layer, ring_k.shape[1], ring_len, window, scale,
         NUM_KV_HEADS=num_kv_heads, GROUP=group, BLOCK=block, HEAD_DIM=head_dim,
         BLOCK_M=block_m, BLOCK_N=_BLOCK_N, KEYS_PER_SPLIT=_KEYS_PER_SPLIT, num_warps=4,
     )
@@ -172,7 +172,7 @@ def _norm_rope(x1, x2, w_ptr, cos, sin, eps, HALF: tl.constexpr):
 @triton.jit
 def _norm_rope_store_kernel(
     src_ptr, src_stride, q_out_ptr, q_norm_ptr, k_norm_ptr, cos_sin_ptr, pos_ptr, rows_ptr, ring_k_ptr, ring_v_ptr,
-    layer0, num_rows, ring, eps,
+    layer0, num_rows, ring_len, eps,
     NUM_Q_HEADS: tl.constexpr, NUM_KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
 ):
     n = tl.program_id(0)
@@ -186,12 +186,12 @@ def _norm_rope_store_kernel(
     x1 = tl.load(base + d).to(tl.float32)
     x2 = tl.load(base + half + d).to(tl.float32)
     pos = tl.load(pos_ptr + n)
-    slot = pos.to(tl.int64) % ring
+    slot = pos.to(tl.int64) % ring_len
     row = tl.load(rows_ptr + n)
     cos = tl.load(cos_sin_ptr + pos * HEAD_DIM + d)
     sin = tl.load(cos_sin_ptr + pos * HEAD_DIM + half + d)
     if h >= NUM_Q_HEADS + NUM_KV_HEADS:
-        dst = ring_v_ptr + (((layer * num_rows + row) * ring + slot) * NUM_KV_HEADS + h - NUM_Q_HEADS - NUM_KV_HEADS) * HEAD_DIM
+        dst = ring_v_ptr + (((layer * num_rows + row) * ring_len + slot) * NUM_KV_HEADS + h - NUM_Q_HEADS - NUM_KV_HEADS) * HEAD_DIM
         tl.store(dst + d, x1.to(ring_v_ptr.dtype.element_ty))
         tl.store(dst + half + d, x2.to(ring_v_ptr.dtype.element_ty))
     elif h < NUM_Q_HEADS:
@@ -201,7 +201,7 @@ def _norm_rope_store_kernel(
         tl.store(dst + half + d, o2.to(q_out_ptr.dtype.element_ty))
     else:
         o1, o2 = _norm_rope(x1, x2, k_norm_ptr + layer * HEAD_DIM, cos, sin, eps, half)
-        dst = ring_k_ptr + (((layer * num_rows + row) * ring + slot) * NUM_KV_HEADS + h - NUM_Q_HEADS) * HEAD_DIM
+        dst = ring_k_ptr + (((layer * num_rows + row) * ring_len + slot) * NUM_KV_HEADS + h - NUM_Q_HEADS) * HEAD_DIM
         tl.store(dst + d, o1.to(ring_k_ptr.dtype.element_ty))
         tl.store(dst + half + d, o2.to(ring_k_ptr.dtype.element_ty))
 
@@ -211,7 +211,7 @@ def norm_rope_store(
     k_norms: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor,
     ring_k: torch.Tensor, ring_v: torch.Tensor, layer0: int, eps: float,
 ) -> None:
-    """Per-head RMSNorm + NeoX RoPE of ``[n, num_layers*(q|k|v heads)*head_dim]`` rows: q into ``q_out``, k and v into the ring at ``positions % ring``.
+    """Per-head RMSNorm + NeoX RoPE of ``[n, num_layers*(q|k|v heads)*head_dim]`` rows: q into ``q_out``, k and v into the ring at ``positions % ring_len``.
 
     ``k_norms`` is ``[layers, head_dim]`` indexed by ``layer0 + layer``; ``cos_sin`` is ``[max_pos, head_dim]`` (cos half, sin half).
     """

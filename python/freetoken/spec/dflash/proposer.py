@@ -124,9 +124,9 @@ class DFlashProposer(Proposer):
     def budget(cls, config) -> tuple[int, int]:
         c = cls._draft_config(config)
         block, rows, item = config.speculative_num_steps + 1, config.max_running_req + 1, config.dtype.itemsize
-        ring = DFlashWindow.length(c.window, block)
-        kv = 2 * c.num_layers * rows * ring * c.num_kv_heads * c.head_dim * item
-        scratch = sum(t.nbytes for t in ring_attention_workspace(rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring, torch.device("meta")))
+        ring_len = DFlashWindow.length(c.window, block)
+        kv = 2 * c.num_layers * rows * ring_len * c.num_kv_heads * c.head_dim * item
+        scratch = sum(t.nbytes for t in ring_attention_workspace(rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring_len, torch.device("meta")))
         aux = config.max_running_req * block * len(c.target_layer_ids) * c.hidden_size * item
         # the rope table is sized by the page table at attach; max_seq_len bounds its width
         rope = config.max_seq_len * c.head_dim * 4
@@ -154,7 +154,7 @@ class DFlashProposer(Proposer):
         self.ring_len = DFlashWindow.length(c.window, self.block)
         self._seen: Dict[int, int] = {}  # table row -> uid of the request whose chunks its ring holds
         self._prefill_sink: _PrefillSink | None = None
-        self.ring = self.window = self.aux_buf = None
+        self.dflash_ring = self.window = self.aux_buf = None
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._inject_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         params = sum(t.numel() for t in self.draft.state_dict().values())
@@ -168,14 +168,14 @@ class DFlashProposer(Proposer):
     def attach(self, ctx: DraftContext) -> None:
         super().attach(ctx)
         mr = self.config.max_running_req
-        self.ring = self.draft.make_ring(mr + 1, self.block, self.ring_len, ctx.page_table.shape[1], ctx.device)
+        self.dflash_ring = self.draft.make_dflash_ring(mr + 1, self.block, self.ring_len, ctx.page_table.shape[1], ctx.device)
         self.window = DFlashWindow(ctx.slot_states, self.ring_len, self.hidden) if DFlashWindow.NAME in ctx.slot_states else None
         self.aux_buf = torch.zeros(mr * self.block, len(self.taps) * self.hidden, dtype=self.dtype, device=ctx.device)
 
     def detach(self, *, keep_kv: bool) -> None:
         # the ring is keyed by table row and position, not by KV slot, and a rebuild finds no request running
         self._graphs, self._inject_graphs = {}, {}
-        self.ring = self.window = self.aux_buf = None
+        self.dflash_ring = self.window = self.aux_buf = None
         self._seen.clear()
         super().detach(keep_kv=keep_kv)
 
@@ -185,13 +185,13 @@ class DFlashProposer(Proposer):
     # ------------------------------------------------------------------ draft step
 
     def _draft(self, bonus, starts, rows, temperature, greedy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden = self.draft.forward_block(bonus, starts, rows, self.ring)
+        hidden = self.draft.forward_block(bonus, starts, rows, self.dflash_ring)
         return self.draft.propose(hidden, bonus, temperature, greedy)
 
     def _inject(self, features: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor | None) -> None:
         """The context rows of ``features`` into the ring rows ``rows`` and the window slots ``slots`` at ``positions``."""
         ctx = self.draft.context_rows(features)
-        self.draft.store_context(ctx, positions, rows, self.ring)
+        self.draft.store_context(ctx, positions, rows, self.dflash_ring)
         if self.window is not None:
             self.window.write(ctx, positions, slots)
 
@@ -334,10 +334,10 @@ class DFlashProposer(Proposer):
                 torch.cat([window.read(slot, lo, hi - lo) for slot, lo, hi, _ in restore]),
                 make_device_tensor([p for _, lo, hi, _ in restore for p in range(lo, hi)], torch.int32, self.device),
                 make_device_tensor([row for _, lo, hi, row in restore for _ in range(lo, hi)], torch.int64, self.device),
-                self.ring,
+                self.dflash_ring,
             )
         positions = make_device_tensor(pos, torch.int32, self.device)
-        self.draft.store_context(ctx, positions, make_device_tensor(rows, torch.int64, self.device), self.ring)
+        self.draft.store_context(ctx, positions, make_device_tensor(rows, torch.int64, self.device), self.dflash_ring)
         if window is None:
             return
         window.write(ctx, positions, make_device_tensor(slots, torch.int64, self.device))
