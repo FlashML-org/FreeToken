@@ -230,6 +230,25 @@ void ggml_cuda_mul_mat_q(
                 ntiles_J_best = ntiles_x;
             }
         }
+
+        // With a flat MoE grid, ncols_opt is only the mean number of columns per expert.
+        // A J that exactly divides it leaves the average tile full, so with random routing
+        // about half the experts spill into an extra tile. One J step up absorbs the spill
+        // without adding a tile for the average expert.
+        if (ids != nullptr && ncols_max <= 0 && ncols_opt > 0 && ncols_opt % J_best == 0) {
+            for (int J = J_best + 8; J <= 128; J += 8) {
+                const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
+                if (config.type == GGML_TYPE_COUNT) {
+                    continue;
+                }
+                if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+                    break; // shared memory grows with J on the nvidia ladders; a dip on another ladder only skips the step-up
+                }
+                J_best = config.J;
+                nthreads_best = config.nthreads;
+                break;
+            }
+        }
     }
     GGML_ASSERT(J_best > 0);
 
