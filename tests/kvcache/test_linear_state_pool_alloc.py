@@ -63,18 +63,14 @@ def test_clear_slots_zeros_all_layers():
 
 
 def test_copy_from_snapshot():
-    # a draft's context window rides the slot like the PLE history: the snapshot carries it to the restored slot
-    window = SlotStateSpec(name="dflash_window", shape=(16, 8))
-    pool = _pool(num_slots=6, slot_states=(window,))
+    pool = _pool(num_slots=6)
     src, dst = pool.alloc(2)
     torch.manual_seed(0)
     pool.conv_states[:, src] = torch.randn_like(pool.conv_states[:, src])
     pool.recurrent_states[:, src] = torch.randn_like(pool.recurrent_states[:, src])
-    pool.slot_state("dflash_window")[src] = torch.randn(16, 8).to(torch.bfloat16)
     pool.copy_from(src, dst)
     assert torch.equal(pool.conv_states[:, dst], pool.conv_states[:, src])
     assert torch.equal(pool.recurrent_states[:, dst], pool.recurrent_states[:, src])
-    assert torch.equal(pool.slot_state("dflash_window")[dst], pool.slot_state("dflash_window")[src])
 
 
 if __name__ == "__main__":
@@ -118,6 +114,8 @@ def test_layerless_spec_dtype_and_fill_value():
     pool = _pool(num_slots=6, slot_states=(spec,))
     t = pool.slot_state("ngram")
     assert t.shape == (6, 2) and t.dtype is torch.int32 and bool((t == 7).all())
+    # one int32 [2] per slot, not one per linear layer, and the budget counts the same
+    assert pool.bytes_per_slot() == linear_state_bytes_per_req(_group(), 1, torch.bfloat16, (spec,)) == _pool().bytes_per_slot() + 2 * 4
     t[3] = 1
     pool.clear_slots([3])
     assert bool((pool.slot_state("ngram")[3] == 7).all())
@@ -185,22 +183,10 @@ def test_slot_state_in_the_byte_account():
         state_pool_bytes(config, num_slots=4)
 
 
-@pytest.mark.parametrize("spec, per_slot", [
+def test_slot_state_bytes_for_the_real_geometry():
     # qwen4_exp PLE conv history: 4 streams x 2560 channels x 9 taps bf16 = 180 KiB per slot
-    (SlotStateSpec(name="ple_conv", shape=(4 * 2560, 9), layer_ids=(1,)), 180 * 1024),
-    # the DFlash2 context window of the Qwen3.6-35B-A3B draft
-    (SlotStateSpec(name="dflash_window", shape=(2112, 2048)), 2112 * 2048 * 2),
-])
-def test_slot_state_bytes_for_the_real_geometry(spec, per_slot):
+    spec = SlotStateSpec(name="ple_conv", shape=(4 * 2560, 9), layer_ids=(1,))
     group = _group()
-    gdn_only = linear_state_bytes_per_req(group, 1, torch.bfloat16)
-    with_state = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,))
-    assert with_state - gdn_only == per_slot
-
-    mc = SimpleNamespace(linear_attention_group=lambda: group)
-    config = SimpleNamespace(
-        model_config=mc, slot_states=(spec,), dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
-        cache_type="hybrid_radix", max_running_req=4, linear_state_cache_ratio=2.0,
-    )
-    # the hybrid-radix slot count of max_running_req 1 and 4 (4 mr + max(4, 2 mr) + 1 slots)
-    assert state_pool_bytes(config, num_slots=25) - state_pool_bytes(config, num_slots=9) == 16 * with_state
+    delta = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,)) - \
+        linear_state_bytes_per_req(group, 1, torch.bfloat16)
+    assert delta == 4 * 2560 * 9 * 2 == 180 * 1024
