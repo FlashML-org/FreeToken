@@ -33,7 +33,7 @@ class DFlashRing:
     cos_sin: torch.Tensor  # [max_position, head_dim] fp32
 
 
-class _GroupedConv(BaseOP):
+class DFlashGroupedConv(BaseOP):
     """Grouped dynamic depthwise 2-tap convolution along the block axis (sglang DFlashGroupedConv)."""
 
     def __init__(self, hidden: int, taps: int, group_size: int, *, quant_config: QuantConfig, prefix: str) -> None:
@@ -53,7 +53,7 @@ class _GroupedConv(BaseOP):
         return grouped_conv(x, coef, self.base_kernel[1], block, self.group_size)
 
 
-class _Attention(BaseOP):
+class DFlashAttention(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
         self.q_size = config.num_heads * config.head_dim
         self.qkv_proj = LinearQKVMerged(
@@ -65,18 +65,18 @@ class _Attention(BaseOP):
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
 
 
-class _Layer(BaseOP):
+class DFlashDecoderLayer(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
-        self.self_attn = _Attention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
+        self.self_attn = DFlashAttention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
         self.mlp = GatedMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         conv = dict(taps=config.conv_kernel_size, group_size=config.conv_group_size, quant_config=quant_config)
-        self.attention_conv = _GroupedConv(config.hidden_size, prefix=f"{prefix}.attention_conv", **conv)
-        self.mlp_conv = _GroupedConv(config.hidden_size, prefix=f"{prefix}.mlp_conv", **conv)
+        self.attention_conv = DFlashGroupedConv(config.hidden_size, prefix=f"{prefix}.attention_conv", **conv)
+        self.mlp_conv = DFlashGroupedConv(config.hidden_size, prefix=f"{prefix}.mlp_conv", **conv)
 
 
-class _CandidateSelector(BaseOP):
+class DFlashCandidateSelector(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
         self.hidden_projection = LinearReplicated(
             config.hidden_size, config.selector_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.hidden_projection",
@@ -93,9 +93,9 @@ class DFlash2DraftModel(BaseOP):
         hidden, taps = config.hidden_size, len(config.target_layer_ids)
         self.fc = LinearReplicated(taps * hidden, hidden, has_bias=False, quant_config=quant_config, prefix="fc")
         self.hidden_norm = RMSNorm(hidden, config.rms_norm_eps)
-        self.layers = OPList([_Layer(config, quant_config=quant_config, prefix=f"layers.{i}") for i in range(config.num_layers)])
+        self.layers = OPList([DFlashDecoderLayer(config, quant_config=quant_config, prefix=f"layers.{i}") for i in range(config.num_layers)])
         self.norm = RMSNormFused(hidden, config.rms_norm_eps)
-        self.candidate_selector = _CandidateSelector(config, quant_config=quant_config, prefix="candidate_selector")
+        self.candidate_selector = DFlashCandidateSelector(config, quant_config=quant_config, prefix="candidate_selector")
         # the target's own modules; underscore names keep them out of this module's state dict
         self._embed_tokens = target_model.model.embed_tokens
         self._lm_head = target_model.lm_head
