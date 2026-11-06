@@ -6,6 +6,7 @@ The tensors are tiny but the key names, dtypes and the fusion geometry that matt
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import random
 from types import SimpleNamespace
@@ -16,6 +17,8 @@ from safetensors.torch import save_file
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
+import freetoken.models.qwen4_exp.weight as qwen4_exp_weight
+from freetoken.models.nvfp4_banks import decode_csf_scales, iter_nvfp4_expert_pieces
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseReader,
@@ -63,6 +66,282 @@ def _hc_weights(prefix: str, inject: bool) -> dict[str, torch.Tensor]:
 
 def _fp8_scale(weight: torch.Tensor) -> torch.Tensor:
     return torch.rand(weight.shape[0] // BLOCK, weight.shape[1] // BLOCK) + 0.5
+
+
+def _csf_target(rows: int, cols: int, seed: int = 0) -> torch.Tensor:
+    """An E4M3 scale matrix whose rows share a high nibble (so base + 4-bit offset is exact)."""
+    rng = random.Random(seed)
+    high = torch.tensor([[rng.randrange(16)] for _ in range(rows)], dtype=torch.uint8)
+    off = torch.tensor([[rng.randrange(16) for _ in range(cols)] for _ in range(rows)], dtype=torch.uint8)
+    return high << 4 | off
+
+
+def _csf_encode(target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CSF slab pair of ``target``: fixed slabs (per-row high-nibble bases + 4-bit offsets) and a
+    few absolute exception records. The reference the decoder test compares against."""
+    rows, cols = target.shape
+    assert rows % 16 == 0 and cols % 2 == 0
+    row_bytes = cols // 2
+    fixed = torch.zeros(rows // 16, 16 * (1 + row_bytes), dtype=torch.uint8)
+    exceptions: list[int] = []
+    for r in range(rows):
+        slab, row = divmod(r, 16)
+        base = target[r, 0] & 0xF0
+        fixed[slab, row] = base
+        for j in range(row_bytes):
+            fixed[slab, 16 + row * row_bytes + j] = (target[r, 2 * j + 1] & 0xF) << 4 | (target[r, 2 * j] & 0xF)
+    # absolute records: (value << 24) | row-major position, U32 bit patterns stored as int32
+    for pos in (3, rows * cols - 1):
+        value = 0xFF - target.ravel()[pos].item()
+        rec = (value << 24) | pos
+        exceptions.append(rec - 0x100000000 if rec >= 0x80000000 else rec)
+    exc = torch.tensor(exceptions, dtype=torch.int32)
+    ref = target.clone()
+    for rec in exceptions:
+        ref.view(-1)[rec & 0xFFFFFF] = (rec >> 24) & 0xFF
+    return fixed, exc, ref
+
+
+# --------------------------------------------------------------------------- CSF slab scales
+
+
+def test_csf_decode_roundtrip():
+    for rows, cols in ((32, 8), (128, 160), (40 * 16, 40)):
+        target = _csf_target(rows, cols, seed=rows)
+        fixed, exc, ref = _csf_encode(target)
+        out = decode_csf_scales(fixed, exc)
+        assert out.shape == (rows, cols) and out.dtype is torch.float8_e4m3fn
+        assert torch.equal(out.view(torch.uint8), ref)
+        # the same records as a U32 byte stream
+        assert torch.equal(decode_csf_scales(fixed, exc.view(torch.uint8)).view(torch.uint8), ref)
+        # the same records as their true uint32 dtype (sign-bit records included)
+        assert torch.equal(decode_csf_scales(fixed, exc.to(torch.uint32)).view(torch.uint8), ref)
+        # with no exceptions the slab decode is the target itself (rows share a high nibble)
+        no_exc = decode_csf_scales(fixed, torch.zeros(0, dtype=torch.int32))
+        assert torch.equal(no_exc.view(torch.uint8), target)
+
+
+def test_csf_decode_rejects_streams_of_the_wrong_dtype():
+    target = _csf_target(32, 8, seed=1)
+    fixed, exc, _ref = _csf_encode(target)
+    with pytest.raises(ValueError, match="U32 records"):
+        decode_csf_scales(fixed, exc.to(torch.float32))
+    with pytest.raises(ValueError, match="expected U8"):
+        decode_csf_scales(fixed.to(torch.int32), exc)
+
+
+def test_rename_scaled_maps_the_checkpoint_scale_names_to_the_model_roles(monkeypatch):
+    """FP4-Local quantises the vision tower: attention as MXFP8, the MLP as W4A16 NVFP4.
+
+    The checkpoint names the block scale ``weight_scale`` while the engine's buffers are
+    ``weight_scale_inv`` (and the per-tensor global ``weight_scale_2``), so the reader must
+    rename along the module prefix -- and only for modules the quant config actually names.
+    """
+    from freetoken.layers.quantization import ModelOptConfig
+
+    quant = ModelOptConfig({
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.visual.blocks.0.attn.qkv": {"quant_algo": "MXFP8"},
+            "model.visual.blocks.0.mlp.linear_fc1": {"quant_algo": "W4A16_NVFP4"},
+            "model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+        },
+    })
+    monkeypatch.setattr(qwen4_exp_weight, "get_quant_config", lambda: quant)
+
+    # MXFP8 block scale: checkpoint role name -> the engine's buffer name
+    got = qwen4_exp_weight._rename_scaled("model.visual.blocks.0.attn.qkv.weight_scale")
+    assert got == "visual.blocks.0.attn.qkv.weight_scale_inv"
+    # W4A16 per-tensor global: the vision prefix lands under visual., the role under weight_global
+    got = qwen4_exp_weight._rename_scaled("model.visual.blocks.0.mlp.linear_fc1.weight_scale_2")
+    assert got == "visual.blocks.0.mlp.linear_fc1.weight_global"
+    # a scale whose module the config leaves unquantized stays noise
+    assert qwen4_exp_weight._rename_scaled("model.visual.blocks.1.attn.qkv.weight_scale") is None
+    # routed experts read their scales through the bank readers, never the dense path
+    assert qwen4_exp_weight._rename_scaled(
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale.nvfp4_csf_fixed"
+    ) is None
+
+
+def test_global_expander_broadcasts_the_scalar_once_its_weight_is_seen():
+    """The W4A16 global is a scalar fp32; the model buffer is one fp32 entry per output row.
+
+    The pair may arrive in either order, so the expansion is flushed only once both are known.
+    """
+    g = qwen4_exp_weight._GlobalExpander()
+    module = "visual.blocks.0.mlp.linear_fc1"
+    scalar = torch.tensor(0.0625)
+    # global first: buffered until the weight fixes the row count
+    assert g.on_global(module + ".weight_global", scalar) is None
+    name, tensor = g.on_weight(module, 256)
+    assert name == module + ".weight_global"
+    assert tensor.shape == (256,) and tensor.dtype is torch.float32
+    assert torch.all(tensor == 0.0625)
+    # weight first: the global flushes on the spot
+    g2 = qwen4_exp_weight._GlobalExpander()
+    assert g2.on_weight(module, 64) is None
+    name, tensor = g2.on_global(module + ".weight_global", scalar)
+    assert name == module + ".weight_global" and tensor.shape == (64,)
+    # a full-width global passes through untouched; a miscounted one raises
+    full = torch.ones(64, dtype=torch.float16)
+    assert g2.on_global(module + ".weight_global", full) == (module + ".weight_global", full)
+    row = torch.arange(3, dtype=torch.float16)
+    with pytest.raises(ValueError, match="holds 3 elements"):
+        g2.on_global(module + ".weight_global", row)
+    g.check_complete()
+    g2.check_complete()
+    # a scalar that never met its weight fails the completeness assert
+    g3 = qwen4_exp_weight._GlobalExpander()
+    g3.on_global(module + ".weight_global", scalar)
+    with pytest.raises(ValueError, match="without a weight"):
+        g3.check_complete()
+
+
+def _csf_expert_raw() -> tuple[dict[str, torch.Tensor], dict[tuple[int, str], torch.Tensor]]:
+    """One CSF-quantised MoE layer: packed codes, slab scale pairs, globals and input scales."""
+    lm = "model.language_model"
+    H_, I_ = 128, 64  # hidden / expert width; K multiples of 16, rows multiples of 16
+    raw: dict[str, torch.Tensor] = {}
+    refs: dict[tuple[int, str], torch.Tensor] = {}
+    for expert in range(2):
+        for proj, rows, k in (("gate_proj", I_, H_), ("up_proj", I_, H_), ("down_proj", H_, I_)):
+            base = f"{lm}.layers.0.mlp.experts.{expert}.{proj}"
+            raw[f"{base}.weight"] = torch.randint(0, 256, (rows, k // 2), dtype=torch.uint8)
+            raw[f"{base}.weight_scale_2"] = torch.rand(()) + 0.5
+            raw[f"{base}.input_scale"] = torch.rand(()) + 0.5
+            fixed, exc, ref = _csf_encode(_csf_target(rows, k // 16, seed=expert + k))
+            raw[f"{base}.weight_scale.nvfp4_csf_fixed"] = fixed
+            raw[f"{base}.weight_scale.nvfp4_csf_exceptions"] = exc
+            refs[(expert, proj)] = ref
+    return raw, refs
+
+
+def test_nvfp4_expert_spec_selects_the_csf_checkpoint(tmp_path):
+    """A weight map carrying CSF slab pairs switches the spec onto the shared decoder."""
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    raw, _refs = _csf_expert_raw()
+    (tmp_path / "csf").mkdir()
+    folder, _full = _write_checkpoint(tmp_path / "csf", raw, quant)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    assert spec.scale_pair == qwen4_exp_weight._CSF_KINDS
+    assert spec.scale_decoder is qwen4_exp_weight.decode_csf_scales
+    assert "CSF" in spec.desc
+    plain = {k.replace(".weight_scale.nvfp4_csf_fixed", ".weight_scale"): v for k, v in raw.items()}
+    (tmp_path / "plain").mkdir()
+    folder, _full = _write_checkpoint(tmp_path / "plain", plain, quant)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    assert spec.scale_pair is None and spec.scale_decoder is None
+
+
+def test_csf_expert_reader_expands_the_scale_pieces(tmp_path):
+    """A CSF checkpoint streams slab pairs; the reader expands them into the plain bank roles."""
+    from freetoken.models.loader import drop_page_cache
+
+    lm = "model.language_model"
+    raw, refs = _csf_expert_raw()
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    (tmp_path / "reader").mkdir()
+    folder, _full = _write_checkpoint(tmp_path / "reader", raw, quant)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    assert spec.scale_pair is not None
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    pieces = list(iter_nvfp4_expert_pieces(folder, config, spec, drop_page_cache=drop_page_cache))
+    assert sorted(p[1] for p in pieces) == [0, 1]
+    for layer, e0, e1, piece in pieces:
+        assert (layer, e0, e1) == (0, e0, e0 + 1)
+        for proj, role in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
+            base = f"{lm}.layers.0.mlp.experts.{e0}.{proj}"
+            assert torch.equal(piece[role][0], raw[f"{base}.weight"])
+            assert piece[f"{role}_global"].dtype is torch.float32 and torch.equal(
+                piece[f"{role}_global"].reshape(-1), raw[f"{base}.weight_scale_2"].reshape(-1).float()
+            )
+            assert piece[f"{role}_input"].dtype is torch.float32 and torch.equal(
+                piece[f"{role}_input"].reshape(-1), raw[f"{base}.input_scale"].reshape(-1).float()
+            )
+            assert piece[f"{role}_scale"].shape == (1, raw[f"{base}.weight"].shape[0], raw[f"{base}.weight"].shape[1] // 8)
+            assert torch.equal(piece[f"{role}_scale"].view(torch.uint8)[0], refs[(e0, proj)])
+
+
+def test_csf_pieces_decoder_errors_surface_to_the_consumer(tmp_path):
+    """A raising scale decoder must fail the stream, not silently drop pieces."""
+    raw, _refs = _csf_expert_raw()
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    folder, _full = _write_checkpoint(tmp_path, raw, quant)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    calls = iter(range(99))
+
+    def boom(fixed, exceptions):
+        if next(calls) == 4:
+            raise RuntimeError("decoder boom")
+        return decode_csf_scales(fixed, exceptions)
+
+    spec = dataclasses.replace(spec, scale_decoder=boom)
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    with pytest.raises(RuntimeError, match="decoder boom"):
+        list(iter_nvfp4_expert_pieces(folder, config, spec))
+
+
+def test_csf_expert_reader_parallel_streams_csf_pieces(tmp_path):
+    """The O_DIRECT parallel reader (the production path) expands CSF pairs identically."""
+    raw, refs = _csf_expert_raw()
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    folder, _full = _write_checkpoint(tmp_path, raw, quant)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    pieces = list(iter_nvfp4_expert_pieces(folder, config, spec, parallel=True, workers=2, chunk=1 << 20))
+    assert sorted(p[1] for p in pieces) == [0, 1]
+    for _layer, e0, e1, piece in pieces:
+        assert (e0, e1) == (0, 1) or (e0, e1) == (1, 2)
+        for proj, role in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
+            base = f"model.language_model.layers.0.mlp.experts.{e0}.{proj}"
+            assert piece[f"{role}_scale"].shape == (1, raw[f"{base}.weight"].shape[0], raw[f"{base}.weight"].shape[1] // 8)
+            assert torch.equal(piece[f"{role}_scale"].view(torch.uint8)[0], refs[(e0, proj)])
+
+
+def test_csf_pieces_read_activation_scales_out_of_band(tmp_path, monkeypatch):
+    """input_scale rides no part of the expert stream.
+
+    The FP4-Local checkpoint keeps every input_scale in one trailing shard; streaming
+    them made the first piece wait on that shard with all weights already in hand.
+    """
+    from freetoken.models import weight as models_weight
+
+    probed: list = []
+    real = models_weight.iter_expert_tensors_parallel
+
+    def spy(folder, is_expert, **kwargs):
+        probed.append(is_expert)
+        yield from real(folder, is_expert, **kwargs)
+
+    monkeypatch.setattr(models_weight, "iter_expert_tensors_parallel", spy)
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    raw, _refs = _csf_expert_raw()
+    # mimic the real checkpoint: the whole input_scale set lives in its own shard
+    act_tensors = {name: raw.pop(name) for name in list(raw) if name.endswith(".input_scale")}
+    assert len(act_tensors) == 6
+    folder, _full = _write_checkpoint(tmp_path, raw, quant)
+    save_file(act_tensors, str(tmp_path / "model-act-00000.safetensors"))
+    assert folder == str(tmp_path)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    pieces = list(iter_nvfp4_expert_pieces(folder, config, spec, parallel=True, workers=2, chunk=1 << 20))
+    assert len(pieces) == 2
+    for _layer, _e0, _e1, piece in pieces:
+        for role in ("gate", "up", "down"):
+            assert piece[f"{role}_input"].dtype is torch.float32
+    assert probed
+    want = probed[0]
+    for expert in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            base = f"model.language_model.layers.0.mlp.experts.{expert}.{proj}"
+            assert not want(f"{base}.input_scale")
+            assert want(f"{base}.weight")
 
 
 def _raw_checkpoint(dense_fp8: bool = False, channel_fp8: bool = False, mxfp8_scale: str | None = None) -> dict[str, torch.Tensor]:
@@ -424,6 +703,70 @@ def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
     args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS + 1, ngram_head_dim=NGRAM_DIM)
     with pytest.raises(ValueError, match="shards 0"):
         load_ple_table(folder, args, pin=False)
+
+
+def _nvfp4_ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor, int, int, int]:
+    """The FP4-Local table: packed e2m1 values (u8, two per byte) with per-16 e4m3 scale rows.
+
+    head_dim is 16 so a packed row is 8 bytes with a single per-16 scale.
+    """
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    rows, parts, dim = 5, 3, 16
+    tensors = {
+        f"{prefix}.shard_{i}.weight": (
+            torch.arange(i * rows * dim // 2, (i + 1) * rows * dim // 2)
+            .remainder(255).to(torch.uint8).view(rows, dim // 2)
+        )
+        for i in range(parts)
+    }
+    tensors.update(
+        {
+            f"{prefix}.shard_{i}.weight_scale": (
+                torch.arange(i * rows * dim // 16, (i + 1) * rows * dim // 16)
+                .remainder(127).to(torch.uint8).view(rows, dim // 16).view(torch.float8_e4m3fn)
+            )
+            for i in range(parts)
+        }
+    )
+    scale = torch.tensor([0.25], dtype=torch.float32)
+    tensors[f"{prefix}.weight_scale_2"] = scale
+    return tensors, scale, rows, dim, parts
+
+
+def test_load_ple_table_nvfp4_concatenates_packed_shards(tmp_path):
+    """The FP4-Local table: packed e2m1 value rows, per-16 e4m3 scale rows, global weight_scale_2."""
+    tensors, _scale, rows, dim, parts = _nvfp4_ngram_table()
+    names = sorted(tensors)
+    save_file({n: tensors[n] for n in names[:2]}, str(tmp_path / "model-plefp4-00000.safetensors"))
+    save_file({n: tensors[n] for n in names[2:]}, str(tmp_path / "model-plefp4-00001.safetensors"))
+    args = SimpleNamespace(split_ngram_parts=parts, ngram_head_dim=dim, ple_embedding_dtype="nvfp4")
+    table = load_ple_table(str(tmp_path), args, pin=False)
+    assert table.tensor.shape == (parts * rows, dim // 2)
+    assert table.tensor.dtype is torch.uint8
+    assert table.scale_bank is not None
+    assert table.scale_bank.tensor.shape == (parts * rows, dim // 16)
+    assert table.scale_bank.tensor.dtype is torch.float8_e4m3fn
+    assert table.weight_scale.dtype is torch.float32
+    assert float(table.weight_scale) == 0.25
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    for shard in range(parts):
+        assert torch.equal(
+            table.tensor[shard * rows : (shard + 1) * rows], tensors[f"{prefix}.shard_{shard}.weight"]
+        )
+        assert torch.equal(
+            table.scale_bank.tensor[shard * rows : (shard + 1) * rows],
+            tensors[f"{prefix}.shard_{shard}.weight_scale"],
+        )
+
+
+def test_load_ple_table_rejects_a_nvfp4_table_under_fp8(tmp_path):
+    """A packed table's U8 value shards must not load as an FP8 table."""
+    tensors, _scale, _rows, dim, parts = _nvfp4_ngram_table()
+    for i, name in enumerate(sorted(tensors)):
+        save_file({name: tensors[name]}, str(tmp_path / f"model-plefp4-{i:05d}.safetensors"))
+    args = SimpleNamespace(split_ngram_parts=parts, ngram_head_dim=dim, ple_embedding_dtype="fp8")
+    with pytest.raises(ValueError, match="expected F8_E4M3"):
+        load_ple_table(str(tmp_path), args, pin=False)
 
 
 # ======================================================================================

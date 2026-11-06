@@ -32,6 +32,8 @@ _ST_DTYPE = {
     "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8,
     "U8": torch.uint8, "BOOL": torch.bool,
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2, "F8_E8M0": torch.float8_e8m0fnu,
+    # unsigned integer types (the CSF scale exceptions stream is U32)
+    "U16": torch.uint16, "U32": torch.uint32, "U64": torch.uint64,
 }
 _ODIRECT_BLK = 4096
 
