@@ -1,4 +1,4 @@
-"""Image tokenization against real Qwen VL, Gemma-4, GLM-5.3, Muse-Glimmer, MiniMax-M3 and DeepSeek-V4-Vision checkpoints (skipped when absent)."""
+"""Image tokenization against real Qwen VL, Gemma-4, GLM-5.3, Muse-Glimmer, MiniMax-M3, DeepSeek-V4-Vision and Ornith-1.5 checkpoints (skipped when absent)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,11 @@ from freetoken.mm import MM_PAD_SHIFT_VALUE, mm_pad_value
 
 MODELS = [
     p
-    for p in (os.environ.get("FREETOKEN_QWEN36_MODEL", ""), os.environ.get("FREETOKEN_QWEN3VL_MODEL", ""))
+    for p in (
+        os.environ.get("FREETOKEN_QWEN36_MODEL", ""),
+        os.environ.get("FREETOKEN_QWEN3VL_MODEL", ""),
+        os.environ.get("FREETOKEN_ORNITH_MODEL", ""),
+    )
     if os.path.exists(os.path.join(p, "config.json"))
 ]
 
@@ -26,7 +30,7 @@ pytestmark = [
     pytest.mark.needs_weights,
     pytest.mark.skipif(
         not MODELS and not any(os.path.exists(os.path.join(p, "config.json")) for p in (GEMMA, GLM, MUSE, MINIMAX, DSV4)),
-        reason="no FREETOKEN_QWEN36_MODEL / FREETOKEN_QWEN3VL_MODEL / FREETOKEN_GEMMA4_MODEL / FREETOKEN_GLM53_MODEL / FREETOKEN_MUSE_MODEL / FREETOKEN_MINIMAX_M3_MODEL / FREETOKEN_DSV4_VL_MODEL checkpoint",
+        reason="no FREETOKEN_QWEN36_MODEL / FREETOKEN_QWEN3VL_MODEL / FREETOKEN_ORNITH_MODEL / FREETOKEN_GEMMA4_MODEL / FREETOKEN_GLM53_MODEL / FREETOKEN_MUSE_MODEL / FREETOKEN_MINIMAX_M3_MODEL / FREETOKEN_DSV4_VL_MODEL checkpoint",
     ),
 ]
 
