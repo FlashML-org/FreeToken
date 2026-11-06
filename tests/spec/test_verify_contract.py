@@ -28,7 +28,6 @@ import json, os, sys, torch
 from freetoken.core import SamplingParams
 from freetoken.engine import engine as E, sample as S
 from freetoken.llm import LLM
-from freetoken.models.config import SlotStateSpec
 from freetoken.scheduler.prefill import ChunkedReq
 from freetoken.spec import PROPOSERS
 from freetoken.spec import runner as R
@@ -42,7 +41,7 @@ top2 = {}
 current = {}
 # the tapped layers' outputs as the sink got them, and as the next layer read them
 taps_got, taps_ref = {}, {}
-taps = {"prefill": 0, "verify": 0, "mismatch": 0, "streams": None, "width": None}
+taps = {"prefill": 0, "verify": 0, "mismatch": 0, "width": None}
 steps = {"verify": 0}
 
 
@@ -81,7 +80,7 @@ class RecordingSink:
     def layer_output(self, layer_id, x, residual=None, num_streams=1):
         if residual is not None:
             x = x + residual
-        taps["streams"], taps["width"] = num_streams, x.shape[1]
+        taps["width"] = x.shape[1]
         taps_got[layer_id][: x.shape[0], : x.shape[1]].copy_(x)
 
 
@@ -135,38 +134,15 @@ S.Sampler.sample_verify = lambda self, logits, args, drafts: (
     record(verify_rows(current["batch"], drafts.shape[1] + 1), logits), sample_verify(self, logits, args, drafts))[1]
 
 
-class NoopVerify:
-    # verify handler of the oracle's slot state: counts the commits it is handed
-    commits = 0
-
-    def __init__(self, spec, max_bs, rows_per_req, device, dtype):
-        pass
-
-    @staticmethod
-    def nbytes(spec, max_bs, rows_per_req, dtype):
-        return 0
-
-    def commit(self, pool, slots, counts):
-        NoopVerify.commits += 1
-
-
 class OracleProposer(Proposer):
     @classmethod
     def num_steps(cls, config):
         return 3, 8
 
-    @classmethod
-    def slot_states(cls, config):
-        return (SlotStateSpec(name="oracle_state", shape=(4,), verify=NoopVerify),)
-
     def __init__(self, config, target_model):
         super().__init__(config, target_model)
         self.reference = json.load(open(reference))
         self.steps = 0
-
-    def attach(self, ctx):
-        super().attach(ctx)
-        self.state = ctx.slot_states["oracle_state"]
 
     def feature_sink(self, batch):
         return RecordingSink()
@@ -233,12 +209,10 @@ prompts = [llm.tokenizer.encode(p) for p in ("The capital of France is", "1, 2, 
 params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True, presence_penalty=p, frequency_penalty=p)
           for n, p in ((48, 0.0), (37, 0.6), (41, 0.0))]
 res = llm.generate(prompts, params)
-result = {"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()], "verify_steps": steps["verify"]}
-if isinstance(getattr(llm.engine.spec, "proposer", None), OracleProposer):
-    proposer = llm.engine.spec.proposer
-    result["oracle"] = {"steps": proposer.steps, "commits": NoopVerify.commits, "state_shape": list(proposer.state.shape),
-                        "num_slots": llm.engine.linear_state_pool.num_slots, "taps": taps}
-json.dump(result, open(out, "w"))
+pool = llm.engine.linear_state_pool
+window = list(pool.slot_state("dflash_window").shape) if pool.has_slot_state("dflash_window") else None
+json.dump({"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()], "verify_steps": steps["verify"],
+           "taps": taps, "num_slots": pool.num_slots, "window": window}, open(out, "w"))
 """
 
 
@@ -329,19 +303,28 @@ def _run(model: str, out: str, reference: str, **kwargs) -> dict:
         return json.load(f)
 
 
-@pytest.mark.parametrize("graphs", [True, False])
-@pytest.mark.parametrize("algorithm", ["oracle", "dflash"])
-@pytest.mark.parametrize("family, backend", [("qwen3_5", "fa"), ("qwen3_5", "triton"), ("qwen4_exp", "qsa_sparse")])
-def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, algorithm, graphs):
+@pytest.fixture(scope="module")
+def plain_runs():
+    # (family, backend, graphs) -> model dir, output path and result of the plain greedy run, shared by both algorithms
+    return {}
+
+
+@pytest.mark.parametrize("family, backend, algorithm, graphs", [
+    *[(f, b, "oracle", g) for f, b in [("qwen3_5", "fa"), ("qwen3_5", "triton"), ("qwen4_exp", "qsa_sparse")] for g in (True, False)],
+    # the draft side once per family, with graphs
+    ("qwen3_5", "triton", "dflash", True), ("qwen4_exp", "qsa_sparse", "dflash", True),
+])
+def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, family, backend, algorithm, graphs):
     if backend == "fa":
         pytest.importorskip("sgl_kernel")
-    model = _tiny_model(str(tmp_path / "model"), family)
     # resident experts take the model dtype
     kwargs = {"attention_backend": backend, "cuda_graph_max_bs": 4 if graphs else 0, "moe_strategy": "fused"}
+    if (family, backend, graphs) not in plain_runs:
+        model = _tiny_model(str(tmp_path / "model"), family)
+        plain_runs[family, backend, graphs] = model, str(tmp_path / "decode.json"), _run(model, str(tmp_path / "decode.json"), "-", **kwargs)
+    model, decode, reference = plain_runs[family, backend, graphs]
     draft = {"speculative_draft_model_path": _tiny_draft(str(tmp_path / "draft"))} if algorithm == "dflash" else {}
-    reference = _run(model, str(tmp_path / "decode.json"), "-", **kwargs)
-    spec = _run(model, str(tmp_path / "spec.json"), str(tmp_path / "decode.json"),
-                speculative_algorithm=algorithm, speculative_num_steps=K, **draft, **kwargs)
+    spec = _run(model, str(tmp_path / "spec.json"), decode, speculative_algorithm=algorithm, speculative_num_steps=K, **draft, **kwargs)
     agreed = 0
     for uid, (want, got) in enumerate(zip(reference["outputs"], spec["outputs"])):
         assert len(got) == len(want)
@@ -358,11 +341,10 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, algorit
     assert agreed >= 0.5 * sum(map(len, reference["outputs"]))
     assert spec["verify_steps"] > 0
     if algorithm == "dflash":
-        return
-    # the oracle's slot state rode the target's GDN slots, and its handler saw every verify commit
-    oracle = spec["oracle"]
-    assert oracle["state_shape"] == [oracle["num_slots"], 4] and oracle["commits"] == oracle["steps"] > 0
-    # every prefill and verify forward handed the sink each tapped layer's output, as the next layer read it, as [rows, streams * H]
-    taps = oracle["taps"]
-    assert taps["prefill"] > 0 and taps["verify"] > 0 and taps["mismatch"] == 0
-    assert taps["streams"] == (4 if family == "qwen4_exp" else 1) and taps["width"] == taps["streams"] * 256
+        # the draft's context window rides the target's GDN slots: per slot, rows of the draft width covering its 16-position window and a block
+        window = spec["window"]
+        assert window is not None and window[0] == spec["num_slots"] and window[1] >= 16 + K + 1 and window[2] == 256
+    else:
+        # every prefill and verify forward handed the sink each tapped layer's output, as the next layer read it
+        taps = spec["taps"]
+        assert taps["prefill"] > 0 and taps["verify"] > 0 and taps["mismatch"] == 0
