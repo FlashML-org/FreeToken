@@ -205,17 +205,13 @@ def build_llm(model_path: Path) -> LLM:
             speculative_algorithm=algorithm,
             speculative_draft_model_path=os.environ.get("FREETOKEN_TEST_SPEC_DRAFT_PATH") or None,
             speculative_num_steps=int(os.environ.get("FREETOKEN_TEST_SPEC_NUM_STEPS", "0")),
-            # the accept counters reset at every decode log line; one sample never reaches this many steps
-            decode_log_interval=1 << 30,
         )
     return LLM(**kwargs)
 
 
 def accept_len(llm: LLM) -> float | None:
     """Tokens committed per verify step since the last call, the bonus token included, as the decode log's accept len; None without speculative decoding."""
-    reporter = llm.status_reporter
-    steps, tokens = reporter._spec_req_steps, reporter._spec_tokens
-    reporter._spec_req_steps = reporter._spec_tokens = 0
+    steps, tokens = llm.status_reporter.take_spec_counts()
     return tokens / steps if steps else None
 
 
