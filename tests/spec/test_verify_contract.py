@@ -304,9 +304,18 @@ def _run(model: str, out: str, reference: str, **kwargs) -> dict:
 
 
 @pytest.fixture(scope="module")
-def plain_runs():
-    # (family, backend, graphs) -> model dir, output path and result of the plain greedy run, shared by both algorithms
-    return {}
+def plain_runs(tmp_path_factory):
+    # the plain greedy run of each (family, backend, graphs), shared by both algorithms: model dir, output path, result
+    runs = {}
+
+    def get(family, backend, graphs, kwargs):
+        if (family, backend, graphs) not in runs:
+            root = tmp_path_factory.mktemp(f"plain-{family}-{backend}-{graphs}")
+            model = _tiny_model(str(root / "model"), family)
+            runs[family, backend, graphs] = model, str(root / "decode.json"), _run(model, str(root / "decode.json"), "-", **kwargs)
+        return runs[family, backend, graphs]
+
+    return get
 
 
 @pytest.mark.parametrize("family, backend, algorithm, graphs", [
@@ -319,10 +328,7 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, family, back
         pytest.importorskip("sgl_kernel")
     # resident experts take the model dtype
     kwargs = {"attention_backend": backend, "cuda_graph_max_bs": 4 if graphs else 0, "moe_strategy": "fused"}
-    if (family, backend, graphs) not in plain_runs:
-        model = _tiny_model(str(tmp_path / "model"), family)
-        plain_runs[family, backend, graphs] = model, str(tmp_path / "decode.json"), _run(model, str(tmp_path / "decode.json"), "-", **kwargs)
-    model, decode, reference = plain_runs[family, backend, graphs]
+    model, decode, reference = plain_runs(family, backend, graphs, kwargs)
     draft = {"speculative_draft_model_path": _tiny_draft(str(tmp_path / "draft"))} if algorithm == "dflash" else {}
     spec = _run(model, str(tmp_path / "spec.json"), decode, speculative_algorithm=algorithm, speculative_num_steps=K, **draft, **kwargs)
     agreed = 0

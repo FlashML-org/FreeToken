@@ -72,7 +72,7 @@ def test_each_verify_row_counts_the_drafts_before_it_as_committed():
 
 @cuda
 def test_each_verify_row_samples_with_its_requests_params():
-    """Request i's sampling params cover its k+1 verify rows: a top_k=1 request and a greedy one give the argmax on every row, a full-vocab one does not; the draft-probs verify reads each row's softmax at its request's temperature, renormalized over its top-k and then its top-p."""
+    """Request i's sampling params cover its k+1 verify rows: a top_k=1 request and a greedy one give the argmax on every row, a sampled one does not; the draft-probs verify reads each row's softmax at its request's temperature, renormalized over its top-k and then its top-p."""
     from freetoken.engine.sample import BatchSamplingArgs
 
     device = torch.device("cuda")
