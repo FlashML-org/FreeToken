@@ -92,7 +92,7 @@ class Qwen3_5Model(BaseOP):
         batch = get_global_ctx().batch
         x = embed_input_ids(self.embed_tokens, input_ids, batch)
         residual: torch.Tensor | None = None
-        features = getattr(batch, "features", None)
+        features = batch.features
         wanted = features.wanted_layers if features is not None else ()
         for i, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)

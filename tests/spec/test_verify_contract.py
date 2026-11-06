@@ -47,7 +47,7 @@ steps = {"verify": 0}
 
 
 def check_taps(batch):
-    if not isinstance(getattr(batch, "features", None), RecordingSink):
+    if not isinstance(batch.features, RecordingSink):
         return
     n, width = batch.input_ids.shape[0], taps["width"]
     taps["prefill" if batch.is_prefill else "verify"] += 1

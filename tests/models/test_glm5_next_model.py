@@ -141,6 +141,7 @@ def _batch(ctx, ids, t0, phase):
         positions=torch.arange(t0, t1, device=DEV),
         out_loc=torch.arange(t0, t1, device=DEV),
         active_table_idx=torch.tensor([0], device=DEV) if is_decode else None,
+        features=None,
         fla_metadata=FLAMetadata(
             cu_seqlens=torch.tensor([0, len(ids)], dtype=torch.int32, device=DEV),
             cache_indices=torch.tensor([1], dtype=torch.int32, device=DEV),

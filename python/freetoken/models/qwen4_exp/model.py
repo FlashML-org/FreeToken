@@ -122,7 +122,7 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        features = getattr(batch, "features", None)
+        features = batch.features
         wanted = features.wanted_layers if features is not None else ()
         for i, layer in enumerate(self.layers.op_list):
             hidden = layer.forward(hidden, batch)
