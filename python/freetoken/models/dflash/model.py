@@ -6,6 +6,7 @@ The draft KV holds context rows (target features through ``fc`` and ``hidden_nor
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -84,6 +85,13 @@ class DFlashCandidateSelector(BaseOP):
         self.predecessor_codebook = torch.empty(config.vocab_size, config.selector_rank)
         self.successor_codebook = torch.empty(config.vocab_size, config.selector_rank)
 
+    def sample_path(self, candidate_ids, unary_logits, hidden, anchor, temperature, greedy, uniforms) -> tuple[torch.Tensor, torch.Tensor]:
+        """Walk one path over the ``[bs, k, K]`` candidates: argmax on ``greedy`` rows, else drawn with ``uniforms`` from softmax(scores / temperature); returns the tokens ``[bs, k]`` and the q each was drawn from ``[bs, k, K]``."""
+        return selector_walk(
+            candidate_ids, unary_logits, self.hidden_projection.forward(hidden), anchor,
+            self.predecessor_codebook, self.successor_codebook, temperature, greedy, uniforms,
+        )
+
 
 class DFlash2DraftModel(BaseOP):
     """DFlash 2 weights and compute; the proposer owns the ring, batching and the verify."""
@@ -99,6 +107,12 @@ class DFlash2DraftModel(BaseOP):
         # the target's own modules; underscore names keep them out of this module's state dict
         self._embed_tokens = target_model.model.embed_tokens
         self._lm_head = target_model.lm_head
+        if is_flashinfer_installed():
+            from flashinfer import top_k
+
+            self._top_k = functools.partial(top_k, sorted=True, deterministic=True)
+        else:
+            self._top_k = functools.partial(torch.topk, dim=-1)
 
     @classmethod
     def load(cls, config: DFlashDraftConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> DFlash2DraftModel:
@@ -193,27 +207,8 @@ class DFlash2DraftModel(BaseOP):
 
     # ---------------------------------------------------------------- selector
 
-    def propose(self, hidden: torch.Tensor, anchor: torch.Tensor, temperature: torch.Tensor, greedy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Walk one selector path over the block's draft slots: argmax on ``greedy`` rows, else drawn from softmax(scores / temperature).
-
-        Returns draft tokens ``[bs, k]``, candidate ids ``[bs, k, K]`` and the q each draft was drawn from ``[bs, k, K]``.
-        """
-        bs = anchor.shape[0]
-        pred = hidden.view(bs, -1, self.config.hidden_size)[:, 1:]
-        slots, top_k = pred.shape[1], self.config.selector_top_k
-        logits = self._lm_head.logits(pred.reshape(-1, self.config.hidden_size))
-        # the target head's top-K candidates per slot, best first: a tie in the walk takes the first
-        if is_flashinfer_installed():
-            from flashinfer import top_k as flashinfer_top_k
-
-            unary, ids = flashinfer_top_k(logits, top_k, sorted=True, deterministic=True)
-        else:
-            unary, ids = torch.topk(logits, top_k, dim=-1)
-        ids, unary = ids.long(), unary.float()
-        selector = self.candidate_selector
-        tokens, q = selector_walk(
-            ids.view(bs, slots, top_k), unary.view(bs, slots, top_k), selector.hidden_projection.forward(pred), anchor,
-            selector.predecessor_codebook, selector.successor_codebook, temperature, greedy,
-            torch.rand(bs, slots, device=hidden.device),
-        )
-        return tokens, ids.view(bs, slots, top_k), q
+    def compute_candidates(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The target head's top-K token ids and their fp32 logits over ``hidden [..., H]``, best first, so a tie in the walk takes the first."""
+        vals, ids = self._top_k(self._lm_head.logits(hidden.reshape(-1, hidden.shape[-1])), self.config.selector_top_k)
+        shape = hidden.shape[:-1] + (-1,)
+        return ids.long().view(shape), vals.float().view(shape)

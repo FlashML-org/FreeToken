@@ -184,9 +184,14 @@ class DFlashProposer(Proposer):
 
     # ------------------------------------------------------------------ draft step
 
-    def _draft(self, bonus, starts, rows, temperature, greedy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden = self.draft.forward_block(bonus, starts, rows, self.dflash_ring)
-        return self.draft.propose(hidden, bonus, temperature, greedy)
+    def _draft(self, pending, starts, rows, temperature, greedy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = self.draft.forward_block(pending, starts, rows, self.dflash_ring)
+        # row 0 of each block is the pending token; rows 1..k predict the drafts
+        pred = hidden.view(pending.shape[0], self.block, -1)[:, 1:]
+        candidate_ids, unary_logits = self.draft.compute_candidates(pred)
+        uniforms = torch.rand(pred.shape[:2], device=pred.device)
+        tokens, q = self.draft.candidate_selector.sample_path(candidate_ids, unary_logits, pred, pending, temperature, greedy, uniforms)
+        return tokens, candidate_ids, q
 
     def _inject(self, features: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor | None) -> None:
         """The context rows of ``features`` into the ring rows ``rows`` and the window slots ``slots`` at ``positions``."""

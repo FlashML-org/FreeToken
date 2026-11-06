@@ -234,7 +234,7 @@ def test_ring_rebuilt_from_the_window_rows_drafts_the_same(tmp_path):
     assert not torch.equal(draft.forward_block(bonus, starts, rows_t, dflash_ring)[0], full[0])
 
 
-def test_propose_walks_the_selector_lattice(tmp_path):
+def test_sample_path_walks_the_selector_lattice(tmp_path):
     """Greedy and sampled requests follow the fp32 walk (same uniforms); a request whose scores all tie takes the first candidate; a NaN hidden yields in-range ids and a q that is no distribution, without disturbing the other requests."""
     w = _weights()
     draft, ref = _load_draft(tmp_path, w), _Reference(w)
@@ -247,10 +247,10 @@ def test_propose_walks_the_selector_lattice(tmp_path):
     temperature = torch.tensor([1.0, 0.7, 1.0, 0.7], device=DEV)
     greedy = torch.tensor([True, False, True, False], device=DEV)
 
-    torch.manual_seed(5)
-    tokens, cand, q = draft.propose(hidden, anchor, temperature, greedy)
-    torch.manual_seed(5)
+    pred = hidden.view(bs, block, H)[:, 1:]
+    cand, unary = draft.compute_candidates(pred)
     uniforms = torch.rand(bs, block - 1, device=DEV)
+    tokens, q = draft.candidate_selector.sample_path(cand, unary, pred, anchor, temperature, greedy, uniforms)
     want_tokens, want_q = ref.walk(hidden[: 2 * block], cand[:2], anchor[:2], temperature[:2], greedy[:2], uniforms[:2])
 
     assert tokens.shape == (bs, block - 1) and cand.shape == q.shape == (bs, block - 1, TOP_K)
