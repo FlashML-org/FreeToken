@@ -177,17 +177,18 @@ class _Reference:
 @pytest.mark.parametrize("dtype, tol", [(torch.float32, 2**-6), (torch.bfloat16, 2**-2)])
 @pytest.mark.parametrize("block", [4, 8])
 def test_block_forward_matches_reference(tmp_path, block, dtype, tol):
-    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 draft pins the math (tf32 dots); the bf16 draft, the serving dtype, is held to bf16 noise."""
+    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 draft pins the math (tf32 dots); the bf16 draft, the serving dtype, is held to bf16 noise. A ring rebuilt from only the window rows gives the same hidden, bitwise."""
     w = _weights()
     draft, ref = _load_draft(tmp_path, w, dtype), _Reference(w)
     dflash_ring = draft.make_dflash_ring(max_rows=3, block=block, ring_len=RING, max_position=4096, device=DEV)
     torch.manual_seed(1)
     lengths, rows = (5, 100), (2, 1)
-    contexts = []
+    contexts, draft_contexts = [], []
     for n, row in zip(lengths, rows):
         features = torch.randn(n, len(TAPS) * H, device=DEV, dtype=torch.bfloat16).to(dtype)
         ctx = draft.context_rows(features)
         torch.testing.assert_close(ctx.float(), ref.context_rows(features), atol=0, rtol=2**-6)
+        draft_contexts.append(ctx)
         # as the proposer stores a chunk: its last RING rows at most
         tail = torch.arange(max(0, n - RING), n, device=DEV)
         draft.store_context(ctx[tail], tail, torch.full((len(tail),), row, device=DEV), dflash_ring)
@@ -206,32 +207,13 @@ def test_block_forward_matches_reference(tmp_path, block, dtype, tol):
         want = ref.block(int(bonus[b]), lengths[b], contexts[b], block)
         torch.testing.assert_close(hidden[b * block : (b + 1) * block].float(), want, atol=tol, rtol=tol)
 
-
-def test_ring_rebuilt_from_the_window_rows_drafts_the_same(tmp_path):
-    """Storing only the context rows of positions ``[start-WINDOW+1, start)`` into a zeroed ring gives the hidden the full history gave, bitwise: a restore from the window loses nothing, and the block reads nothing older."""
-    w = _weights()
-    draft = _load_draft(tmp_path, w)
-    block, n, row = 4, 100, 1
-    dflash_ring = draft.make_dflash_ring(max_rows=2, block=block, ring_len=RING, max_position=4096, device=DEV)
-    torch.manual_seed(2)
-    ctx = draft.context_rows(torch.randn(n, len(TAPS) * H, device=DEV, dtype=torch.bfloat16))
-    positions, rows = torch.arange(n, device=DEV), torch.full((n,), row, device=DEV)
-    bonus, starts, rows_t = torch.tensor([7], device=DEV), torch.tensor([n], device=DEV), torch.tensor([row], device=DEV)
-    draft.store_context(ctx[-RING:], positions[-RING:], rows[-RING:], dflash_ring)
-    full = draft.forward_block(bonus, starts, rows_t, dflash_ring)
-
+    # a restore from the window loses nothing, and the block reads nothing older
     dflash_ring.k.zero_()
     dflash_ring.v.zero_()
-    lo = n - WINDOW + 1
-    draft.store_context(ctx[lo:], positions[lo:], rows[lo:], dflash_ring)
-    restored = draft.forward_block(bonus, starts, rows_t, dflash_ring)
-
-    assert torch.equal(restored, full)
-    # one row short, and the first query of the block loses a key
-    dflash_ring.k.zero_()
-    dflash_ring.v.zero_()
-    draft.store_context(ctx[lo + 1 :], positions[lo + 1 :], rows[lo + 1 :], dflash_ring)
-    assert not torch.equal(draft.forward_block(bonus, starts, rows_t, dflash_ring)[0], full[0])
+    for n, row, ctx in zip(lengths, rows, draft_contexts):
+        window = torch.arange(max(0, n - WINDOW + 1), n, device=DEV)
+        draft.store_context(ctx[window], window, torch.full((len(window),), row, device=DEV), dflash_ring)
+    assert torch.equal(draft.forward_block(bonus, starts, rows_t, dflash_ring), hidden)
 
 
 def test_sample_path_walks_the_selector_lattice(tmp_path):
