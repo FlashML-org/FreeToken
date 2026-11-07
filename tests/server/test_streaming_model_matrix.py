@@ -73,6 +73,7 @@ CALL_BLOCKS = {
         "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
     ),
     "qwen25": '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}\n</tool_call>',
+    "ricursive": '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}\n</tool_call>',
     "qwen3_coder": (
         "<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter>"
         "</function></tool_call>"
@@ -111,6 +112,7 @@ MARKUP_MARKERS = {
     "deepseekv32": ["｜DSML｜"],
     "deepseekv41": ["｜DSML｜"],
     "qwen25": ["<tool_call>", "</tool_call>"],
+    "ricursive": ["<tool_call>", "</tool_call>"],
     "qwen3_coder": ["<tool_call>", "<function="],
     "glm47": ["<arg_key>", "<arg_value>", "</tool_call>"],
     "gemma4": ["<|tool_call>", "<tool_call|>"],
@@ -127,6 +129,7 @@ MARKUP_MARKERS = {
 # opens the block implicitly (model emits only the closing marker).
 REASONING_FAMILIES = {
     "flint": ("glm47", "flint", "<think>", "</think>"),
+    "ricursive": ("ricursive", "ricursive", "<think>", "</think>"),
     "dsv4": ("deepseekv32", "deepseekv32", "", "</think>"),
     "dsv4.1": ("deepseekv41", "deepseekv32", "", "</think>"),
     "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),

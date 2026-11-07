@@ -22,9 +22,10 @@ def _stream(parser: ReasoningParser, chunks):
 
 @pytest.mark.parametrize("kwargs", [{}, {"enable_thinking": True}, {"enable_thinking": False}])
 @pytest.mark.parametrize("tools", [None, [{"type": "function", "function": {"name": "read"}}]])
-def test_flint_streaming_opens_reasoning_only_on_a_think_tag(kwargs, tools):
+@pytest.mark.parametrize("family", ["flint", "ricursive"])
+def test_streaming_opens_reasoning_only_on_a_think_tag(kwargs, tools, family):
     spec = GenSpec(messages=[], sampling_params=SimpleNamespace(), chat_template_kwargs=kwargs, template_tools=tools)
-    state = SimpleNamespace(config=SimpleNamespace(reasoning_parser="flint"))
+    state = SimpleNamespace(config=SimpleNamespace(reasoning_parser=family))
     thought = "The literal <tool_call> here is a quotation."
     text = f"<think>{thought}</think>42"
     for size in (1, 3, 7, len(text)):
