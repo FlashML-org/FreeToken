@@ -370,7 +370,9 @@ def _wait_sync_large_graph(tmp_path, kernels, rows_per_req=1):
     from freetoken.engine.graph import GraphRunner
 
     set_tp_info(0, 1)
-    set_global_ctx(Context(page_size=1))
+    ctx = Context(page_size=1)
+    ctx.page_table = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
+    set_global_ctx(ctx)
     disk, oracle, args = _make_table(tmp_path)
     emb = _embedding()
     row_ids = torch.zeros((8 * rows_per_req, args.num_ngram_heads), dtype=torch.int64, device="cuda")

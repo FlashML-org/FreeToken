@@ -32,11 +32,11 @@ class GraphCaptureBuffer:
     rows_per_req: int = 1
 
     @classmethod
-    def init(cls, bs: int, device: torch.device, mrope: bool = False, rows_per_req: int = 1) -> GraphCaptureBuffer:
+    def init(cls, bs: int, device: torch.device, dummy_loc: int, mrope: bool = False, rows_per_req: int = 1) -> GraphCaptureBuffer:
         n = bs * rows_per_req
         return GraphCaptureBuffer(
             input_ids=torch.zeros(n, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(n, dtype=torch.int32, device=device),
+            out_loc=torch.full((n,), dummy_loc, dtype=torch.int32, device=device),
             positions=torch.zeros(n, dtype=torch.int32, device=device),
             mrope_positions=(
                 torch.zeros(3, n, dtype=torch.int32, device=device) if mrope else None
@@ -204,7 +204,9 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, mrope=self.mrope, rows_per_req=self.rows_per_req)
+        # capture runs the forward eagerly and stores K/V, so aim it at the dummy page as replay does for padded rows; slot 0 is a real page
+        dummy_loc = int(get_global_ctx().page_table[self.dummy_req.table_idx, 0])
+        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, self.device, dummy_loc, mrope=self.mrope, rows_per_req=self.rows_per_req)
         self._reset_moe_offload_cache()
 
         pbar = tqdm(

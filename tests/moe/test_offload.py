@@ -462,7 +462,9 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
 
     events = []
     _init_tp()
-    monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
+    ctx = Context(page_size=1)
+    ctx.page_table = torch.zeros(1, 1, dtype=torch.int32)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
 
     class FakeGraph:
         def pool(self):
