@@ -69,6 +69,11 @@ checkpoint is set:
 | `FREETOKEN_MINIMAX_M3_MODEL` | `tokenizer/test_mm_tokenize.py` — local MiniMax-M3 checkpoint (start/end expansion, token budget) |
 | `FREETOKEN_TEST_MOE_CACHE_SIZE` | `e2e/test_aime.py` — >0 switches to the offload MoE backend with this cache size |
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
+| `FREETOKEN_TEST_SPEC_ALGORITHM` | `e2e/test_aime.py` — speculative decoding method (`mtp`, `dflash`); prints the accept len of each sample (tokens committed per verify step, the bonus token included) |
+| `FREETOKEN_TEST_SPEC_DRAFT_PATH` | `e2e/test_aime.py` — the draft checkpoint (`--speculative-draft-model-path`) |
+| `FREETOKEN_TEST_SPEC_NUM_STEPS` | `e2e/test_aime.py` — draft tokens per step (default `0`, the method's own) |
+| `FREETOKEN_TEST_SPEC_MIN_ACCEPT` | `e2e/test_aime.py` — accept len every sample must reach (default `0`, no floor) |
+| `FREETOKEN_TEST_MAX_EXTEND_TOKENS` | `e2e/test_aime.py` — prefill chunk size (default `8192`; `64` chunks the prompt) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — local checkpoint directory or GGUF file; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
 | `FREETOKEN_REBUILD_EXTRA_ARGS` | `e2e/test_cache_rebuild.py` — extra server flags, e.g. `--moe-strategy hybrid --moe-cache-size 1024 --max-running-requests 1` for offloaded MoE |
 | `FREETOKEN_RIPPLE_MODEL`, `FREETOKEN_RIPPLE_GGUF` | `models/ricursive/test_ricursive.py` — local Ripple-65B checkpoint and a GGUF of it (tokenizer, template and config parity; the parsers' round trip through the template needs only the checkpoint) |

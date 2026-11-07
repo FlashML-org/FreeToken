@@ -404,7 +404,7 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
     batch = _track_batch(req, tokens, pool)
 
     fla = batch.fla_metadata
-    assert fla.track_dst.tolist() == [dst]
+    assert fla.track_dst.tolist() == [dst] and fla.track_src.tolist() == [live]
     assert req.mamba_last_track_seqlen == CHUNK_SIZE
     assert fla.track_boundary_row.tolist() == [CHUNK_SIZE]
 

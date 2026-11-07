@@ -11,7 +11,7 @@ import torch
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
 from freetoken.models.blocks import embed_input_ids
-from freetoken.spec.proposer import DraftContext, Proposer
+from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
 
 if TYPE_CHECKING:
@@ -86,7 +86,7 @@ class _PrefillSink:
     def final_hidden(self, x: torch.Tensor) -> None:
         self.hidden = x
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         pass
 
 
@@ -101,19 +101,19 @@ class _VerifySink:
     def final_hidden(self, x: torch.Tensor) -> None:
         self.buffer[: x.shape[0]].copy_(x)
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         pass
 
 
 class MTPProposer(Proposer):
-    default_k = 3
-    max_k = 8
     radix_lookahead = True
 
     @classmethod
-    def adjust_config(cls, config, override) -> None:
-        import os
+    def num_steps(cls, config) -> tuple[int, int]:
+        return 3, 8
 
+    @classmethod
+    def adjust_config(cls, config, override) -> None:
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
         super().adjust_config(config, override)
@@ -124,10 +124,8 @@ class MTPProposer(Proposer):
             raise ValueError("MTP reads its draft from the checkpoint, so it cannot run with --dummy-weight")
         path = config.speculative_draft_model_path or config.model_path
         # checked here because a draft that cannot load otherwise fails only after the whole target has loaded
-        # a HF repo id is "name" or "org/name"; anything else names a local path
-        local = os.path.isabs(path) or path.startswith(".") or path.count("/") > 1 or path.endswith(".gguf")
-        if config.speculative_draft_model_path and local and not os.path.exists(path):
-            raise ValueError(f"--speculative-draft-model-path {path} does not exist")
+        if config.speculative_draft_model_path:
+            check_draft_path(path)
         # FTW keeps only what the target's iter_weights yields, which drops mtp.*
         if is_ftw_checkpoint(path):
             raise ValueError("MTP cannot load its draft from an FTW checkpoint yet")
@@ -282,10 +280,10 @@ class MTPProposer(Proposer):
         if self.k > 1 and ChainGraphs.supports(self.chain_backend):
             self.chain_graphs = ChainGraphs(self, bs_list, self.extend_graphs.graph_pool)
 
-    def propose(self, reqs: List[Req], rows: torch.Tensor) -> torch.Tensor:
+    def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
         cs = [r.cached_len for r in reqs]
         if self.chain_graphs is not None and (drafts := self.chain_graphs.replay(reqs, cs)) is not None:
-            return drafts
+            return SpecProposal(drafts)
         token = self.relay.d1[rows]
         hidden = self.relay.hidden[rows]
         drafts = [token]
@@ -296,7 +294,7 @@ class MTPProposer(Proposer):
             hidden = self._forward(batch, self.chain_backend, self.draft.embed_tokens.forward(token), hidden)
             token = self._draft_token(hidden)
             drafts.append(token)
-        return torch.stack(drafts, dim=1)
+        return SpecProposal(torch.stack(drafts, dim=1))
 
     def feature_sink(self, batch: Batch) -> _PrefillSink | _VerifySink:
         if batch.phase == "verify":

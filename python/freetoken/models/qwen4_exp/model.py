@@ -122,8 +122,12 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
+        features = batch.features
+        wanted = features.wanted_layers if features is not None else ()
+        for i, layer in enumerate(self.layers.op_list):
             hidden = layer.forward(hidden, batch)
+            if i in wanted:
+                features.layer_output(i, hidden, num_streams=self.hc_count)
         if meta is not None and meta.is_verify:
             # the commit rolls the context by the accepted rows only
             get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
@@ -131,7 +135,7 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        if (features := getattr(batch, "features", None)) is not None:
+        if features is not None:
             # a draft reads the residual streams before the final mix
             features.final_hidden(hidden)
         return self.hyper_connection_mixer.mix(hidden)[0]
