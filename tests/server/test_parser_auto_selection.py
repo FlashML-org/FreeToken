@@ -51,11 +51,11 @@ class _Config:
         return self._data
 
 
-def _inferred(architecture: str) -> tuple[str, str | None]:
+def _inferred(architecture: str, path: str = ANON_PATH) -> tuple[str, str | None]:
     """(tool_call_parser, reasoning_parser) that `auto` picks for this architecture."""
     config = _Config({"architectures": [architecture], "torch_dtype": "bfloat16"})
     with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
-        args, _run_shell = parse_args(["--model", ANON_PATH])
+        args, _run_shell = parse_args(["--model", path])
     return args.tool_call_parser, args.reasoning_parser
 
 
@@ -108,3 +108,9 @@ def test_an_explicit_choice_beats_inference():
 def test_flint_uses_optional_reasoning_and_xml_tool_calls():
     assert _inferred("FlintForCausalLM") == ("glm47", "flint")
     assert _inferred("FlintGGUFForCausalLM") == ("glm47", "flint")
+
+
+def test_a_ricursive_directory_does_not_pick_the_ripple_parsers():
+    """Ripple's HF org is ricursiveAI, so the name also lands in paths of checkpoints that are not Ripple."""
+    for path in ("/models/ricursiveAI/anon", "/models/ricursive/anon"):
+        assert _inferred("Glm4MoeForCausalLM", path) == _inferred("Glm4MoeForCausalLM")

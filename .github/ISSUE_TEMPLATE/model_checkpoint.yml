@@ -19,8 +19,6 @@ body:
           required: true
         - label: I have searched [existing issues](https://github.com/FlashML-org/FreeToken/issues?q=is%3Aissue) and found no duplicate.
           required: true
-        - label: This is not a GGUF checkpoint. GGUF support is on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79); please do not open an issue for it.
-          required: true
   - type: input
     id: link
     attributes:
@@ -44,12 +42,12 @@ body:
     id: quant
     attributes:
       label: Is the quantization already supported
-      description: FP8, NVFP4 and MXFP4 are supported today.
+      description: FP8, NVFP4, MXFP4 and GGUF files are supported today.
       options:
         - Not quantized
         - Yes, but this checkpoint's weight format does not load
         - No, a new quantization
-        - GGUF (on the Roadmap, please do not open an issue)
+        - GGUF file
         - Not sure
     validations:
       required: true

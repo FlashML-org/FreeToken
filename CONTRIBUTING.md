@@ -11,7 +11,7 @@ Thanks for helping make FreeToken better. This page covers how to report issues 
 ## Reporting issues
 
 1. **Check the FAQ and the Roadmap first.** If your request is already on the Roadmap, please do not open a new issue for it. Search [existing issues](https://github.com/FlashML-org/FreeToken/issues?q=is%3Aissue); if one matches, comment there.
-2. **Describe the problem clearly.** A report we cannot reproduce is a report we cannot fix. Include your hardware (GPU and VRAM, CPU, system RAM), OS, NVIDIA driver version, FreeToken version (`ft --version`, or the version shown in the Desktop app), the exact checkpoint (the Hugging Face or ModelScope ID, e.g. `Qwen/Qwen3.6-35B-A3B-FP8`, not just the model name), the command, and the full log, not a screenshot of the last line. Mention anything else that may matter: other GPUs in the machine, WSL, proxies.
+2. **Describe the problem clearly.** A report we cannot reproduce is a report we cannot fix. Include your hardware (GPU and VRAM, CPU, system RAM), OS, NVIDIA driver version, FreeToken version (`ft --version`, or the version shown in the Desktop app), the exact checkpoint (its Hugging Face or ModelScope link, e.g. `https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8`, not just the model name), the command, and the full log, not a screenshot of the last line. Mention anything else that may matter: other GPUs in the machine, WSL, proxies.
 3. **Desktop users: make sure you are on the latest version.** The Desktop app updates itself; restart it to pick up the latest version and check whether the problem still happens. Attach the output of **Logs → Server status → Copy**, which copies the full engine log.
 4. **Building from source: check against `main`.** Many problems are already fixed on `main`. Pull, rebuild, confirm the problem still happens, and include the commit you tested (`git rev-parse --short HEAD`).
 
@@ -47,6 +47,8 @@ uv pip install -e ".[accel]"
 ```
 
 See [docs/install.md](docs/install.md) for requirements. CUDA kernels are JIT-compiled on first use and need a CUDA 13 toolkit with `nvcc` on `PATH`.
+
+The ggml kernels are copied from llama.cpp and edited in place. See [docs/ggml-kernels.md](docs/ggml-kernels.md) before changing them.
 
 Run the tests with `pytest`. Most tests need an NVIDIA GPU. `-m "not slow"` skips the long kernel sweeps; tests marked `needs_weights` are off unless you point them at a local checkpoint (see [tests/README.md](tests/README.md)).
 

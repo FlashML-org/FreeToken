@@ -220,6 +220,7 @@ class ShellStats:
     gpu_mem_bytes: int = 0
     started_at: float | None = None
     first_token_at: float | None = None
+    first_token_count: int = 0
     finished_at: float | None = None
 
     def reset(self) -> None:
@@ -228,12 +229,14 @@ class ShellStats:
         self.completion_tokens = 0
         self.started_at = None
         self.first_token_at = None
+        self.first_token_count = 0
         self.finished_at = None
 
     def mark_started(self, now: float | None = None) -> None:
         self.status = "prefill"
         self.started_at = time.time() if now is None else now
         self.first_token_at = None
+        self.first_token_count = 0
         self.finished_at = None
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -244,19 +247,20 @@ class ShellStats:
         # server restarted. Keep the larger value and let the turn's own usage settle it.
         self.prompt_tokens = max(self.prompt_tokens, count)
 
-    def add_completion_tokens(self, count: int, now: float | None = None) -> None:
-        if count <= 0:
+    def count_delta(self, completion_tokens: int | None, now: float | None = None) -> None:
+        """Count one streamed delta: move to the running total it carries, or add one when it carries no total (None or 0)."""
+        count = completion_tokens if completion_tokens else self.completion_tokens + 1
+        if count <= self.completion_tokens:
             return
         current_time = time.time() if now is None else now
         if self.first_token_at is None:
             self.first_token_at = current_time
+            self.first_token_count = count
         self.status = "decode"
-        self.completion_tokens += count
+        self.completion_tokens = count
 
     def apply_usage(self, done: TurnDone) -> None:
-        """Replace the live estimates with the turn's authoritative usage. Completion tokens
-        were counted one-per-delta while streaming, which the server's own reasoning-parser
-        buffering can make lag by a token or two."""
+        """Replace the live estimates with the turn's authoritative usage. The live count misses tokens that reach no text delta (an EOS, text a parser still holds back), and without running usage it counts one token per delta."""
         if done.prompt_tokens > 0:
             self.prompt_tokens = done.prompt_tokens
         if done.completion_tokens > 0:
@@ -299,11 +303,13 @@ class ShellStats:
         self.finished_at = time.time() if now is None else now
 
     def tok_s(self, now: float | None = None) -> float:
-        if self.first_token_at is None or self.completion_tokens == 0:
+        # tokens after the first delta over the time since it, so the first frame is not 1 token / ~0 s
+        decoded = self.completion_tokens - self.first_token_count
+        if self.first_token_at is None or decoded <= 0:
             return 0.0
         end_time = self.finished_at if self.finished_at is not None else (time.time() if now is None else now)
         elapsed = max(end_time - self.first_token_at, 1e-9)
-        return self.completion_tokens / elapsed
+        return decoded / elapsed
 
     def format(self, now: float | None = None) -> str:
         prefix = f"[{self.status}]"
@@ -645,11 +651,11 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
             async for event in events:
                 if isinstance(event, ReasoningDelta):
                     output_buffer.write_reasoning(event.text)
-                    stats.add_completion_tokens(1)
+                    stats.count_delta(event.completion_tokens)
                 elif isinstance(event, ContentDelta):
                     answer.append(event.text)
                     output_buffer.write_content(event.text)
-                    stats.add_completion_tokens(1)
+                    stats.count_delta(event.completion_tokens)
                 elif isinstance(event, TurnDone):
                     stats.apply_usage(event)
                 status_line.maybe()

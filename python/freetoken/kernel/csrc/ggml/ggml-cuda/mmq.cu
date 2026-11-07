@@ -299,6 +299,7 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    ggml_cuda_pool_alloc<int32_t> ids_scratch(ctx.pool(), ggml_cuda_mm_ids_helper_scratch_size(ne02, ne12, n_expert_used));
     // FreeToken: inactive routes (negative ids, only with inactive_ids) get no compact row, so their ids_src1 entries stay -1
     if (inactive_ids) {
         CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
@@ -308,24 +309,23 @@ void ggml_cuda_mul_mat_q(
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
+    // Every expert's column tiles fit in ntx_flat grid columns, so a flat grid needs no host sync to size it.
+    ggml_cuda_pool_alloc<int2> tile_map(ctx.pool());
+    int ntx_flat = 0;
+    int jt_none  = 0;
+    if (ncols_max <= 0) {
+        jt_none  = (ne_get_rows + J_best - 1) / J_best;
+        ntx_flat = jt_none + std::min<int64_t>(ne02, ne_get_rows);
+        tile_map.alloc(ntx_flat);
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Every expert's column tiles fit in ntx_flat grid columns, so a flat grid needs no host sync to size it.
-    ggml_cuda_pool_alloc<int2> tile_map(ctx.pool());
-    int ntx_flat = 0;
-    if (ncols_max <= 0) {
-        const int jt_none = (ne_get_rows + J_best - 1) / J_best;
-        ntx_flat = jt_none + std::min<int64_t>(ne02, ne_get_rows);
-        tile_map.alloc(ntx_flat);
-        ggml_cuda_launch_mm_ids_tile_map(expert_bounds.get(), tile_map.get(), ne02, J_best, ntx_flat, jt_none, stream);
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(), ids_scratch.get(),
+            tile_map.get(), J_best, ntx_flat, jt_none, ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 

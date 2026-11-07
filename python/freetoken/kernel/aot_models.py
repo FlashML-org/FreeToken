@@ -391,6 +391,14 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         arch_aliases=("MuseGlimmerGGUFForCausalLM",),
     ),
     AotModel(
+        name="ricursiveAI/Ripple-65B-Preview",
+        architecture="RicursiveForCausalLM",
+        hidden_size=5120,
+        kv_groups=((8, 128),),  # sliding and full (NoPE) layers share the same geometry
+        aliases=("ricursiveAI/Ripple-65B-Preview-NVFP4",),
+        arch_aliases=("RicursiveGGUFForCausalLM",),
+    ),
+    AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",
         architecture="LlamaForCausalLM",
         hidden_size=4096,

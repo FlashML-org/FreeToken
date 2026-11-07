@@ -435,6 +435,90 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
         )
 
 
+def _drop_newline(text: str, *, lead: bool) -> str:
+    if lead:
+        return text[1:] if text.startswith("\n") else text
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _partial_suffix(text: str, token: str) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of ``token``."""
+    for k in range(min(len(text), len(token) - 1), 0, -1):
+        if token.startswith(text[-k:]):
+            return k
+    return 0
+
+
+class RippleReasoningParser(BaseReasoningParser):
+    """Ripple's optional ``<think>`` block, as the checkpoint's ``inference/server/ripple_format.py`` parses it.
+
+    The model writes ``<think>\\n{reasoning}\\n</think>\\n{content}``, the layout ``chat_template.jinja``
+    renders back. Output is reasoning only when it opens with ``<think>``, and the separator newlines
+    around the block are dropped, so an assistant message sent back re-renders to the generated tokens
+    instead of gaining a newline on each side per turn.
+    """
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        # the generation prompt never opens <think>, so there is nothing to force
+        super().__init__(
+            think_start_token=THINK_START_TOKEN,
+            think_end_token=THINK_END_TOKEN,
+            stream_reasoning=stream_reasoning,
+        )
+        self._state = "start"  # start -> lead -> think -> after -> content
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        if not text.startswith(self.think_start_token):
+            return ReasoningParseResult(normal_text=text)
+        body = _drop_newline(text[len(self.think_start_token):], lead=True)
+        reasoning, end, content = body.partition(self.think_end_token)
+        if not end:  # truncated inside reasoning
+            return ReasoningParseResult(reasoning_text=reasoning)
+        return ReasoningParseResult(
+            reasoning_text=_drop_newline(reasoning, lead=False), normal_text=_drop_newline(content, lead=True)
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        self._buffer += new_text
+        reasoning, normal = "", ""
+        while self._buffer:
+            buf = self._buffer
+            if self._state == "start":
+                if buf.startswith(self.think_start_token):
+                    self._buffer, self._state = buf[len(self.think_start_token):], "lead"
+                elif self.think_start_token.startswith(buf):
+                    break
+                else:
+                    self._state = "content"
+            elif self._state == "lead":
+                self._buffer, self._state = _drop_newline(buf, lead=True), "think"
+            elif self._state == "think":
+                end = buf.find(self.think_end_token)
+                if end >= 0:
+                    reasoning += _drop_newline(buf[:end], lead=False)
+                    self._buffer, self._state = buf[end + len(self.think_end_token):], "after"
+                    continue
+                if not self.stream_reasoning:
+                    break
+                # hold back a possible "\n</think>": its newline is the separator, not reasoning
+                hold = max(_partial_suffix(buf, "\n" + self.think_end_token), _partial_suffix(buf, self.think_end_token))
+                reasoning += buf[:len(buf) - hold]
+                self._buffer = buf[len(buf) - hold:]
+                break
+            elif self._state == "after":
+                self._buffer, self._state = _drop_newline(buf, lead=True), "content"
+            else:
+                normal += buf
+                self._buffer = ""
+        return ReasoningParseResult(reasoning_text=reasoning, normal_text=normal)
+
+    def flush(self) -> ReasoningParseResult:
+        buf, self._buffer = self._buffer, ""
+        if self._state in ("lead", "think"):  # truncated inside reasoning
+            return ReasoningParseResult(reasoning_text=buf)
+        return ReasoningParseResult(normal_text=buf)
+
+
 class MiniMaxM3ReasoningParser(BaseReasoningParser):
     """Reasoning parser for MiniMax-M3's ``<mm:think>...</mm:think>`` protocol.
 
@@ -898,6 +982,7 @@ class ReasoningParser:
 
     ReasoningParserEnum: Dict[str, Type[BaseReasoningParser]] = {
         "flint": ThinkReasoningParser,
+        "ricursive": RippleReasoningParser,
         "deepseekv32": DeepSeekV32ReasoningParser,
         "gpt_oss": GptOssHarmonyReasoningParser,
         "qwen3": Qwen3ReasoningParser,

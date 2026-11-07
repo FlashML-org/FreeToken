@@ -31,7 +31,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model-path`, `--model` | required | Local dir, HF repo id, or an FTW dir (auto-detected) |
+| `--model-path`, `--model` | required | Local dir, HF repo id, a `.gguf` file, or an FTW dir (auto-detected) |
 | `--served-model-name` | basename of `--model` | Model id reported by `/v1/models` |
 | `--hf-overrides` | — | JSON object applied to the checkpoint's config as vLLM's `--hf-overrides`: a nested config section updates key by key, any other value is replaced whole. A YaRN `rope_parameters` override serves `original_max_position_embeddings * factor` positions |
 

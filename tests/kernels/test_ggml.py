@@ -107,6 +107,30 @@ def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive):
     torch.testing.assert_close(actual.cpu(), expected.to(dtype), atol=2e-4, rtol=1e-3)
 
 
+# several sort blocks and two expert-scan passes; one sort block and five passes; a 32k-token prefill chunk
+@pytest.mark.parametrize("n_experts, top_k, batch", [(300, 8, 1500), (1100, 2, 600), (4, 2, 32768)])
+@pytest.mark.parametrize("per_route_x", [False, True])
+@pytest.mark.parametrize("inactive", [False, True])
+def test_q4_moe_skewed_routes_match_cpu(n_experts, top_k, batch, per_route_x, inactive):
+    w, ref = _q4_weights((n_experts, 64, 256))
+    x = _activation((batch, top_k, 256) if per_route_x else (batch, 256), torch.float32)
+    gen = torch.Generator().manual_seed(866)
+    # Zipf-like expert popularity, a third of the experts never routed to
+    popularity = (1 / torch.arange(1, n_experts + 1, dtype=torch.float64) ** 1.2)[torch.randperm(n_experts, generator=gen)]
+    popularity[torch.randperm(n_experts, generator=gen)[: n_experts // 3]] = 0
+    ids = torch.multinomial(popularity.expand(batch, -1), top_k, generator=gen).to(torch.int32)
+    if inactive:
+        ids[::3, 0] = -1
+    actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids.cuda(), inactive=inactive).cpu()
+    xs = x.cpu().float() if per_route_x else x.cpu().float().unsqueeze(1).expand(-1, top_k, -1)
+    expected = torch.zeros(batch, top_k, 64)
+    for e in ids.unique().tolist():
+        if e >= 0:
+            route = ids == e
+            expected[route] = xs[route] @ ref[e].T
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=1e-3)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch", [1, 17, 300])
 def test_iq1_m_matrix_and_moe_routes_match_cpu(dtype, batch):
