@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 
@@ -607,7 +608,10 @@ class Scheduler(SchedulerIOMixin):
                 )
                 return
             if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
+                # Offline callers may share one SamplingParams across prompts; clip a copy.
+                msg.sampling_params = dataclasses.replace(
+                    msg.sampling_params, max_tokens=max_output_len
+                )
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
