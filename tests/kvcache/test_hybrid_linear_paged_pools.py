@@ -92,6 +92,53 @@ def test_factory_kpool1_builds_plain_dsa_pool():
     assert type(pool) is DSAKVCache
 
 
+@pytest.mark.parametrize("kv_quant", ["none", "fp8"])
+def test_full_group_quantization_preserves_hybrid_layer_mapping_and_cost(kv_quant):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    cfg = _glm5_like_config()
+    linear, full = cfg.attention_groups
+    cfg = replace(
+        cfg, num_qo_heads=16, num_kv_heads=2, head_dim=256,
+        attention_groups=(
+            replace(linear, variant="gdn", output_gate="silu"),
+            FullAttentionGroupConfig(name="full", layer_ids=full.layer_ids,
+                                     num_kv_heads=2, head_dim=256, rotary_config=cfg.rotary_config),
+        ),
+    )
+    pool = create_kvcache_pool(cfg, 7, 8, torch.bfloat16, torch.device("cpu"), kv_quant=kv_quant)
+    config = SimpleNamespace(model_config=cfg, tp_info=SimpleNamespace(size=1),
+                             dtype=torch.bfloat16, page_size=8, kv_quant=kv_quant)
+    # Only the three full layers own KV; the other nine have no code or scale slab.
+    bytes_per_token = 3 * 2 * 2 * (256 + 4 if kv_quant == "fp8" else 256 * 2)
+    assert MHAKVCache.kv_cost(config)[0] == bytes_per_token * 8
+    for pages in (7, 11, 3):
+        if pages != 7:
+            pool.rebuild(pages)
+        assert pool.unit_bytes() == (bytes_per_token, 0)
+        assert pool._kv_buffer.numel() * pool._kv_buffer.element_size() == (
+            3 * 2 * 2 * 256 * pages * 8 * (1 if kv_quant == "fp8" else 2))
+        for lid in full.layer_ids:
+            pool.k_cache(lid).fill_(lid)
+            pool.v_cache(lid).fill_(lid + 1)
+            if kv_quant == "fp8":
+                pool.k_scale(lid).fill_(lid / 10)
+                pool.v_scale(lid).fill_((lid + 1) / 10)
+        for lid in full.layer_ids:
+            assert torch.all(pool.k_cache(lid) == lid)
+            assert torch.all(pool.v_cache(lid) == lid + 1)
+            if kv_quant == "fp8":
+                assert pool.k_scale(lid).shape == (pages * 8, 2)
+                torch.testing.assert_close(pool.k_scale(lid), torch.full((pages * 8, 2), lid / 10))
+                torch.testing.assert_close(pool.v_scale(lid), torch.full((pages * 8, 2), (lid + 1) / 10))
+        for lid in linear.layer_ids:
+            with pytest.raises(KeyError):
+                pool.k_cache(lid)
+
+
 def test_cost_model_kpool_shadow_slab_quarter_cost():
     """The shadow slab stores one row per index_ratio tokens: the kpool spec's
     index bytes are 1/ratio of the plain DSA slab (rings/scratch are per-request

@@ -80,6 +80,22 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
+def _validate_kv_quant_pool(model_config, kv_quant: str) -> None:
+    if kv_quant == "none":
+        return
+    from freetoken.attention import AttnType
+
+    # Linear layers own recurrent state, not paged KV. Quantize only the full group.
+    specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    if (
+        kv_quant != "fp8"
+        or not specs
+        or any(s.attn_type != AttnType.FULL for s in specs)
+        or (getattr(model_config, "has_linear_attention", False) and len(specs) != 1)
+    ):
+        raise ValueError("FP8 KV requires MHA/GQA full-attention storage")
+
+
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
@@ -89,6 +105,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4.v4_pool import DSV4PagedKVCache
 
     model_config = config.model_config
+    kv_quant = getattr(config, "kv_quant", "none")
+    _validate_kv_quant_pool(model_config, kv_quant)
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
@@ -137,6 +155,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         num_speculative_tokens=getattr(config, "decode_rows_per_req", 1) - 1,
+        kv_quant=kv_quant,
     )
 
 
@@ -149,7 +168,9 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
     num_speculative_tokens: int = 0,
+    kv_quant: str = "none",
 ) -> BaseKVCachePool:
+    _validate_kv_quant_pool(model_config, kv_quant)
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -278,6 +299,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_quant=kv_quant,
     )
 
 

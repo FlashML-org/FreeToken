@@ -55,6 +55,12 @@ class BaseAttnMetadata(ABC):
 
 
 class BaseAttnBackend(ABC):
+    def init_workspace(self) -> None:
+        """Allocate persistent attention scratch before capture or serving."""
+
+    def reset_workspace(self) -> None:
+        """Release scratch at the synchronized runtime-cache rebuild boundary."""
+
     @abstractmethod
     def forward(
         self,
@@ -93,6 +99,14 @@ class BaseAttnBackend(ABC):
 
 
 class HybridBackend(BaseAttnBackend):
+    def init_workspace(self) -> None:
+        self.prefill_backend.init_workspace()
+        self.decode_backend.init_workspace()
+
+    def reset_workspace(self) -> None:
+        self.prefill_backend.reset_workspace()
+        self.decode_backend.reset_workspace()
+
     def __init__(
         self,
         prefill_backend: BaseAttnBackend,
