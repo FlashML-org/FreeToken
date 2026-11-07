@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -56,7 +57,9 @@ def register_control_routes(
 ) -> None:
     @app.get("/health")
     async def health():
-        return build_health(get_state(), app.version)
+        doc = build_health(get_state(), app.version)
+        # Probes such as llama-swap read only the status: 200 means a request would be admitted.
+        return JSONResponse(doc, status_code=200 if doc.get("maintenance") == "serving" else 503)
 
     from . import request_ring
 
