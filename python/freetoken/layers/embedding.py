@@ -130,7 +130,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if export_hidden and (features := getattr(batch, "features", None)) is not None:
+        if export_hidden and (features := batch.features) is not None:
             features.final_hidden(x)
         if batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(bs)

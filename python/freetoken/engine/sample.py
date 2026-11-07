@@ -23,19 +23,24 @@ def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> 
     return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
 
-def sample_impl(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    top_k: torch.Tensor | int | None,
-    top_p: torch.Tensor | float | None,
-) -> torch.Tensor:
+def sampling_module():
+    """flashinfer.sampling when installed, else the triton kernels with the same API."""
     from freetoken.kernel.backend import is_flashinfer_installed
 
     if is_flashinfer_installed():
         import flashinfer.sampling as sampling
     else:
         import freetoken.kernel.triton.sampling as sampling
+    return sampling
 
+
+def sample_impl(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor | int | None,
+    top_p: torch.Tensor | float | None,
+) -> torch.Tensor:
+    sampling = sampling_module()
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
     if top_k is None and top_p is None:
         return sampling.sampling_from_probs(probs)
@@ -144,6 +149,28 @@ class Sampler:
             greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
             tokens = torch.where(rows(args.greedy_mask), greedy_tokens, tokens)
         return tokens
+
+    def probs(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor | None:
+        """[bs*(k+1), V] fp32 distribution each verify row samples from (softmax(T), then top-k, then top-p, as the fused samplers apply them), penalized like sample_verify and one-hot at the argmax on greedy rows; None when every request is greedy."""
+        if args.temperatures is None:
+            return None
+        sampling = sampling_module()
+        width = drafts.shape[1] + 1
+        if args.penalties:
+            logits = self._penalize_rows(logits, args, drafts)
+        top = None if args.greedy_mask is None else torch.argmax(logits, dim=-1, keepdim=True)
+        probs = sampling.softmax(logits.float(), args.temperatures.repeat_interleave(width), enable_pdl=is_sm90_supported())
+        # frees the penalized copy before the renorms allocate theirs
+        del logits
+        if args.top_k is not None:
+            probs = sampling.top_k_renorm_probs(probs, args.top_k.repeat_interleave(width))
+        if args.top_p is not None:
+            probs = sampling.top_p_renorm_probs(probs, args.top_p.repeat_interleave(width))
+        if top is not None:
+            greedy = args.greedy_mask.repeat_interleave(width).unsqueeze(1)
+            hot = torch.where(greedy, 1.0, probs.gather(1, top))
+            probs.masked_fill_(greedy, 0.0).scatter_(1, top, hot)
+        return probs
 
     def _penalize_rows(self, logits: torch.Tensor, args: BatchSamplingArgs, drafts: torch.Tensor) -> torch.Tensor:
         k = drafts.shape[1]

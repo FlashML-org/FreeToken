@@ -23,6 +23,11 @@ Env knobs:
   FREETOKEN_TEST_MOE_CACHE_AUTO 1 sizes the MoE cache from free VRAM instead of MOE_CACHE_SIZE
   FREETOKEN_TEST_KV_RESERVE     KV token floor reserved before auto-cache fills experts
   FREETOKEN_TEST_MEM_RATIO      offload memory ratio (default 0.9)
+  FREETOKEN_TEST_SPEC_ALGORITHM speculative decoding method (mtp, dflash); each sample prints its accept len (tokens committed per verify step, the bonus token included)
+  FREETOKEN_TEST_SPEC_DRAFT_PATH  draft checkpoint (--speculative-draft-model-path)
+  FREETOKEN_TEST_SPEC_NUM_STEPS draft tokens per step (0 = the method's default)
+  FREETOKEN_TEST_SPEC_MIN_ACCEPT  accept len every sample must reach (default 0, no floor)
+  FREETOKEN_TEST_MAX_EXTEND_TOKENS  prefill chunk size (default 8192; e.g. 64 chunks the prompt)
 
 fp8 / offload recipe: point FREETOKEN_TEST_MODEL at the fp8 checkpoint dir and set
 FREETOKEN_TEST_MOE_CACHE_SIZE (e.g. 8192).
@@ -176,7 +181,7 @@ def build_llm(model_path: Path) -> LLM:
         # (DSV4 -> dsv4_sparse, SWA models -> triton).
         attention_backend="auto",
         max_running_req=1,
-        max_extend_tokens=8192,
+        max_extend_tokens=int(os.environ.get("FREETOKEN_TEST_MAX_EXTEND_TOKENS", "8192")),
     )
     if quant_backend := os.environ.get("FREETOKEN_TEST_QUANT_BACKEND"):
         kwargs["quant_backend"] = quant_backend  # --quant-backend syntax, e.g. moe.nvfp4=b12x
@@ -195,7 +200,19 @@ def build_llm(model_path: Path) -> LLM:
             max_seq_len_override=max_tokens() + 2048,
             cuda_graph_max_bs=1,
         )
+    if algorithm := os.environ.get("FREETOKEN_TEST_SPEC_ALGORITHM"):
+        kwargs.update(
+            speculative_algorithm=algorithm,
+            speculative_draft_model_path=os.environ.get("FREETOKEN_TEST_SPEC_DRAFT_PATH") or None,
+            speculative_num_steps=int(os.environ.get("FREETOKEN_TEST_SPEC_NUM_STEPS", "0")),
+        )
     return LLM(**kwargs)
+
+
+def accept_len(llm: LLM) -> float | None:
+    """Tokens committed per verify step since the last call, the bonus token included, as the decode log's accept len; None without speculative decoding."""
+    steps, tokens = llm.status_reporter.take_spec_counts()
+    return tokens / steps if steps else None
 
 
 def free_gpu_memory_gib() -> float:
@@ -243,8 +260,10 @@ def test_aime():
     # Build the engine once and reuse it across every selected problem.
     llm = build_llm(model_path)
     sampling, n_samples = recommended_sampling(model_path)
+    min_accept = float(os.environ.get("FREETOKEN_TEST_SPEC_MIN_ACCEPT", "0"))
 
     failures: list[tuple[int, list[str | None], str]] = []
+    low_accept: list[str] = []
     for idx in selected:
         row = rows[idx]
         prompt, expected = row["prompt"], str(row["answer"])
@@ -256,6 +275,11 @@ def test_aime():
         for _ in range(n_samples):
             outputs = llm.generate([formatted_prompt], sampling)
             answers.append(extract_answer(str(outputs[0]["text"])))
+            accept = accept_len(llm)
+            if accept is not None:
+                print(f"req {idx + 1}: {len(outputs[0]['token_ids'])} tokens, accept len {accept:.2f}, answer {answers[-1]}")
+            if min_accept and (accept or 0.0) < min_accept:
+                low_accept.append(f"req {idx + 1}: accept len {accept or 0.0:.2f}")
         if expected not in answers:
             failures.append((idx + 1, answers, expected))
 
@@ -263,3 +287,4 @@ def test_aime():
         f"  req {req_id}: answers={answers} expected={expected}"
         for req_id, answers, expected in failures
     )
+    assert not low_accept, f"accept len below FREETOKEN_TEST_SPEC_MIN_ACCEPT={min_accept}:\n" + "\n".join(f"  {line}" for line in low_accept)

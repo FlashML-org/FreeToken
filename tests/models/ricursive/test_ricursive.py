@@ -118,7 +118,7 @@ def test_model_matches_the_reference_on_every_row(monkeypatch, clamp):
 
         ids = torch.randint(0, VOCAB, (3 * WINDOW,), device="cuda")
         batch = SimpleNamespace(
-            input_ids=ids, size=1, is_prefill=False, get_attn_positions=lambda: torch.arange(ids.numel(), device="cuda"),
+            input_ids=ids, size=1, is_prefill=False, features=None, get_attn_positions=lambda: torch.arange(ids.numel(), device="cuda"),
         )
         ctx = SimpleNamespace(batch=batch, attn_backend=_SDPABackend())
         for mod in ("attention", "model"):

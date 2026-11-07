@@ -60,8 +60,8 @@ class FeatureSink(Protocol):
         """Every row's final hidden state, once per forward: the LM head's input, or what the model hands over itself before the head."""
         ...
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, num_streams: int = 1) -> None:
-        """A layer's output rows; called only for layers in ``wanted_layers``."""
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+        """A layer's output rows, ``x + residual`` (``x`` alone when ``residual`` is None), ``[T, num_streams*H]`` stream-major; called only for layers in ``wanted_layers``. The sum is left to the sink, so it adds only the rows it keeps. The forward may overwrite ``x`` and ``residual`` afterwards, so copy what is kept."""
         ...
 
 

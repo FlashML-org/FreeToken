@@ -114,6 +114,8 @@ def test_layerless_spec_dtype_and_fill_value():
     pool = _pool(num_slots=6, slot_states=(spec,))
     t = pool.slot_state("ngram")
     assert t.shape == (6, 2) and t.dtype is torch.int32 and bool((t == 7).all())
+    # one int32 [2] per slot, not one per linear layer, and the budget counts the same
+    assert pool.bytes_per_slot() == linear_state_bytes_per_req(_group(), 1, torch.bfloat16, (spec,)) == _pool().bytes_per_slot() + 2 * 4
     t[3] = 1
     pool.clear_slots([3])
     assert bool((pool.slot_state("ngram")[3] == 7).all())
@@ -165,18 +167,17 @@ def test_slot_state_in_the_byte_account():
     assert with_state - gdn_only == 32 * 9 * 2
     assert _pool(slot_states=_SPECS).bytes_per_slot() == with_state
 
-    mc = SimpleNamespace(slot_states=_SPECS)
-    mc.linear_attention_group = lambda: group
+    mc = SimpleNamespace(linear_attention_group=lambda: group)
     config = SimpleNamespace(
-        model_config=mc, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
+        model_config=mc, slot_states=_SPECS, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1),
         cache_type="naive", max_running_req=3, linear_state_cache_ratio=0.5,
     )
     assert state_pool_bytes(config, num_slots=4) == with_state * 4
 
-    mc.slot_states = ()
+    config.slot_states = ()
     assert state_pool_bytes(config, num_slots=4) == gdn_only * 4
 
-    mc.slot_states = _SPECS
+    config.slot_states = _SPECS
     mc.linear_attention_group = lambda: None
     with pytest.raises(ValueError, match="slot_states"):
         state_pool_bytes(config, num_slots=4)

@@ -215,7 +215,9 @@ def _spec_runner():
 
 def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
     """Resolve k and the method's own limits, then check what every speculative method needs of the target."""
-    _spec_runner().adjust_config(config, override)
+    runner = _spec_runner()
+    runner.adjust_config(config, override)
+    override("spec_slot_states", runner.slot_states(config))
     if windowed_kv:
         raise ValueError(
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
@@ -574,7 +576,7 @@ class Engine:
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
-                slot_states=config.model_config.slot_states,
+                slot_states=config.slot_states,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:

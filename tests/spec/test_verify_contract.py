@@ -1,6 +1,6 @@
 """A k+1-row verify step commits exactly what k+1 decode steps would: with drafts taken from a plain greedy run and wrong at a different place each step (so every accept count occurs), speculative decoding must reproduce that run token for token.
 
-Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone.
+Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone; a second run drafts with a DFlash 2 draft of random weights, whose wrong drafts must leave the target's output alone through its ring, window and graphs.
 A verify row and a decode step run different GEMM and attention shapes, so their logits can differ by an ulp: the runs may part at a near tie, and the test checks they part only there. fp16 keeps such ties rare (bf16 has 3 fewer mantissa bits), and fan-in scaled dummy weights keep the activations O(1), so ulp noise does not grow through the layers.
 """
 
@@ -31,13 +31,26 @@ from freetoken.llm import LLM
 from freetoken.scheduler.prefill import ChunkedReq
 from freetoken.spec import PROPOSERS
 from freetoken.spec import runner as R
-from freetoken.spec.proposer import Proposer
+from freetoken.spec.proposer import Proposer, SpecProposal
 
 model, out, reference, kwargs = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+TAPS, H = (1, 2), 256
 
 # (uid, output index) -> top-2 token ids and logits of the row that picked it
 top2 = {}
 current = {}
+# the tapped layers' outputs as the sink got them, and as the next layer read them
+taps_got, taps_ref = {}, {}
+taps = {"prefill": 0, "verify": 0, "mismatch": 0, "width": None}
+steps = {"verify": 0}
+
+
+def check_taps(batch):
+    if not isinstance(batch.features, RecordingSink):
+        return
+    n, width = batch.input_ids.shape[0], taps["width"]
+    taps["prefill" if batch.is_prefill else "verify"] += 1
+    taps["mismatch"] += sum(not torch.equal(taps_got[i][:n, :width], taps_ref[i][:n, :width]) for i in TAPS)
 
 
 def watch(cls, name):
@@ -45,13 +58,57 @@ def watch(cls, name):
 
     def wrapped(self, batch, *args):
         current["batch"] = batch
-        return original(self, batch, *args)
+        result = original(self, batch, *args)
+        check_taps(batch)
+        steps["verify"] += batch.phase == "verify"
+        return result
 
     setattr(cls, name, wrapped)
 
 
 watch(E.Engine, "forward_batch")
 watch(R.SpecRunner, "verify_step")
+
+
+class RecordingSink:
+    # copies the tapped layers' outputs into persistent buffers, so a captured verify graph writes them too
+    wanted_layers = frozenset(TAPS)
+
+    def final_hidden(self, x):
+        pass
+
+    def layer_output(self, layer_id, x, residual=None, num_streams=1):
+        if residual is not None:
+            x = x + residual
+        taps["width"] = x.shape[1]
+        taps_got[layer_id][: x.shape[0], : x.shape[1]].copy_(x)
+
+
+def tap_next_layer_inputs(model):
+    # the reference for layer i's output is what layer i+1 reads: the residual its fused add forms (qwen3_5), or its input streams (qwen4_exp)
+    layers = model.model.layers.op_list
+    for i in TAPS:
+        taps_got[i] = torch.zeros(4096, 4 * H, dtype=torch.float16, device="cuda")
+        taps_ref[i] = torch.zeros(4096, 4 * H, dtype=torch.float16, device="cuda")
+    if hasattr(layers[0], "input_layernorm"):
+        cls, by_id = type(layers[0].input_layernorm), {id(layers[i + 1].input_layernorm): i for i in TAPS}
+        original = cls.forward
+
+        def wrapped(self, x, residual=None):
+            x, residual = original(self, x, residual)
+            if (i := by_id.get(id(self))) is not None:
+                taps_ref[i][: x.shape[0], : x.shape[1]].copy_(residual)
+            return x, residual
+    else:
+        cls, by_id = type(layers[0]), {id(layers[i + 1]): i for i in TAPS}
+        original = cls.forward
+
+        def wrapped(self, hidden, batch):
+            if (i := by_id.get(id(self))) is not None:
+                taps_ref[i][: hidden.shape[0], : hidden.shape[1]].copy_(hidden)
+            return original(self, hidden, batch)
+
+    cls.forward = wrapped
 
 
 def record(rows, logits):
@@ -78,15 +135,19 @@ S.Sampler.sample_verify = lambda self, logits, args, drafts: (
 
 
 class OracleProposer(Proposer):
-    default_k = 3
-    max_k = 8
+    @classmethod
+    def num_steps(cls, config):
+        return 3, 8
 
     def __init__(self, config, target_model):
         super().__init__(config, target_model)
         self.reference = json.load(open(reference))
         self.steps = 0
 
-    def propose(self, reqs, rows):
+    def feature_sink(self, batch):
+        return RecordingSink()
+
+    def propose(self, reqs, rows, pending):
         drafts = []
         for req in reqs:
             done = req.cached_len - req.prompt_len  # outputs committed before the pending token at cached_len
@@ -97,7 +158,7 @@ class OracleProposer(Proposer):
                 want[wrong] = (want[wrong] + 1) % 1000
             drafts.append(want)
         self.steps += 1
-        return torch.tensor(drafts, dtype=torch.int64, device=rows.device)
+        return SpecProposal(torch.tensor(drafts, dtype=torch.int64, device=rows.device))
 
 
 def fan_in_scaled(tensor):
@@ -134,7 +195,10 @@ def create_model_with_ple_rows(*args, **kwargs):
             super().__init__(torch.randn(num_rows, head_dim, generator=generator, device="cuda", dtype=dtype))
 
     ple.ZeroTable = RandomTable
-    return create_model(*args, **kwargs)
+    model = create_model(*args, **kwargs)
+    if reference != "-":
+        tap_next_layer_inputs(model)
+    return model
 
 
 E.create_model = create_model_with_ple_rows
@@ -145,7 +209,10 @@ prompts = [llm.tokenizer.encode(p) for p in ("The capital of France is", "1, 2, 
 params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True, presence_penalty=p, frequency_penalty=p)
           for n, p in ((48, 0.0), (37, 0.6), (41, 0.0))]
 res = llm.generate(prompts, params)
-json.dump({"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()]}, open(out, "w"))
+pool = llm.engine.linear_state_pool
+window = list(pool.slot_state("dflash_window").shape) if pool.has_slot_state("dflash_window") else None
+json.dump({"outputs": [r["token_ids"] for r in res], "top2": [[u, i, *t] for (u, i), t in top2.items()], "verify_steps": steps["verify"],
+           "taps": taps, "num_slots": pool.num_slots, "window": window}, open(out, "w"))
 """
 
 
@@ -188,6 +255,46 @@ def _tiny_model(path: str, family: str) -> str:
     return path
 
 
+def _tiny_draft(path: str) -> str:
+    """A DFlash 2 draft of the tiny targets: two layers over target layers 1 and 2, a 16-position window, random fan-in scaled weights."""
+    from safetensors.torch import save_file
+
+    os.makedirs(path, exist_ok=True)
+    hidden, layers, heads, kv_heads, head_dim, inter, group = 256, 2, 4, 2, 64, 512, 16
+    config = {
+        "architectures": ["DFlash2DraftModel"], "model_type": "qwen3", "is_causal": False, "hidden_size": hidden,
+        "num_hidden_layers": layers, "num_attention_heads": heads, "num_key_value_heads": kv_heads, "head_dim": head_dim,
+        "intermediate_size": inter, "hidden_act": "silu", "rms_norm_eps": 1e-6, "vocab_size": 248320, "num_target_layers": 4,
+        "layer_types": ["sliding_attention"] * layers, "use_sliding_window": True, "sliding_window": 16, "max_position_embeddings": 4096,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+        "dflash_config": {"block_size": 8, "conv_kernel_size": 2, "conv_group_size": group, "mask_token_id": 248300,
+                          "selector_rank": 8, "selector_top_k": 4, "target_layer_ids": [1, 2]},
+    }
+    with open(os.path.join(path, "config.json"), "w") as f:
+        json.dump(config, f)
+    shapes = {"fc.weight": (hidden, 2 * hidden), "hidden_norm.weight": (hidden,), "norm.weight": (hidden,),
+              "candidate_selector.hidden_projection.weight": (8, hidden),
+              "candidate_selector.predecessor_codebook": (248320, 8), "candidate_selector.successor_codebook": (248320, 8)}
+    for i in range(layers):
+        p = f"layers.{i}"
+        shapes.update({
+            f"{p}.self_attn.q_proj.weight": (heads * head_dim, hidden), f"{p}.self_attn.k_proj.weight": (kv_heads * head_dim, hidden),
+            f"{p}.self_attn.v_proj.weight": (kv_heads * head_dim, hidden), f"{p}.self_attn.o_proj.weight": (hidden, heads * head_dim),
+            f"{p}.self_attn.q_norm.weight": (head_dim,), f"{p}.self_attn.k_norm.weight": (head_dim,),
+            f"{p}.mlp.gate_proj.weight": (inter, hidden), f"{p}.mlp.up_proj.weight": (inter, hidden), f"{p}.mlp.down_proj.weight": (hidden, inter),
+            f"{p}.input_layernorm.weight": (hidden,), f"{p}.post_attention_layernorm.weight": (hidden,),
+        })
+        for conv in ("attention_conv", "mlp_conv"):
+            shapes.update({f"{p}.{conv}.base_kernel": (2, 2, hidden), f"{p}.{conv}.kernel_projection.weight": (4 * hidden // group, hidden)})
+    g = torch.Generator().manual_seed(0)
+    weights = {}
+    for name, shape in shapes.items():
+        t = torch.randn(*shape, generator=g)
+        weights[name] = (t * shape[-1] ** -0.5 if len(shape) > 1 else 1 + 0.1 * t).to(torch.bfloat16)
+    save_file(weights, os.path.join(path, "model.safetensors"))
+    return path
+
+
 def _run(model: str, out: str, reference: str, **kwargs) -> dict:
     run = subprocess.run([sys.executable, "-c", _SCRIPT, model, out, reference, json.dumps(kwargs)],
                          capture_output=True, text=True, timeout=900, env=dict(os.environ))
@@ -196,17 +303,34 @@ def _run(model: str, out: str, reference: str, **kwargs) -> dict:
         return json.load(f)
 
 
-@pytest.mark.parametrize("graphs", [True, False])
-@pytest.mark.parametrize("family, backend", [("qwen3_5", "fa"), ("qwen3_5", "triton"), ("qwen4_exp", "qsa_sparse")])
-def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, graphs):
+@pytest.fixture(scope="module")
+def plain_runs(tmp_path_factory):
+    # the plain greedy run of each (family, backend, graphs), shared by both algorithms: model dir, output path, result
+    runs = {}
+
+    def get(family, backend, graphs, kwargs):
+        if (family, backend, graphs) not in runs:
+            root = tmp_path_factory.mktemp(f"plain-{family}-{backend}-{graphs}")
+            model = _tiny_model(str(root / "model"), family)
+            runs[family, backend, graphs] = model, str(root / "decode.json"), _run(model, str(root / "decode.json"), "-", **kwargs)
+        return runs[family, backend, graphs]
+
+    return get
+
+
+@pytest.mark.parametrize("family, backend, algorithm, graphs", [
+    *[(f, b, "oracle", g) for f, b in [("qwen3_5", "fa"), ("qwen3_5", "triton"), ("qwen4_exp", "qsa_sparse")] for g in (True, False)],
+    # the draft side once per family, with graphs
+    ("qwen3_5", "triton", "dflash", True), ("qwen4_exp", "qsa_sparse", "dflash", True),
+])
+def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, family, backend, algorithm, graphs):
     if backend == "fa":
         pytest.importorskip("sgl_kernel")
-    model = _tiny_model(str(tmp_path / "model"), family)
     # resident experts take the model dtype
     kwargs = {"attention_backend": backend, "cuda_graph_max_bs": 4 if graphs else 0, "moe_strategy": "fused"}
-    reference = _run(model, str(tmp_path / "decode.json"), "-", **kwargs)
-    spec = _run(model, str(tmp_path / "spec.json"), str(tmp_path / "decode.json"),
-                speculative_algorithm="oracle", speculative_num_steps=K, **kwargs)
+    model, decode, reference = plain_runs(family, backend, graphs, kwargs)
+    draft = {"speculative_draft_model_path": _tiny_draft(str(tmp_path / "draft"))} if algorithm == "dflash" else {}
+    spec = _run(model, str(tmp_path / "spec.json"), decode, speculative_algorithm=algorithm, speculative_num_steps=K, **draft, **kwargs)
     agreed = 0
     for uid, (want, got) in enumerate(zip(reference["outputs"], spec["outputs"])):
         assert len(got) == len(want)
@@ -221,3 +345,12 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, family, backend, graphs)
                 assert {a, b} == pair and va - vb <= 2 * ulp, f"request {uid} parts at {split}: top-2 {(a, b)} gap {va - vb}"
     # most of the run must still be compared, or a tie early in every request would hide a bug
     assert agreed >= 0.5 * sum(map(len, reference["outputs"]))
+    assert spec["verify_steps"] > 0
+    if algorithm == "dflash":
+        # the draft's context window rides the target's GDN slots: per slot, rows of the draft width covering its 16-position window and a block
+        window = spec["window"]
+        assert window is not None and window[0] == spec["num_slots"] and window[1] >= 16 + K + 1 and window[2] == 256
+    else:
+        # every prefill and verify forward handed the sink each tapped layer's output, as the next layer read it
+        taps = spec["taps"]
+        assert taps["prefill"] > 0 and taps["verify"] > 0 and taps["mismatch"] == 0
