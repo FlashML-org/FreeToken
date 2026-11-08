@@ -205,8 +205,14 @@ void ggml_cuda_launch_mm_ids_helper(
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     const int nblocks  = mm_ids_nblocks(n_tokens, n_expert_used);
     const int n_routes = n_tokens*n_expert_used;
+    // FreeToken: an offloaded MoE passes its slot count as n_experts, so the cap is the device's opt-in limit less mm_ids_block_scan's static warp_sums.
+    const size_t max_shared    = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo - mm_ids_nthreads/32*sizeof(int);
     const size_t nbytes_shared = n_experts*sizeof(int);
-    GGML_ASSERT(nbytes_shared <= 32*1024 && "mm_ids_helper keeps one int per expert in shared memory");
+    GGML_ASSERT(nbytes_shared <= max_shared && "mm_ids_helper keeps one int per expert in shared memory");
+    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_sort_one_block, max_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_count, max_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_bounds, max_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_scatter, max_shared);
 
     if (nblocks == 1) {
         mm_ids_sort_one_block<<<1, mm_ids_nthreads, nbytes_shared, stream>>>(

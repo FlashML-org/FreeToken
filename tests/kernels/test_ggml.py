@@ -107,8 +107,8 @@ def test_q4_moe_routes_match_cpu(dtype, batch, per_route_x, inactive):
     torch.testing.assert_close(actual.cpu(), expected.to(dtype), atol=2e-4, rtol=1e-3)
 
 
-# several sort blocks and two expert-scan passes; one sort block and five passes; a 32k-token prefill chunk
-@pytest.mark.parametrize("n_experts, top_k, batch", [(300, 8, 1500), (1100, 2, 600), (4, 2, 32768)])
+# several sort blocks and two expert-scan passes; one sort block and five passes; a 32k-token prefill chunk; more experts than the 48 KiB shared memory default holds (an offloaded MoE's slot pool), in one sort block and in several
+@pytest.mark.parametrize("n_experts, top_k, batch", [(300, 8, 1500), (1100, 2, 600), (4, 2, 32768), (12300, 8, 16), (12300, 8, 600)])
 @pytest.mark.parametrize("per_route_x", [False, True])
 @pytest.mark.parametrize("inactive", [False, True])
 def test_q4_moe_skewed_routes_match_cpu(n_experts, top_k, batch, per_route_x, inactive):
