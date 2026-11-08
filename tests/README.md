@@ -15,7 +15,7 @@ directories (`kvcache/test_dsv4_pool.py`) or in `dsv4/`, and will move there.
 | `spec/`      | `freetoken.spec` — speculative decoding: rejection sampling, GDN verify and replay, the verify contract |
 | `kvcache/`   | `freetoken.kvcache` — paged pools (incl. DSV4's), rebuild, cache-cost accounting; the three prefix caches live in `kvcache/radix/` behind a shared reference model (see its README) |
 | `tokenizer/` | `freetoken.tokenizer` — tokenize/detokenize request plumbing, thinking-mode resolution |
-| `engine/`    | `freetoken.engine` — cache budget planning, config resolution, backend gating |
+| `engine/`    | `freetoken.engine` — cache budget planning, config resolution, backend gating, graph capture |
 | `kernels/`   | `freetoken.kernel` / `freetoken.layers` — attention, rope, fused ops, JIT cache, pinned memory |
 | `attention/` | `freetoken.attention` — attention backends against eager references |
 | `layers/`    | `freetoken.layers` — whole layer modules (mHC, GatedDeltaNet); a layer's kernels and fused ops go in `kernels/` |
