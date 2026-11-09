@@ -242,6 +242,14 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     swa_kv = int(kv_per_layer[swa_layer_ids[0]]) if swa_layer_ids else int(kv_per_layer[0])
     full_kv = int(kv_per_layer[full_layer_ids[0]]) if full_layer_ids else int(kv_per_layer[0])
 
+    # Full layers ship no v in the GGUF (k is reused as v), except on E2B / E4B. A metadata-only
+    # GGUF (an FTW dir's source_metadata.gguf) has no tensor table, so there the key has to say.
+    index = gguf_tensor_index(shim.model_path)
+    full_k_eq_v = (
+        not any(f"blk.{i}.{part}.weight" in index for i in full_layer_ids for part in ("attn_v", "attn_qkv"))
+        if index
+        else "gemma4.attention.value_length" not in m
+    )
     max_pos = int(g("context_length"))
     full_rotary = RotaryConfig(
         head_dim=full_head_dim,
@@ -294,6 +302,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             int(m.get("gemma4.embedding_length_per_layer_input", 0)),
             int(shim.vocab_size),
             int(m.get("gemma4.attention.shared_kv_layers", 0)),
+            num_experts,
         ),
         attention_groups=(
             FullAttentionGroupConfig(
@@ -302,8 +311,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
                 num_kv_heads=full_kv,
                 head_dim=full_head_dim,
                 rotary_config=full_rotary,
-                # Full layers ship no v_proj in the GGUF (k reused as v), except on E2B / E4B.
-                k_eq_v="gemma4.attention.value_length" not in m,
+                k_eq_v=full_k_eq_v,
             ),
             SWAAttentionGroupConfig(
                 name="swa",
@@ -455,7 +463,13 @@ def iter_gguf_weights(
                 # the converter folds per_expert_scale into the NVFP4 down weight_scale_2, which the expert kernel applies
                 tensor = torch.ones_like(tensor)
             yield f"{base}.{rel}", tensor.reshape(1) if rel.endswith("layer_scalar") else tensor
-        if kv_shared:
+        if kv_shared and f"{blk}.attn_qkv.weight" in index:
+            # --fuse-qkv fuses a KV-shared layer too (the HF checkpoint still ships its k and v):
+            # q is the leading rows, as llama.cpp reads it, and the rest go unread
+            qkv = t(f"{blk}.attn_qkv")
+            q_rows = config.num_qo_heads * config.attention_group_for_layer(layer).head_dim
+            yield from fused(f"{base}.self_attn.q_proj", [qkv], [matrix(qkv)[:q_rows]], hidden)
+        elif kv_shared:
             q = t(f"{blk}.attn_q")
             yield from fused(f"{base}.self_attn.q_proj", [q], [matrix(q)], hidden)
         else:

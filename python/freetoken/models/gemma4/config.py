@@ -61,13 +61,16 @@ class Gemma4EArgs:
 
 
 def gemma4_e_args(
-    num_layers: int, per_layer_hidden_size: int, per_layer_vocab_size: int, num_kv_shared_layers: int
+    num_layers: int, per_layer_hidden_size: int, per_layer_vocab_size: int, num_kv_shared_layers: int, num_experts: int
 ) -> Gemma4EArgs | None:
     """None for the releases without per-layer inputs: their configs set the width to 0."""
     if not per_layer_hidden_size:
         if num_kv_shared_layers:
             raise NotImplementedError("gemma4 with KV-shared layers but no per-layer inputs is not supported")
         return None
+    if num_experts:
+        # the per-layer input step sits between the dense MLP's residual and layer_scalar, which the MoE block fuses
+        raise NotImplementedError("gemma4 with per-layer inputs and routed experts is not supported")
     return Gemma4EArgs(per_layer_hidden_size, per_layer_vocab_size, num_layers - num_kv_shared_layers)
 
 
@@ -232,6 +235,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             getattr(cfg, "hidden_size_per_layer_input", None) or 0,
             getattr(cfg, "vocab_size_per_layer_input", None) or 0,
             num_kv_shared_layers,
+            num_experts,
         ),
         attention_groups=(
             FullAttentionGroupConfig(

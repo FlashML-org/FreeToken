@@ -317,3 +317,78 @@ def test_rotating_q_alone_matches_rotating_it_with_a_real_key():
 
     assert torch.equal(with_key, alone)
     assert not zeros.any()
+
+
+def test_per_layer_inputs_with_routed_experts_are_refused():
+    """The per-layer input step runs between the dense MLP's residual and layer_scalar; the MoE block has no such seam."""
+    with pytest.raises(NotImplementedError, match="routed experts"):
+        parse_config(_hf_config(E4B, num_experts=8, top_k_experts=2, moe_intermediate_size=64))
+
+
+def _f32(ne, values=None):
+    """A float GGUF tensor as the reader hands it out: ggml dims, raw bytes."""
+    n = int(np.prod(ne))
+    raw = (values if values is not None else torch.randn(n)).to(torch.float32).numpy().view(np.uint8)
+    return SimpleNamespace(ggml_type=0, ne=tuple(ne), nbytes=raw.nbytes, data=lambda raw=raw: raw, name="", path="", root="")
+
+
+def test_a_fused_qkv_file_gives_a_kv_shared_layer_its_q_rows(monkeypatch):
+    """llama.cpp's --fuse-qkv also fuses a KV-shared layer, whose k and v the HF checkpoint still ships; q must be
+    the leading rows of attn_qkv, as llama.cpp reads it, not the k or v rows after them."""
+    from freetoken.models.gemma4 import gguf as gemma4_gguf
+    import freetoken.utils
+
+    release = dict(E2B, layers=3, shared=1, period=3, hidden=8, ffn=16, double_wide=False)
+    config = parse_config(_hf_config(release, vocab_size=32, vocab_size_per_layer_input=32, hidden_size_per_layer_input=4))
+    H, P, L, V = 8, 4, 3, 32
+    index = {"token_embd.weight": _f32((H, V)), "output_norm.weight": _f32((H,)),
+             "per_layer_token_embd.weight": _f32((L * P, V)), "per_layer_model_proj.weight": _f32((H, L * P)),
+             "per_layer_proj_norm.weight": _f32((P,))}
+    for i in range(L):
+        group = config.attention_group_for_layer(i)
+        q, kv = config.num_qo_heads * group.head_dim, group.num_kv_heads * group.head_dim
+        for suffix in ("attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm", "post_norm"):
+            index[f"blk.{i}.{suffix}.weight"] = _f32((H,))
+        for suffix in ("attn_q_norm", "attn_k_norm"):
+            index[f"blk.{i}.{suffix}.weight"] = _f32((group.head_dim,))
+        index[f"blk.{i}.layer_output_scale.weight"] = _f32((1,))
+        index[f"blk.{i}.attn_qkv.weight"] = _f32((H, q + 2 * kv))
+        index[f"blk.{i}.attn_output.weight"] = _f32((q, H))
+        for part in ("gate", "up"):
+            index[f"blk.{i}.ffn_{part}.weight"] = _f32((H, 16))
+        index[f"blk.{i}.ffn_down.weight"] = _f32((16, H))
+        index[f"blk.{i}.inp_gate.weight"] = _f32((H, P))
+        index[f"blk.{i}.proj.weight"] = _f32((P, H))
+    monkeypatch.setattr(gemma4_gguf, "gguf_tensor_index", lambda path: index)
+    monkeypatch.setattr(gemma4_gguf, "parse_gguf_config", lambda shim: config)
+    monkeypatch.setattr(gemma4_gguf, "log_mmproj", lambda *a: None)
+    monkeypatch.setattr(freetoken.utils, "cached_load_hf_config", lambda path: None)
+
+    weights = dict(gemma4_gguf.iter_gguf_weights("fused.gguf", torch.device("cpu"), include_moe_experts=False, include_non_moe=True))
+
+    shared = config.attention_group_for_layer(2)
+    q_rows = config.num_qo_heads * shared.head_dim
+    fused_rows = gemma4_gguf.float_tensor(index["blk.2.attn_qkv.weight"])
+    assert torch.equal(weights["model.layers.2.self_attn.q_proj.weight"], fused_rows[:q_rows].to(torch.bfloat16))
+    assert weights["model.layers.0.self_attn.qkv_proj.weight"].shape[0] == index["blk.0.attn_qkv.weight"].ne[1]
+    expected = _meta_model(config).state_dict()
+    assert set(weights) == set(expected)
+    assert [k for k in weights if tuple(weights[k].shape) != tuple(expected[k].shape)] == []
+
+
+@pytest.mark.parametrize("tensors,k_eq_v", [
+    ((), True),                                  # the 26B / 31B files: full layers store no v
+    (("blk.5.attn_v.weight",), False),           # E2B / E4B: full layers store their v
+    (("blk.5.attn_qkv.weight",), False),         # and so does a --fuse-qkv E-series file
+])
+def test_k_eq_v_follows_the_tensors_when_the_file_has_them(tensors, k_eq_v, tmp_path, monkeypatch):
+    from freetoken.models.gemma4 import gguf as gemma4_gguf
+    from freetoken.models.gguf import tensors as gguf_tensors
+
+    shim = _gguf_shim(tmp_path, E4B, ffn=10240)
+    del shim.metadata["gemma4.attention.value_length"]   # the key alone would now say k_eq_v
+    index = {"blk.0.attn_q.weight": SimpleNamespace(ggml_type=0)} | {n: SimpleNamespace(ggml_type=0) for n in tensors}
+    monkeypatch.setattr(gemma4_gguf, "gguf_tensor_index", lambda path: index)
+    monkeypatch.setattr(gguf_tensors, "gguf_tensor_index", lambda path: index)
+
+    assert parse_gguf_config(shim).attention_groups[0].k_eq_v is k_eq_v
