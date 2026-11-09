@@ -35,7 +35,7 @@ class ModelOptConfig(QuantConfig):
     @classmethod
     def claims(cls, q: dict[str, Any]) -> bool:
         method = str(q.get("quant_method") or "").lower()
-        return method == "modelopt" or (not method and bool(q.get("quant_algo")))
+        return method in ("modelopt", "modelopt_mixed") or (not method and bool(q.get("quant_algo")))
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)

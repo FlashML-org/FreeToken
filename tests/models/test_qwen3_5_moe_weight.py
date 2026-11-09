@@ -210,6 +210,14 @@ MODELOPT_MIXED = {
 MODELOPT_MIXED_A16 = {**MODELOPT_MIXED, "quantized_layers": {
     **MODELOPT_MIXED["quantized_layers"], **{f"{LM}.layers.{l}.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16} for l in (0, 1)}}}
 MODELOPT_MIXED_NOINPUT = {**MODELOPT_MIXED, "with_input_scale": False}
+# apodex/Apodex-1.1-mini-NVFP4: per-tensor FP8 attention / GDN / shared expert, NVFP4 experts, bf16 lm_head; the config says modelopt_mixed
+MODELOPT_TENSOR_FP8_MOE = {
+    "quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION", "ignore": ["mtp*"],
+    "quantized_layers": {
+        **{m: {"quant_algo": "FP8"} for m in GDN_QKVZ_OUT + ATTN + SHARED},
+        **{f"{LM}.layers.{l}.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16} for l in (0, 1)},
+    },
+}
 # sakamakismile/Qwen3.6-27B-NVFP4: every Linear of the dense model, GDN in_proj included
 CT_NVFP4_DENSE = _ct({"group_0": {**NVFP4_GROUP, "targets": ["Linear"]}}, ["lm_head"], "nvfp4-pack-quantized")
 # RedHatAI/Qwen3.6-35B-A3B-NVFP4: every Linear but the GDN, the routers and lm_head
@@ -258,6 +266,10 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
         for key in [k for k in raw if k.endswith(".input_scale") and stripped(k)]:
             del raw[key]
         return moe, {"modelopt_mixed_a16": MODELOPT_MIXED_A16, "modelopt_mixed_noinput": MODELOPT_MIXED_NOINPUT}.get(name, MODELOPT_MIXED), raw
+    if name == "modelopt_tensor_fp8_moe":
+        _quantize(raw, GDN_QKVZ_OUT + ATTN + SHARED, _fp8_tensor)
+        _experts(raw, lambda w: _nvfp4(w, ct=False))
+        return moe, MODELOPT_TENSOR_FP8_MOE, raw
     if name == "ct_nvfp4_dense":
         _quantize(raw, GDN_QKVZ_OUT + GDN_BA + ATTN + DENSE_MLP, lambda w: _nvfp4(w, ct=True))
         return moe, CT_NVFP4_DENSE, raw
@@ -286,7 +298,7 @@ def _layout(name: str) -> tuple[bool, dict | None, dict[str, torch.Tensor]]:
     raise KeyError(name)
 
 
-LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "modelopt_mixed_a16", "modelopt_mixed_noinput", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe", "ct_block_experts"]
+LAYOUTS = ["bf16", "fp8_block", "modelopt_mixed", "modelopt_mixed_a16", "modelopt_mixed_noinput", "modelopt_tensor_fp8_moe", "ct_nvfp4_dense", "ct_nvfp4_moe", "ct_mixed_fast", "ct_tensor_fp8_moe", "ct_block_moe", "ct_block_experts"]
 
 
 def _config_json(moe: bool, quantization_config) -> dict:
