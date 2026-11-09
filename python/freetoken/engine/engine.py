@@ -16,7 +16,7 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
+from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
@@ -342,13 +342,15 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
     """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
     if config.embed_weights != "host":
         return frozenset()
-    if config.model_config.tie_word_embeddings:
+    # a tied LM head reads its whole table every step, so that table stays on the GPU
+    tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
+    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied}
+    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if not keys and tied:
         raise ValueError(
             "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
             "every step; serve it with --embed-weights gpu"
         )
-    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding}
-    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
     if not keys:
         raise ValueError(
             f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
