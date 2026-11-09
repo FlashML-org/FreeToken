@@ -65,6 +65,7 @@ from .generation import (
     GenerationError,
     GenResult,
     GenSpec,
+    GenUsage,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
@@ -98,6 +99,9 @@ class ResponsesRequest(BaseModel):
     top_p: float | None = None
     top_k: int | None = None
     stream: bool = False
+    # llama.cpp's field: every delta event carries the timings block (effective only with
+    # --enable-timings-report; extra="allow" used to swallow it).
+    timings_per_token: bool = False
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
     reasoning: dict[str, Any] | None = None
@@ -156,6 +160,13 @@ async def handle_responses(
         spec = convert_responses_to_genspec(
             req, model_sampling, default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            # stamp per-token only when the server opted into timings too; llama.cpp
+            # publishes partial timings on streams, so non-stream requests never pay
+            timings_per_token=bool(
+                req.stream
+                and req.timings_per_token
+                and getattr(state.config, "enable_timings_report", False)
+            ),
         )
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
@@ -165,9 +176,13 @@ async def handle_responses(
 
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
+        # shared with generate_events: its ack loop stamps usage.timings before yielding
+        # each event, so a delta reads the snapshot of the ack behind it
+        usage = GenUsage()
         events = responses_stream_generator(
-            generate_events(uid, spec, state, source="/v1/responses"), req, response_id, created,
-            cache_report=cache_report, state=state,
+            generate_events(uid, spec, state, source="/v1/responses", usage=usage),
+            req, response_id, created,
+            cache_report=cache_report, state=state, usage=usage,
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -193,6 +208,7 @@ def convert_responses_to_genspec(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     reasoning_parser: str | None = None,
+    timings_per_token: bool = False,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -250,6 +266,7 @@ def convert_responses_to_genspec(
             max_tokens=req.max_output_tokens or default_max_tokens,
             ignore_eos=False,
             model_sampling=model_sampling,
+            timings_per_token=timings_per_token,
         ),
         chat_template_kwargs=ctk,
         template_tools=template_tools,
@@ -508,8 +525,17 @@ async def responses_stream_generator(
     created: int,
     cache_report: bool = False,
     state: Any = None,
+    usage: GenUsage | None = None,
 ) -> AsyncIterator[str]:
     seq = _Seq()
+
+    def timings_extra() -> dict[str, Any]:
+        # per-token: every delta carries the ack's snapshot. Request-side gate: the
+        # terminal snapshot rides every request, so post-terminal residue must stay clean.
+        if not req.timings_per_token or usage is None:
+            return {}
+        t = timings_block(state, usage.timings)
+        return {"timings": t} if t is not None else {}
 
     def snapshot(status, output, usage=None, incomplete_reason=None):
         return _response_obj(
@@ -609,6 +635,7 @@ async def responses_stream_generator(
         return _sse(ResponseFunctionCallArgumentsDeltaEvent(
             type="response.function_call_arguments.delta", sequence_number=seq.next(),
             item_id=current["id"], output_index=output_index, delta=fragment,
+            **timings_extra(),
         ))
 
     events = with_keepalive(events, KEEPALIVE_INTERVAL_S)
@@ -643,7 +670,7 @@ async def responses_stream_generator(
                 yield _sse(ResponseReasoningTextDeltaEvent(
                     type="response.reasoning_text.delta", sequence_number=seq.next(),
                     item_id=current["id"], output_index=output_index, content_index=0,
-                    delta=ev.text,
+                    delta=ev.text, **timings_extra(),
                 ))
 
             elif isinstance(ev, ContentDelta):
@@ -670,7 +697,7 @@ async def responses_stream_generator(
                 yield _sse(ResponseTextDeltaEvent(
                     type="response.output_text.delta", sequence_number=seq.next(),
                     item_id=current["id"], output_index=output_index, content_index=0,
-                    delta=ev.text, logprobs=[],
+                    delta=ev.text, logprobs=[], **timings_extra(),
                 ))
 
             elif isinstance(ev, ToolCallStart):

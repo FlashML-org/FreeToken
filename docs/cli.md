@@ -133,7 +133,11 @@ measured in the scheduler: `queue_ms` covers admission to the first prefill chun
 evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
 streams the object rides the final chunk; a multi-prompt `/v1/completions` request
 reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
-(llama.cpp emits no timings there either).
+(llama.cpp emits no timings there either). A streaming chat completion, completion or
+Responses request may set the llama.cpp top-level body field `"timings_per_token": true`
+to carry the block with growing values on every chunk that follows an ack: text and
+reasoning deltas, tool-argument fragments, and the finish chunk (or the usage chunk
+with `include_usage`). Without the server flag the field is ignored.
 
 ### Image input
 

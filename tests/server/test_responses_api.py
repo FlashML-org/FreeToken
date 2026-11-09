@@ -15,6 +15,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PY = os.path.join(_ROOT, "python")
 if _PY not in sys.path:
@@ -24,7 +26,13 @@ from freetoken.message.frontend import UserReply  # noqa: E402
 from freetoken.server import responses_api as RP  # noqa: E402
 from freetoken.server.responses_api import ResponsesRequest  # noqa: E402
 from freetoken.server.function_call_parser import ToolCallItem  # noqa: E402
-from freetoken.server.generation import ContentDelta, GenDone, GenResult, ToolCallsDelta  # noqa: E402
+from freetoken.server.generation import (  # noqa: E402
+    ContentDelta,
+    GenDone,
+    GenResult,
+    GenUsage,
+    ToolCallsDelta,
+)
 
 
 async def _aiter(items):
@@ -331,6 +339,63 @@ def test_stream_timings_ride_the_completed_event_data_not_the_response():
     assert "timings" not in completed["response"]
     # every earlier event stays clean
     assert all("timings" not in e for e in data_events[:-1])
+
+
+def _pt_snapshot(n: int, ms: float) -> dict:
+    return {"queue_ms": 5.0, "cache_n": 0, "prompt_n": 4, "prompt_ms": 200.0,
+            "predicted_n": n, "predicted_ms": max(ms, 0.001), "draft_n": 0, "draft_n_accepted": 0}
+
+
+@pytest.mark.parametrize("asked", [True, False])
+def test_stream_timings_per_token_rides_every_delta_event(asked):
+    payload = {"model": "gpt-x", "input": "hi", "stream": True}
+    if asked:
+        payload["timings_per_token"] = True
+    req = ResponsesRequest.model_validate(payload)
+    terminal = _pt_snapshot(3, 90.0)
+    usage = GenUsage()
+
+    async def src():
+        # mirrors generate_events: each ack stamps usage.timings before its events go out
+        usage.timings = _pt_snapshot(1, 0.001)
+        yield ContentDelta("Hel")
+        usage.timings = _pt_snapshot(2, 40.0)
+        yield ContentDelta("lo")
+        # the terminal ack, then the buffered tool-call close flushed after the loop:
+        # a stream that did not ask must not get a block on that residue
+        usage.timings = terminal
+        yield ToolCallsDelta([ToolCallItem(tool_index=0, name="get_weather", parameters='{"city": "SF"}')])
+        yield GenDone("tool_calls", 4, 3, timings=terminal)
+
+    async def run():
+        out = []
+        async for frame in RP.responses_stream_generator(
+            src(), req, "resp_1", 0, state=SimpleNamespace(config=SimpleNamespace(enable_timings_report=True)), usage=usage
+        ):
+            for line in frame.split("\n"):
+                if line.startswith("data:"):
+                    out.append(json.loads(line[len("data:"):].strip()))
+        return out
+
+    data_events = asyncio.run(run())
+    text = [e for e in data_events if e["type"] == "response.output_text.delta"]
+    argd = [e for e in data_events if e["type"] == "response.function_call_arguments.delta"]
+    assert len(text) == 2 and len(argd) == 1
+    if asked:
+        # growing per-ack snapshots on every delta, terminal value on the post-ack residue
+        assert [e["timings"]["predicted_n"] for e in text] == [1, 2]
+        assert argd[0]["timings"]["predicted_n"] == 3
+    else:
+        assert all("timings" not in e for e in text + argd)
+    completed = data_events[-1]
+    assert completed["type"] == "response.completed"
+    # the #814 terminal placement is unchanged either way
+    assert completed["timings"]["predicted_n"] == 3
+    # structural events (created/in_progress/added/done) never carry a block
+    assert all("timings" not in e for e in data_events
+               if e["type"] not in ("response.output_text.delta",
+                                    "response.function_call_arguments.delta",
+                                    "response.completed"))
 
 
 def test_stream_tool_call_events():
