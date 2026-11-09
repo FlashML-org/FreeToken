@@ -52,6 +52,8 @@ class Gemma4EArgs:
     per_layer_vocab_size: int
     # layers from here on project q only and reuse k, v of the last earlier layer of their attention type
     first_kv_shared_layer: int
+    # their dense MLP's width: E2B doubles it, E4B keeps intermediate_size
+    kv_shared_intermediate_size: int
 
     def is_kv_shared(self, layer_id: int) -> bool:
         return layer_id >= self.first_kv_shared_layer
@@ -61,7 +63,12 @@ class Gemma4EArgs:
 
 
 def gemma4_e_args(
-    num_layers: int, per_layer_hidden_size: int, per_layer_vocab_size: int, num_kv_shared_layers: int, num_experts: int
+    num_layers: int,
+    per_layer_hidden_size: int,
+    per_layer_vocab_size: int,
+    num_kv_shared_layers: int,
+    num_experts: int,
+    kv_shared_intermediate_size: int,
 ) -> Gemma4EArgs | None:
     """None for the releases without per-layer inputs: their configs set the width to 0."""
     if not per_layer_hidden_size:
@@ -71,7 +78,9 @@ def gemma4_e_args(
     if num_experts:
         # the per-layer input step sits between the dense MLP's residual and layer_scalar, which the MoE block fuses
         raise NotImplementedError("gemma4 with per-layer inputs and routed experts is not supported")
-    return Gemma4EArgs(per_layer_hidden_size, per_layer_vocab_size, num_layers - num_kv_shared_layers)
+    return Gemma4EArgs(
+        per_layer_hidden_size, per_layer_vocab_size, num_layers - num_kv_shared_layers, kv_shared_intermediate_size
+    )
 
 
 def _text_config(hf_config: Any) -> tuple[Any, list[str] | None, Any]:
@@ -193,15 +202,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
     expert_quant = detect_expert_quant(top_cfg)
     dense_quant = "nvfp4" if (expert_quant == "nvfp4" and not num_experts > 0) else "none"
 
-    # E2B doubles the MLP of its KV-shared tail. Gemma4UnifiedTextConfig omits these fields.
-    num_kv_shared_layers = getattr(cfg, "num_kv_shared_layers", None) or 0
-    first_kv_shared_layer = cfg.num_hidden_layers - num_kv_shared_layers
-    layer_intermediate_sizes = (
-        tuple(cfg.intermediate_size * (2 if i >= first_kv_shared_layer else 1) for i in range(cfg.num_hidden_layers))
-        if getattr(cfg, "use_double_wide_mlp", False) and num_kv_shared_layers
-        else ()
-    )
-
     return ModelConfig(
         num_layers=cfg.num_hidden_layers,
         num_qo_heads=cfg.num_attention_heads,
@@ -210,7 +210,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         hidden_size=cfg.hidden_size,
         vocab_size=cfg.vocab_size,
         intermediate_size=cfg.intermediate_size,
-        layer_intermediate_sizes=layer_intermediate_sizes,
         hidden_act="gelu_tanh",
         rms_norm_eps=cfg.rms_norm_eps,
         tie_word_embeddings=bool(getattr(cfg, "tie_word_embeddings", True)),
@@ -230,12 +229,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         embedding_scale=float(cfg.hidden_size) ** 0.5,
         vision_config=_parse_vision_config(top_cfg, cfg.hidden_size),
         image_token_id=getattr(top_cfg, "image_token_id", None),
+        # Gemma4UnifiedTextConfig omits the E-series fields
         gemma4_e_args=gemma4_e_args(
             cfg.num_hidden_layers,
             getattr(cfg, "hidden_size_per_layer_input", None) or 0,
             getattr(cfg, "vocab_size_per_layer_input", None) or 0,
-            num_kv_shared_layers,
+            getattr(cfg, "num_kv_shared_layers", None) or 0,
             num_experts,
+            cfg.intermediate_size * (2 if getattr(cfg, "use_double_wide_mlp", False) else 1),
         ),
         attention_groups=(
             FullAttentionGroupConfig(

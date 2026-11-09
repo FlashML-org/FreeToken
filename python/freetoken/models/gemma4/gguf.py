@@ -224,11 +224,12 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     num_qo_heads = int(g("attention.head_count"))
     # per-layer lists, or one value for every layer
     kv_per_layer = g("attention.head_count_kv")
-    ffn_per_layer = g("feed_forward_length")
     if not isinstance(kv_per_layer, (list, tuple)):
         kv_per_layer = [kv_per_layer] * num_layers
-    layer_intermediate_sizes = tuple(int(x) for x in ffn_per_layer) if isinstance(ffn_per_layer, (list, tuple)) else ()
-    assert len(layer_intermediate_sizes) in (0, num_layers), "feed_forward_length length != block_count"
+    ffn_per_layer = g("feed_forward_length")
+    if not isinstance(ffn_per_layer, (list, tuple)):
+        ffn_per_layer = [ffn_per_layer] * num_layers
+    ffn_per_layer = [int(x) for x in ffn_per_layer]
     # True -> sliding-window (SWA) layer, False -> full attention.
     swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
@@ -250,6 +251,20 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         if index
         else "gemma4.attention.value_length" not in m
     )
+    e_args = gemma4_e_args(
+        num_layers,
+        int(m.get("gemma4.embedding_length_per_layer_input", 0)),
+        int(shim.vocab_size),
+        int(m.get("gemma4.attention.shared_kv_layers", 0)),
+        num_experts,
+        ffn_per_layer[-1],
+    )
+    # the config holds one MLP width, and one more for the KV-shared layers (E2B doubles theirs)
+    if ffn_per_layer != [
+        e_args.kv_shared_intermediate_size if e_args is not None and e_args.is_kv_shared(i) else ffn_per_layer[0]
+        for i in range(num_layers)
+    ]:
+        raise NotImplementedError(f"gemma4 GGUF MLP widths {sorted(set(ffn_per_layer))} do not split at the KV-shared layers")
     max_pos = int(g("context_length"))
     full_rotary = RotaryConfig(
         head_dim=full_head_dim,
@@ -277,8 +292,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         head_dim=full_head_dim,
         hidden_size=hidden,
         vocab_size=int(shim.vocab_size),
-        intermediate_size=layer_intermediate_sizes[0] if layer_intermediate_sizes else int(ffn_per_layer),
-        layer_intermediate_sizes=layer_intermediate_sizes,
+        intermediate_size=ffn_per_layer[0],
         hidden_act="gelu_tanh",
         rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
@@ -297,13 +311,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         embedding_scale=float(hidden) ** 0.5,
         vision_config=vision_config,
         image_token_id=getattr(shim, "image_token_id", None),
-        gemma4_e_args=gemma4_e_args(
-            num_layers,
-            int(m.get("gemma4.embedding_length_per_layer_input", 0)),
-            int(shim.vocab_size),
-            int(m.get("gemma4.attention.shared_kv_layers", 0)),
-            num_experts,
-        ),
+        gemma4_e_args=e_args,
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",

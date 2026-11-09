@@ -93,9 +93,12 @@ class Gemma4DenseMLP(BaseOP):
     ``post_feedforward_layernorm.``) resolves the dense checkpoint unchanged."""
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        e_args = config.gemma4_e_args
         self.shared_mlp = GatedMLP(
             config,
-            intermediate_size=config.intermediate_size_for_layer(layer_id),
+            intermediate_size=(
+                e_args.kv_shared_intermediate_size if e_args is not None and e_args.is_kv_shared(layer_id) else None
+            ),
             quant_config=config.quant,
             prefix=f"{prefix}.shared_mlp",
         )

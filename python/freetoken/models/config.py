@@ -321,8 +321,6 @@ class ModelConfig:
     # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0
-    # The dense MLP's width per layer, for a family whose layers differ (Gemma-4 E2B's double-wide KV-shared tail); () -> intermediate_size on every layer.
-    layer_intermediate_sizes: Tuple[int, ...] = ()
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
     # The first ``first_k_dense_replace`` decoder layers use a dense MLP instead of the
@@ -387,9 +385,6 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
-
-    def intermediate_size_for_layer(self, layer_id: int) -> int:
-        return self.layer_intermediate_sizes[layer_id] if self.layer_intermediate_sizes else self.intermediate_size
 
     @property
     def is_moe(self) -> bool:

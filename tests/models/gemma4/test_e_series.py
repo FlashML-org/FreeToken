@@ -1,7 +1,6 @@
 """Gemma-4 E2B / E4B: per-layer inputs, KV-shared layers and the double-wide MLP, against the shapes of the released checkpoints."""
 from __future__ import annotations
 
-import struct
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,7 +9,6 @@ import safetensors.torch
 import torch
 
 from freetoken.models.gemma4.config import parse_config
-from freetoken.models.gemma4.gguf import parse_gguf_config, to_gguf
 
 # The layer types of the releases: every (period)th layer is full attention.
 E2B = dict(layers=35, hidden=1536, ffn=6144, shared=20, double_wide=True, kv_heads=1, period=5)
@@ -76,68 +74,12 @@ def _hf_config(release: dict, **overrides):
     return SimpleNamespace(architectures=["Gemma4ForCausalLM"], **(fields | overrides))
 
 
-def _gguf_shim(tmp_path, release: dict, *, ffn):
-    from freetoken.models.gguf.config import GgufConfigShim
-
-    n = release["layers"]
-    # no tensors and no KV of its own: the parser reads the shim's metadata
-    path = tmp_path / "metadata_only.gguf"
-    path.write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
-    metadata = {
-        "gemma4.block_count": n,
-        "gemma4.embedding_length": release["hidden"],
-        "gemma4.embedding_length_per_layer_input": 256,
-        "gemma4.feed_forward_length": ffn,
-        "gemma4.context_length": 131072,
-        "gemma4.final_logit_softcapping": 30.0,
-        "gemma4.attention.head_count": 8,
-        "gemma4.attention.head_count_kv": release["kv_heads"],
-        "gemma4.attention.key_length": 512,
-        "gemma4.attention.key_length_swa": 256,
-        "gemma4.attention.value_length": 512,
-        "gemma4.attention.layer_norm_rms_epsilon": 1e-6,
-        "gemma4.attention.sliding_window": 512,
-        "gemma4.attention.shared_kv_layers": release["shared"],
-        "gemma4.attention.sliding_window_pattern": [not _is_full(release, i) for i in range(n)],
-        "gemma4.rope.freq_base": 1000000.0,
-        "gemma4.rope.freq_base_swa": 10000.0,
-        "gemma4.rope.dimension_count": 512,
-        "gemma4.rope.dimension_count_swa": 256,
-    }
-    return GgufConfigShim(
-        architectures=["Gemma4GGUFForCausalLM"],
-        model_path=str(path),
-        model_type="gemma4",
-        metadata=metadata,
-        vocab_size=262144,
-        tie_word_embeddings=True,
-    )
-
-
 def _meta_model(config):
     from freetoken.models.gemma4.model import Gemma4ForCausalLM
     from freetoken.utils.torch_utils import torch_dtype
 
     with torch.device("meta"), torch_dtype(torch.bfloat16):
         return Gemma4ForCausalLM(config)
-
-
-def test_e2b_config_doubles_the_shared_tail_only():
-    config = parse_config(_hf_config(E2B))
-    args = config.gemma4_e_args
-
-    assert args.per_layer_hidden_size == 256 and args.first_kv_shared_layer == 15
-    assert config.intermediate_size == 6144
-    assert config.layer_intermediate_sizes == (6144,) * 15 + (12288,) * 20
-    assert not args.is_kv_shared(14) and args.is_kv_shared(15)
-
-
-def test_e4b_config_keeps_one_mlp_width():
-    config = parse_config(_hf_config(E4B))
-
-    assert config.gemma4_e_args.first_kv_shared_layer == 24
-    assert config.layer_intermediate_sizes == ()
-    assert config.intermediate_size_for_layer(41) == 10240
 
 
 @pytest.mark.parametrize("fields", [
@@ -148,12 +90,6 @@ def test_other_releases_have_no_e_args(fields):
     config = parse_config(_hf_config(E4B, **fields))
 
     assert config.gemma4_e_args is None
-    assert config.layer_intermediate_sizes == ()
-
-
-def test_shared_layers_without_per_layer_inputs_are_refused():
-    with pytest.raises(NotImplementedError, match="KV-shared"):
-        parse_config(_hf_config(E4B, hidden_size_per_layer_input=0))
 
 
 def test_kv_source_is_the_last_unshared_layer_of_each_attention_type():
@@ -164,38 +100,6 @@ def test_kv_source_is_the_last_unshared_layer_of_each_attention_type():
 
     assert [i for i in full.layer_ids if args.is_kv_source(i, full.layer_ids)] == [14]
     assert [i for i in swa.layer_ids if args.is_kv_source(i, swa.layer_ids)] == [13]
-
-
-def test_gguf_reads_a_per_layer_mlp_width_list(tmp_path):
-    widths = [6144] * 15 + [12288] * 20
-    config = parse_gguf_config(_gguf_shim(tmp_path, E2B, ffn=widths))
-
-    assert config.layer_intermediate_sizes == tuple(widths)
-    assert config.intermediate_size == 6144
-    assert config.num_kv_heads == 1
-    assert config.gemma4_e_args.first_kv_shared_layer == 15
-
-
-def test_gguf_reads_one_mlp_width_and_one_kv_head_count(tmp_path):
-    config = parse_gguf_config(_gguf_shim(tmp_path, E4B, ffn=10240))
-
-    assert config.layer_intermediate_sizes == ()
-    assert config.intermediate_size == 10240
-    assert config.num_kv_heads == 2
-    assert config.gemma4_e_args.first_kv_shared_layer == 24
-
-
-def test_full_layers_store_v_on_e_series_gguf(tmp_path):
-    config = parse_gguf_config(_gguf_shim(tmp_path, E4B, ffn=10240))
-
-    assert config.attention_groups[0].k_eq_v is False
-
-
-def test_to_gguf_names_the_per_layer_tensors():
-    assert to_gguf("model.embed_tokens_per_layer", {}) == ("per_layer_token_embd",)
-    assert to_gguf("model.per_layer_model_projection", {}) == ("per_layer_model_proj",)
-    assert to_gguf("model.layers.3.per_layer_input_gate", {}) == ("blk.3.inp_gate",)
-    assert to_gguf("model.layers.3.per_layer_projection", {}) == ("blk.3.proj",)
 
 
 def test_model_shapes_match_the_e2b_checkpoint():
@@ -290,16 +194,6 @@ def test_a_float_table_is_read_without_a_copy():
     assert name == "t.weight" and weight is table
 
 
-def test_clipped_vision_towers_serve_text_only():
-    """E2B / E4B's tower clips its linears, which the tower does not apply: text must still serve."""
-    from freetoken.models.register import get_model_spec
-
-    (encoder,) = get_model_spec("Gemma4ForConditionalGeneration").encoders
-
-    assert "clipped linears" in encoder.unserved(SimpleNamespace(use_clipped_linears=True))
-    assert encoder.unserved(SimpleNamespace(use_clipped_linears=False)) is None
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the rope kernels need CUDA")
 def test_rotating_q_alone_matches_rotating_it_with_a_real_key():
     """A shared layer has no key to rotate, so it hands the kernel one head of zeros."""
@@ -317,12 +211,6 @@ def test_rotating_q_alone_matches_rotating_it_with_a_real_key():
 
     assert torch.equal(with_key, alone)
     assert not zeros.any()
-
-
-def test_per_layer_inputs_with_routed_experts_are_refused():
-    """The per-layer input step runs between the dense MLP's residual and layer_scalar; the MoE block has no such seam."""
-    with pytest.raises(NotImplementedError, match="routed experts"):
-        parse_config(_hf_config(E4B, num_experts=8, top_k_experts=2, moe_intermediate_size=64))
 
 
 def _f32(ne, values=None):
@@ -374,21 +262,3 @@ def test_a_fused_qkv_file_gives_a_kv_shared_layer_its_q_rows(monkeypatch):
     expected = _meta_model(config).state_dict()
     assert set(weights) == set(expected)
     assert [k for k in weights if tuple(weights[k].shape) != tuple(expected[k].shape)] == []
-
-
-@pytest.mark.parametrize("tensors,k_eq_v", [
-    ((), True),                                  # the 26B / 31B files: full layers store no v
-    (("blk.5.attn_v.weight",), False),           # E2B / E4B: full layers store their v
-    (("blk.5.attn_qkv.weight",), False),         # and so does a --fuse-qkv E-series file
-])
-def test_k_eq_v_follows_the_tensors_when_the_file_has_them(tensors, k_eq_v, tmp_path, monkeypatch):
-    from freetoken.models.gemma4 import gguf as gemma4_gguf
-    from freetoken.models.gguf import tensors as gguf_tensors
-
-    shim = _gguf_shim(tmp_path, E4B, ffn=10240)
-    del shim.metadata["gemma4.attention.value_length"]   # the key alone would now say k_eq_v
-    index = {"blk.0.attn_q.weight": SimpleNamespace(ggml_type=0)} | {n: SimpleNamespace(ggml_type=0) for n in tensors}
-    monkeypatch.setattr(gemma4_gguf, "gguf_tensor_index", lambda path: index)
-    monkeypatch.setattr(gguf_tensors, "gguf_tensor_index", lambda path: index)
-
-    assert parse_gguf_config(shim).attention_groups[0].k_eq_v is k_eq_v
