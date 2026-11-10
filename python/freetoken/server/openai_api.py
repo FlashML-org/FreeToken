@@ -321,7 +321,9 @@ async def stream_chat_completion_chunks(
             if ev is KEEPALIVE:
                 if not output_started:
                     # Event-based idle timers ignore SSE comments during queue/prefill silence.
-                    yield _sse(_chat_chunk(
+                    # A chunk like any other after the role chunk: emit() adds the usage so
+                    # far and, once an ack has delivered one, its timings snapshot.
+                    yield emit(_chat_chunk(
                         req, uid, created, [{"delta": {}, "index": 0, "finish_reason": None}],
                     ))
                 continue

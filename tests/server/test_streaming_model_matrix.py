@@ -743,6 +743,78 @@ def test_chat_keepalive_only_before_content(monkeypatch, include_usage):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("asked", [True, False])
+def test_chat_keepalive_carries_running_usage_and_timings_when_requested(monkeypatch, asked):
+    """A keep-alive is one more chunk after the role chunk: with continuous_usage_stats it
+    carries the usage so far, and with timings_per_token the snapshot of the ack behind it,
+    so never a block during queue/prefill, where nothing is measured yet."""
+    from freetoken.server import openai_api as O
+
+    monkeypatch.setattr(O, "KEEPALIVE_INTERVAL_S", 0.02, raising=False)
+
+    def snapshot(predicted_n, predicted_ms):
+        return dict(queue_ms=0.0, cache_n=0, prompt_n=5, prompt_ms=100.0, predicted_n=predicted_n,
+                    predicted_ms=predicted_ms, draft_n=0, draft_n_accepted=0)
+
+    async def run():
+        prefill = asyncio.Event()
+        decode = asyncio.Event()
+        state = FakeState([], tool_call_parser="llama3")
+        state.config.enable_timings_report = True
+
+        async def wait_for_ack(uid):
+            await prefill.wait()
+            # a committed token that reaches no delta yet: the stream stays silent after an ack
+            yield UserReply(uid=uid, incremental_output="", finished=False, prompt_tokens_delta=5,
+                            completion_tokens_delta=1, timings=snapshot(1, 0.001) if asked else None)
+            await decode.wait()
+            yield UserReply(uid=uid, incremental_output="hi", finished=True, finish_reason="stop",
+                            completion_tokens_delta=1, timings=snapshot(2, 40.0))
+
+        monkeypatch.setattr(state, "wait_for_ack", wait_for_ack)
+        req = ChatCompletionRequest(
+            model="m", messages=[], stream=True, timings_per_token=asked,
+            stream_options={"include_usage": True, "continuous_usage_stats": asked},
+        )
+        stream = stream_chat_completion_chunks(42, req, state, _spec(tools=None))
+
+        async def chunk():
+            frame = await asyncio.wait_for(anext(stream), timeout=1)
+            return json.loads(frame.decode().removeprefix("data: "))
+
+        try:
+            role = await chunk()
+            assert "usage" not in role and "timings" not in role
+            queued = await chunk()  # before the first ack
+            prefill.set()
+            held = await chunk()  # after an ack that produced no delta
+            for beat in (queued, held):
+                assert beat["choices"] == [{"index": 0, "delta": {}, "finish_reason": None}]
+            if asked:
+                assert queued["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                assert "timings" not in queued
+                assert held["usage"] == {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+                assert held["timings"]["predicted_n"] == 1
+            else:
+                assert all("usage" not in beat and "timings" not in beat for beat in (queued, held))
+
+            decode.set()
+            content = await chunk()
+            assert content["choices"][0]["delta"] == {"content": "hi"}
+            assert ("usage" in content, "timings" in content) == (asked, asked)
+            frames = [frame async for frame in stream]
+            assert frames[-1] == b"data: [DONE]\n\n"
+            final = json.loads(frames[-2].decode().removeprefix("data: "))
+            # the keep-alives leave the terminal usage chunk as it was
+            assert final["choices"] == []
+            assert final["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+            assert final["timings"]["predicted_n"] == 2
+        finally:
+            await stream.aclose()
+
+    asyncio.run(run())
+
+
 # --------------------------------------------------------------------------- #
 # Review regressions: empty args, same-chunk trailing text, non-stream parity
 # --------------------------------------------------------------------------- #
