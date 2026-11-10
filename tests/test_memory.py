@@ -197,8 +197,12 @@ def test_unusable_file_cache_subtracts_nothing(
     assert memory_files.effective() == 4 << 30
 
 
+# The oversized case is well-formed line by line (70,000 bytes of distinct
+# counters), so only the read bound can reject it.
 @pytest.mark.parametrize(
-    "suffix", [b"\xff", b"x" * (65 * 1024)], ids=["non-ascii", "oversized"]
+    "suffix",
+    [b"\xff", b"".join(b"pad%04d 0\n" % n for n in range(7000))],
+    ids=["non-ascii", "oversized"],
 )
 def test_non_ascii_or_oversized_file_cache_subtracts_nothing(
     memory_files: FakeMemoryFiles, file_cache_cgroup, suffix: bytes
