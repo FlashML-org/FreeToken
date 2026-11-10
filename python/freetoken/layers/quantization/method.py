@@ -52,6 +52,8 @@ class QuantMethod(ABC):
     kind: ClassVar[QuantKind]
     layer_kind: ClassVar[LayerKind]
     candidates: ClassVar[tuple[type, ...]] = ()
+    # declares the bf16 weight the checkpoint stores and converts it in finalize; the engine loads such weights to host first
+    online: ClassVar[bool] = False
 
     def __init__(self, cfg: Any, requested: str = "auto"):
         self.cfg = cfg

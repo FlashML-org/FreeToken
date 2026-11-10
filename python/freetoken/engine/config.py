@@ -37,6 +37,10 @@ class EngineConfig:
     ple_backend: str = "disk"
     # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
     embed_weights: str = "gpu"
+    # --online-quant: a QuantKind the layers this checkpoint stores bf16 are converted to at load (df11)
+    online_quant: str | None = None
+    # --online-quant-modules: checkpoint module names / globs that limit --online-quant to those modules
+    online_quant_modules: tuple[str, ...] = ()
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"
@@ -128,6 +132,8 @@ class EngineConfig:
             raise ValueError(f"moe_locked_fetch {self.moe_locked_fetch} rounds to 0 in Q16; pass 0 to keep locked layers CPU-only")
         if self.moe_locked_max_fetch < 1:
             raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
+        if self.online_quant_modules and not self.online_quant:
+            raise ValueError("--online-quant-modules names the modules --online-quant converts; pass --online-quant too")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -173,7 +179,9 @@ class EngineConfig:
             if key not in built and getattr(hf_config, key, None) is not None:
                 setattr(hf_config, key, None)
         spec = self.model_spec
-        quant = checkpoint_quant_config(self.model_path, hf_config, spec)
+        quant = checkpoint_quant_config(
+            self.model_path, hf_config, spec, online=self.online_quant, online_modules=self.online_quant_modules
+        )
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
         return replace(model_config, quant=quant)

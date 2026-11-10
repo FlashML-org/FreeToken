@@ -35,6 +35,7 @@ class VocabParallelEmbedding(BaseOP):
         finish_idx = min(start_idx + self.num_embeddings_tp, num_embeddings)
         self.vocab_range = (start_idx, finish_idx - start_idx)
         self.embedding_dim = embedding_dim
+        self.prefix = prefix
         # the LM head subclass is a linear and builds its own method
         self.quant_method = None
         if self.quant_layer_kind is LayerKind.EMBEDDING:
@@ -84,6 +85,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.prefix = prefix
         self.tied_embedding = tied_embedding
         assert (tied_embedding is not None) == tie_word_embeddings
+        if tied_embedding is not None and tied_embedding.quant_method.online:
+            raise ValueError("--online-quant compresses the embedding table, which this model ties to its LM head; serve it without --online-quant")
         self.in_features = embedding_dim
         self.out_features = self.num_embeddings_tp
         self.output_sizes = (self.num_embeddings_tp,)

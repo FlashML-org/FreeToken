@@ -18,6 +18,7 @@ from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
+from freetoken.layers.quantization.names import name_set
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
@@ -344,7 +345,9 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
         return frozenset()
     # a tied LM head reads its whole table every step, so that table stays on the GPU
     tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
-    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied}
+    tables = {
+        id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied and not op.quant_method.online
+    }
     keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
     if not keys and tied:
         raise ValueError(
@@ -353,10 +356,33 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
         )
     if not keys:
         raise ValueError(
-            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
-            "on the GPU); serve it with --embed-weights gpu"
+            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (an --online-quant "
+            "table stays on the GPU); serve it with --embed-weights gpu"
         )
     return keys
+
+
+def _online_quant_keys(model, config: EngineConfig) -> frozenset[str]:
+    """State-dict keys of the bf16 weights an online quant method converts in finalize; they load to host RAM so the GPU holds one of them at a time."""
+    if not config.online_quant:
+        return frozenset()
+    to_checkpoint = config.model_config.quant.name_map.to_checkpoint
+    ops = [op for op in iter_ops(model) if getattr(op, "quant_method", None) is not None and op.quant_method.online]
+    names = [name for op in ops for name in to_checkpoint(op.prefix)]
+    missed = [p for p in config.online_quant_modules if not any(map(name_set((p,)), names))]
+    if missed:
+        example = to_checkpoint(next(op.prefix for op in iter_ops(model) if getattr(op, "prefix", "")))[0]
+        raise ValueError(
+            f"--online-quant-modules: no layer --online-quant {config.online_quant} converts matches {', '.join(missed)}; "
+            f"give the checkpoint's module names, e.g. {example!r}"
+        )
+    if not ops:
+        raise ValueError(
+            f"--online-quant {config.online_quant}: {config.model_path} has no bf16 layer it can convert (it skips layers the "
+            "checkpoint quantizes or the model family keeps bf16, the LM head and vision encoders)"
+        )
+    weights = {id(op.weight) for op in ops}
+    return frozenset(key for key, t in model.state_dict().items() if id(t) in weights)
 
 
 def _pinned_copy(key: str, t: torch.Tensor) -> torch.Tensor:
@@ -378,6 +404,7 @@ def _make_dummy_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -402,6 +429,8 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
         if key in host_keys:
             state_dict[key] = _pinned_copy(key, state_dict[key])
+        elif key in staged_keys:
+            state_dict[key] = state_dict[key].cpu()
     return state_dict
 
 
@@ -436,6 +465,7 @@ def _materialize_loaded_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
@@ -447,6 +477,8 @@ def _materialize_loaded_weight_state_dict(
             state_dict[key] = weight.to(device=device)
         elif key in host_keys:
             state_dict[key] = _pinned_copy(key, weight.to(dtype=expected.dtype))
+        elif key in staged_keys:
+            state_dict[key] = weight.to(device="cpu", dtype=expected.dtype)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
     return state_dict
@@ -517,7 +549,10 @@ class Engine:
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        host_embeds = [op for op in iter_ops(self.model) if type(op) is VocabParallelEmbedding and not op.weight.is_cuda]
+        host_embeds = [
+            op for op in iter_ops(self.model)
+            if type(op) is VocabParallelEmbedding and not op.quant_method.online and not op.weight.is_cuda
+        ]
         self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
         if host_embeds:
             logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
@@ -675,16 +710,21 @@ class Engine:
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
         host_keys = _host_embedding_keys(self.model, config)
+        staged_keys = _online_quant_keys(self.model, config)
+        if config.online_quant:
+            logger.info_rank0(f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load")
         with _weight_load_context():
-            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
+            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys, staged_keys))
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
 
-    def _load_weight_state_dict(self, config: EngineConfig, host_keys: frozenset[str]) -> Dict[str, torch.Tensor]:
+    def _load_weight_state_dict(
+        self, config: EngineConfig, host_keys: frozenset[str], staged_keys: frozenset[str]
+    ) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys)
+            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys, staged_keys=staged_keys)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
@@ -698,6 +738,7 @@ class Engine:
             ),
             device=self.device,
             host_keys=host_keys,
+            staged_keys=staged_keys,
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:

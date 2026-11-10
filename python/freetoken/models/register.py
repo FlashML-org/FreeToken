@@ -563,11 +563,14 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
     return getattr(module, attr_name)
 
 
-def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming.
+def checkpoint_quant_config(
+    model_path: str, hf_config: Any, spec: ModelSpec, *, online: str | None = None, online_modules: tuple[str, ...] = ()
+):
+    """The checkpoint's QuantConfig under the family's naming, serving its bf16 layers (those ``online_modules`` names, when given) as the ``online`` kind.
 
     A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
-    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig
+    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig, QuantKind
+    from freetoken.layers.quantization.names import name_set
 
     name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
     if spec.parse_config == "parse_gguf_config":
@@ -575,8 +578,12 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
         from freetoken.models.gguf.reader import gguf_tensor_index
 
         types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
-        return GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
-    return QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+        quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+    else:
+        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+    quant.online = QuantKind(online) if online else None
+    quant.online_modules = name_set(online_modules) if online_modules else None
+    return quant
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

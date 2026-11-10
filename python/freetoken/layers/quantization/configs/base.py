@@ -55,6 +55,9 @@ class QuantConfig(ABC):
     dialect: ClassVar[str]
     # per kind the dialect exports, role -> the checkpoint tensor suffix (or Stored) that feeds it
     STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]]
+    # --online-quant: the kind served for the layers this checkpoint stores bf16; --online-quant-modules narrows them (glob patterns on checkpoint names)
+    online: QuantKind | None = None
+    online_modules: Matcher | None = None
 
     def __init__(self, name_map: NameMap | None = None, unquantized: tuple[str, ...] = ()):
         self.name_map = name_map or NameMap()
@@ -97,9 +100,30 @@ class QuantConfig(ABC):
         if layer_kind is LayerKind.EMBEDDING and kind not in methods_for(layer_kind):
             # a checkpoint that quantizes its linears stores the vocab table dense
             scheme, kind = None, QuantKind.NONE
+        if kind is QuantKind.NONE and self._online_serves(layer, layer_kind, prefix):
+            kind = self.online
         cls = method_class(kind, layer_kind)
         cfg = self.layer_config(layer, layer_kind, scheme)
         return cls(cfg, get_quant_backend().select(layer_kind, kind))
+
+    def _online_serves(self, layer: Any, layer_kind: LayerKind, prefix: str) -> bool:
+        from freetoken.layers.embedding import ParallelLMHead
+        from freetoken.models.config import VISION_KEY_PREFIXES
+
+        if self.online is None or self.online not in methods_for(layer_kind):
+            return False
+        # the LM head's full-vocab product would decode the whole table every step; encoder blocks stream to the GPU in one shared layout, which entropy-sized buffers break
+        if isinstance(layer, ParallelLMHead) or prefix.startswith(VISION_KEY_PREFIXES):
+            return False
+        names = self.name_map.to_checkpoint(prefix)
+        if any(self.unquantized(n) for n in names):
+            return False
+        if self.online_modules is None:
+            return True
+        hits = {self.online_modules(n) for n in names}
+        if len(hits) > 1:
+            raise ValueError(f"--online-quant-modules covers only part of the fused module {prefix!r}: {names}")
+        return hits.pop()
 
     def layer_config(self, layer: Any, layer_kind: LayerKind, scheme: QuantScheme | None) -> LinearConfig | MoEConfig:
         """The layer's Linear / MoE config; a dialect overrides it to add what only its checkpoint knows."""

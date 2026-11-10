@@ -9,7 +9,6 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Glm4MoeAttention
-from .df11_embedding import EmbeddingDF11
 from .mlp import GlmGatedMLP
 from .moe import Glm4MoeSparseBlock
 
@@ -45,15 +44,9 @@ class Glm4MoeDecoderLayer(BaseOP):
 
 class Glm4MoeModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
-        if config.quant is not None and config.quant.dialect == "gguf":
-            self.embed_tokens: BaseOP = VocabParallelEmbedding(
-                config.vocab_size, config.hidden_size, quant_config=config.quant, prefix=f"{prefix}.embed_tokens"
-            )
-        else:
-            self.embed_tokens = EmbeddingDF11(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-            )
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size, quant_config=config.quant, prefix=f"{prefix}.embed_tokens"
+        )
         self.layers = OPList(
             [
                 Glm4MoeDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
