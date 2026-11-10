@@ -83,7 +83,12 @@ def _host_memory_available(meminfo_path: Path) -> int | None:
 
 
 def _cgroup_file_cache(directory: Path, *, v1: bool = False) -> int:
-    """Return file-LRU bytes, or zero if optional statistics cannot be trusted."""
+    """Return droppable file-LRU bytes, or zero if the statistics cannot be trusted.
+
+    Dirty and writeback pages sit on the file lists too, but they cannot be
+    dropped until they are written, and a cgroup at its limit is OOM-killed
+    before that finishes, so they are taken back out of the credit.
+    """
     try:
         _, text = _read_bounded_ascii(
             Path(directory) / "memory.stat", _CGROUP_STAT_MAX_BYTES
@@ -104,9 +109,13 @@ def _cgroup_file_cache(directory: Path, *, v1: bool = False) -> int:
 
     # v1 totals match hierarchical usage. Unlike `file`, file LRU lists exclude shmem.
     prefix = "total_" if v1 else ""
-    return counters.get(prefix + "inactive_file", 0) + counters.get(
+    cache = counters.get(prefix + "inactive_file", 0) + counters.get(
         prefix + "active_file", 0
     )
+    dirty, writeback = (
+        ("total_dirty", "total_writeback") if v1 else ("file_dirty", "file_writeback")
+    )
+    return max(0, cache - counters.get(dirty, 0) - counters.get(writeback, 0))
 
 
 def _cgroup_pair_remaining(

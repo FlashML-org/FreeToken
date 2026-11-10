@@ -140,6 +140,51 @@ def test_file_cache_uses_only_matching_file_lists(
 
 
 @pytest.mark.parametrize(
+    "dirty,writeback,remaining",
+    [(2, 1, 15), (2, 0, 16), (0, 1, 17), (16, 0, 4), (8, 8, 4)],
+)
+def test_dirty_and_writeback_pages_are_not_room(
+    memory_files: FakeMemoryFiles,
+    file_cache_cgroup,
+    dirty: int,
+    writeback: int,
+    remaining: int,
+):
+    directory, prefix = file_cache_cgroup
+    dirty_key, writeback_key = (
+        ("total_dirty", "total_writeback")
+        if prefix
+        else ("file_dirty", "file_writeback")
+    )
+    (directory / "memory.stat").write_text(
+        f"{prefix}inactive_file {8 << 30}\n{prefix}active_file {6 << 30}\n"
+        f"{dirty_key} {dirty << 30}\n{writeback_key} {writeback << 30}\n",
+        encoding="ascii",
+    )
+
+    assert memory_files.remaining() == remaining << 30
+    assert memory_files.effective() == remaining << 30
+
+
+def test_other_hierarchy_dirty_counters_are_ignored(
+    memory_files: FakeMemoryFiles, file_cache_cgroup
+):
+    directory, prefix = file_cache_cgroup
+    other_dirty, other_writeback = (
+        ("file_dirty", "file_writeback")
+        if prefix
+        else ("total_dirty", "total_writeback")
+    )
+    (directory / "memory.stat").write_text(
+        f"{prefix}inactive_file {8 << 30}\n{prefix}active_file {6 << 30}\n"
+        f"{other_dirty} {2 << 30}\n{other_writeback} {1 << 30}\n",
+        encoding="ascii",
+    )
+
+    assert memory_files.remaining() == 18 << 30
+
+
+@pytest.mark.parametrize(
     "stat_text",
     [
         None,
