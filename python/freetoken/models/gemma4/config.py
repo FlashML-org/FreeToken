@@ -61,6 +61,16 @@ class Gemma4EArgs:
     def is_kv_source(self, layer_id: int, group_layer_ids: tuple[int, ...]) -> bool:
         return layer_id == max((i for i in group_layer_ids if i < self.first_kv_shared_layer), default=None)
 
+    def kv_shared_layers(self, *groups_layer_ids: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
+        """``ModelConfig.kv_shared_layers``: each shared layer paired with its group's source."""
+        pairs = []
+        for layer_ids in groups_layer_ids:
+            source = next((i for i in layer_ids if self.is_kv_source(i, layer_ids)), None)
+            # no earlier layer of this type: nothing to read, so those layers keep their own slabs
+            if source is not None:
+                pairs += [(i, source) for i in layer_ids if self.is_kv_shared(i)]
+        return tuple(sorted(pairs))
+
 
 def gemma4_e_args(
     num_layers: int,
@@ -201,6 +211,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # checkpoint's own ignore-list.
     expert_quant = detect_expert_quant(top_cfg)
     dense_quant = "nvfp4" if (expert_quant == "nvfp4" and not num_experts > 0) else "none"
+    # Gemma4UnifiedTextConfig omits the E-series fields
+    e_args = gemma4_e_args(
+        cfg.num_hidden_layers,
+        getattr(cfg, "hidden_size_per_layer_input", None) or 0,
+        getattr(cfg, "vocab_size_per_layer_input", None) or 0,
+        getattr(cfg, "num_kv_shared_layers", None) or 0,
+        num_experts,
+        cfg.intermediate_size * (2 if getattr(cfg, "use_double_wide_mlp", False) else 1),
+    )
 
     return ModelConfig(
         num_layers=cfg.num_hidden_layers,
@@ -229,15 +248,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         embedding_scale=float(cfg.hidden_size) ** 0.5,
         vision_config=_parse_vision_config(top_cfg, cfg.hidden_size),
         image_token_id=getattr(top_cfg, "image_token_id", None),
-        # Gemma4UnifiedTextConfig omits the E-series fields
-        gemma4_e_args=gemma4_e_args(
-            cfg.num_hidden_layers,
-            getattr(cfg, "hidden_size_per_layer_input", None) or 0,
-            getattr(cfg, "vocab_size_per_layer_input", None) or 0,
-            getattr(cfg, "num_kv_shared_layers", None) or 0,
-            num_experts,
-            cfg.intermediate_size * (2 if getattr(cfg, "use_double_wide_mlp", False) else 1),
-        ),
+        gemma4_e_args=e_args,
+        kv_shared_layers=e_args.kv_shared_layers(full_layer_ids, sliding_layer_ids) if e_args is not None else (),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",

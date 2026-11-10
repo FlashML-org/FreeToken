@@ -130,6 +130,9 @@ class KVCacheGroupSpec:
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
     attn_type: AttnType = AttnType.FULL
+    # (layer, source) pairs: layers of this group that read the source's slab and own none.
+    # They are not in ``layer_ids``, so neither the pool nor the cost model gives them a slab.
+    shared_layers: Tuple[Tuple[int, int], ...] = ()
 
     @property
     def num_layers(self) -> int:
@@ -382,6 +385,8 @@ class ModelConfig:
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
+    # (layer, source) pairs: the layer attends over the KV the source layer stored and stores none
+    kv_shared_layers: Tuple[Tuple[int, int], ...] = ()
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
@@ -498,13 +503,21 @@ class ModelConfig:
                 ),
             )
 
+        sources = dict(self.kv_shared_layers)
+
+        def split(group) -> dict:
+            return dict(
+                layer_ids=tuple(i for i in group.layer_ids if i not in sources),
+                shared_layers=tuple((i, sources[i]) for i in group.layer_ids if i in sources),
+            )
+
         specs: list[KVCacheGroupSpec] = []
         for group in self.attention_groups:
             if isinstance(group, FullAttentionGroupConfig):
                 specs.append(
                     KVCacheGroupSpec(
                         name=group.name,
-                        layer_ids=group.layer_ids,
+                        **split(group),
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=None,
@@ -519,7 +532,7 @@ class ModelConfig:
                 specs.append(
                     KVCacheGroupSpec(
                         name=group.name,
-                        layer_ids=group.layer_ids,
+                        **split(group),
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,

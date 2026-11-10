@@ -102,6 +102,32 @@ def test_kv_source_is_the_last_unshared_layer_of_each_attention_type():
     assert [i for i in swa.layer_ids if args.is_kv_source(i, swa.layer_ids)] == [13]
 
 
+@pytest.mark.parametrize("kv_format", ["none", "int8_per_token_head"])
+@pytest.mark.parametrize("release, full_slabs, swa_slabs", [(E2B, 3, 12), (E4B, 4, 20)])
+def test_shared_layers_read_their_source_slab_and_own_none(release, full_slabs, swa_slabs, kv_format):
+    from freetoken.kvcache import create_kvcache_pool
+    from freetoken.kvcache.format import KV_FORMATS
+
+    config = parse_config(_hf_config(release))
+    pool = create_kvcache_pool(
+        model_config=config, num_pages=2, page_size=16, num_swa_tokens=8,
+        dtype=torch.bfloat16, device=torch.device("cpu"), kv_format=KV_FORMATS[kv_format],
+    )
+
+    assert pool.full_kv_pool.buffer.shape[1] == full_slabs
+    assert pool.swa_kv_pool.buffer.shape[1] == swa_slabs
+    args = config.gemma4_e_args
+    for group in config.attention_groups:
+        (source,) = [i for i in group.layer_ids if args.is_kv_source(i, group.layer_ids)]
+        for i in filter(args.is_kv_shared, group.layer_ids):
+            assert pool.k_cache(i).data_ptr() == pool.k_cache(source).data_ptr()
+            assert pool.v_cache(i).data_ptr() == pool.v_cache(source).data_ptr()
+            if kv_format != "none":
+                # a shared layer reading zero scales would only show up as worse 8-bit outputs
+                assert pool.k_scale(i).data_ptr() == pool.k_scale(source).data_ptr()
+                assert pool.v_scale(i).data_ptr() == pool.v_scale(source).data_ptr()
+
+
 def test_model_shapes_match_the_e2b_checkpoint():
     state = _meta_model(parse_config(_hf_config(E2B))).state_dict()
 

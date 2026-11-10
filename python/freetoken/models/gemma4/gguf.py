@@ -312,6 +312,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         vision_config=vision_config,
         image_token_id=getattr(shim, "image_token_id", None),
         gemma4_e_args=e_args,
+        kv_shared_layers=e_args.kv_shared_layers(full_layer_ids, swa_layer_ids) if e_args is not None else (),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",

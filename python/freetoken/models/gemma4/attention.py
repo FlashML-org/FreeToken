@@ -19,8 +19,8 @@ class Gemma4Attention(BaseOP):
 
     On E2B / E4B the KV-shared tail projects q only and attends over the k, v of the last
     earlier layer of its attention type. That layer hands its rows over in ``shared_kv``, a
-    dict living for one forward, so a captured graph records the same tensors. Each shared
-    layer still stores them in its own KV slab; reading the source's slab would save that memory.
+    dict living for one forward, so a captured graph records the same tensors. The KV pool
+    maps a shared layer onto its source's slab and skips its store (``kv_shared_layers``).
     """
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
