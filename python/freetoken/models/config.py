@@ -376,6 +376,9 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
+    # layers. Opaque to model-agnostic engine code; None for every other model.
+    gemma4_e_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

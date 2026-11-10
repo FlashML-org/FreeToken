@@ -26,9 +26,9 @@ from freetoken.models.config import (
 )
 from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
 from freetoken.models.gguf.reader import gguf_tensor_index, load_gguf_metadata
-from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, weight_scale
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, table_matrix, weight_scale
 
-from .config import _parse_vision_config
+from .config import _parse_vision_config, gemma4_e_args
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -140,6 +140,7 @@ def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, 
             "rope_parameters": {"rope_theta": _ROPE_THETA},
             "hidden_activation": "gelu_pytorch_tanh",
             "standardize": "v.std_bias" in index,
+            "use_clipped_linears": "v.blk.0.attn_q.input_max" in index,
         }
         processor_type = "Gemma4ImageProcessor"
     else:
@@ -217,13 +218,18 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             raise KeyError(f"missing GGUF metadata key gemma4.{key}")
         return val
 
-    if int(m.get("gemma4.embedding_length_per_layer_input", 0)) or int(m.get("gemma4.attention.shared_kv_layers", 0)):
-        raise NotImplementedError("gemma4 E2B / E4B GGUF (per-layer input embeddings, shared KV layers) is not supported")
     num_layers = int(g("block_count"))
     hidden = int(g("embedding_length"))
     num_experts = int(m.get("gemma4.expert_count", 0))
     num_qo_heads = int(g("attention.head_count"))
-    kv_per_layer = g("attention.head_count_kv")  # per-layer list
+    # per-layer lists, or one value for every layer
+    kv_per_layer = g("attention.head_count_kv")
+    if not isinstance(kv_per_layer, (list, tuple)):
+        kv_per_layer = [kv_per_layer] * num_layers
+    ffn_per_layer = g("feed_forward_length")
+    if not isinstance(ffn_per_layer, (list, tuple)):
+        ffn_per_layer = [ffn_per_layer] * num_layers
+    ffn_per_layer = [int(x) for x in ffn_per_layer]
     # True -> sliding-window (SWA) layer, False -> full attention.
     swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
@@ -237,6 +243,28 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     swa_kv = int(kv_per_layer[swa_layer_ids[0]]) if swa_layer_ids else int(kv_per_layer[0])
     full_kv = int(kv_per_layer[full_layer_ids[0]]) if full_layer_ids else int(kv_per_layer[0])
 
+    # Full layers ship no v in the GGUF (k is reused as v), except on E2B / E4B. A metadata-only
+    # GGUF (an FTW dir's source_metadata.gguf) has no tensor table, so there the key has to say.
+    index = gguf_tensor_index(shim.model_path)
+    full_k_eq_v = (
+        not any(f"blk.{i}.{part}.weight" in index for i in full_layer_ids for part in ("attn_v", "attn_qkv"))
+        if index
+        else "gemma4.attention.value_length" not in m
+    )
+    e_args = gemma4_e_args(
+        num_layers,
+        int(m.get("gemma4.embedding_length_per_layer_input", 0)),
+        int(shim.vocab_size),
+        int(m.get("gemma4.attention.shared_kv_layers", 0)),
+        num_experts,
+        ffn_per_layer[-1],
+    )
+    # the config holds one MLP width, and one more for the KV-shared layers (E2B doubles theirs)
+    if ffn_per_layer != [
+        e_args.kv_shared_intermediate_size if e_args is not None and e_args.is_kv_shared(i) else ffn_per_layer[0]
+        for i in range(num_layers)
+    ]:
+        raise NotImplementedError(f"gemma4 GGUF MLP widths {sorted(set(ffn_per_layer))} do not split at the KV-shared layers")
     max_pos = int(g("context_length"))
     full_rotary = RotaryConfig(
         head_dim=full_head_dim,
@@ -264,7 +292,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         head_dim=full_head_dim,
         hidden_size=hidden,
         vocab_size=int(shim.vocab_size),
-        intermediate_size=int(g("feed_forward_length")),
+        intermediate_size=ffn_per_layer[0],
         hidden_act="gelu_tanh",
         rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
@@ -283,6 +311,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         embedding_scale=float(hidden) ** 0.5,
         vision_config=vision_config,
         image_token_id=getattr(shim, "image_token_id", None),
+        gemma4_e_args=e_args,
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
@@ -290,8 +319,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
                 num_kv_heads=full_kv,
                 head_dim=full_head_dim,
                 rotary_config=full_rotary,
-                # Full layers ship no v_proj in the GGUF (k reused as v).
-                k_eq_v=True,
+                k_eq_v=full_k_eq_v,
             ),
             SWAAttentionGroupConfig(
                 name="swa",
@@ -331,8 +359,15 @@ _MOE_LAYER_SCALAR_MAP = {
     "ffn_down_exps.scale": "feed_forward.router.per_expert_scale",
 }
 
+# E2B / E4B's per-layer input
+_PER_LAYER_SCALAR_MAP = {
+    "post_norm.weight": "post_per_layer_input_norm.weight",
+}
+
 # checkpoint module leaf (gemma4 HF naming) -> GGUF tensor
 _LAYER_LEAVES = {
+    "per_layer_input_gate": "inp_gate",
+    "per_layer_projection": "proj",
     "self_attn.q_proj": "attn_q",
     "self_attn.k_proj": "attn_k",
     "self_attn.o_proj": "attn_output",
@@ -350,6 +385,10 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     """Checkpoint module name -> the GGUF tensors (without ``.weight``) that store it; empty for modules the GGUF has no matrix for."""
     if name == "model.embed_tokens":
         return ("token_embd",)
+    if name == "model.embed_tokens_per_layer":
+        return ("per_layer_token_embd",)
+    if name == "model.per_layer_model_projection":
+        return ("per_layer_model_proj",)
     if name == "lm_head":
         return ("output",) if "output.weight" in tensors else ()
     m = _LAYER_RE.match(name)
@@ -410,27 +449,54 @@ def iter_gguf_weights(
         yield from fused("lm_head", [out], [matrix(out)], hidden)
     yield "model.norm.weight", float_tensor(t("output_norm"))
 
-    scalar_map = {**_LAYER_SCALAR_MAP, **_MOE_LAYER_SCALAR_MAP} if config.moe_enabled else _LAYER_SCALAR_MAP
+    e_args = config.gemma4_e_args
+    if e_args is not None:
+        table, projection = t("per_layer_token_embd"), t("per_layer_model_proj")
+        yield from fused("model.embed_tokens_per_layer", [table], [table_matrix(table)], int(table.ne[0]))
+        yield from fused("model.per_layer_model_projection", [projection], [matrix(projection)], hidden)
+        yield "model.per_layer_projection_norm.weight", float_tensor(t("per_layer_proj_norm"))
+
+    scalar_map = {**_LAYER_SCALAR_MAP, **_MOE_LAYER_SCALAR_MAP} if config.moe_enabled else dict(_LAYER_SCALAR_MAP)
+    if e_args is not None:
+        scalar_map.update(_PER_LAYER_SCALAR_MAP)
     for layer in range(config.num_layers):
         blk, base = f"blk.{layer}", f"model.layers.{layer}"
+        kv_shared = e_args is not None and e_args.is_kv_shared(layer)
         for suffix, rel in scalar_map.items():
+            # a KV-shared layer has no k_norm, whether or not the file still ships one
+            if kv_shared and suffix == "attn_k_norm.weight":
+                continue
             tensor = float_tensor(index[f"{blk}.{suffix}"])
             if suffix == "ffn_down_exps.scale" and weight_scale(index[f"{blk}.ffn_down_exps.weight"]) is not None:
                 # the converter folds per_expert_scale into the NVFP4 down weight_scale_2, which the expert kernel applies
                 tensor = torch.ones_like(tensor)
             yield f"{base}.{rel}", tensor.reshape(1) if rel.endswith("layer_scalar") else tensor
-        if f"{blk}.attn_qkv.weight" in index:
-            # convert_hf_to_gguf.py --fuse-qkv stores q, k and v as one attn_qkv matrix
-            qkv = [t(f"{blk}.attn_qkv")]
+        if kv_shared and f"{blk}.attn_qkv.weight" in index:
+            # --fuse-qkv fuses a KV-shared layer too (the HF checkpoint still ships its k and v):
+            # q is the leading rows, as llama.cpp reads it, and the rest go unread
+            qkv = t(f"{blk}.attn_qkv")
+            q_rows = config.num_qo_heads * config.attention_group_for_layer(layer).head_dim
+            yield from fused(f"{base}.self_attn.q_proj", [qkv], [matrix(qkv)[:q_rows]], hidden)
+        elif kv_shared:
+            q = t(f"{blk}.attn_q")
+            yield from fused(f"{base}.self_attn.q_proj", [q], [matrix(q)], hidden)
         else:
-            q, k = t(f"{blk}.attn_q"), t(f"{blk}.attn_k")
-            qkv = [q, k, index.get(f"{blk}.attn_v.weight", k)]
-        yield from fused(f"{base}.self_attn.qkv_proj", qkv, [matrix(p) for p in qkv], hidden)
+            if f"{blk}.attn_qkv.weight" in index:
+                # convert_hf_to_gguf.py --fuse-qkv stores q, k and v as one attn_qkv matrix
+                qkv = [t(f"{blk}.attn_qkv")]
+            else:
+                q, k = t(f"{blk}.attn_q"), t(f"{blk}.attn_k")
+                qkv = [q, k, index.get(f"{blk}.attn_v.weight", k)]
+            yield from fused(f"{base}.self_attn.qkv_proj", qkv, [matrix(p) for p in qkv], hidden)
         o = t(f"{blk}.attn_output")
         yield from fused(f"{base}.self_attn.o_proj", [o], [matrix(o)], int(o.ne[0]))
         gate, up, down = (t(f"{blk}.ffn_{p}") for p in ("gate", "up", "down"))
         yield from fused(f"{base}.feed_forward.shared_mlp.gate_up_proj", [gate, up], [matrix(gate), matrix(up)], hidden)
         yield from fused(f"{base}.feed_forward.shared_mlp.down_proj", [down], [matrix(down)], int(down.ne[0]))
+        if e_args is not None:
+            gate, proj = t(f"{blk}.inp_gate"), t(f"{blk}.proj")
+            yield from fused(f"{base}.per_layer_input_gate", [gate], [matrix(gate)], hidden)
+            yield from fused(f"{base}.per_layer_projection", [proj], [matrix(proj)], int(proj.ne[0]))
 
     if vision:
         yield from iter_mmproj_weights(find_mmproj(model_path))

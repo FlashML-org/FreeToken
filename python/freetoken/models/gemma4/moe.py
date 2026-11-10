@@ -92,17 +92,28 @@ class Gemma4DenseMLP(BaseOP):
     (``mlp.* -> feed_forward.shared_mlp.*``, bare ``layer_scalar`` /
     ``post_feedforward_layernorm.``) resolves the dense checkpoint unchanged."""
 
-    def __init__(self, config: ModelConfig, *, prefix: str = ""):
-        self.shared_mlp = GatedMLP(config, quant_config=config.quant, prefix=f"{prefix}.shared_mlp")
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        e_args = config.gemma4_e_args
+        self.shared_mlp = GatedMLP(
+            config,
+            intermediate_size=(
+                e_args.kv_shared_intermediate_size if e_args is not None and e_args.is_kv_shared(layer_id) else None
+            ),
+            quant_config=config.quant,
+            prefix=f"{prefix}.shared_mlp",
+        )
         self.post_feedforward_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_scalar = torch.empty(1)
 
-    def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def forward_unscaled(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """The sandwich before ``layer_scalar``; E2B / E4B add their per-layer input in between."""
         h = self.shared_mlp.forward(pre_ff)
-        h = self.post_feedforward_layernorm.forward(h)
-        return (x + h) * self.layer_scalar
+        return x + self.post_feedforward_layernorm.forward(h)
+
+    def forward(self, pre_ff: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_unscaled(pre_ff, x) * self.layer_scalar
 
 
 __all__ = [

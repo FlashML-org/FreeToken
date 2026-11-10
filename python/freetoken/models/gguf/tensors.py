@@ -29,6 +29,13 @@ def matrix(info: GgufTensorInfo) -> torch.Tensor:
     return packed_rows(info) if is_quantized(info.ggml_type) else float_tensor(info)
 
 
+def table_matrix(info: GgufTensorInfo) -> torch.Tensor:
+    """``matrix`` for a table too large to copy first: float rows stay a read-only view of the mapped file, and the loader's copy to the table's final place is the only one."""
+    if is_quantized(info.ggml_type):
+        return packed_rows(info)
+    return torch.from_numpy(info.data()).view(_FLOAT_DTYPES[info.ggml_type]).view(*reversed(info.ne))
+
+
 def check_scales(model_path: str, *, nvfp4: bool = True, known: tuple[str, ...] = ()) -> None:
     """Refuse ``.scale`` / ``.input_scale`` tensors that nothing reads.
 
@@ -78,7 +85,8 @@ def fused(prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k
         rows = [p.to(torch.bfloat16) for p in parts]
         if pad:
             rows.append(torch.zeros(pad, *rows[0].shape[1:], dtype=torch.bfloat16))
-        yield f"{prefix}.weight", torch.cat(rows, dim=0)
+        # one part needs no copy: a BF16 per-layer table is 5.6 GB
+        yield f"{prefix}.weight", rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
         return
     segs = segments(tuple(types), tuple(p.shape[0] for p in parts))
     for i, seg in enumerate(segs):
@@ -97,4 +105,4 @@ def fused(prefix: str, infos: list[GgufTensorInfo], parts: list[torch.Tensor], k
         yield f"{prefix}.ggml_scale", scales
 
 
-__all__ = ["check_scales", "float_tensor", "fused", "matrix", "packed_rows", "weight_scale"]
+__all__ = ["check_scales", "float_tensor", "fused", "matrix", "packed_rows", "table_matrix", "weight_scale"]

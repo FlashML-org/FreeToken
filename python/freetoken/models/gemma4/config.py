@@ -43,6 +43,46 @@ class UnifiedVisionConfig:
     text_hidden_size: int
 
 
+@dataclass(frozen=True)
+class Gemma4EArgs:
+    """What the E2B / E4B releases add to the decoder."""
+
+    # width of one layer's per-layer input; the table holds num_layers of them per token
+    per_layer_hidden_size: int
+    per_layer_vocab_size: int
+    # layers from here on project q only and reuse k, v of the last earlier layer of their attention type
+    first_kv_shared_layer: int
+    # their dense MLP's width: E2B doubles it, E4B keeps intermediate_size
+    kv_shared_intermediate_size: int
+
+    def is_kv_shared(self, layer_id: int) -> bool:
+        return layer_id >= self.first_kv_shared_layer
+
+    def is_kv_source(self, layer_id: int, group_layer_ids: tuple[int, ...]) -> bool:
+        return layer_id == max((i for i in group_layer_ids if i < self.first_kv_shared_layer), default=None)
+
+
+def gemma4_e_args(
+    num_layers: int,
+    per_layer_hidden_size: int,
+    per_layer_vocab_size: int,
+    num_kv_shared_layers: int,
+    num_experts: int,
+    kv_shared_intermediate_size: int,
+) -> Gemma4EArgs | None:
+    """None for the releases without per-layer inputs: their configs set the width to 0."""
+    if not per_layer_hidden_size:
+        if num_kv_shared_layers:
+            raise NotImplementedError("gemma4 with KV-shared layers but no per-layer inputs is not supported")
+        return None
+    if num_experts:
+        # the per-layer input step sits between the dense MLP's residual and layer_scalar, which the MoE block fuses
+        raise NotImplementedError("gemma4 with per-layer inputs and routed experts is not supported")
+    return Gemma4EArgs(
+        per_layer_hidden_size, per_layer_vocab_size, num_layers - num_kv_shared_layers, kv_shared_intermediate_size
+    )
+
+
 def _text_config(hf_config: Any) -> tuple[Any, list[str] | None, Any]:
     top_architectures = getattr(hf_config, "architectures", None)
     if hasattr(hf_config, "text_config") and hf_config.text_config is not None:
@@ -189,6 +229,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
         embedding_scale=float(cfg.hidden_size) ** 0.5,
         vision_config=_parse_vision_config(top_cfg, cfg.hidden_size),
         image_token_id=getattr(top_cfg, "image_token_id", None),
+        # Gemma4UnifiedTextConfig omits the E-series fields
+        gemma4_e_args=gemma4_e_args(
+            cfg.num_hidden_layers,
+            getattr(cfg, "hidden_size_per_layer_input", None) or 0,
+            getattr(cfg, "vocab_size_per_layer_input", None) or 0,
+            getattr(cfg, "num_kv_shared_layers", None) or 0,
+            num_experts,
+            cfg.intermediate_size * (2 if getattr(cfg, "use_double_wide_mlp", False) else 1),
+        ),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
@@ -211,4 +260,4 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["UnifiedVisionConfig", "VisionConfig", "parse_config"]
+__all__ = ["Gemma4EArgs", "UnifiedVisionConfig", "VisionConfig", "gemma4_e_args", "parse_config"]

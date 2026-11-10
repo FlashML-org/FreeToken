@@ -147,12 +147,17 @@ class EngineConfig:
     @cached_property
     def active_encoders(self) -> tuple[EncoderSpec, ...]:
         """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
-        return tuple(
-            e
-            for e in self.model_spec.encoders
-            if getattr(self.hf_config, e.config_key, None) is not None
-            and e.kind not in self.mm.disabled_encoders
-        )
+        active = []
+        for e in self.model_spec.encoders:
+            section = getattr(self.hf_config, e.config_key, None)
+            if section is None or e.kind in self.mm.disabled_encoders:
+                continue
+            reason = e.unserved(section) if e.unserved is not None else None
+            if reason is not None:
+                logger.warning(f"{e.kind} input is not served on this checkpoint: {reason}")
+                continue
+            active.append(e)
+        return tuple(active)
 
     @cached_property
     def served_modalities(self) -> frozenset[str]:
