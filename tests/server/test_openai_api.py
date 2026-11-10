@@ -18,6 +18,7 @@ from freetoken.server.openai_api import (
     stream_chat_completion_chunks,
     stream_completion_chunks,
 )
+from freetoken.server.responses_api import ResponsesRequest, handle_responses
 
 
 def run(coro):
@@ -844,6 +845,154 @@ def test_stream_timings_stay_off_without_the_flag():
 
     events = parse_sse(run(collect()))
     assert not [e for e in events if isinstance(e, dict) and "timings" in e]
+
+
+def _pt_replies(timings_on_intermediate: bool) -> list[UserReply]:
+    """Two token acks; the terminal one always carries the snapshot (the scheduler
+    stamps it for every request), the intermediate one only when the handler's AND
+    (asked AND server flag) told the engine to stamp per-token."""
+    t1 = _sched_timings(prompt_n=5, prompt_ms=100.0, predicted_n=1, predicted_ms=0.001)
+    t2 = _sched_timings(prompt_n=5, prompt_ms=100.0, predicted_n=2, predicted_ms=40.0)
+    return [
+        UserReply(uid=42, incremental_output="a", finished=False, prompt_tokens_delta=5,
+                  completion_tokens_delta=1, timings=t1 if timings_on_intermediate else None),
+        UserReply(uid=42, incremental_output="b", finished=True, finish_reason="stop",
+                  completion_tokens_delta=1, timings=t2),
+    ]
+
+
+@pytest.mark.parametrize("asked,report", [(True, True), (False, True), (True, False)])
+def test_stream_timings_per_token_rides_every_chat_content_chunk(asked, report):
+    # the engine stamps partials only when the handler's AND passed: asked AND flag
+    state = FakeState(_pt_replies(asked and report))
+    if report:
+        state.config.enable_timings_report = True
+    # include_usage and continuous_usage_stats must coexist with the per-token blocks
+    req = chat_request(tools=None, stream=True, timings_per_token=asked,
+                       stream_options={"include_usage": True, "continuous_usage_stats": True})
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    # the role-first chunk precedes the first ack: nothing measured, never a block
+    assert "timings" not in events[0]
+    content = [e for e in events if e["choices"] and e["choices"][0]["delta"].get("content")]
+    if not report:
+        # asked but the server never opted in: no block on any chunk, finish included
+        assert all("timings" not in e for e in events)
+        return
+    if asked:
+        assert [e["timings"]["predicted_n"] for e in content] == [1, 2]
+        assert all("usage" in e for e in content)  # continuous usage keeps riding too
+    else:
+        assert all("timings" not in e for e in content)
+    # the #814 final placement survives: the usage chunk still carries the terminal snapshot
+    final = next(e for e in reversed(events) if e.get("usage") is not None and not e["choices"])
+    assert final["timings"]["predicted_n"] == 2
+
+
+@pytest.mark.parametrize("asked", [True, False])
+def test_stream_timings_per_token_off_keeps_the_post_terminal_flush_clean(asked):
+    """The terminal ack carries timings for EVERY request; text a parser flushes after
+    it (qwen3 holds a trailing partial tag to the end of stream) must attach a block
+    only for a stream that asked, else the terminal snapshot rides residue chunks."""
+    t1 = _sched_timings(prompt_n=4, prompt_ms=100.0, predicted_n=1, predicted_ms=0.001)
+    t2 = _sched_timings(prompt_n=4, prompt_ms=100.0, predicted_n=2, predicted_ms=40.0)
+    state = FakeState([
+        UserReply(uid=42, incremental_output="ok", finished=False, prompt_tokens_delta=4,
+                  completion_tokens_delta=1, timings=t1 if asked else None),
+        UserReply(uid=42, incremental_output="<", finished=True, finish_reason="stop",
+                  completion_tokens_delta=1, timings=t2),
+    ], reasoning_parser="qwen3")
+    state.config.enable_timings_report = True
+    req = chat_request(tools=None, stream=True, timings_per_token=asked)
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    flushed = [e for e in events if e["choices"] and e["choices"][0]["delta"].get("reasoning_content") == "<"]
+    assert len(flushed) == 1
+    assert ("timings" in flushed[0]) is asked
+    if asked:
+        assert flushed[0]["timings"]["predicted_n"] == 2  # the terminal snapshot
+
+
+@pytest.mark.parametrize("asked,report", [(True, True), (False, True), (True, False)])
+def test_completions_stream_timings_per_token_rides_every_content_chunk(asked, report):
+    # the engine stamps partials only when the handler's AND passed: asked AND flag
+    state = FakeState(_pt_replies(asked and report))
+    if report:
+        state.config.enable_timings_report = True
+    options = {"include_usage": True, "continuous_usage_stats": True}
+    req = CompletionRequest(model="client-model", prompt="hi", stream=True,
+                            stream_options=options, timings_per_token=asked)
+
+    async def collect():
+        return [chunk async for chunk in stream_completion_chunks(42, req, state)]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    content = [e for e in events if e["choices"] and e["choices"][0]["text"]]
+    if not report:
+        # asked but the server never opted in: no block on any chunk, finish included
+        assert all("timings" not in e for e in events)
+        return
+    if asked:
+        assert [e["timings"]["predicted_n"] for e in content] == [1, 2]
+        assert all("usage" in e for e in content)  # continuous usage keeps riding too
+    else:
+        assert all("timings" not in e for e in content)
+    # as on the chat stream: the final usage chunk keeps the #814 terminal placement
+    final = next(e for e in reversed(events) if not e["choices"])
+    assert final["usage"]["completion_tokens"] == 2
+    assert final["timings"]["predicted_n"] == 2
+
+
+def test_timings_per_token_only_stamps_the_engine_when_the_server_agrees():
+    """The request field is silently dropped unless the server runs with
+    --enable-timings-report AND the request streams (llama.cpp publishes partials
+    on streams only): the API layer ANDs all three before the scheduler sees it."""
+    req = chat_request(tools=None, stream=True, timings_per_token=True)
+    state = FakeState([UserReply(uid=42, incremental_output="x", finished=True)])
+    run(handle_chat_completion(req, request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # server flag off: ignored
+
+    state.config.enable_timings_report = True
+    run(handle_chat_completion(req, request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.timings_per_token
+    run(handle_chat_completion(chat_request(tools=None, timings_per_token=True),
+                               request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # not a stream: ignored
+
+    creq = CompletionRequest(model="client-model", prompt="hi", stream=True,
+                             timings_per_token=True)
+    state = FakeState([UserReply(uid=42, incremental_output="x", finished=True)])
+    run(handle_completion(creq, request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token
+
+    state.config.enable_timings_report = True
+    run(handle_completion(creq, request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.timings_per_token
+    run(handle_completion(
+        CompletionRequest(model="client-model", prompt="hi", timings_per_token=True),
+        request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # not a stream: ignored
+
+    rreq = ResponsesRequest.model_validate(
+        {"model": "gpt-x", "input": "hi", "stream": True, "timings_per_token": True})
+    state = FakeState([UserReply(uid=42, incremental_output="x", finished=True)])
+    run(handle_responses(rreq, request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # server flag off: ignored
+
+    state.config.enable_timings_report = True
+    run(handle_responses(rreq, request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.timings_per_token
+    run(handle_responses(
+        ResponsesRequest.model_validate(
+            {"model": "gpt-x", "input": "hi", "timings_per_token": True}),
+        request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # not a stream: ignored
 
 
 # --------------------------------------------------------------- minimax think

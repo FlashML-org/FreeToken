@@ -123,11 +123,12 @@ GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | T
 
 @dataclass
 class GenUsage:
-    """Token counts of a streaming generation so far. generate_events() updates it from each engine reply before it yields that reply's events."""
+    """Token counts of a streaming generation so far. generate_events() updates it from each engine reply before it yields that reply's events. `timings` carries that reply's raw scheduler snapshot (the terminal one on requests that did not ask for per-token timings); streamers attach it per chunk only for requests that did."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
 
 
 @dataclass
@@ -146,7 +147,8 @@ class GenResult:
 def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
     """llama.cpp's per-request timings object (server_slot_stats::to_json, b10408+) as
     frontends like llama-swap read it, plus queue_ms as a FreeToken extension. The spans
-    and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack:
+    and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack
+    (on every ack of a timings_per_token request):
     queue_ms covers waiting-queue admission to the first prefill chunk, prompt_ms the
     first chunk to the first sampled token on the host, predicted_ms the first to the
     last committed token. prompt_n counts only the evaluated tokens and the decode rates
@@ -221,6 +223,7 @@ def resolve_sampling(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    timings_per_token: bool = False,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -244,6 +247,7 @@ def resolve_sampling(
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
+        timings_per_token=timings_per_token,
     )
 
 
@@ -759,6 +763,7 @@ async def _generate_events_impl(
         usage.cached_tokens += ack.cached_tokens
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
+            usage.timings = timings
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)

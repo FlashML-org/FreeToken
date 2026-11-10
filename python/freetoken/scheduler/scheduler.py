@@ -374,7 +374,8 @@ class Scheduler(SchedulerIOMixin):
                     msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
                     req.stats.stamp_token(now)
                     reply.append(msg)
-                    if msg.finished:
+                    # a timings_per_token request gets the snapshot on every reply, growing
+                    if msg.finished or req.sampling_params.timings_per_token:
                         msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
                     finished = msg.finished
 
@@ -445,7 +446,8 @@ class Scheduler(SchedulerIOMixin):
             req.stats.draft_n += k
             req.stats.draft_n_accepted += min(n, emitted)
             reply.append(msg)
-            if msg.finished:
+            # a timings_per_token request gets the snapshot on every reply, growing
+            if msg.finished or req.sampling_params.timings_per_token:
                 msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
             req.commit_pending(n)
             self.cache_manager.rollback_tail(req, req.cached_len, cached + k + 1)

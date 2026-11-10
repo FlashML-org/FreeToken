@@ -55,12 +55,14 @@ def _setup():
     return pool, cm, tm, dm, stub, events
 
 
-def _decoding_req(pool, cm, tm, uid: int, max_tokens: int) -> Req:
+def _decoding_req(pool, cm, tm, uid: int, max_tokens: int, timings_per_token: bool = False) -> Req:
     """A request whose prefill has drained: KV for the prompt, its first output token pending at PROMPT."""
     prompt = torch.arange(1, PROMPT + 1, dtype=torch.int32) + 100 * uid
     match = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=PROMPT))
     req = Req(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=max_tokens, uid=uid,
-              sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True), cache_handle=match.cuda_handle)
+              sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True,
+                                             timings_per_token=timings_per_token),
+              cache_handle=match.cuda_handle)
     req.linear_slot_idx = pool.alloc(1)[0]
     req.mamba_ping_pong = tuple(pool.alloc(2))
     req.mamba_next_track_idx = 1
@@ -147,3 +149,35 @@ def test_drain_counts_drafts_and_attaches_timings():
     assert t["predicted_n"] == 3  # first token + the two committed here
     assert t["predicted_ms"] > 0.0  # first -> last committed token
     assert t["draft_n"] == K and t["draft_n_accepted"] == 2
+
+
+def test_drain_stamps_intermediate_timings_when_requested():
+    """A request whose sampling_params ask for per-token timings get the ReqStats
+    snapshot on every reply, not only the terminal one; the non-asking table above
+    keeps the old None-on-intermediate rule."""
+    pool, cm, tm, dm, stub, events = _setup()
+    reqs = [_decoding_req(pool, cm, tm, 1, 16, timings_per_token=True),
+            _decoding_req(pool, cm, tm, 2, 3, timings_per_token=True)]
+    dm.filter_reqs(reqs)
+    for req in reqs:
+        req.widen_pending(K)
+    cm.allocate_paged(reqs)
+    for req in reqs:
+        req.stats.enqueued_at = 1.0
+        req.stats.first_chunk_at = 2.0
+        req.stats.first_token_at = 3.0
+        req.stats.prompt_n = PROMPT
+    out = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]])
+    output = SimpleNamespace(next_tokens_gpu=out, next_tokens_cpu=out, emitted_cpu=torch.tensor([3, 3]))
+    batch = Batch(reqs=reqs, phase="verify", rows_per_req=K + 1)
+    reply, finished = [], set()
+
+    Scheduler._drain_verify(stub, batch, output, reply, finished)
+
+    # req 1's step is not terminal, yet its reply already carries the growing snapshot
+    assert not reply[0].finished and reply[0].timings is not None
+    assert reply[0].timings["predicted_n"] == 5  # first token + the four committed here
+    assert reply[0].timings["prompt_n"] == PROMPT
+    assert reply[0].timings["draft_n"] == K and reply[0].timings["draft_n_accepted"] == 3
+    # the terminal reply of the same drain keeps the unchanged terminal snapshot
+    assert reply[1].finished and reply[1].timings["predicted_n"] == 3

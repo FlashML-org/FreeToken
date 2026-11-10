@@ -49,8 +49,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
-    # Scheduler-measured per-request timings (ReqStats.finish) on the terminal reply
-    # only; None on intermediate replies, errors and aborts.
+    # Scheduler-measured per-request timings (ReqStats.finish): on the terminal reply,
+    # plus every intermediate reply when sampling_params.timings_per_token was set;
+    # None on other intermediate replies, errors and aborts.
     timings: dict | None = None
 
 

@@ -47,7 +47,8 @@ class UserReply(BaseFrontendMsg):
     gpu_mem_bytes: int = 0
     # Scheduler-measured per-request timings (queue/prompt/predicted spans, cache/prompt/
     # predicted counts, draft counters), passthrough of DetokenizeMsg.timings: present on
-    # the terminal reply of a served request, None otherwise.
+    # the terminal reply of a served request, and on every reply when the request asked
+    # for per-token timings; None otherwise.
     timings: dict | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
