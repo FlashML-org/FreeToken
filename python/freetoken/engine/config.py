@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
+from freetoken.kvcache.format import KVFormat, resolve_kv_format
 from freetoken.layers.quantization import online_kinds, set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
@@ -28,6 +29,8 @@ class EngineConfig:
     hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # --kv-cache-dtype: "auto" stores K and V in the compute dtype
+    kv_cache_dtype: str = "auto"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
@@ -124,6 +127,10 @@ class EngineConfig:
     num_token_override: int | None = None
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
+
+    @property
+    def kv_format(self) -> KVFormat:
+        return resolve_kv_format(self.kv_cache_dtype)
 
     def __post_init__(self):
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):

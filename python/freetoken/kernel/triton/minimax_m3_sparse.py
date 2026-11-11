@@ -43,6 +43,9 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile
+from freetoken.kvcache.format import NONE, KVFormat
+
 # One sparse block == one KV page (the engine pins page_size to this).
 SPARSE_BLOCK_SIZE = 128
 
@@ -577,6 +580,8 @@ def _gqa_sparse_fwd_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
     k_ptr,  # K slab, row-flat: [rows, num_kv_heads, head_dim]
     v_ptr,  # V slab, row-flat: [rows, num_kv_heads, head_dim]
+    k_scale_ptr,  # [rows, num_kv_heads, 1]
+    v_scale_ptr,  # [rows, num_kv_heads, 1]
     t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
     o_ptr,  # [total_q, num_heads, head_dim]
     block_rows_ptr,  # [num_reqs, max_blocks] int32 base rows
@@ -591,12 +596,14 @@ def _gqa_sparse_fwd_kernel(
     stride_qn, stride_qh, stride_qd,
     stride_kr, stride_kh, stride_kd,
     stride_vr, stride_vh, stride_vd,
+    stride_kss, stride_vss,
     stride_th, stride_tn, stride_tk,
     stride_on, stride_oh, stride_od,
     stride_br_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
+    KV_FMT: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -650,15 +657,16 @@ def _gqa_sparse_fwd_kernel(
         # partial newest page nearly every step; unmasked rows would NaN the
         # whole output row). BSAKVCache's zero-init is defense-in-depth, not a
         # substitute -- recycled pages get re-dirtied.
-        k = tl.load(
+        k = kv_tile(
             k_ptr
             + (base + off_n[None, :]) * stride_kr
             + pid_kh * stride_kh
             + off_d[:, None] * stride_kd,
-            mask=d_mask[:, None] & pos_mask[None, :],
-            other=0.0,
+            d_mask[:, None] & pos_mask[None, :],
+            KV_FMT,
         )  # [D, N]
-        qk = tl.dot(q, k) * sm_scale_log2e
+        scale_k = kv_row_scale(k_scale_ptr + (base + off_n) * stride_kss + pid_kh, pos_mask, KV_FMT)
+        qk = tl.dot(q, k) * sm_scale_log2e * scale_k[None, :]
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         # All-masked rows keep a -inf running max NaN-free.
@@ -666,15 +674,16 @@ def _gqa_sparse_fwd_kernel(
         p = tl.where(pos_mask[None, :], tl.exp2(qk - m_ij[:, None]), 0.0)
         l_ij = tl.sum(p, axis=1)
         acc_o = acc_o * alpha[:, None]
-        v = tl.load(
+        v = kv_tile(
             v_ptr
             + (base + off_n[:, None]) * stride_vr
             + pid_kh * stride_vh
             + off_d[None, :] * stride_vd,
-            mask=pos_mask[:, None] & d_mask[None, :],
-            other=0.0,
+            pos_mask[:, None] & d_mask[None, :],
+            KV_FMT,
         )  # [N, D]
-        acc_o += tl.dot(p.to(v.dtype), v)
+        scale_v = kv_row_scale(v_scale_ptr + (base + off_n) * stride_vss + pid_kh, pos_mask, KV_FMT)
+        acc_o += tl.dot((p * scale_v[None, :]).to(v.dtype), v)
         m_i = m_ij
         lse_i = tl.where(
             m_ij == float("-inf"),
@@ -708,6 +717,8 @@ def _gqa_sparse_decode_kernel(
     q_ptr,  # [num_reqs, num_heads, head_dim]
     k_ptr,  # K slab, row-flat: [rows, num_kv_heads, head_dim]
     v_ptr,  # V slab, row-flat: [rows, num_kv_heads, head_dim]
+    k_scale_ptr,  # [rows, num_kv_heads, 1]
+    v_scale_ptr,  # [rows, num_kv_heads, 1]
     t_ptr,  # topk_idx: [num_kv_heads, num_reqs, topk]
     o_ptr,  # partial out: [chunks, num_reqs, num_heads, head_dim]
     lse_ptr,  # partial lse (log2): [chunks, num_reqs, num_heads]
@@ -721,6 +732,7 @@ def _gqa_sparse_decode_kernel(
     stride_qn, stride_qh, stride_qd,
     stride_kr, stride_kh, stride_kd,
     stride_vr, stride_vh, stride_vd,
+    stride_kss, stride_vss,
     stride_th, stride_tn, stride_tk,
     stride_o_c, stride_o_b, stride_o_h, stride_o_d,
     stride_l_c, stride_l_b, stride_l_h,
@@ -729,6 +741,7 @@ def _gqa_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
+    KV_FMT: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
@@ -778,30 +791,32 @@ def _gqa_sparse_decode_kernel(
         # K/V loads must be pos-masked (same contract as the sequential attend
         # kernel): with K masked, the additive -inf lanes stay -inf and
         # p = exp2(-inf) = 0. Zero-init is defense-in-depth, not a substitute.
-        k = tl.load(
+        k = kv_tile(
             k_ptr
             + (base + off_n[None, :]) * stride_kr
             + pid_kh * stride_kh
             + off_d[:, None] * stride_kd,
-            mask=d_mask[:, None] & pos_mask[None, :],
-            other=0.0,
+            d_mask[:, None] & pos_mask[None, :],
+            KV_FMT,
         )
+        scale_k = kv_row_scale(k_scale_ptr + (base + off_n) * stride_kss + pid_kh, pos_mask, KV_FMT)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-        qk += tl.dot(q, k) * sm_scale_log2e
+        qk += tl.dot(q, k) * sm_scale_log2e * scale_k[None, :]
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp2(qk - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
         acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-        v = tl.load(
+        v = kv_tile(
             v_ptr
             + (base + off_n[:, None]) * stride_vr
             + pid_kh * stride_vh
             + off_d[None, :] * stride_vd,
-            mask=pos_mask[:, None] & d_mask[None, :],
-            other=0.0,
+            pos_mask[:, None] & d_mask[None, :],
+            KV_FMT,
         )
-        acc_o += tl.dot(p.to(v.dtype), v)
+        scale_v = kv_row_scale(v_scale_ptr + (base + off_n) * stride_vss + pid_kh, pos_mask, KV_FMT)
+        acc_o += tl.dot((p * scale_v[None, :]).to(v.dtype), v)
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
 
@@ -1034,6 +1049,9 @@ def m3_sparse_attn_prefill(
     max_query_len: int,
     sm_scale: float,
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    kv_format: KVFormat = NONE,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     """GQA block-sparse attention over the selected blocks (prefill/extend)."""
     total_q, num_heads, head_dim = q.shape
@@ -1041,18 +1059,21 @@ def m3_sparse_attn_prefill(
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
+    k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_rows, v_rows, k_scale, v_scale, q)
     grid = (max_query_len, num_kv_heads, batch)
     _gqa_sparse_fwd_kernel[grid](
-        q, k_rows, v_rows, topk_idx, output, block_rows,
+        q, k_rows, v_rows, k_scale_arg, v_scale_arg, topk_idx, output, block_rows,
         cu_seqlens_q, seq_lens, prefix_lens,
         num_kv_heads, gqa_group_size, head_dim, topk, sm_scale,
         q.stride(0), q.stride(1), q.stride(2),
         k_rows.stride(0), k_rows.stride(1), k_rows.stride(2),
         v_rows.stride(0), v_rows.stride(1), v_rows.stride(2),
+        stride_kss, stride_vss,
         topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
         output.stride(0), output.stride(1), output.stride(2),
         block_rows.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        KV_FMT=kv_format.name,
         num_warps=4, num_stages=2,
     )
 
@@ -1067,6 +1088,9 @@ def m3_sparse_attn_decode(
     seq_lens: torch.Tensor,  # [num_reqs] int32 (device, live)
     sm_scale: float,
     output: torch.Tensor,  # [num_reqs, num_heads, head_dim]
+    kv_format: KVFormat = NONE,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     """GQA block-sparse attention for decode (split-K over the top-k blocks +
     LSE merge; cudagraph-safe)."""
@@ -1083,20 +1107,24 @@ def m3_sparse_attn_decode(
     lse_partial = torch.empty(
         (num_topk_chunks, num_reqs, num_heads), dtype=torch.float32, device=q.device
     )
+    k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_rows, v_rows, k_scale, v_scale, q)
     grid = (num_reqs * num_topk_chunks, num_kv_heads)
     _gqa_sparse_decode_kernel[grid](
-        q, k_rows, v_rows, topk_idx, o_partial, lse_partial, block_rows, seq_lens,
+        q, k_rows, v_rows, k_scale_arg, v_scale_arg, topk_idx, o_partial, lse_partial, block_rows, seq_lens,
         num_reqs, gqa_group_size, head_dim, max_topk, sm_scale,
         q.stride(0), q.stride(1), q.stride(2),
         k_rows.stride(0), k_rows.stride(1), k_rows.stride(2),
         v_rows.stride(0), v_rows.stride(1), v_rows.stride(2),
+        stride_kss, stride_vss,
         topk_idx.stride(0), topk_idx.stride(1), topk_idx.stride(2),
         o_partial.stride(0), o_partial.stride(1), o_partial.stride(2), o_partial.stride(3),
         lse_partial.stride(0), lse_partial.stride(1), lse_partial.stride(2),
         block_rows.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
-        num_warps=4, num_stages=2,
+        KV_FMT=kv_format.name,
+        # the decode arms raise register use
+        num_warps=8 if kv_format.quantized else 4, num_stages=2,
     )
     _merge_topk_attn_out_kernel[(num_reqs, num_heads)](
         o_partial, lse_partial, output, head_dim,

@@ -91,6 +91,16 @@ def test_auto_backend_selection_by_arch(monkeypatch, major, flashinfer, sgl, exp
     assert config.attention_backend == expected
 
 
+@pytest.mark.parametrize("major", [12, 10, 9])
+def test_auto_backend_picks_one_that_reads_the_kv_format(monkeypatch, major):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=major)
+    config = _engine_config(attention_backend="auto", kv_cache_dtype="fp8_per_token_head")
+    _adjust_config(config)
+    assert config.attention_backend == "triton"
+
+
 def test_explicit_trtllm_rejected_outside_sm100_family(monkeypatch):
     from freetoken.engine.engine import _adjust_config
 

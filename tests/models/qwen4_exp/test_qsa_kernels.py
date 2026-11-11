@@ -501,3 +501,55 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("fmt_name", ["fp8_per_token_head", "int8_per_token_head"])
+def test_sparse_attention_reads_quantized_kv(fmt_name: str):
+    from freetoken.kernel.triton.kv_rows import store_kv_rows
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+    from freetoken.kvcache.format import KV_FORMATS
+
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    fmt = KV_FORMATS[fmt_name]
+    pages, kv_heads, q_heads, dim, rows, topk = 8, 2, 32, 64, 3, 96
+    slots = pages * PAGE_SIZE
+    # rows of different magnitude, so a scale read from the wrong slot changes the result
+    gain = torch.logspace(-1, 1, slots, device=device)[:, None]
+    k = (torch.randn(slots, kv_heads * dim, device=device) * gain).to(torch.bfloat16)
+    v = (torch.randn(slots, kv_heads * dim, device=device) * gain.flip(0)).to(torch.bfloat16)
+    k_cache = torch.zeros(slots, kv_heads, dim, device=device, dtype=fmt.elem_store_dtype)
+    v_cache = torch.zeros_like(k_cache)
+    k_scale = torch.zeros(slots, kv_heads, 1, device=device, dtype=fmt.scale_store_dtype)
+    v_scale = torch.zeros_like(k_scale)
+    store_kv_rows(fmt, k, v, torch.arange(slots, device=device, dtype=torch.int32), k_cache, v_cache, k_scale, v_scale)
+
+    block_table = torch.randperm(pages, device=device).to(torch.int32).view(1, pages)
+    token_to_req = torch.zeros(rows, device=device, dtype=torch.int32)
+    indices = torch.stack([torch.randperm(slots, device=device)[:topk] for _ in range(rows)]).to(torch.int32)
+    indices[:, -5:] = -1
+    q = torch.randn(rows, q_heads, dim, device=device, dtype=torch.bfloat16)
+
+    out = qsa_sparse_paged_attention(
+        q, k_cache.view(pages, PAGE_SIZE, kv_heads, dim), v_cache.view(pages, PAGE_SIZE, kv_heads, dim),
+        indices, block_table, token_to_req, kv_format=fmt, k_scale=k_scale, v_scale=v_scale,
+    )
+
+    def dequantize(codes, scale):
+        if fmt_name == "fp8_per_token_head":
+            return codes.cpu().view(torch.float8_e4m3fn).float().to(device) * scale
+        return codes.float() * scale
+
+    k_ref, v_ref = dequantize(k_cache, k_scale), dequantize(v_cache, v_scale)
+    safe = indices.clamp_min(0).long()
+    physical = block_table[0, safe // PAGE_SIZE].long() * PAGE_SIZE + safe % PAGE_SIZE
+    group = q_heads // kv_heads
+    expected = torch.empty(rows, q_heads, dim, device=device, dtype=torch.float32)
+    for row in range(rows):
+        live = physical[row][indices[row] >= 0]
+        for head in range(q_heads):
+            keys = k_ref[live, head // group]
+            logits = (q[row, head].float() @ keys.T) * dim**-0.5
+            expected[row, head] = logits.softmax(-1) @ v_ref[live, head // group]
+    torch.testing.assert_close(out.float(), expected, atol=2e-2 * expected.abs().max().item(), rtol=2e-2)

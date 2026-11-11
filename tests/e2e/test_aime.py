@@ -183,6 +183,8 @@ def build_llm(model_path: Path) -> LLM:
         max_running_req=1,
         max_extend_tokens=int(os.environ.get("FREETOKEN_TEST_MAX_EXTEND_TOKENS", "8192")),
     )
+    if kv_cache_dtype := os.environ.get("FREETOKEN_TEST_KV_CACHE_DTYPE"):
+        kwargs["kv_cache_dtype"] = kv_cache_dtype
     if quant_backend := os.environ.get("FREETOKEN_TEST_QUANT_BACKEND"):
         kwargs["quant_backend"] = quant_backend  # --quant-backend syntax, e.g. moe.nvfp4=b12x
     cache_size = int(os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "0"))

@@ -12,6 +12,7 @@ import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
+from freetoken.kvcache.format import NONE
 from freetoken.models.blocks import embed_input_ids
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
@@ -175,7 +176,8 @@ class MTPProposer(Proposer):
         # relay hidden and carry, and the verify hiddens
         fixed = rows * (config.speculative_num_steps + 3) * relay_bytes
         groups = draft_cls.draft_config(with_resident_moe(config.model_config)).kv_cache_group_specs()
-        return fixed, sum(spec_kv_bytes_per_token(group, config) for group in groups)
+        fmt = getattr(config, "kv_format", NONE)
+        return fixed, sum(spec_kv_bytes_per_token(group, config, fmt) for group in groups)
 
     def __init__(self, config, target_model) -> None:
         super().__init__(config, target_model)
@@ -212,6 +214,7 @@ class MTPProposer(Proposer):
             self.kv = create_kvcache_pool(
                 model_config=cfg, num_pages=ctx.num_pages + 1, page_size=self.config.page_size, dtype=self.dtype,
                 device=ctx.device, num_req_slots=rows, num_speculative_tokens=self.k,
+                kv_format=getattr(self.config, "kv_format", NONE),
             )
         width = self.draft.relay_width(self.config.model_config)
         self.relay = HiddenRelay(rows, width, self.dtype, ctx.device)

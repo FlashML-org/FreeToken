@@ -61,6 +61,16 @@ def _generic_config(num_page_override=None):
     )
 
 
+def test_quantized_kv_cost_prices_codes_and_scales():
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = _generic_config()
+    config.kv_format = FP8_PER_TOKEN_HEAD
+    # 2 slabs x (head_dim + fp32 scale) x kv_heads x layers
+    assert MHAKVCache.kv_cost(config)[0] == 2 * (64 + 4) * 2 * 2 * config.page_size
+
+
 def test_generic_kv_cost_and_solve_parity():
     from freetoken.kvcache.base import spec_kv_bytes_per_token
     from freetoken.kvcache.mha_pool import MHAKVCache

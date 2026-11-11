@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
@@ -37,6 +38,31 @@ def test_mha_kv_cache_rebuild_changes_pages_preserves_identity():
     assert pool.k_cache(0).shape == (10, 16, 8, 64)
 
 
+@pytest.mark.parametrize("name", ["fp8_per_token_head", "int8_per_token_head"])
+def test_mha_quantized_pool_allocates_prices_and_rebuilds_the_scales(name: str):
+    from freetoken.kvcache.format import KV_FORMATS
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    _init_tp()
+    fmt = KV_FORMATS[name]
+    pool = MHAKVCache(
+        num_kv_heads=8, num_layers=3, head_dim=64,
+        num_pages=4, page_size=16, dtype=torch.bfloat16, device=torch.device("cpu"), kv_format=fmt,
+    )
+    per_token = 2 * 3 * 8 * (64 + 4)  # K and V, layers, heads, one byte per element plus an fp32 scale
+    assert pool.dtype == torch.bfloat16
+    assert pool.k_cache(0).dtype == pool.v_cache(0).dtype == fmt.elem_store_dtype
+    assert pool.k_scale(1).shape == pool.v_scale(2).shape == (4 * 16, 8, 1)
+    assert pool.unit_bytes() == (per_token, 0)
+
+    pool.rebuild(10)
+
+    assert pool.dtype == torch.bfloat16
+    assert pool.k_cache(0).shape == (10, 16, 8, 64)
+    assert pool.k_scale(0).shape == pool.v_scale(0).shape == (10 * 16, 8, 1)
+    assert pool.unit_bytes() == (per_token, 0)
+
+
 def test_mha_rebuild_from_config_adds_the_dummy_page():
     # The engine speaks USABLE pages; the +1 dummy page is the pool's own.
     pool = _mha_pool()
@@ -65,12 +91,105 @@ def test_mla_and_dsa_rebuild_from_config_and_unit_bytes():
     assert dsa.unit_bytes() == (layers * latent * 2 + n_idx * idx_dim * 2, 0)
 
 
+@pytest.mark.parametrize("name", ["fp8_per_token_head", "int8_per_token_head"])
+def test_mla_quantized_pool_prices_and_rebuilds_one_scale_per_segment(name: str):
+    from freetoken.kvcache.dsa_pool import MLAKVCache
+    from freetoken.kvcache.format import KV_FORMATS
+
+    fmt = KV_FORMATS[name]
+    pool = MLAKVCache(
+        latent_dim=80, num_layers=2, num_pages=8, page_size=1,
+        dtype=torch.bfloat16, device=torch.device("cpu"), kv_format=fmt,
+    )
+    per_token = 2 * (80 + 2 * 4)  # layers, one byte per element plus an fp32 scale for ckv and kpe
+    assert pool.dtype == torch.bfloat16
+    assert pool.latent_rows(0).dtype == fmt.elem_store_dtype
+    assert pool.latent_scale(1).shape == (8, 2)
+    assert pool.unit_bytes() == (per_token, 0)
+
+    pool.rebuild_from_config(config=None, num_pages=20)
+
+    assert pool.latent_rows(0).shape == (21, 80)
+    assert pool.latent_scale(0).shape == (21, 2)
+    assert pool.unit_bytes() == (per_token, 0)
+
+
 def _hybrid_groups():
     from freetoken.models.config import KVCacheGroupSpec
 
     full = KVCacheGroupSpec(name="full", layer_ids=(0, 2), num_kv_heads=8, head_dim=64, sliding_window=None)
     swa = KVCacheGroupSpec(name="swa", layer_ids=(1,), num_kv_heads=8, head_dim=64, sliding_window=128)
     return [full, swa]
+
+
+@pytest.mark.parametrize("name", ["fp8_per_token_head", "int8_per_token_head"])
+def test_hybrid_swa_quantized_pool_prices_and_rebuilds_both_groups(name: str):
+    from freetoken.kvcache.format import KV_FORMATS
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+
+    _init_tp()
+    fmt = KV_FORMATS[name]
+    pool = HybridSWAKVCache(
+        groups=_hybrid_groups(), num_layers=3, num_full_pages=4, page_size=16,
+        dtype=torch.bfloat16, device=torch.device("cpu"), num_swa_tokens=32, kv_format=fmt,
+    )
+    row = 2 * 8 * (64 + 4)  # K and V, heads, one byte per element plus an fp32 scale
+    assert pool.dtype == torch.bfloat16
+    assert pool.k_cache(0).dtype == pool.v_cache(1).dtype == fmt.elem_store_dtype
+    assert pool.k_scale(0).shape == pool.v_scale(2).shape == (4 * 16, 8, 1)
+    assert pool.k_scale(1).shape == (32, 8, 1)
+    assert pool.unit_bytes() == (2 * row, row)
+
+    pool.rebuild(num_full_pages=10, num_swa_tokens=48)
+
+    assert pool.dtype == torch.bfloat16
+    assert pool.k_cache(0).dtype == fmt.elem_store_dtype
+    assert pool.k_scale(2).shape == (10 * 16, 8, 1)
+    assert pool.v_scale(1).shape == (48, 8, 1)
+    assert pool.unit_bytes() == (2 * row, row)
+
+
+def _factory_config(specs, *, swa: bool = False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        kv_cache_group_specs=lambda: specs, num_layers=3, num_kv_heads=2, head_dim=64,
+        has_swa_attention=swa, has_linear_attention=False, model_is_mrope=False,
+    )
+
+
+def _factory_specs():
+    from freetoken.attention import AttnType
+    from freetoken.models.config import KVCacheGroupSpec as Spec
+
+    common = dict(name="full", layer_ids=(0, 1, 2), num_kv_heads=2, head_dim=64, sliding_window=None)
+    latent = dict(common, num_kv_heads=1, head_dim=80, mla=True)
+    index = dict(index_head_dim=32, num_index_layers=1)
+    return {
+        "mha": ([Spec(**common)], False),
+        "bsa": ([Spec(**common, **index, attn_type=AttnType.BSA)], False),
+        "qsa": ([Spec(**common, **index, index_ratio=4, attn_type=AttnType.QSA)], False),
+        "mla": ([Spec(**latent, attn_type=AttnType.MLA)], False),
+        "dsa": ([Spec(**latent, **index, attn_type=AttnType.DSA)], False),
+        "kpool": ([Spec(**latent, **index, index_ratio=4, attn_type=AttnType.DSA)], False),
+        "swa": (_hybrid_groups(), True),
+    }
+
+
+@pytest.mark.parametrize("family", ["mha", "bsa", "qsa", "mla", "dsa", "kpool", "swa"])
+def test_pool_factory_forwards_the_kv_format(family: str):
+    from freetoken.kvcache import create_kvcache_pool
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD
+
+    _init_tp()
+    specs, swa = _factory_specs()[family]
+    pool = create_kvcache_pool(
+        model_config=_factory_config(specs, swa=swa), num_pages=4, page_size=64, device=torch.device("cpu"),
+        dtype=torch.bfloat16, num_swa_tokens=64, num_req_slots=2, kv_format=FP8_PER_TOKEN_HEAD,
+    )
+    assert pool.kv_format is FP8_PER_TOKEN_HEAD
+    assert FP8_PER_TOKEN_HEAD.name in pool.kv_formats
+    assert pool.k_cache(0).dtype == torch.uint8
 
 
 def test_hybrid_swa_rebuild_resizes_both_groups_preserves_identity():
