@@ -26,3 +26,13 @@ def test_explicit_chat_mode():
 
 def test_invalid_mode_falls_back_to_chat():
     assert resolve_thinking_mode({"thinking_mode": "bogus"}, None) == "chat"
+
+
+def test_explicit_disable_overrides_tools():
+    """An explicit enable_thinking=False (or thinking=False) must win even
+    when tools are present — the caller knows their intent better than the
+    tools-presumed-thinking heuristic."""
+    assert resolve_thinking_mode({"enable_thinking": False}, [{"type": "function"}]) == "chat"
+    assert resolve_thinking_mode({"thinking": False}, [{"type": "function"}]) == "chat"
+    assert resolve_thinking_mode({"enable_thinking": False, "thinking": True}, [{"type": "function"}]) == "chat"
+    assert resolve_thinking_mode({"thinking": False, "enable_thinking": True}, [{"type": "function"}]) == "chat"
