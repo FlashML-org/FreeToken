@@ -509,7 +509,7 @@ def parse_args(
         help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
         "element plus one scale per token and head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
         "attention backends read "
-        "them. They need --dtype bfloat16 and no tensor parallelism or speculative decoding.",
+        "them. They need --dtype bfloat16 and no tensor parallelism. An mtp draft stores its KV in the same format.",
     )
 
     parser.add_argument(
