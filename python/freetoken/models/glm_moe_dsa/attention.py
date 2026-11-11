@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from freetoken.layers.quantization import QuantKind
+from freetoken.layers.quantization import QuantKind, without_online
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.rotary import get_rope
@@ -148,7 +148,7 @@ class GlmMoeDsaAttention(BaseOP):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
+            quant_config=without_online(config.quant), prefix=f"{prefix}.kv_b_proj",
         )
         assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
         self.o_proj = LinearReplicated(

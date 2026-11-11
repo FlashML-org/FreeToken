@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from freetoken.utils import init_logger
+
 from ..embedding import EmbeddingConfig
 from ..linear import LinearConfig
+from ..method import KernelSelectionError
 from ..moe import MoEConfig
 from ..names import Matcher, NameMap, name_set
 from ..quant_backend import get_quant_backend
-from ..registry import LayerKind, dialects, method_class, methods_for, register_dialect
+from ..registry import LayerKind, dialects, method_class, methods_for, online_kinds, register_dialect
 from ..scheme import QuantKind, QuantScheme
+
+logger = init_logger(__name__)
 
 LAYER_CONFIGS = {LayerKind.LINEAR: LinearConfig, LayerKind.MOE: MoEConfig, LayerKind.EMBEDDING: EmbeddingConfig}
 
@@ -55,6 +61,9 @@ class QuantConfig(ABC):
     dialect: ClassVar[str]
     # per kind the dialect exports, role -> the checkpoint tensor suffix (or Stored) that feeds it
     STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]]
+    # --online-quant: the kind served for the layers this checkpoint stores bf16; --online-quant-modules narrows them (glob patterns on checkpoint names)
+    online: QuantKind | None = None
+    online_modules: Matcher | None = None
 
     def __init__(self, name_map: NameMap | None = None, unquantized: tuple[str, ...] = ()):
         self.name_map = name_map or NameMap()
@@ -97,9 +106,40 @@ class QuantConfig(ABC):
         if layer_kind is LayerKind.EMBEDDING and kind not in methods_for(layer_kind):
             # a checkpoint that quantizes its linears stores the vocab table dense
             scheme, kind = None, QuantKind.NONE
-        cls = method_class(kind, layer_kind)
         cfg = self.layer_config(layer, layer_kind, scheme)
+        if kind is QuantKind.NONE and (method := self._online_method(layer, layer_kind, prefix, cfg)) is not None:
+            return method
+        cls = method_class(kind, layer_kind)
         return cls(cfg, get_quant_backend().select(layer_kind, kind))
+
+    def with_online(self, kind: QuantKind | None, modules: tuple[str, ...] = ()) -> "QuantConfig":
+        """A copy that serves the layers this checkpoint stores bf16 as ``kind`` (only those ``modules`` names, when given)."""
+        if kind is not None and kind not in online_kinds():
+            raise ValueError(f"{kind} has no online method; known: {sorted(str(k) for k in online_kinds())}")
+        quant = copy.copy(self)
+        quant.online = kind
+        quant.online_modules = name_set(tuple(modules)) if kind is not None and modules else None
+        return quant
+
+    def _online_method(self, layer: Any, layer_kind: LayerKind, prefix: str, cfg: Any):
+        if self.online is None or self.online not in methods_for(layer_kind):
+            return None
+        if self.online_modules is not None:
+            names = self.name_map.to_checkpoint(prefix)
+            hits = {self.online_modules(n) for n in names}
+            if len(hits) > 1:
+                raise ValueError(f"--online-quant-modules covers only part of the fused module {prefix!r}: {names}")
+            if not hits.pop():
+                return None
+        cls = method_class(self.online, layer_kind)
+        reason = cls.refuses(layer)
+        if reason is None:
+            try:
+                return cls(cfg, get_quant_backend().select(layer_kind, self.online))
+            except KernelSelectionError as exc:
+                reason = str(exc)
+        logger.info("--online-quant %s leaves %s as stored: %s", self.online, prefix, reason)
+        return None
 
     def layer_config(self, layer: Any, layer_kind: LayerKind, scheme: QuantScheme | None) -> LinearConfig | MoEConfig:
         """The layer's Linear / MoE config; a dialect overrides it to add what only its checkpoint knows."""

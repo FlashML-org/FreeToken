@@ -32,7 +32,9 @@ from freetoken.layers.quantization import (
     QuantConfig,
     QuantKind,
 )
+from freetoken.layers.quantization.embedding import Df11EmbeddingMethod, UnquantizedEmbeddingMethod
 from freetoken.layers.quantization.linear import (
+    Df11LinearMethod,
     Fp8BlockLinearMethod,
     Fp8TensorLinearMethod,
     Mxfp8LinearMethod,
@@ -70,11 +72,14 @@ def op_at(model, path: str):
     return op
 
 
-def build_meta_model(path: str, strategy: str):
+def build_meta_model(path: str, strategy: str, online: str | None = None, online_modules: tuple[str, ...] = ()):
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
     set_rope_device(torch.device("cpu"))
-    config = EngineConfig(model_path=path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy)
+    config = EngineConfig(
+        model_path=path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy,
+        online_quant=online, online_quant_modules=online_modules,
+    )
     from freetoken.engine.engine import _decode_target
 
     object.__setattr__(config.model_config, "moe_strategy", strategy)
@@ -122,6 +127,8 @@ class Case:
     skip_if: Callable[[], bool] | None = None
     env: dict[str, str] = field(default_factory=dict)
     check: Callable[[Any, dict], None] | None = None  # family extras beyond the method table
+    online: str | None = None  # --online-quant
+    online_modules: tuple[str, ...] = ()  # --online-quant-modules
 
 
 def _qwen35_fp8(model, idx):
@@ -269,6 +276,11 @@ CASES = [
     Case("google/gemma-4-12B-it", NoQuantConfig, {
         "model.layers.0.feed_forward.shared_mlp.gate_up_proj": BF16, "model.layers.0.self_attn.qkv_proj": BF16,
     }, strategy="auto", check=_gemma_tied_head),
+    # online df11 leaves the table tied to the LM head bf16 and converts the rest
+    Case("google/gemma-4-12B-it", NoQuantConfig, {
+        "model.embed_tokens": UnquantizedEmbeddingMethod, "model.layers.0.self_attn.qkv_proj": Df11LinearMethod,
+        "model.layers.0.feed_forward.shared_mlp.gate_up_proj": Df11LinearMethod,
+    }, strategy="auto", online="df11"),
     Case("Qwen/Qwen3-4B", NoQuantConfig, {
         "model.layers.0.self_attn.qkv_proj": BF16, "model.layers.0.self_attn.o_proj": BF16,
         "model.layers.0.mlp.gate_up_proj": BF16, "model.layers.0.mlp.down_proj": BF16,
@@ -293,6 +305,11 @@ CASES = [
         "model.hyper_connection_mixer.input_mix_weight_down": BF16,
         "model.layers.{ple}.ple.key_proj": BF16, "model.layers.{ple}.ple.value_proj": BF16,
     }, check=_no_split),
+    # the vision tower streams its blocks in one shared layout, so online df11 leaves it bf16
+    Case("RadixArk/Qwen3.8-Flash-Next-NVFP4", ModelOptConfig, {
+        "visual.blocks.0.attn.qkv": BF16, "visual.blocks.0.mlp.linear_fc1": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": Df11LinearMethod, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod, "lm_head": BF16,
+    }, online="df11"),
     Case("deepseek-ai/DeepSeek-V4-Flash-0731", Fp8BlockConfig, {
         **{f"model.layers.2.{p}": (FP8B, "dsv4") for p in (
             "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_b", "attn.indexer.wq_b",
@@ -302,6 +319,11 @@ CASES = [
             "attn.compressor.wkv", "attn.compressor.wgate", "attn.indexer.weights_proj", "attn.indexer.compressor.wkv")},
         "model.head": (BF16, "torch"), "model.layers.2.ffn.experts": (Mxfp4MoEMethod, "triton"),
     }, check=_dsv4),
+    # online df11 leaves the compressors bf16: their forward reads the weight directly
+    Case("deepseek-ai/DeepSeek-V4-Flash-0731", Fp8BlockConfig, {
+        "model.embed": Df11EmbeddingMethod, "model.layers.2.attn.indexer.weights_proj": Df11LinearMethod,
+        "model.layers.2.attn.compressor.wkv": BF16, "model.layers.2.attn.compressor.wgate": BF16, "model.head": BF16,
+    }, online="df11"),
     Case("nvidia/MiniMax-M2.5-NVFP4", ModelOptConfig, {
         "model.layers.3.block_sparse_moe.experts": Nvfp4MoEMethod, "model.layers.3.self_attn.qkv_proj": BF16,
         "model.layers.3.self_attn.o_proj": BF16, "model.layers.3.block_sparse_moe.gate": BF16, "lm_head": BF16,
@@ -340,6 +362,17 @@ CASES = [
         "model.layers.{moe}.mlp.experts": Nvfp4MoEMethod, "model.layers.{moe}.mlp.shared_experts.gate_proj": NVFP4,
         "model.layers.{moe}.mlp.shared_experts.down_proj": NVFP4, "model.layers.{moe}.mlp.gate": BF16, "lm_head": BF16,
     }),
+    # online df11 takes only the layers the checkpoint leaves bf16, and never the LM head
+    Case("nvidia/GLM-4.7-NVFP4", ModelOptConfig, {
+        "model.embed_tokens": Df11EmbeddingMethod, "model.layers.{dense}.self_attn.q_proj": Df11LinearMethod,
+        "model.layers.{moe}.self_attn.o_proj": Df11LinearMethod, "model.layers.{dense}.mlp.gate_proj": NVFP4,
+        "model.layers.{moe}.mlp.shared_experts.down_proj": NVFP4, "model.layers.{moe}.mlp.experts": Nvfp4MoEMethod,
+        "model.layers.{moe}.mlp.gate": BF16, "lm_head": BF16,
+    }, online="df11"),
+    Case("nvidia/GLM-4.7-NVFP4", ModelOptConfig, {
+        "model.embed_tokens": UnquantizedEmbeddingMethod, "model.layers.{moe}.self_attn.q_proj": Df11LinearMethod,
+        "model.layers.{moe}.mlp.shared_experts.down_proj": NVFP4, "lm_head": BF16,
+    }, online="df11", online_modules=("model.layers.*.self_attn",)),
     Case("nvidia/GLM-5.3-NVFP4", ModelOptConfig, {
         "model.layers.{moe}.mlp.experts": Nvfp4MoEMethod, "model.layers.{moe}.mlp.gate": BF16,
         "model.layers.{moe}.mlp.shared_experts.gate_proj": BF16, "model.layers.{moe}.self_attn.o_proj": BF16, "lm_head": BF16,
@@ -357,7 +390,9 @@ CASES = [
 ]
 
 
-@pytest.mark.parametrize("case", CASES, ids=[f"{c.name.split('/')[-1]}:{c.strategy}" for c in CASES])
+@pytest.mark.parametrize(
+    "case", CASES, ids=[f"{c.name.split('/')[-1]}:{c.strategy}" + "".join(f":{x}" for x in (c.online, *c.online_modules) if x) for c in CASES]
+)
 def test_probed_layers_get_the_method_their_config_says(case: Case, monkeypatch):
     path = model_dir(case.name)
     if path is None:
@@ -368,9 +403,9 @@ def test_probed_layers_get_the_method_their_config_says(case: Case, monkeypatch)
         monkeypatch.setenv(key, value)
     if case.raises is not None:
         with pytest.raises(case.raises):
-            build_meta_model(path, case.strategy)
+            build_meta_model(path, case.strategy, case.online, case.online_modules)
         return
-    model, model_config = build_meta_model(path, case.strategy)
+    model, model_config = build_meta_model(path, case.strategy, case.online, case.online_modules)
     assert type(model_config.quant) is case.dialect
     idx = _layer_indices(model)
     for template, expected in case.methods.items():

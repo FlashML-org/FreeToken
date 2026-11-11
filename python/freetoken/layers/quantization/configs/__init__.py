@@ -16,6 +16,13 @@ def quant_method_for(quant_config, layer, prefix: str):
     return (quant_config if quant_config is not None else _NO_QUANT).get_quant_method(layer, prefix)
 
 
+def without_online(quant_config: QuantConfig | None) -> QuantConfig | None:
+    """The config with --online-quant off, for layers that must keep the weight as stored."""
+    if quant_config is None or quant_config.online is None:
+        return quant_config
+    return quant_config.with_online(None)
+
+
 _UNSET = object()
 _QUANT_CONFIG = _UNSET
 
@@ -33,7 +40,7 @@ def get_quant_config() -> QuantConfig | None:
 
 
 __all__ = [
-    "QuantConfig", "quantization_config_of", "quant_method_for", "set_quant_config", "get_quant_config",
+    "QuantConfig", "quantization_config_of", "quant_method_for", "without_online", "set_quant_config", "get_quant_config",
     "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config", "GGUFConfig",
     "compressed_tensors", "fp8", "gguf", "modelopt", "mxfp4",
 ]

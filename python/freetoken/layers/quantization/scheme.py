@@ -21,6 +21,7 @@ class QuantKind(Enum):
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
     GGUF = "gguf"
+    DF11 = "df11"
 
     def __str__(self) -> str:
         return self.value

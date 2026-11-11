@@ -149,6 +149,12 @@ def parse_args(
             raise argparse.ArgumentTypeError(str(exc)) from None
         return value
 
+    def _parse_module_list(value: str) -> tuple[str, ...]:
+        names = tuple(p.strip() for p in value.split(",") if p.strip())
+        if not names:
+            raise argparse.ArgumentTypeError("expected comma-separated module names or glob patterns")
+        return names
+
     def _parse_moe_cache_rate(value: str) -> float:
         try:
             rate = float(value)
@@ -723,6 +729,30 @@ def parse_args(
             "Where the input token embedding tables live. 'gpu' (default) keeps them in VRAM; 'host' keeps them in "
             "pinned host RAM and each lookup reads its rows over PCIe, so their VRAM goes to the expert cache and KV. "
             "A table tied to the LM head stays on the GPU; Gemma-4 E2B / E4B's per-layer table is the one that moves."
+        ),
+    )
+
+    parser.add_argument(
+        "--online-quant",
+        default=ServerArgs.online_quant,
+        choices=["df11"],
+        help=(
+            "Convert the Linear layers and input embedding tables that the checkpoint stores in bf16 at load. 'df11' "
+            "compresses them losslessly to ~11 bits per weight and decodes them bit-for-bit on use: about 30%% less "
+            "VRAM for those weights, at the cost of a decode per use. The LM head, a table tied to it, vision encoders and "
+            "layers whose weight the model reads directly stay bf16; refused when no layer qualifies."
+        ),
+    )
+
+    parser.add_argument(
+        "--online-quant-modules",
+        default=ServerArgs.online_quant_modules,
+        type=_parse_module_list,
+        help=(
+            "Limit --online-quant to these modules: comma-separated checkpoint module names or glob patterns, "
+            "e.g. 'model.layers.*.self_attn,model.embed_tokens' ('model.language_model.layers.*' where the checkpoint "
+            "nests the text model). A name also covers the modules under it; one that selects no convertible layer is "
+            "refused. Default: every layer --online-quant can convert."
         ),
     )
 

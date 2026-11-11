@@ -9,7 +9,6 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Glm4MoeAttention
-from .df11_embedding import EmbeddingDF11
 from .mlp import GlmGatedMLP
 from .moe import Glm4MoeSparseBlock
 
@@ -45,15 +44,9 @@ class Glm4MoeDecoderLayer(BaseOP):
 
 class Glm4MoeModel(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
-        if config.quant is not None and config.quant.dialect == "gguf":
-            self.embed_tokens: BaseOP = VocabParallelEmbedding(
-                config.vocab_size, config.hidden_size, quant_config=config.quant, prefix=f"{prefix}.embed_tokens"
-            )
-        else:
-            self.embed_tokens = EmbeddingDF11(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-            )
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size, quant_config=config.quant, prefix=f"{prefix}.embed_tokens"
+        )
         self.layers = OPList(
             [
                 Glm4MoeDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
@@ -61,6 +54,14 @@ class Glm4MoeModel(BaseOP):
             ]
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        if (f"{prefix}.embed_tokens.low8" if prefix else "embed_tokens.low8") in state_dict:
+            raise RuntimeError(
+                "the checkpoint stores the attention and embedding as DF11; an FTW checkpoint converted by an earlier build "
+                "does this -- reconvert it with `ft checkpoint` (pass --online-quant df11 to compress them at load)"
+            )
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
