@@ -87,6 +87,7 @@ _GEMMA4_SEGMENTS = (
 _GEMMA4_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
+_GEMMA4_DRAFTS = (("shared_kv_mtp", "freetoken.models.gemma4.mtp:Gemma4MTPDraft"),)
 
 
 def _gemma4_vision_unserved(section: Any) -> str | None:
@@ -434,12 +435,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "Gemma4ForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     # the gemma-4-12B "Unified" release (model_type gemma4_unified): the gemma4 decoder with a dense feed-forward and a linear vision embedder in place of the ViT tower; audio is not wired
     "Gemma4UnifiedForConditionalGeneration": ModelSpec(
@@ -450,12 +453,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "Gemma4UnifiedForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     # llama.cpp gemma4 GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Gemma4GGUFForCausalLM": ModelSpec(
@@ -467,6 +472,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     # the same text GGUF with a gemma4uv mmproj (12B): the text GGUF does not tell the 12B apart, so build_gguf_shim picks this row from the projector
     "Gemma4UnifiedGGUFForCausalLM": ModelSpec(
@@ -478,6 +484,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",

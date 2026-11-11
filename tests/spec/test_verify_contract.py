@@ -1,6 +1,6 @@
 """A k+1-row verify step commits exactly what k+1 decode steps would: with drafts taken from a plain greedy run and wrong at a different place each step (so every accept count occurs), speculative decoding must reproduce that run token for token.
 
-Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone; a second run drafts with a DFlash 2 draft of random weights, whose wrong drafts must leave the target's output alone through its ring, window and graphs.
+Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone; a second run drafts with a DFlash 2 draft of random weights, whose wrong drafts must leave the target's output alone through its ring, window and graphs; a third drafts with the target's own MTP layer of random weights, which needs the tiny target materialized as a real checkpoint since MTP rejects dummy weights.
 A verify row and a decode step run different GEMM and attention shapes, so their logits can differ by an ulp: the runs may part at a near tie, and the test checks they part only there. fp16 keeps such ties rare (bf16 has 3 fewer mantissa bits), and fan-in scaled dummy weights keep the activations O(1), so ulp noise does not grow through the layers.
 """
 
@@ -34,6 +34,7 @@ from freetoken.spec import runner as R
 from freetoken.spec.proposer import Proposer, SpecProposal
 
 model, out, reference, kwargs = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+dump_weights, use_dummy_weight = kwargs.pop("dump_weights", None), kwargs.pop("use_dummy_weight", True)
 TAPS, H = (1, 2), 256
 
 # (uid, output index) -> top-2 token ids and logits of the row that picked it
@@ -169,8 +170,19 @@ def fan_in_scaled(tensor):
 
 
 dummy_state = E._make_dummy_weight_state_dict
-E._make_dummy_weight_state_dict = lambda *args, **kwargs: {
-    name: fan_in_scaled(tensor) for name, tensor in dummy_state(*args, **kwargs).items()}
+
+
+def dummy_scaled(*args, **kw):
+    state = {name: fan_in_scaled(tensor) for name, tensor in dummy_state(*args, **kw).items()}
+    if dump_weights:
+        # the seeded dummy tensors are the target's weights; the MTP run loads them as a real checkpoint
+        from safetensors.torch import save_file
+
+        save_file({k: v.detach().cpu().contiguous() for k, v in state.items()}, dump_weights)
+    return state
+
+
+E._make_dummy_weight_state_dict = dummy_scaled
 create_model = E.create_model
 
 
@@ -204,7 +216,7 @@ def create_model_with_ple_rows(*args, **kwargs):
 E.create_model = create_model_with_ple_rows
 if reference != "-":
     PROPOSERS.register("oracle")("__main__:OracleProposer")
-llm = LLM(model_path=model, dtype=torch.float16, use_dummy_weight=True, max_running_req=4, **kwargs)
+llm = LLM(model_path=model, dtype=torch.float16, use_dummy_weight=use_dummy_weight, max_running_req=4, **kwargs)
 prompts = [llm.tokenizer.encode(p) for p in ("The capital of France is", "1, 2, 3, 4,", "def fibonacci(n):")]
 params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True, presence_penalty=p, frequency_penalty=p)
           for n, p in ((48, 0.0), (37, 0.6), (41, 0.0))]
@@ -295,6 +307,34 @@ def _tiny_draft(path: str) -> str:
     return path
 
 
+def _tiny_mtp_draft(path: str, target: str) -> str:
+    """The tiny target's own MTP layer as a checkpoint: one draft attention layer over random fan-in scaled weights, written in the pre-fusion HF names iter_mtp_weights consumes (q_proj carries the output gate)."""
+    from safetensors.torch import save_file
+
+    os.makedirs(path, exist_ok=True)
+    shutil.copy(os.path.join(target, "config.json"), os.path.join(path, "config.json"))
+    hidden, heads, kv_heads, head_dim, inter = 256, 4, 2, 64, 512
+    shapes = {
+        "mtp.fc.weight": (hidden, 2 * hidden), "mtp.pre_fc_norm_embedding.weight": (hidden,),
+        "mtp.pre_fc_norm_hidden.weight": (hidden,), "mtp.norm.weight": (hidden,),
+        "mtp.layers.0.self_attn.q_proj.weight": (2 * heads * head_dim, hidden),
+        "mtp.layers.0.self_attn.k_proj.weight": (kv_heads * head_dim, hidden),
+        "mtp.layers.0.self_attn.v_proj.weight": (kv_heads * head_dim, hidden),
+        "mtp.layers.0.self_attn.o_proj.weight": (hidden, heads * head_dim),
+        "mtp.layers.0.self_attn.q_norm.weight": (head_dim,), "mtp.layers.0.self_attn.k_norm.weight": (head_dim,),
+        "mtp.layers.0.mlp.gate_proj.weight": (inter, hidden), "mtp.layers.0.mlp.up_proj.weight": (inter, hidden),
+        "mtp.layers.0.mlp.down_proj.weight": (hidden, inter),
+        "mtp.layers.0.input_layernorm.weight": (hidden,), "mtp.layers.0.post_attention_layernorm.weight": (hidden,),
+    }
+    g = torch.Generator().manual_seed(0)
+    weights = {}
+    for name, shape in shapes.items():
+        t = torch.randn(*shape, generator=g)
+        weights[name] = (t * shape[-1] ** -0.5 if len(shape) > 1 else 1 + 0.1 * t).to(torch.bfloat16)
+    save_file(weights, os.path.join(path, "model.safetensors"))
+    return path
+
+
 def _run(model: str, out: str, reference: str, **kwargs) -> dict:
     run = subprocess.run([sys.executable, "-c", _SCRIPT, model, out, reference, json.dumps(kwargs)],
                          capture_output=True, text=True, timeout=900, env=dict(os.environ))
@@ -305,7 +345,7 @@ def _run(model: str, out: str, reference: str, **kwargs) -> dict:
 
 @pytest.fixture(scope="module")
 def plain_runs(tmp_path_factory):
-    # the plain greedy run of each (family, backend, graphs), shared by both algorithms: model dir, output path, result
+    # the plain greedy run of each (family, backend, graphs), shared by every algorithm: model dir, output path, result
     runs = {}
 
     def get(family, backend, graphs, kwargs):
@@ -322,6 +362,7 @@ def plain_runs(tmp_path_factory):
     *[(f, b, "oracle", g) for f, b in [("qwen3_5", "fa"), ("qwen3_5", "triton"), ("qwen4_exp", "qsa_sparse")] for g in (True, False)],
     # the draft side once per family, with graphs
     ("qwen3_5", "triton", "dflash", True), ("qwen4_exp", "qsa_sparse", "dflash", True),
+    ("qwen3_5", "triton", "mtp", True),
 ])
 def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, family, backend, algorithm, graphs):
     if backend == "fa":
@@ -330,7 +371,14 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, family, back
     kwargs = {"attention_backend": backend, "cuda_graph_max_bs": 4 if graphs else 0, "moe_strategy": "fused"}
     model, decode, reference = plain_runs(family, backend, graphs, kwargs)
     draft = {"speculative_draft_model_path": _tiny_draft(str(tmp_path / "draft"))} if algorithm == "dflash" else {}
-    spec = _run(model, str(tmp_path / "spec.json"), decode, speculative_algorithm=algorithm, speculative_num_steps=K, **draft, **kwargs)
+    extra = {}
+    if algorithm == "mtp":
+        # MTP rejects dummy weights: write the same seeded dummy tensors a plain run would generate into the target dir
+        _run(model, str(tmp_path / "materialize.json"), "-", dump_weights=os.path.join(model, "model.safetensors"), **kwargs)
+        draft = {"speculative_draft_model_path": _tiny_mtp_draft(str(tmp_path / "draft"), model)}
+        extra = {"use_dummy_weight": False}
+    spec = _run(model, str(tmp_path / "spec.json"), decode, speculative_algorithm=algorithm, speculative_num_steps=K,
+                **draft, **extra, **kwargs)
     agreed = 0
     for uid, (want, got) in enumerate(zip(reference["outputs"], spec["outputs"])):
         assert len(got) == len(want)
@@ -350,6 +398,9 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, family, back
         # the draft's context window rides the target's GDN slots: per slot, rows of the draft width covering its 16-position window and a block
         window = spec["window"]
         assert window is not None and window[0] == spec["num_slots"] and window[1] >= 16 + K + 1 and window[2] == 256
+    elif algorithm == "mtp":
+        # MTPProposer installs its own prefill and verify sinks, so the recording sink must have seen no target forward
+        assert spec["taps"]["prefill"] == 0 and spec["taps"]["verify"] == 0
     else:
         # every prefill and verify forward handed the sink each tapped layer's output, as the next layer read it
         taps = spec["taps"]

@@ -184,3 +184,4 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it, upstream publishes `google/gemma-4-*-it-assistant`; pass the sidecar with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).

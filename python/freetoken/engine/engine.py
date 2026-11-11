@@ -218,7 +218,7 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
     runner = _spec_runner()
     runner.adjust_config(config, override)
     override("spec_slot_states", runner.slot_states(config))
-    if windowed_kv:
+    if windowed_kv and not runner.target_may_be_windowed(config):
         raise ValueError(
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
             "their window frees would release slots a verify step still reads"

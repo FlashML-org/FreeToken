@@ -21,9 +21,17 @@ if TYPE_CHECKING:
 
 def proposer_class(config) -> type[Proposer]:
     from freetoken.models.register import _load_attr
-    from freetoken.spec import PROPOSERS
+    from freetoken.spec import DRAFT_PROPOSERS, PROPOSERS
 
-    module, attr = PROPOSERS[config.speculative_algorithm].split(":")
+    algorithm = config.speculative_algorithm
+    if algorithm == "mtp":
+        # a family's draft method picks the proposer behind the mtp CLI name; one with no draft of the
+        # right method falls through to MTPProposer, whose adjust_config refuses draft-less families
+        drafts = dict(config.model_spec.spec_drafts)
+        for method, ref in DRAFT_PROPOSERS.items():
+            if method in drafts:
+                return _load_attr(*ref.split(":"))
+    module, attr = PROPOSERS[algorithm].split(":")
     return _load_attr(module, attr)
 
 
@@ -61,6 +69,10 @@ class SpecRunner:
     def slot_states(cls, config) -> tuple[SlotStateSpec, ...]:
         return proposer_class(config).slot_states(config)
 
+    @classmethod
+    def target_may_be_windowed(cls, config) -> bool:
+        return proposer_class(config).target_may_be_windowed(config)
+
     def attach(self, engine) -> None:
         """Second construction phase, after the pools and before graph capture."""
         self.engine = engine
@@ -69,7 +81,7 @@ class SpecRunner:
         states = {s.name: pool.slot_state(s.name) for s in self.config.spec_slot_states} if pool is not None else {}
         self.proposer.attach(DraftContext(
             page_table=engine.page_table, num_pages=engine.num_pages, device=engine.device,
-            stream=engine.stream, dummy_req=engine.dummy_req, slot_states=states,
+            stream=engine.stream, dummy_req=engine.dummy_req, slot_states=states, kv_cache=engine.kv_cache,
         ))
 
     def detach(self, *, keep_kv: bool) -> None:
