@@ -55,6 +55,14 @@ class Glm4MoeModel(BaseOP):
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
 
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        if (f"{prefix}.embed_tokens.low8" if prefix else "embed_tokens.low8") in state_dict:
+            raise RuntimeError(
+                "the checkpoint stores the attention and embedding as DF11; an FTW checkpoint converted by an earlier build "
+                "does this -- reconvert it with `ft checkpoint` (pass --online-quant df11 to compress them at load)"
+            )
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None

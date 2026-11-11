@@ -275,6 +275,11 @@ CASES = [
     Case("google/gemma-4-12B-it", NoQuantConfig, {
         "model.layers.0.feed_forward.shared_mlp.gate_up_proj": BF16, "model.layers.0.self_attn.qkv_proj": BF16,
     }, strategy="auto", check=_gemma_tied_head),
+    # online df11 leaves the table tied to the LM head bf16 and converts the rest
+    Case("google/gemma-4-12B-it", NoQuantConfig, {
+        "model.embed_tokens": UnquantizedEmbeddingMethod, "model.layers.0.self_attn.qkv_proj": Df11LinearMethod,
+        "model.layers.0.feed_forward.shared_mlp.gate_up_proj": Df11LinearMethod,
+    }, strategy="auto", online="df11"),
     Case("Qwen/Qwen3-4B", NoQuantConfig, {
         "model.layers.0.self_attn.qkv_proj": BF16, "model.layers.0.self_attn.o_proj": BF16,
         "model.layers.0.mlp.gate_up_proj": BF16, "model.layers.0.mlp.down_proj": BF16,
@@ -313,6 +318,11 @@ CASES = [
             "attn.compressor.wkv", "attn.compressor.wgate", "attn.indexer.weights_proj", "attn.indexer.compressor.wkv")},
         "model.head": (BF16, "torch"), "model.layers.2.ffn.experts": (Mxfp4MoEMethod, "triton"),
     }, check=_dsv4),
+    # online df11 leaves the compressors bf16: their forward reads the weight directly
+    Case("deepseek-ai/DeepSeek-V4-Flash-0731", Fp8BlockConfig, {
+        "model.embed": Df11EmbeddingMethod, "model.layers.2.attn.indexer.weights_proj": Df11LinearMethod,
+        "model.layers.2.attn.compressor.wkv": BF16, "model.layers.2.attn.compressor.wgate": BF16, "model.head": BF16,
+    }, online="df11"),
     Case("nvidia/MiniMax-M2.5-NVFP4", ModelOptConfig, {
         "model.layers.3.block_sparse_moe.experts": Nvfp4MoEMethod, "model.layers.3.self_attn.qkv_proj": BF16,
         "model.layers.3.self_attn.o_proj": BF16, "model.layers.3.block_sparse_moe.gate": BF16, "lm_head": BF16,

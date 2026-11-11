@@ -570,7 +570,6 @@ def checkpoint_quant_config(
 
     A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
     from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig, QuantKind
-    from freetoken.layers.quantization.names import name_set
 
     name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
     if spec.parse_config == "parse_gguf_config":
@@ -581,9 +580,7 @@ def checkpoint_quant_config(
         quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
     else:
         quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
-    quant.online = QuantKind(online) if online else None
-    quant.online_modules = name_set(online_modules) if online_modules else None
-    return quant
+    return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

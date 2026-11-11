@@ -378,8 +378,8 @@ def _online_quant_keys(model, config: EngineConfig) -> frozenset[str]:
         )
     if not ops:
         raise ValueError(
-            f"--online-quant {config.online_quant}: {config.model_path} has no bf16 layer it can convert (it skips layers the "
-            "checkpoint quantizes or the model family keeps bf16, the LM head and vision encoders)"
+            f"--online-quant {config.online_quant}: {config.model_path} has no layer it converts; the checkpoint quantizes "
+            "its Linear layers and tables, or they must stay as stored"
         )
     weights = {id(op.weight) for op in ops}
     return frozenset(key for key, t in model.state_dict().items() if id(t) in weights)

@@ -60,6 +60,11 @@ class QuantMethod(ABC):
         self.requested = requested
         self.kernel = select_kernel(self.candidates, requested, cfg)
 
+    @classmethod
+    def refuses(cls, layer: Any) -> str | None:
+        """Why this online method leaves ``layer`` as the checkpoint stores it, or None when it converts it."""
+        return None
+
     @property
     def scheme(self):
         return self.cfg.scheme

@@ -6,11 +6,10 @@ from typing import Any
 
 import torch
 
+from ..linear.df11 import df11_bundle, df11_install
 from ..registry import LayerKind, register_method
 from ..scheme import QuantKind
 from .base import EmbeddingConfig, EmbeddingKernel, EmbeddingMethod
-
-DF11_KEYS = ("low8", "bitstream", "chunk_start", "lut")
 
 
 class Df11EmbeddingKernel(EmbeddingKernel):
@@ -24,18 +23,12 @@ class Df11EmbeddingKernel(EmbeddingKernel):
     def finalize(self, layer: Any) -> None:
         from freetoken.kernel.triton.df11 import df11_compress_rows
 
-        c = df11_compress_rows(layer.weight.cuda())
-        del layer.weight
-        for key in DF11_KEYS:
-            setattr(layer, key, c[key])
-        layer.df11_meta = c["meta"]
+        df11_install(layer, df11_compress_rows(layer.weight.cuda()))
 
     def embed(self, layer: Any, ids: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.df11_decode import df11_gather_decode
 
-        bundle = {key: getattr(layer, key) for key in DF11_KEYS}
-        bundle["meta"] = layer.df11_meta
-        return df11_gather_decode(bundle, ids).view(*ids.shape, layer.embedding_dim)
+        return df11_gather_decode(df11_bundle(layer), ids).view(*ids.shape, layer.embedding_dim)
 
     def logits(self, layer: Any, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         raise NotImplementedError("a DF11 table cannot serve a tied LM head")

@@ -16,6 +16,7 @@ DF11_KEYS = ("low8", "bitstream", "chunk_start", "lut")
 
 # decodes run one layer at a time, so every DF11 linear on a device shares one scratch sized to the largest weight
 _SCRATCH: dict[torch.device, torch.Tensor] = {}
+_GEMM = TorchLinearKernel()
 
 
 def _scratch(n: int, device: torch.device) -> torch.Tensor:
@@ -24,6 +25,18 @@ def _scratch(n: int, device: torch.device) -> torch.Tensor:
         buf = torch.empty(n, dtype=torch.int16, device=device)
         _SCRATCH[device] = buf
     return buf[:n]
+
+
+def df11_install(layer: Any, compressed: dict) -> None:
+    """Replace ``layer.weight`` with the DF11 tensors of ``compressed``."""
+    del layer.weight
+    for key in DF11_KEYS:
+        setattr(layer, key, compressed[key])
+    layer.df11_meta = compressed["meta"]
+
+
+def df11_bundle(layer: Any) -> dict:
+    return {**{key: getattr(layer, key) for key in DF11_KEYS}, "meta": layer.df11_meta}
 
 
 class Df11LinearKernel(LinearKernel):
@@ -37,27 +50,29 @@ class Df11LinearKernel(LinearKernel):
     def finalize(self, layer: Any) -> None:
         from freetoken.kernel.triton.df11 import df11_compress
 
-        c = df11_compress(layer.weight.cuda())
-        del layer.weight
-        for key in DF11_KEYS:
-            setattr(layer, key, c[key])
-        layer.df11_meta = c["meta"]
+        df11_install(layer, df11_compress(layer.weight.cuda()))
         # sized here, not in the first forward, so a CUDA graph capture never grows it
         _scratch(layer.out_features * layer.in_features, layer.low8.device)
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.df11_decode import df11_decompress
 
-        bundle = {key: getattr(layer, key) for key in DF11_KEYS}
-        bundle["meta"] = layer.df11_meta
         out = _scratch(layer.out_features * layer.in_features, x.device).view(layer.out_features, layer.in_features)
-        return TorchLinearKernel().apply(SimpleNamespace(weight=df11_decompress(bundle, out=out), bias=layer.bias), x)
+        return _GEMM.apply(SimpleNamespace(weight=df11_decompress(df11_bundle(layer), out=out), bias=layer.bias), x)
 
 
 @register_method(QuantKind.DF11, LayerKind.LINEAR)
 class Df11LinearMethod(LinearMethod):
     candidates = (Df11LinearKernel,)
     online = True
+
+    @classmethod
+    def refuses(cls, layer: Any) -> str | None:
+        from freetoken.layers.embedding import ParallelLMHead
+
+        if isinstance(layer, ParallelLMHead):
+            return "the LM head would decode its whole weight every step"
+        return None
 
     def create_weights(self, layer: Any) -> None:
         layer.weight = torch.empty(self.cfg.out_features, self.cfg.in_features)

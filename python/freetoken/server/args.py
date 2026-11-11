@@ -739,8 +739,8 @@ def parse_args(
         help=(
             "Convert the Linear layers and input embedding tables that the checkpoint stores in bf16 at load. 'df11' "
             "compresses them losslessly to ~11 bits per weight and decodes them bit-for-bit on use: about 30%% less "
-            "VRAM for those weights, at the cost of a decode per use. The LM head and vision encoders stay bf16; refused "
-            "when no layer qualifies."
+            "VRAM for those weights, at the cost of a decode per use. The LM head, a table tied to it, vision encoders and "
+            "layers whose weight the model reads directly stay bf16; refused when no layer qualifies."
         ),
     )
 

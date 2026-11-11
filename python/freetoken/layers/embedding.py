@@ -5,10 +5,12 @@ from typing import Dict
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
-from freetoken.utils import div_ceil, nvtx_annotate
+from freetoken.utils import div_ceil, init_logger, nvtx_annotate
 
 from .base import BaseOP
 from .quantization import LayerKind, QuantConfig, quant_method_for
+
+logger = init_logger(__name__)
 
 
 class VocabParallelEmbedding(BaseOP):
@@ -86,7 +88,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.tied_embedding = tied_embedding
         assert (tied_embedding is not None) == tie_word_embeddings
         if tied_embedding is not None and tied_embedding.quant_method.online:
-            raise ValueError("--online-quant compresses the embedding table, which this model ties to its LM head; serve it without --online-quant")
+            # the head multiplies by the whole table every step, which an online table would decode in full each time
+            logger.info("--online-quant leaves %s as stored: the LM head is tied to it", tied_embedding.prefix)
+            tied_embedding.quant_method = quant_method_for(None, tied_embedding, tied_embedding.prefix)
+            tied_embedding.quant_method.create_weights(tied_embedding)
         self.in_features = embedding_dim
         self.out_features = self.num_embeddings_tp
         self.output_sizes = (self.num_embeddings_tp,)

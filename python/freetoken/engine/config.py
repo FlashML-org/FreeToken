@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.layers.quantization import set_quant_config
+from freetoken.layers.quantization import online_kinds, set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
@@ -134,6 +134,10 @@ class EngineConfig:
             raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
         if self.online_quant_modules and not self.online_quant:
             raise ValueError("--online-quant-modules names the modules --online-quant converts; pass --online-quant too")
+        if self.online_quant is not None and self.online_quant not in (known := sorted(str(k) for k in online_kinds())):
+            raise ValueError(f"online_quant {self.online_quant!r} has no online method; known: {known}")
+        if isinstance(self.online_quant_modules, str):
+            raise TypeError("online_quant_modules takes a tuple of module names or globs, not a string")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
