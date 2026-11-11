@@ -25,10 +25,10 @@ from freetoken.models.config import (
     SWAAttentionGroupConfig,
 )
 from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
-from freetoken.models.gguf.reader import gguf_tensor_index, load_gguf_metadata
+from freetoken.models.gguf.reader import gguf_architecture, gguf_tensor_index, load_gguf_metadata
 from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, table_matrix, weight_scale
 
-from .config import _parse_vision_config, gemma4_e_args
+from .config import Gemma4EArgs, _parse_vision_config, gemma4_e_args
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -502,10 +502,200 @@ def iter_gguf_weights(
         yield from iter_mmproj_weights(find_mmproj(model_path))
 
 
+# --------------------------------------------------------------------------------------
+# MTP draft: the gemma4-assistant sidecar (llama.cpp's gemma4-assistant.cpp). Four
+# KV-shared decoder layers over the target's hidden that read its cache and store nothing,
+# with the draft's own tied vocab table.
+# --------------------------------------------------------------------------------------
+
+ASSISTANT_ARCH = "gemma4-assistant"
+
+_ASSISTANT_LEAVES = {
+    "self_attn.q_proj": "attn_q",
+    "self_attn.o_proj": "attn_output",
+    "feed_forward.shared_mlp.gate_proj": "ffn_gate",
+    "feed_forward.shared_mlp.up_proj": "ffn_up",
+    "feed_forward.shared_mlp.down_proj": "ffn_down",
+}
+_ASSISTANT_LAYER_RE = re.compile(r"^layers\.(\d+)\.(.+)$")
+
+
+def to_gguf_assistant(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
+    """Draft module name -> sidecar tensor. The draft has no k or v (it reads the target's) and its tied head has no tensor of its own."""
+    if name == "vocab":
+        return ("token_embd",)
+    if name == "lm_head":
+        return ()
+    if name in ("pre_projection", "post_projection"):
+        return (f"nextn.{name}",)
+    m = _ASSISTANT_LAYER_RE.match(name)
+    if m is None:
+        return ()
+    leaf = _ASSISTANT_LEAVES.get(m.group(2))
+    return (f"blk.{m.group(1)}.{leaf}",) if leaf is not None else ()
+
+
+def assistant_quant(model_path: str) -> "GGUFConfig":
+    """The draft's quant over the sidecar's own tensor table: its matrices and its F32 norms live in the same file."""
+    from freetoken.layers.quantization import GGUFConfig, NameMap
+
+    types = {name: info.ggml_type for name, info in gguf_tensor_index(model_path).items()}
+    return GGUFConfig(types, to_gguf_assistant, name_map=NameMap(packed=(("gate_up_proj", ("gate_proj", "up_proj")),)))
+
+
+def assistant_config(model_path: str) -> ModelConfig:
+    """The geometry the sidecar describes for itself: draft-width layers, sliding window x3 plus one full partial-rotary layer, all KV-shared."""
+    if gguf_architecture(model_path) != ASSISTANT_ARCH:
+        raise ValueError(f"{model_path}: a gemma4 MTP draft is a {ASSISTANT_ARCH} GGUF, not {gguf_architecture(model_path)!r}")
+    m = load_gguf_metadata(model_path)
+
+    def g(key: str):
+        val = m.get(f"{ASSISTANT_ARCH}.{key}")
+        if val is None:
+            raise KeyError(f"missing GGUF metadata key {ASSISTANT_ARCH}.{key}")
+        return val
+
+    num_layers = int(g("block_count"))
+    swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
+    assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
+    swa_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if is_swa)
+    full_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if not is_swa)
+    kv_per_layer = g("attention.head_count_kv")
+    if not isinstance(kv_per_layer, (list, tuple)):
+        kv_per_layer = [kv_per_layer] * num_layers
+    ffn = g("feed_forward_length")
+    if isinstance(ffn, (list, tuple)):
+        if len({int(x) for x in ffn}) != 1:
+            raise NotImplementedError(f"{model_path}: per-layer draft MLP widths are not supported")
+        ffn = int(ffn[0])
+    if int(m.get(f"{ASSISTANT_ARCH}.embedding_length_per_layer_input", 0)):
+        raise NotImplementedError(f"{model_path}: an assistant with per-layer inputs is not supported")
+
+    full_head_dim = int(g("attention.key_length"))
+    if int(g("attention.value_length")) != full_head_dim:
+        raise ValueError(f"{model_path}: the assistant requires key_length == value_length")
+    swa_head_dim = int(g("attention.key_length_swa"))
+    if int(g("attention.value_length_swa")) != swa_head_dim:
+        raise ValueError(f"{model_path}: the assistant requires key_length_swa == value_length_swa")
+
+    max_pos = int(g("context_length"))
+    index = gguf_tensor_index(model_path)
+    if "rope_freqs.weight" not in index:
+        raise ValueError(f"{model_path}: no rope_freqs.weight to size the full layer's partial rotary")
+    # the same divisor tensor as the target's full layer: [1.0] * n_rot/2 + [1e30] * rest (see _full_rotary_dim)
+    full_rotary = RotaryConfig(
+        head_dim=full_head_dim,
+        rotary_dim=int((float_tensor(index["rope_freqs.weight"]) == 1.0).sum().item()) * 2,
+        max_position=max_pos,
+        base=float(g("rope.freq_base")),
+        scaling={"rope_type": "proportional"},
+    )
+    swa_rotary = RotaryConfig(
+        head_dim=swa_head_dim,
+        rotary_dim=int(g("rope.dimension_count_swa")),
+        max_position=max_pos,
+        base=float(g("rope.freq_base_swa")),
+        scaling=None,
+    )
+
+    return ModelConfig(
+        num_layers=num_layers,
+        num_qo_heads=int(g("attention.head_count")),
+        num_kv_heads=int(kv_per_layer[full_layer_ids[0]]),
+        head_dim=full_head_dim,
+        hidden_size=int(g("embedding_length")),
+        vocab_size=int(index["token_embd.weight"].ne[1]),
+        intermediate_size=ffn,
+        hidden_act="gelu_tanh",
+        rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
+        tie_word_embeddings=True,
+        rotary_config=full_rotary,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        norm_topk_prob=True,
+        model_type="gemma4",
+        architectures=["Gemma4AssistantForCausalLM"],
+        moe_enabled=False,
+        expert_quant="none",
+        use_qk_norm=True,
+        attn_sm_scale=1.0,
+        # the assistant's graph caps nothing: no final_logit_softcapping metadata in any release
+        final_logit_softcapping=None,
+        # its tied table only ever serves logits; input embeddings are the target's, already sqrt-scaled
+        embedding_scale=None,
+        # its own e_args: width 0 (no per-layer inputs), every layer KV-shared from the first
+        gemma4_e_args=Gemma4EArgs(
+            per_layer_hidden_size=0, per_layer_vocab_size=0, first_kv_shared_layer=0, kv_shared_intermediate_size=ffn
+        ),
+        attention_groups=(
+            FullAttentionGroupConfig(
+                name="full",
+                layer_ids=full_layer_ids,
+                num_kv_heads=int(kv_per_layer[full_layer_ids[0]]),
+                head_dim=full_head_dim,
+                rotary_config=full_rotary,
+            ),
+            SWAAttentionGroupConfig(
+                name="swa",
+                layer_ids=swa_layer_ids,
+                num_kv_heads=int(kv_per_layer[swa_layer_ids[0]]),
+                head_dim=swa_head_dim,
+                rotary_config=swa_rotary,
+                sliding_window=int(g("attention.sliding_window")),
+            ),
+        ),
+    )
+
+
+def iter_assistant_weights(model_path: str, config: ModelConfig) -> Iterator[tuple[str, torch.Tensor]]:
+    """The sidecar as ``Gemma4MTPDraft`` names its state dict, gate/up fused as the target's loader does.
+
+    Norms read verbatim: gemma4 checkpoints store the norm's final scale (llama.cpp's
+    ``Gemma4Model.norm_shift`` is 0), unlike qwen3.5's zero-centred ones. ``rope_freqs.weight``
+    sizes the full layer's rotary in ``assistant_config`` and is no module's parameter.
+    """
+    index = gguf_tensor_index(model_path)
+
+    def t(name: str):
+        key = name if name in index else f"{name}.weight"
+        if key not in index:
+            raise ValueError(f"{model_path}: the draft lacks {key}; reconvert with a current llama.cpp")
+        return index[key]
+
+    embed = t("token_embd")
+    yield from fused("vocab", [embed], [matrix(embed)], config.hidden_size)
+    for src, dst in (("nextn.pre_projection", "pre_projection"), ("nextn.post_projection", "post_projection")):
+        proj = t(src)
+        yield from fused(dst, [proj], [matrix(proj)], int(proj.ne[0]))
+    yield "norm.weight", float_tensor(t("output_norm"))
+
+    for layer in range(config.num_layers):
+        blk, base = f"blk.{layer}", f"layers.{layer}"
+        sa, ff = f"{base}.self_attn", f"{base}.feed_forward.shared_mlp"
+        q, o = t(f"{blk}.attn_q"), t(f"{blk}.attn_output")
+        yield from fused(f"{sa}.q_proj", [q], [matrix(q)], int(q.ne[0]))
+        yield from fused(f"{sa}.o_proj", [o], [matrix(o)], int(o.ne[0]))
+        gate, up, down = (t(f"{blk}.ffn_{p}") for p in ("gate", "up", "down"))
+        yield from fused(f"{ff}.gate_up_proj", [gate, up], [matrix(gate), matrix(up)], int(gate.ne[0]))
+        yield from fused(f"{ff}.down_proj", [down], [matrix(down)], int(down.ne[0]))
+        yield f"{base}.input_layernorm.weight", float_tensor(t(f"{blk}.attn_norm"))
+        yield f"{sa}.q_norm.weight", float_tensor(t(f"{blk}.attn_q_norm"))
+        yield f"{base}.post_attention_layernorm.weight", float_tensor(t(f"{blk}.post_attention_norm"))
+        yield f"{base}.pre_feedforward_layernorm.weight", float_tensor(t(f"{blk}.ffn_norm"))
+        yield f"{base}.feed_forward.post_feedforward_layernorm.weight", float_tensor(t(f"{blk}.post_ffw_norm"))
+        yield f"{base}.feed_forward.layer_scalar", float_tensor(t(f"{blk}.layer_output_scale")).reshape(1)
+
+
 __all__ = [
+    "ASSISTANT_ARCH",
+    "assistant_config",
+    "assistant_quant",
     "gguf_mm_config",
+    "iter_assistant_weights",
     "iter_mmproj_weights",
     "parse_gguf_config",
     "iter_gguf_weights",
     "to_gguf",
+    "to_gguf_assistant",
 ]
