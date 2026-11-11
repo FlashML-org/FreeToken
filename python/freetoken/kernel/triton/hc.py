@@ -13,6 +13,8 @@ import triton.language as tl
 
 from freetoken.utils.arch import is_sm90_supported
 
+from .q8_1 import empty_q8_1, store_q8_1
+
 
 @functools.cache
 def _pdl_supported() -> bool:
@@ -24,12 +26,14 @@ def _grouped_gemma_rmsnorm_kernel(
     x_ptr,
     w_ptr,
     y_ptr,
+    q_ptr,
     stride_x,
     stride_y,
     DIM: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     W_SHARED: tl.constexpr,
     EPS: tl.constexpr,
+    Q_BLOCKS: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
     GROUP_DIM: tl.constexpr = DIM // NUM_GROUPS
@@ -60,12 +64,16 @@ def _grouped_gemma_rmsnorm_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
+    y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + row * stride_y + offsets, y, mask)
+    if Q_BLOCKS > 0:
+        store_q8_1(y, GROUP_DIM, q_ptr, row, group_id * GROUP_DIM, DIM, Q_BLOCKS)
 
 
 def grouped_gemma_rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
-) -> torch.Tensor:
+    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int, to=None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return the norm and, if the linear ``to`` reads it as q8_1, that copy (else None)."""
     N, DIM = x.shape
     assert x.stride(1) == 1, "grouped Gemma RMSNorm requires unit inner stride"
     assert weight.is_contiguous(), "grouped Gemma RMSNorm weight must be contiguous"
@@ -74,29 +82,34 @@ def grouped_gemma_rmsnorm(
     assert weight.numel() in (group_dim, DIM)
 
     y = x.new_empty(x.shape)
+    yq, q_blocks = empty_q8_1(y, to, group_dim)
     _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
         x,
         weight,
         y,
+        yq,
         x.stride(0),
         y.stride(0),
         DIM,
         num_groups,
         W_SHARED=weight.numel() == group_dim,
         EPS=eps,
+        Q_BLOCKS=q_blocks,
         launch_pdl=_pdl_supported(),
     )
-    return y
+    return y, yq
 
 
 @triton.jit
 def _hc_silu_kernel(
     x_ptr,
     y_ptr,
+    q_ptr,
     stride_x,
     stride_y,
     DIM: tl.constexpr,
     HC: tl.constexpr,
+    Q_BLOCKS: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
     BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(DIM)
@@ -113,24 +126,31 @@ def _hc_silu_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
+    y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + row * stride_y + offs, y, mask)
+    if Q_BLOCKS > 0:
+        store_q8_1(y, DIM, q_ptr, row, 0, DIM, Q_BLOCKS)
 
 
-def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
+def hc_silu(x: torch.Tensor, hc_count: int, to=None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return ``silu(x / hc_count)`` and, if the linear ``to`` reads it as q8_1, that copy (else None)."""
     num_tokens, DIM = x.shape
     assert x.stride(1) == 1
 
     output = x.new_empty(x.shape)
+    output_q, q_blocks = empty_q8_1(output, to, DIM)
     _hc_silu_kernel[(num_tokens,)](
         x,
         output,
+        output_q,
         x.stride(0),
         output.stride(0),
         DIM=DIM,
         HC=hc_count,
+        Q_BLOCKS=q_blocks,
         launch_pdl=_pdl_supported(),
     )
-    return output
+    return output, output_q
 
 
 @triton.jit

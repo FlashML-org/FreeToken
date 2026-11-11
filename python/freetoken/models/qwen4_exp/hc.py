@@ -52,7 +52,7 @@ class GroupedPlusOneRMSNorm(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # the kernel is 2D-only, higher-rank callers keep the torch chain
         if x.is_cuda and x.dim() == 2:
-            return grouped_gemma_rmsnorm(x, self.weight, self.eps, self.num_groups)
+            return grouped_gemma_rmsnorm(x, self.weight, self.eps, self.num_groups)[0]
         return grouped_plus_one_rms_norm(x, self.weight, self.eps, self.num_groups)
 
 
@@ -112,18 +112,23 @@ class GatedResidual(BaseOP):
             quant_config=config.quant, prefix=f"{prefix}.input_mix_weight_up",
         )
 
-    def _down(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    @property
+    def _down_linear(self) -> LinearReplicated:
+        return self.input_mix_weight_down_block_inject if self.use_combine else self.input_mix_weight_down
+
+    def _down(self, rn: torch.Tensor, rn_q: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""
         if not self.use_combine:
-            return self.input_mix_weight_down.forward(rn), None
-        down = self.input_mix_weight_down_block_inject.forward(rn)
+            return self.input_mix_weight_down.forward(rn, rn_q), None
+        down = self.input_mix_weight_down_block_inject.forward(rn, rn_q)
         # both slices keep unit inner stride, so the kernels read them without a copy
         return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
 
     def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
-        lora, s = self._down(rn)
-        gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
+        rn, rn_q = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count, to=self._down_linear)
+        lora, s = self._down(rn, rn_q)
+        act, act_q = hc_silu(lora, self.hc_count, to=self.input_mix_weight_up)
+        gate = self.input_mix_weight_up.forward(act, act_q)
         return hc_gate_mix(rn, gate, self.hc_count), s
 
     def _mix_torch(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
