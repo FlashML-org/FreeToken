@@ -715,6 +715,8 @@ class Engine:
             logger.info_rank0(f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load")
         with _weight_load_context():
             self.model.load_state_dict(self._load_weight_state_dict(config, host_keys, staged_keys))
+        if config.speculative_algorithm is not None:
+            _spec_runner().prepare_target(config, self.model)
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
