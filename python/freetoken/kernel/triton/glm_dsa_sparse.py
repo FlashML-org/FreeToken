@@ -54,6 +54,7 @@ def _glm_dsa_sparse_kernel(
     HAS_COUNTS: tl.constexpr,
     HAS_ROPE: tl.constexpr,
     KV_FMT: tl.constexpr,
+    KV_OFFSET_DTYPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -85,7 +86,7 @@ def _glm_dsa_sparse_kernel(
         t_mask = offs_t < n_active
         idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
         valid = idxs >= 0
-        kv_base = pool_ptr + idxs[:, None] * stride_pn
+        kv_base = pool_ptr + idxs[:, None].to(KV_OFFSET_DTYPE) * stride_pn
         scale_base = scale_ptr + idxs * stride_ps
         kv_v = kv_tile(kv_base + offs_v[None, :] * stride_pd, valid[:, None], KV_FMT).to(tl.float32)
         scale_v = kv_row_scale(scale_base, valid, KV_FMT)
@@ -223,6 +224,7 @@ def _glm_dsa_splitk_kernel(
     HAS_ROPE: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     KV_FMT: tl.constexpr,
+    KV_OFFSET_DTYPE: tl.constexpr,
 ):
     """Stage 1 (decode flash-decoding): each program reduces one BLOCK_T-aligned slice of
     the candidate list and writes a normalized [D_V] partial + log-sum-exp. Same structure
@@ -262,7 +264,7 @@ def _glm_dsa_splitk_kernel(
             t_mask = offs_t < split_end
             idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
             valid = idxs >= 0
-            kv_base = pool_ptr + idxs[:, None] * stride_pn
+            kv_base = pool_ptr + idxs[:, None].to(KV_OFFSET_DTYPE) * stride_pn
             scale_base = scale_ptr + idxs * stride_ps
             kv_v = kv_tile(kv_base + offs_v[None, :] * stride_pd, valid[:, None], KV_FMT).to(tl.float32)
             scale_v = kv_row_scale(scale_base, valid, KV_FMT)
@@ -391,6 +393,7 @@ def glm_dsa_sparse_attn(
     # the decode arms raise register use; this tile compiles without spills on sm_80 to sm_120
     block_t, num_warps = (16, 8) if kv_format.quantized else (BLOCK_T, 4)
     idx = topk_idxs.contiguous().to(torch.int32)
+    offset_dtype = tl.int32 if pool_2d.shape[0] * pool_2d.stride(0) < 1 << 31 else tl.int64
     broadcast_m = idx.shape[1] == 1 and m > 1
     assert broadcast_m or idx.shape[1] == m, (idx.shape, m)
     if out is None:
@@ -427,7 +430,7 @@ def glm_dsa_sparse_attn(
             stride_nb, stride_nm,
             D_V=d_v, D_R=d_r,
             BLOCK_H=BLOCK_H, BLOCK_T=block_t,
-            HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, NUM_SPLITS=n_splits, KV_FMT=kv_format.name,
+            HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, NUM_SPLITS=n_splits, KV_FMT=kv_format.name, KV_OFFSET_DTYPE=offset_dtype,
             num_warps=num_warps, num_stages=2,
         )
         grid2 = (m, b, h)
@@ -453,7 +456,7 @@ def glm_dsa_sparse_attn(
         stride_nb, stride_nm,
         D_V=d_v, D_R=d_r,
         BLOCK_H=BLOCK_H, BLOCK_T=block_t,
-        HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, KV_FMT=kv_format.name,
+        HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, KV_FMT=kv_format.name, KV_OFFSET_DTYPE=offset_dtype,
         num_warps=num_warps, num_stages=2,
     )
     return o

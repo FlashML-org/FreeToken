@@ -194,6 +194,41 @@ def test_sparse_kernel_reads_quantized_latent_rows(fmt_name, force_splits):
     torch.testing.assert_close(o[0, 0].float(), ref, atol=2e-2 * ref.abs().max().item(), rtol=2e-2)
 
 
+@pytest.mark.parametrize("force_splits", [0, 4])
+def test_sparse_kernel_reads_latent_rows_past_int32_offsets(force_splits):
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+    from freetoken.kernel.triton.kv_rows import store_latent_rows
+    from freetoken.kvcache.format import INT8_PER_TOKEN_HEAD as fmt
+
+    torch.manual_seed(0)
+    h, dv, dr, n = 16, 512, 64, 64
+    high = (1 << 31) // (dv + dr) + 128
+    required = (high + n) * (dv + dr + 2 * fmt.scale_store_dtype.itemsize)
+    if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+            pytest.skip("High-row DSA regression needs 3.2 GiB of free GPU memory")
+
+    # an int32 row offset wraps into the zeroed low rows and fails numerically
+    pool = torch.zeros(high + n, dv + dr, device="cuda", dtype=fmt.elem_store_dtype)
+    scale = torch.zeros(high + n, 2, device="cuda", dtype=fmt.scale_store_dtype)
+    rows = torch.arange(high, high + n, device="cuda", dtype=torch.int32)
+    c_kv = torch.randn(n, dv, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.randn(n, dr, device="cuda", dtype=torch.bfloat16)
+    store_latent_rows(fmt, c_kv, k_rope, rows, pool, scale)
+    latent = _dequantize(fmt.name, pool[high:, :dv], scale[high:, 0][:, None])
+    rope = _dequantize(fmt.name, pool[high:, dv:], scale[high:, 1][:, None])
+
+    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=torch.bfloat16)
+    sm_scale = (dv + dr) ** -0.5
+    idx = rows.view(1, 1, n)
+    o = glm_dsa_sparse_attn(q, pool, idx, sm_scale, force_splits=force_splits, kv_format=fmt, scale=scale)
+
+    keys = torch.cat([latent, rope], dim=-1)
+    ref = ((q[0, 0].float() @ keys.T) * sm_scale).softmax(-1) @ latent
+    torch.testing.assert_close(o[0, 0].float(), ref, atol=2e-2 * ref.abs().max().item(), rtol=2e-2)
+
+
 def test_identity_selection_equals_topk_selection_at_short_kv():
     """The dense regimes serve through IDENTITY selection (one shared row list,
     stride-0 broadcast, causal counts). At kv <= index_topk the DSA select picks
