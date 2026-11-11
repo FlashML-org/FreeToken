@@ -486,6 +486,7 @@ def test_lm_head_keeps_the_requested_rows(make_scheme):
 
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
+    torch.manual_seed(0)
     quant = OneScheme()
     with torch_dtype(torch.bfloat16):
         head = ParallelLMHead(1024, 2304, bias=True, quant_config=quant, prefix="lm_head")
