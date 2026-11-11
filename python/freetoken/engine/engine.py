@@ -168,7 +168,15 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
+def _resolve_kv_quant(value: str | None) -> str:
+    key = (value or "none").lower()
+    aliases = {"auto": "none", "bf16": "none", "none": "none", "fp8": "fp8"}
+    if key not in aliases:
+        raise ValueError(f"unknown --kv-cache-dtype {value!r}; expected auto, bf16 or fp8")
+    return aliases[key]
+
+
+def _resolve_auto_attention_backend(required: frozenset[AttnType], *, kv_quant: str = "none") -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
@@ -197,6 +205,10 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         if not arch_ok:
             continue
         if not _backend_parts_serve(name, required):
+            continue
+        if kv_quant == "fp8" and not all(
+            attention_backend_info(p).supports_fp8_kv for p in name.split(",")
+        ):
             continue
         if not _backend_requirements_met(name):
             continue
@@ -258,6 +270,8 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     backend_parts = [p.strip() for p in config.attention_backend.split(",")]
     for part in backend_parts:
         info = attention_backend_info(part)
+        if getattr(config, "kv_quant", "none") == "fp8" and not info.supports_fp8_kv:
+            raise ValueError("--kv-cache-dtype fp8 requires --attention-backend triton")
         missing = required - info.supported_types
         if missing:
             valid = [
@@ -637,6 +651,7 @@ class Engine:
             config.attention_backend, config.model_config
         )
         self.linear_backend = LinearAttnBackend(self.device, self.linear_state_pool) if self.linear_state_pool is not None else None
+        self.attn_backend.init_workspace()
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -798,7 +813,7 @@ class Engine:
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
-        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.runtime_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         spec_fixed, draft_page = self._spec_budget(config)
         fixed_cache_size += spec_fixed
@@ -1336,6 +1351,7 @@ class Engine:
         if self.spec is not None:
             # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
             self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
+        self.attn_backend.reset_workspace()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -1361,6 +1377,7 @@ class Engine:
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
+        self.attn_backend.init_workspace()
         aligned_max_seq_len = self.page_table.shape[1]
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
@@ -2061,10 +2078,22 @@ def _adjust_config(config: EngineConfig):
     if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
         # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
         raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
+    kv_quant = _resolve_kv_quant(getattr(config, "kv_quant", "none"))
+    override("kv_quant", kv_quant)
+    if kv_quant == "fp8":
+        from freetoken.kvcache import _validate_kv_quant_pool
+
+        _validate_kv_quant_pool(model_config, kv_quant)
+        if config.dtype != torch.bfloat16:
+            raise ValueError("--kv-cache-dtype fp8 currently requires --dtype bfloat16")
+        if config.tp_info.size != 1:
+            raise ValueError("--kv-cache-dtype fp8 currently requires TP=1")
+        if config.speculative_algorithm is not None:
+            raise ValueError("--kv-cache-dtype fp8 does not support speculative decoding yet")
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types),
+            _resolve_auto_attention_backend(required_attn_types, kv_quant=kv_quant),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)

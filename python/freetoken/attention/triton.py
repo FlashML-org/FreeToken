@@ -6,9 +6,12 @@ from typing import TYPE_CHECKING, List
 import torch
 from freetoken.core import Batch, get_global_ctx
 from freetoken.kernel.triton.attention import decode_kv_split_cap
+from freetoken.utils import init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
@@ -61,6 +64,7 @@ class TritonMetadata(BaseAttnMetadata):
     attn_logits: torch.Tensor | None = None
     attn_lse: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
+    has_prefix: bool = True
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
@@ -83,6 +87,16 @@ class TritonAttentionBackend(BaseAttnBackend):
             default=int(getattr(config, "head_dim", 1)),
         )
         self.kv_heads = sorted({group.num_kv_heads for group in kv_groups}) or [int(getattr(config, "num_kv_heads", 1))]
+        self.prefill_workspace: torch.Tensor | None = None
+
+    def init_workspace(self) -> None:
+        shape = self.kvcache.prefill_workspace_shape
+        if shape is not None:
+            self.prefill_workspace = torch.empty((2, *shape), device=self.device, dtype=torch.bfloat16)
+            logger.info(f"FP8 prefill workspace: {self.prefill_workspace.numel() * 2} bytes, shared across layers")
+
+    def reset_workspace(self) -> None:
+        self.prefill_workspace = None
 
     def _split_cap(self, bs: int) -> int:
         """The most decode KV splits any layer group takes at this batch size."""
@@ -142,6 +156,8 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert head_dim == q.shape[-1]
         k_cache = k_raw.view(-1, kv_heads, head_dim)
         v_cache = v_raw.view(-1, kv_heads, head_dim)
+        k_scale = self.kvcache.k_scale(layer_id)
+        v_scale = self.kvcache.v_scale(layer_id)
 
         spec = attn_spec or AttentionSpec()
         block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
@@ -166,12 +182,29 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         if (
             (not metadata.is_decode)
             and q.dtype in (torch.float16, torch.bfloat16)
             and (q.shape[-1] <= 256 or metadata.max_q_len >= self.prefill_tile_min_q)
         ):
+            k_extend = k.view(q.shape[0], kv_heads, head_dim)
+            v_extend = v.view(q.shape[0], kv_heads, head_dim)
+            if k_scale is not None and not metadata.has_prefix:
+                # No cached rows are read on the first chunk; retain main's BF16 kernel.
+                k_cache, v_cache = k_extend, v_extend
+                k_scale = v_scale = None
+            elif k_scale is not None and metadata.max_q_len >= 128 and metadata.prefix_lens.numel() == 1:
+                from freetoken.kernel.triton.kv_quant import reconstruct_kv_prefix
+
+                assert self.prefill_workspace is not None, "FP8 prefill workspace must be initialized before serving"
+                wk, wv = self.prefill_workspace.unbind(0)
+                reconstruct_kv_prefix(k_cache, v_cache, k_scale, v_scale,
+                                      metadata.indptr, indices, metadata.prefix_lens, wk, wv)
+                k_cache, v_cache = wk, wv
+                k_scale = v_scale = None
             return extend_paged_attention(
                 q=q,
                 k_cache=k_cache,
@@ -184,9 +217,11 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
-                k_extend=k.view(q.shape[0], kv_heads, head_dim),
-                v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_extend=k_extend,
+                v_extend=v_extend,
                 block_ends=block_ends,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         if block_ends is not None:
             raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
@@ -201,6 +236,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
@@ -253,6 +290,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             prefix_lens=prefix_lens,
             max_q_len=max(seqlens_q),
             swa_indices=swa_indices,
+            has_prefix=any(cached_lens),
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:

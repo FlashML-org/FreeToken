@@ -28,6 +28,7 @@ class EngineConfig:
     hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4
     attention_backend: str = "auto"
+    kv_quant: str = "none"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)

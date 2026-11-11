@@ -35,6 +35,7 @@ class BackendInfo:
     consumes_attn_spec: bool = False
     # How the backend captures a graph of `rows_per_req` query rows per request: "device" keeps all metadata on device, "host_plan" plans on the host before each replay, "none" cannot.
     uniform_extend_graph: Literal["none", "host_plan", "device"] = "none"
+    supports_fp8_kv: bool = False
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -89,6 +90,7 @@ def create_fa_backend(config: ModelConfig):
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
         consumes_attn_spec=True,
         uniform_extend_graph="device",
+        supports_fp8_kv=True,
     ),
 )
 def create_triton_backend(config: ModelConfig):

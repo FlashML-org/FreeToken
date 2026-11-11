@@ -452,6 +452,14 @@ def parse_args(
         help="Print one decode scheduler status line every N decode forwards.",
     )
 
+    parser.add_argument(
+        "--kv-cache-dtype",
+        dest="kv_quant",
+        choices=("auto", "bf16", "fp8"),
+        default="auto",
+        help="KV storage dtype. FP8 currently requires BF16 compute, TP=1, full attention and the Triton backend.",
+    )
+
     kv_capacity_group = parser.add_mutually_exclusive_group()
     kv_capacity_group.add_argument(
         "--num-pages",

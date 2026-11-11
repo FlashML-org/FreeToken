@@ -76,7 +76,29 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--online-quant-modules` | all | Limit `--online-quant` to these modules: comma-separated checkpoint module names or glob patterns, e.g. `model.layers.*.self_attn,model.embed_tokens` (`model.language_model.layers.*` where the checkpoint nests the text model); a name also covers the modules under it, and one that selects no convertible layer is refused. A fused layer (`qkv_proj`) must be covered in all of its checkpoint parts |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
+| `--kv-cache-dtype` | auto | `auto`/`bf16`: compute-dtype KV storage; `fp8`: E4M3 KV storage with FP32 row scales. FP8 requires BF16 compute, TP=1, MHA/GQA full-attention KV and Triton |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+
+FP8 KV is independent of weight quantization. For Qwen3 and Qwen3.5/3.6, use
+`--dtype bfloat16 --kv-cache-dtype fp8 --attention-backend triton`.
+Each cached K/V row stores E4M3 codes in a byte buffer and one FP32 scale per
+token, layer and KV head. At head dimension 128 this saves 48.44% of KV memory
+relative to BF16 for persistent storage. Single-request prefix prefill with at
+least 128 new tokens reconstructs history once per layer into a shared BF16
+workspace, then uses the mainline BF16 attention tiles. The workspace has one
+layer's K/V shape, including the dummy page; it is reused across all layers.
+For Qwen3-30B-A3B at 33059 physical token rows this adds 64.57 MiB, leaving a
+46.35% saving for persistent KV plus workspace. Startup sizing, automatic MoE
+sizing, and live pool resizing include this workspace and the FP32 scales.
+Hybrid linear/full-attention models quantize only their full-attention KV layers;
+linear recurrent state retains its existing precision and storage. SWA, MLA,
+sparse KV pools and speculative decoding are rejected. The Triton decode split
+policy remains adaptive, with the mainline maximum of 64.
+On gfx1201, single-request BF16 decode uses native packed FP8 reads for D=128
+with GQA4/8 and for D=256 with 16 query heads and 2 KV heads. D=128 GQA2 retains
+its tuned compatibility path. Other shapes and devices use the generic path.
+The inline FP8 prefill fallback uses at most 64x32 tiles on ROCm; prefill and
+the stage-2 decode reduction are unchanged by the native decode path.
 
 ### MoE offload
 

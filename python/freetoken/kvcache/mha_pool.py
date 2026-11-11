@@ -9,6 +9,17 @@ from freetoken.utils import div_even
 from .base import BaseKVCachePool
 
 
+def _kv_store_dtype(dtype: torch.dtype, kv_quant: str) -> torch.dtype:
+    """Storage dtype of the KV buffer for a quantization mode."""
+    if kv_quant == "none":
+        return dtype
+    if kv_quant == "fp8":
+        from freetoken.kernel.triton.kv_quant import kv_codes_dtype
+
+        return kv_codes_dtype()
+    raise ValueError(f"unknown kv_quant {kv_quant!r}")
+
+
 class MHAKVCache(BaseKVCachePool):
     """
     Base class for key-value caches.
@@ -20,6 +31,12 @@ class MHAKVCache(BaseKVCachePool):
     that hold no paged KV; passing the full-attention layer ids here allocates one
     storage slab per KV layer (not per model layer) and remaps the global id to its
     dense slot, avoiding a multiple-x over-allocation of unused slabs.
+
+    ``kv_quant="fp8"`` stores rows as e4m3 codes and every
+    ``(token, slab, layer, kv head)`` row carries one fp32 scale (see
+    :mod:`freetoken.kernel.triton.kv_quant`). The codes buffer keeps the exact same
+    shape as the 16-bit one, so ``k_cache``/``v_cache`` and every index into them are
+    unchanged -- only the element type, and ``store_kv``'s write path, differ.
     """
 
     def __init__(
@@ -32,10 +49,16 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        kv_quant: str = "none",
     ) -> None:
+        _kv_store_dtype(dtype, kv_quant)
+        if kv_quant == "fp8" and dtype != torch.bfloat16:
+            raise ValueError("FP8 KV currently requires BF16 compute")
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
         self._num_layers = num_layers
+        self.kv_quant = kv_quant
+        self._compute_dtype = dtype
         if layer_ids is None:
             num_storage_layers = num_layers
             self._layer_map: list[int] | None = None
@@ -47,14 +70,35 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
+        self._device = device
+        self._alloc(num_pages, page_size, num_storage_layers, local_kv_heads, head_dim)
+
+    def _alloc(
+        self,
+        num_pages: int,
+        page_size: int,
+        num_storage_layers: int,
+        local_kv_heads: int,
+        head_dim: int,
+    ) -> None:
+        """Allocate storage and scales; zero FP8 dummy rows to avoid NaN codes."""
+        shape = (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim)
+        if self.kv_quant == "fp8":
+            from freetoken.kernel.triton.kv_quant import alloc_codes
+
+            self._kv_buffer = alloc_codes(shape, self._device)
+            self._scale_buffer = torch.zeros(
+                (2, num_storage_layers, num_pages * page_size, local_kv_heads),
+                device=self._device,
+                dtype=torch.float32,
+            )
+        else:
+            self._kv_buffer = torch.empty(
+                shape, device=self._device, dtype=self._compute_dtype
+            )
+            self._scale_buffer = None
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
     def rebuild(self, num_pages: int) -> None:
@@ -65,22 +109,32 @@ class MHAKVCache(BaseKVCachePool):
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
         _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
-        dtype = self._kv_buffer.dtype
         device = self._device
         self._k_buffer = None
         self._v_buffer = None
         self._kv_buffer = None
+        self._scale_buffer = None
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
-        self._k_buffer = self._kv_buffer[0]
-        self._v_buffer = self._kv_buffer[1]
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._alloc(num_pages, page_size, num_storage_layers, local_kv_heads, head_dim)
+
+    @classmethod
+    def runtime_cost(cls, config, **kwargs) -> tuple[int, int, int, int]:
+        per_page, fixed, tokens, reserve = cls.kv_cost(config, **kwargs)
+        if getattr(config, "kv_quant", "none") != "fp8":
+            return per_page, fixed, tokens, reserve
+        specs = [s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0]
+        spec = specs[0] if len(specs) == 1 else config.model_config
+        heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+        workspace_per_page = config.page_size * 2 * heads * spec.head_dim * 2
+        # One workspace is shared by all layers; both it and storage include the dummy page.
+        total = per_page + workspace_per_page
+        return total, fixed + total, tokens, reserve
+
+    @property
+    def prefill_workspace_shape(self) -> tuple[int, int, int] | None:
+        return self._storage_shape if self.kv_quant == "fp8" else None
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
@@ -101,7 +155,11 @@ class MHAKVCache(BaseKVCachePool):
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
         tokens = int(buf.shape[2]) * int(buf.shape[3])
-        return int(buf.numel() * buf.element_size()) // tokens, 0
+        kv = int(buf.numel() * buf.element_size()) // tokens
+        if self._scale_buffer is not None:
+            sc = self._scale_buffer
+            kv += int(sc.numel() * sc.element_size()) // tokens
+        return kv, 0
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:
@@ -117,6 +175,16 @@ class MHAKVCache(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
 
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        if self._scale_buffer is None:
+            return None
+        return self._scale_buffer[0][self._dense(index)]
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        if self._scale_buffer is None:
+            return None
+        return self._scale_buffer[1][self._dense(index)]
+
     def store_kv(
         self,
         k: torch.Tensor,
@@ -124,9 +192,22 @@ class MHAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
+        dense = self._dense(layer_id)
+        if self.kv_quant == "fp8":
+            from freetoken.kernel.triton.kv_quant import quantize_kv_to_cache
+
+            quantize_kv_to_cache(
+                k=k,
+                v=v,
+                out_loc=out_loc,
+                k_cache=self._k_buffer[dense].view(self._storage_shape),
+                v_cache=self._v_buffer[dense].view(self._storage_shape),
+                k_scale=self._scale_buffer[0][dense],
+                v_scale=self._scale_buffer[1][dense],
+            )
+            return
         from freetoken.kernel import store_cache
 
-        dense = self._dense(layer_id)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
@@ -141,6 +222,15 @@ class MHAKVCache(BaseKVCachePool):
 
     @property
     def dtype(self) -> torch.dtype:
+        """The COMPUTE dtype (kvcache/base.py): what ``store_kv`` receives and what
+        backends size their scratch with -- still 16-bit on an fp8 pool."""
+        return self._compute_dtype
+
+    @property
+    def store_dtype(self) -> torch.dtype:
+        """Element type of ``_kv_buffer``: fp8/uint8 codes when quantized, else the
+        compute dtype. Reading the buffer itself needs THIS, and a backend that cannot
+        apply the row scales never gets a quantized pool (supports_fp8_kv gate)."""
         return self._kv_buffer.dtype
 
     @property

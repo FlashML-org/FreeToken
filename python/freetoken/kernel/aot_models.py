@@ -33,7 +33,7 @@ from dataclasses import dataclass
 
 from .index import num_splits_for
 
-KV_CACHE_DTYPE_BYTES = 2  # every current model allocates bf16 paged KV
+KV_CACHE_DTYPE_BYTES = 2  # raw store_cache rows; FP8 KV uses its Triton quantize/scatter kernel
 EMBED_DTYPE_BYTES = 2  # embedding weights stay bf16 on the indexing() path
 
 
