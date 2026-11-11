@@ -12,6 +12,12 @@ from ..scheme import QuantKind, gguf_types
 from .base import LinearConfig, LinearKernel, LinearMethod
 
 
+def _mmvq_segments(layer: Any, m: int) -> int:
+    """How many segments of ``layer`` run the vector kernel, the one that reads q8_1 activations, at ``m`` rows."""
+    from freetoken.kernel import ggml
+
+    return sum(is_quantized(s.ggml_type) and ggml.uses_mmvq(s.ggml_type, m) for s in layer._ggml_segments)
+
 
 class GgmlLinearKernel(LinearKernel):
     name = "ggml"
@@ -19,7 +25,11 @@ class GgmlLinearKernel(LinearKernel):
     def unusable_reason(self, cfg: LinearConfig) -> str | None:
         return None
 
-    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+    def input_format(self, layer: Any, x: torch.Tensor) -> str | None:
+        m = x.reshape(-1, x.shape[-1]).shape[0]
+        return "q8_1" if _mmvq_segments(layer, m) else None
+
+    def apply(self, layer: Any, x: torch.Tensor, xq: torch.Tensor | None = None) -> torch.Tensor:
         from freetoken.kernel import ggml
 
         x2 = x.reshape(-1, x.shape[-1])
@@ -27,7 +37,8 @@ class GgmlLinearKernel(LinearKernel):
         m = x2.shape[0]
         y = torch.empty(m, sum(s.rows for s in segs), dtype=x.dtype, device=x.device)
         # every segment reads the same x: quantize it once for all the vector-kernel segments
-        xq = ggml.quantize_q8_1(x2) if sum(is_quantized(s.ggml_type) and ggml.uses_mmvq(s.ggml_type, m) for s in segs) > 1 else None
+        if xq is None and _mmvq_segments(layer, m) > 1:
+            xq = ggml.quantize_q8_1(x2)
         for i, s in enumerate(segs):
             w = getattr(layer, segment_param(i))[: s.rows]
             out = y[:, s.out_start : s.out_start + s.rows]
