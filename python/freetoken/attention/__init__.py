@@ -205,6 +205,11 @@ def create_attention_backend(
         backend = p_backend  # both are the same, fall through to single backend
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
 
+    from freetoken.core import get_global_ctx
+
+    kv_format = get_global_ctx().kv_cache.kv_format
+    if kv_format.name not in attention_backend_info(backend).kv_formats:
+        raise ValueError(f"attention backend {backend!r} cannot read {kv_format.name} KV")
     return SUPPORTED_ATTENTION_BACKENDS[backend](config)
 
 

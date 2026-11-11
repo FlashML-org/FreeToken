@@ -41,7 +41,7 @@ def _stage(x):
 
 @triton.jit
 def kv_tile_staged(ptrs, mask, FMT: tl.constexpr):
-    """kv_tile for a tile that every warp of the CTA reads in full: decodes once per CTA and hands the bf16 tile to the MMA through shared memory."""
+    """kv_tile for a tile that every warp of the CTA reads in full: on NVIDIA it decodes once per CTA and hands the bf16 tile to the MMA through shared memory; on HIP it is kv_tile."""
     if FMT == "none":
         tile = tl.load(ptrs, mask=mask, other=0.0)
     else:

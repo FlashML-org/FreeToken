@@ -108,12 +108,17 @@ def _pick_inner_backend(block_size: int, kv_format: KVFormat = NONE) -> str:
         # trtllm (the sm_100 first pick) pins 16/32/64-token pages; walk the rest
         # of the SAME tree (same arch gates, same requirement probes) with the
         # page filter applied.
-        from freetoken.engine.engine import _backend_requirements_met
+        from freetoken.engine.engine import _backend_parts_serve, _backend_requirements_met
         from freetoken.utils.arch import is_sm90_family
 
         skipped = name
         for candidate, arch_ok in (("fa,fi", is_sm90_family()), ("fi", True), ("triton", True)):
-            if arch_ok and _page_ok(candidate) and _backend_requirements_met(candidate):
+            if (
+                arch_ok
+                and _page_ok(candidate)
+                and _backend_parts_serve(candidate, frozenset({AttnType.FULL}), kv_format)
+                and _backend_requirements_met(candidate)
+            ):
                 name = candidate
                 break
         else:  # pragma: no cover - triton is unconditional

@@ -109,24 +109,45 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = kv_tile(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            valid[None, :],
-            KV_FMT,
-        )
-        values = kv_tile(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            valid[:, None],
-            KV_FMT,
-        )
+        # bf16 loads directly: through kv_tile the 64-row tile is scheduled differently and its register use changes
+        if KV_FMT == "none":
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+        else:
+            keys = kv_tile(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                valid[None, :],
+                KV_FMT,
+            )
+            values = kv_tile(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                valid[:, None],
+                KV_FMT,
+            )
         scale_rows = safe_page * PAGE_SIZE + page_offset
         key_scales = kv_row_scale(k_scale_ptr + scale_rows * stride_k_scale + kv_head, valid, KV_FMT)
         value_scales = kv_row_scale(v_scale_ptr + scale_rows * stride_v_scale + kv_head, valid, KV_FMT)

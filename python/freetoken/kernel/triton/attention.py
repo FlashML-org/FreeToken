@@ -38,10 +38,11 @@ def _stage2_launch(max_kv_splits: int, block_dv: int) -> tuple[int, int]:
 
 
 def _quantized_decode_launch(block_d: int, block_n: int, num_stages: int) -> tuple[int, int, int]:
-    """(block_n, num_stages, num_warps) of stage 1 for quantized K/V: the decode arms raise register use, and ptxas compiles these without spills on sm_80 to sm_120."""
+    """(block_n, num_stages, num_warps) of stage 1 for quantized K/V, whose decode arms raise register use."""
     if block_d >= 512:
         return min(block_n, 32), num_stages, 8
     if block_d >= 256:
+        # 3 stages also for a one-tile window: 2 stages spill in more configs
         return (block_n, 3, 8) if block_n == 64 else (block_n, 2, 4)
     if block_d >= 128 and block_n == 64:
         return block_n, num_stages, 8
@@ -95,7 +96,7 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
 
 
 def _quantized_extend_tile(head_dim: int, block_d: int, has_blocks: bool) -> tuple[int, int]:
-    """``(BLOCK_M, BLOCK_N)`` for quantized K/V: the small-SMEM tiles on every GPU, which compile without spills on sm_80 to sm_120; multimodal spans at head_dim 256 need a smaller one."""
+    """``(BLOCK_M, BLOCK_N)`` for quantized K/V: the small-SMEM tiles on every GPU; multimodal spans at head_dim 256 need a smaller one."""
     if has_blocks and 128 < head_dim <= 256:
         return 32, 16
     return _select_extend_tile(head_dim, block_d, 0)

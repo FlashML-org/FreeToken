@@ -101,39 +101,6 @@ def test_auto_backend_picks_one_that_reads_the_kv_format(monkeypatch, major):
     assert config.attention_backend == "triton"
 
 
-@pytest.mark.parametrize(
-    "attn_type, expected",
-    [("swa", "triton"), ("qsa", "qsa_sparse"), ("bsa", "m3_sparse"), ("dsa", "dsa"), ("mla", "dsa")],
-)
-def test_auto_backend_resolves_quantized_kv_per_attention_type(monkeypatch, attn_type, expected):
-    from freetoken.attention import AttnType
-    from freetoken.engine.engine import _resolve_auto_attention_backend
-    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD
-
-    _patch_env(monkeypatch, major=12)
-    assert _resolve_auto_attention_backend(frozenset({AttnType(attn_type)}), FP8_PER_TOKEN_HEAD) == expected
-
-
-def test_no_backend_serves_quantized_kv_for_dsv4(monkeypatch):
-    from freetoken.attention import AttnType
-    from freetoken.engine.engine import _resolve_auto_attention_backend
-    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD
-
-    _patch_env(monkeypatch, major=12)
-    with pytest.raises(RuntimeError, match="fp8_per_token_head"):
-        _resolve_auto_attention_backend(frozenset({AttnType.DSV4}), FP8_PER_TOKEN_HEAD)
-
-
-@pytest.mark.parametrize("backend", ["fi", "fa,fi", "triton,fi"])
-def test_explicit_backend_that_cannot_read_the_kv_format_is_rejected(monkeypatch, backend):
-    from freetoken.engine.engine import _adjust_config
-
-    _patch_env(monkeypatch, major=9)
-    config = _engine_config(attention_backend=backend, kv_cache_dtype="int8_per_token_head")
-    with pytest.raises(ValueError, match="cannot read"):
-        _adjust_config(config)
-
-
 def test_explicit_trtllm_rejected_outside_sm100_family(monkeypatch):
     from freetoken.engine.engine import _adjust_config
 

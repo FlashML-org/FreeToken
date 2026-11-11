@@ -108,6 +108,7 @@ class BSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._scale_buffer = None
             raise
 
     def unit_bytes(self) -> tuple[int, int]:

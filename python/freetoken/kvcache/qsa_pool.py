@@ -159,6 +159,7 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._scale_buffer = None
             raise
 
     @classmethod

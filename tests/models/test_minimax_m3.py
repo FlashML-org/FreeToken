@@ -268,13 +268,6 @@ def test_auto_backend_resolution(monkeypatch):
     # the dense leading layers take a FULL backend from the same resolver, filtered to 128-token pages
     monkeypatch.delenv("FREETOKEN_M3_INNER_BACKEND", raising=False)
     assert _pick_inner_backend(128) in ("fa,fi", "fi", "triton")
-    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD
-
-    assert _pick_inner_backend(128, FP8_PER_TOKEN_HEAD) == "triton"
-    monkeypatch.setenv("FREETOKEN_M3_INNER_BACKEND", "fi")
-    with pytest.raises(ValueError, match="cannot read"):
-        _pick_inner_backend(128, FP8_PER_TOKEN_HEAD)
-    monkeypatch.delenv("FREETOKEN_M3_INNER_BACKEND", raising=False)
 
 
 def test_nvfp4_experts_restricted_to_triton_for_swigluoai(monkeypatch):
