@@ -657,14 +657,25 @@ def _gqa_sparse_fwd_kernel(
         # partial newest page nearly every step; unmasked rows would NaN the
         # whole output row). BSAKVCache's zero-init is defense-in-depth, not a
         # substitute -- recycled pages get re-dirtied.
-        k = kv_tile(
-            k_ptr
-            + (base + off_n[None, :]) * stride_kr
-            + pid_kh * stride_kh
-            + off_d[:, None] * stride_kd,
-            d_mask[:, None] & pos_mask[None, :],
-            KV_FMT,
-        )  # [D, N]
+        # bf16 loads directly: through kv_tile the compiled code is reordered and spills more
+        if KV_FMT == "none":
+            k = tl.load(
+                k_ptr
+                + (base + off_n[None, :]) * stride_kr
+                + pid_kh * stride_kh
+                + off_d[:, None] * stride_kd,
+                mask=d_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+        else:
+            k = kv_tile(
+                k_ptr
+                + (base + off_n[None, :]) * stride_kr
+                + pid_kh * stride_kh
+                + off_d[:, None] * stride_kd,
+                d_mask[:, None] & pos_mask[None, :],
+                KV_FMT,
+            )  # [D, N]
         scale_k = kv_row_scale(k_scale_ptr + (base + off_n) * stride_kss + pid_kh, pos_mask, KV_FMT)
         qk = tl.dot(q, k) * sm_scale_log2e * scale_k[None, :]
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
@@ -674,14 +685,24 @@ def _gqa_sparse_fwd_kernel(
         p = tl.where(pos_mask[None, :], tl.exp2(qk - m_ij[:, None]), 0.0)
         l_ij = tl.sum(p, axis=1)
         acc_o = acc_o * alpha[:, None]
-        v = kv_tile(
-            v_ptr
-            + (base + off_n[:, None]) * stride_vr
-            + pid_kh * stride_vh
-            + off_d[None, :] * stride_vd,
-            pos_mask[:, None] & d_mask[None, :],
-            KV_FMT,
-        )  # [N, D]
+        if KV_FMT == "none":
+            v = tl.load(
+                v_ptr
+                + (base + off_n[:, None]) * stride_vr
+                + pid_kh * stride_vh
+                + off_d[None, :] * stride_vd,
+                mask=pos_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+        else:
+            v = kv_tile(
+                v_ptr
+                + (base + off_n[:, None]) * stride_vr
+                + pid_kh * stride_vh
+                + off_d[None, :] * stride_vd,
+                pos_mask[:, None] & d_mask[None, :],
+                KV_FMT,
+            )  # [N, D]
         scale_v = kv_row_scale(v_scale_ptr + (base + off_n) * stride_vss + pid_kh, pos_mask, KV_FMT)
         acc_o += tl.dot((p * scale_v[None, :]).to(v.dtype), v)
         m_i = m_ij
@@ -791,14 +812,25 @@ def _gqa_sparse_decode_kernel(
         # K/V loads must be pos-masked (same contract as the sequential attend
         # kernel): with K masked, the additive -inf lanes stay -inf and
         # p = exp2(-inf) = 0. Zero-init is defense-in-depth, not a substitute.
-        k = kv_tile(
-            k_ptr
-            + (base + off_n[None, :]) * stride_kr
-            + pid_kh * stride_kh
-            + off_d[:, None] * stride_kd,
-            d_mask[:, None] & pos_mask[None, :],
-            KV_FMT,
-        )
+        # bf16 loads directly: through kv_tile the compiled code is reordered and spills more
+        if KV_FMT == "none":
+            k = tl.load(
+                k_ptr
+                + (base + off_n[None, :]) * stride_kr
+                + pid_kh * stride_kh
+                + off_d[:, None] * stride_kd,
+                mask=d_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+        else:
+            k = kv_tile(
+                k_ptr
+                + (base + off_n[None, :]) * stride_kr
+                + pid_kh * stride_kh
+                + off_d[:, None] * stride_kd,
+                d_mask[:, None] & pos_mask[None, :],
+                KV_FMT,
+            )
         scale_k = kv_row_scale(k_scale_ptr + (base + off_n) * stride_kss + pid_kh, pos_mask, KV_FMT)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
@@ -807,14 +839,24 @@ def _gqa_sparse_decode_kernel(
         p = tl.exp2(qk - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
         acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-        v = kv_tile(
-            v_ptr
-            + (base + off_n[:, None]) * stride_vr
-            + pid_kh * stride_vh
-            + off_d[None, :] * stride_vd,
-            pos_mask[:, None] & d_mask[None, :],
-            KV_FMT,
-        )
+        if KV_FMT == "none":
+            v = tl.load(
+                v_ptr
+                + (base + off_n[:, None]) * stride_vr
+                + pid_kh * stride_vh
+                + off_d[None, :] * stride_vd,
+                mask=pos_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+        else:
+            v = kv_tile(
+                v_ptr
+                + (base + off_n[:, None]) * stride_vr
+                + pid_kh * stride_vh
+                + off_d[None, :] * stride_vd,
+                pos_mask[:, None] & d_mask[None, :],
+                KV_FMT,
+            )
         scale_v = kv_row_scale(v_scale_ptr + (base + off_n) * stride_vss + pid_kh, pos_mask, KV_FMT)
         acc_o += tl.dot((p * scale_v[None, :]).to(v.dtype), v)
         m_i = m_ij
