@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.kvcache.format import NONE, KVFormat
 from freetoken.utils import init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
@@ -52,7 +53,7 @@ _PREFILL_SCORE_BYTES = 256 << 20
 _PREFILL_SCORE_CHUNK = 4096
 
 
-def _pick_inner_backend(block_size: int) -> str:
+def _pick_inner_backend(block_size: int, kv_format: KVFormat = NONE) -> str:
     """FULL backend for the dense leading layers, resolved through the engine's
     own FULL auto-tree (one resolver, so the two trees cannot diverge), then
     filtered for page-size compatibility: this pool serves 128-token pages, so a
@@ -90,6 +91,8 @@ def _pick_inner_backend(block_size: int) -> str:
                     f"FREETOKEN_M3_INNER_BACKEND={override!r}: {part!r} does not "
                     "serve FULL attention (the dense leading layers)."
                 )
+            if kv_format.name not in info.kv_formats:
+                raise ValueError(f"FREETOKEN_M3_INNER_BACKEND={override!r}: {part!r} cannot read {kv_format.name} KV.")
         if not _page_ok(override):
             raise ValueError(
                 f"FREETOKEN_M3_INNER_BACKEND={override!r} cannot address the "
@@ -100,7 +103,7 @@ def _pick_inner_backend(block_size: int) -> str:
 
     from freetoken.engine.engine import _resolve_auto_attention_backend
 
-    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}))
+    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}), kv_format)
     if not _page_ok(name):
         # trtllm (the sm_100 first pick) pins 16/32/64-token pages; walk the rest
         # of the SAME tree (same arch gates, same requirement probes) with the
@@ -178,7 +181,7 @@ class M3SparseAttnBackend(BaseAttnBackend):
         # Wrapped FULL backend for the dense leading layers.
         from freetoken.attention import create_attention_backend
 
-        self._inner_name = _pick_inner_backend(self.block_size)
+        self._inner_name = _pick_inner_backend(self.block_size, self.kvcache.kv_format)
         self.inner = create_attention_backend(self._inner_name, config)
 
         # decode staging (static buffers under CUDA graphs; eager decode builds
@@ -290,6 +293,9 @@ class M3SparseAttnBackend(BaseAttnBackend):
         m3_sparse_attn_decode(
             q, self._k_rows(layer_id), self._v_rows(layer_id),
             topk_idx, block_rows, kvlen, self.sm_scale, out,
+            kv_format=self.kvcache.kv_format,
+            k_scale=self.kvcache.k_scale(layer_id),
+            v_scale=self.kvcache.v_scale(layer_id),
         )
         return out
 
@@ -364,6 +370,9 @@ class M3SparseAttnBackend(BaseAttnBackend):
                 m3_sparse_attn_prefill(
                     q[sl], k_rows, v_rows, topk_idx, block_rows,
                     cu, seq, prefix, chunk_len, self.sm_scale, out[sl],
+                    kv_format=self.kvcache.kv_format,
+                    k_scale=self.kvcache.k_scale(layer_id),
+                    v_scale=self.kvcache.v_scale(layer_id),
                 )
         return out
 

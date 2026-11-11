@@ -148,6 +148,52 @@ def test_sparse_kernel_equals_dense_when_all_selected():
     assert (o[0, 0].float() - ref).abs().max().item() < 2e-2
 
 
+def _dequantize(fmt_name, codes, scale):
+    if fmt_name == "fp8_per_token_head":
+        return codes.cpu().view(torch.float8_e4m3fn).float().to(codes.device) * scale
+    return codes.float() * scale
+
+
+@pytest.mark.parametrize("fmt_name", ["fp8_per_token_head", "int8_per_token_head"])
+@pytest.mark.parametrize("force_splits", [0, 4])
+def test_sparse_kernel_reads_quantized_latent_rows(fmt_name, force_splits):
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+    from freetoken.kernel.triton.kv_rows import store_latent_rows
+    from freetoken.kvcache.format import KV_FORMATS
+
+    torch.manual_seed(0)
+    fmt = KV_FORMATS[fmt_name]
+    h, dv, dr, n = 40, 512, 64, 977
+    capacity = n + 13
+    gain = torch.logspace(-1, 1, n, device="cuda")[:, None]
+    c_kv = (torch.randn(n, dv, device="cuda") * gain).to(torch.bfloat16)
+    # the rope part has a far smaller range than the latent part of the same row, and its own per-row range
+    k_rope = (torch.randn(n, dr, device="cuda") * 0.01 * gain.flip(0)).to(torch.bfloat16)
+    rows = torch.randperm(capacity, device="cuda")[:n].to(torch.int32)
+    pool = torch.zeros(capacity, dv + dr, device="cuda", dtype=fmt.elem_store_dtype)
+    scale = torch.zeros(capacity, 2, device="cuda", dtype=fmt.scale_store_dtype)
+    store_latent_rows(fmt, c_kv, k_rope, rows, pool, scale)
+
+    live = rows.long()
+    latent = _dequantize(fmt_name, pool[live, :dv], scale[live, 0][:, None])
+    rope = _dequantize(fmt_name, pool[live, dv:], scale[live, 1][:, None])
+    torch.testing.assert_close(latent.abs().amax(-1), c_kv.float().abs().amax(-1), rtol=1e-5, atol=0.0)
+    torch.testing.assert_close(rope.abs().amax(-1), k_rope.float().abs().amax(-1), rtol=1e-5, atol=0.0)
+
+    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=torch.bfloat16)
+    # a large rope query keeps the small rope keys in the logits, so a wrong kpe scale moves the output
+    q[..., dv:] *= 500
+    sm_scale = (dv + dr) ** -0.5
+    idx = torch.full((1, 1, 2048), -1, device="cuda", dtype=torch.int32)
+    idx[0, 0, :n] = rows
+    cnt = torch.tensor([[n]], device="cuda", dtype=torch.int32)
+    o = glm_dsa_sparse_attn(q, pool, idx, sm_scale, counts=cnt, force_splits=force_splits, kv_format=fmt, scale=scale)
+
+    keys = torch.cat([latent, rope], dim=-1)
+    ref = ((q[0, 0].float() @ keys.T) * sm_scale).softmax(-1) @ latent
+    torch.testing.assert_close(o[0, 0].float(), ref, atol=2e-2 * ref.abs().max().item(), rtol=2e-2)
+
+
 def test_identity_selection_equals_topk_selection_at_short_kv():
     """The dense regimes serve through IDENTITY selection (one shared row list,
     stride-0 broadcast, causal counts). At kv <= index_topk the DSA select picks

@@ -311,6 +311,52 @@ def test_prefill_attend_equals_dense_when_topk_covers():
     assert err < 3e-2, err
 
 
+def _dequantize(fmt_name: str, codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    if fmt_name == "fp8_per_token_head":
+        return codes.cpu().view(torch.float8_e4m3fn).float().to(codes.device) * scale
+    return codes.float() * scale
+
+
+@pytest.mark.parametrize("fmt_name", ["fp8_per_token_head", "int8_per_token_head"])
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_attend_reads_quantized_kv(fmt_name: str, phase: str):
+    from freetoken.kernel.triton.kv_rows import store_kv_rows
+    from freetoken.kvcache.format import KV_FORMATS
+
+    fmt = KV_FORMATS[fmt_name]
+    kv_len, q_len = BLK * 3 + 21, 40 if phase == "prefill" else 1
+    q, k, v, iq, ik, q_pos, block_rows, total_pages, _, prefix = _attend_case(kv_len, q_len, seed=6)
+    logical = torch.arange(kv_len, device=DEV)
+    slots = (block_rows[logical // BLK] + logical % BLK).to(torch.int32)
+    k_slab = torch.zeros(total_pages * BLK, KVH, D, device=DEV, dtype=fmt.elem_store_dtype)
+    v_slab = torch.zeros_like(k_slab)
+    k_scale = torch.zeros(total_pages * BLK, KVH, 1, device=DEV, dtype=fmt.scale_store_dtype)
+    v_scale = torch.zeros_like(k_scale)
+    store_kv_rows(fmt, k.view(kv_len, -1), v.view(kv_len, -1), slots, k_slab, v_slab, k_scale, v_scale)
+    ik_slab = scatter_rows(ik, block_rows, total_pages, fill=0.0)
+    rows = block_rows.view(1, -1)
+    seq = torch.tensor([kv_len], dtype=torch.int32, device=DEV)
+    kv_args = dict(kv_format=fmt, k_scale=k_scale, v_scale=v_scale)
+    out = torch.empty_like(q)
+    if phase == "prefill":
+        cu = torch.tensor([0, q_len], dtype=torch.int32, device=DEV)
+        pre = torch.tensor([prefix], dtype=torch.int32, device=DEV)
+        score = m3_index_score_prefill(iq, ik_slab, rows, cu, seq, pre, q_len, kv_len)
+        topk_idx = m3_index_topk_prefill(score, cu, pre, q_len, TOPK, INIT, LOCAL)
+        m3_sparse_attn_prefill(q, k_slab, v_slab, topk_idx, rows, cu, seq, pre, q_len, SCALE, out, **kv_args)
+    else:
+        topk_idx = m3_index_decode(iq, ik_slab, rows, seq, rows.shape[1], TOPK, INIT, LOCAL)
+        m3_sparse_attn_decode(q, k_slab, v_slab, topk_idx, rows, seq, SCALE, out, **kv_args)
+
+    sel = ref_select(ref_block_scores(iq, ik, q_pos), q_pos, TOPK, INIT, LOCAL)
+    live = slots.long()
+    k_ref = _dequantize(fmt_name, k_slab[live], k_scale[live])
+    v_ref = _dequantize(fmt_name, v_slab[live], v_scale[live])
+    ref = ref_sparse_attend(q, k_ref, v_ref, sel, q_pos, SCALE)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 3e-2, err
+
+
 @pytest.mark.parametrize("topk", [4, 16])
 @pytest.mark.parametrize("kv_lens", [[BLK * 6 + 17, 70, BLK * 3, BLK * 9]])
 def test_decode_attend(kv_lens: list[int], topk: int):

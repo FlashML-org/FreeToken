@@ -18,9 +18,12 @@ bytes off the attention-group spec) stay correct by construction.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 
 from .base import BaseKVCachePool
+from .format import NONE, ROW_SCALE_FORMATS, KVFormat
 
 
 class MLAKVCache(BaseKVCachePool):
@@ -32,7 +35,11 @@ class MLAKVCache(BaseKVCachePool):
     ``layer_ids`` backs only a SUBSET of the model's layers (hybrid linear x
     MLA/DSA) while callers keep addressing by GLOBAL layer id -- the same remap
     contract as MHAKVCache; None keeps the identity mapping.
+
+    A quantized row keeps two scales: ckv and kpe have their own ranges.
     """
+
+    kv_formats: ClassVar[frozenset[str]] = ROW_SCALE_FORMATS
 
     def __init__(
         self,
@@ -43,7 +50,9 @@ class MLAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: "tuple[int, ...] | None" = None,
+        kv_format: KVFormat = NONE,
     ) -> None:
+        self.kv_format = kv_format
         self._latent_dim = latent_dim
         if layer_ids is None:
             self._num_layers = num_layers
@@ -61,11 +70,20 @@ class MLAKVCache(BaseKVCachePool):
 
     def _alloc(self, num_pages: int) -> None:
         self._num_pages = num_pages
-        self._kv_buffer = torch.empty(
-            (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim),
+        fmt = self.kv_format
+        new = torch.zeros if fmt.quantized else torch.empty
+        self._kv_buffer = new(
+            (1, self._num_layers, num_pages, self._page_size, 1, fmt.elem_dim(self._latent_dim)),
             device=self._device,
-            dtype=self._dtype,
+            dtype=fmt.elem_tensor_dtype(self._dtype),
         )
+        self._scale_buffer = None
+        if fmt.scale_dtype is not None:
+            self._scale_buffer = torch.zeros(
+                (self._num_layers, num_pages * self._page_size, 2),
+                device=self._device,
+                dtype=fmt.scale_store_dtype,
+            )
 
     # -- views (addressed by GLOBAL layer id; remapped when layer_ids was given) --
     def k_cache(self, layer_id: int) -> torch.Tensor:
@@ -82,6 +100,10 @@ class MLAKVCache(BaseKVCachePool):
         """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
         return self._kv_buffer[0, self._local_layer(layer_id)].view(-1, self._latent_dim)
 
+    def latent_scale(self, layer_id: int) -> torch.Tensor | None:
+        """Row scales ``[num_pages * page_size, 2]`` (ckv, kpe), or None when rows are not quantized."""
+        return None if self._scale_buffer is None else self._scale_buffer[self._local_layer(layer_id)]
+
     # -- writes -----------------------------------------------------------------
     def store_kv(
         self,
@@ -97,6 +119,11 @@ class MLAKVCache(BaseKVCachePool):
         store.cu (two-width store).
         """
         rows = self.latent_rows(layer_id)
+        if self.kv_format.quantized:
+            from freetoken.kernel.triton.kv_rows import store_latent_rows
+
+            store_latent_rows(self.kv_format, c_kv, k_rope, out_loc, rows, self.latent_scale(layer_id))
+            return
         split = rows.shape[1] - k_rope.shape[-1]
         rows[out_loc, :split] = c_kv
         rows[out_loc, split:] = k_rope
@@ -105,6 +132,7 @@ class MLAKVCache(BaseKVCachePool):
         """In-place resize (frees the old slab first; object identity preserved --
         callers re-derive views per forward, same contract as MHAKVCache.rebuild)."""
         self._kv_buffer = None
+        self._scale_buffer = None
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
@@ -115,7 +143,7 @@ class MLAKVCache(BaseKVCachePool):
         from .base import spec_kv_bytes_per_token
 
         per_token = sum(
-            spec_kv_bytes_per_token(spec, config)
+            spec_kv_bytes_per_token(spec, config, getattr(config, "kv_format", NONE))
             for spec in config.model_config.kv_cache_group_specs()
         )
         return per_token * config.page_size, 0, config.page_size, 0
@@ -127,7 +155,10 @@ class MLAKVCache(BaseKVCachePool):
 
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
-        return int(buf.numel() * buf.element_size()) // (self._num_pages * self._page_size), 0
+        total = int(buf.numel() * buf.element_size())
+        if self._scale_buffer is not None:
+            total += int(self._scale_buffer.numel() * self._scale_buffer.element_size())
+        return total // (self._num_pages * self._page_size), 0
 
     # -- pool properties ----------------------------------------------------------
     @property
@@ -158,12 +189,13 @@ class DSAKVCache(MLAKVCache):
         index_head_dim: int,
         num_index_layers: int,
         layer_ids: "tuple[int, ...] | None" = None,
+        kv_format: KVFormat = NONE,
     ) -> None:
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
         super().__init__(
             latent_dim, num_layers, num_pages, page_size, dtype, device,
-            layer_ids=layer_ids,
+            layer_ids=layer_ids, kv_format=kv_format,
         )
 
     def _index_rows(self, num_pages: int) -> int:
