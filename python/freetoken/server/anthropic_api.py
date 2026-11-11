@@ -453,7 +453,7 @@ async def anthropic_event_stream(
         block_open = "thinking"
         return _event(AnthropicStreamEvent(
             type="content_block_start", index=block_index,
-            content_block=AnthropicContentBlock(type="thinking", thinking=""),
+            content_block=AnthropicContentBlock(type="thinking", thinking="", signature=""),
         ))
 
     def _stop_block() -> list[str]:

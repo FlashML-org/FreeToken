@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, List, Protocol
 
+import numpy as np
 import torch
 
 from freetoken.core import Batch, get_global_ctx
@@ -14,11 +16,14 @@ from freetoken.kvcache.format import NONE
 from freetoken.models.blocks import embed_input_ids
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
+from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
     from freetoken.core import Req
     from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
+
+logger = init_logger(__name__)
 
 
 class MTPDraft(Protocol):
@@ -106,6 +111,15 @@ class _VerifySink:
         pass
 
 
+def read_token_map(path: str, vocab_size: int) -> torch.Tensor:
+    """The token ids in a ``--speculative-token-map`` file."""
+    raw = Path(path).read_bytes()
+    ids = torch.from_numpy(np.frombuffer(raw, dtype="<i4", count=len(raw) // 4).astype(np.int64))
+    if len(raw) % 4 or ids.numel() == 0 or ids.min() < 0 or ids.max() >= vocab_size or ids.unique().numel() != ids.numel():
+        raise ValueError(f"--speculative-token-map {path} must hold distinct little-endian int32 token ids below {vocab_size}")
+    return ids
+
+
 class MTPProposer(Proposer):
     radix_lookahead = True
 
@@ -131,6 +145,20 @@ class MTPProposer(Proposer):
         if is_ftw_checkpoint(path):
             raise ValueError("MTP cannot load its draft from an FTW checkpoint yet")
         cls._draft_class(config).check_source(path, config.model_path)
+        if config.speculative_token_map:
+            if config.model_config.tie_word_embeddings:
+                raise ValueError("--speculative-token-map needs an LM head with its own weights, but this one is tied to the embedding")
+            read_token_map(config.speculative_token_map, config.model_config.vocab_size)
+
+    @classmethod
+    def prepare_target(cls, config, model) -> None:
+        if not config.speculative_token_map:
+            return
+        head = model.lm_head
+        head.keep_rows(read_token_map(config.speculative_token_map, head.num_embeddings), config.model_config.quant)
+        kept, ids = head.kept_rows
+        mib = sum(t.nbytes for t in kept.state_dict().values()) / 2**20
+        logger.info_rank0(f"--speculative-token-map: the draft head keeps {ids.numel()} of {head.num_embeddings} rows ({mib:.0f} MiB)")
 
     @classmethod
     def _draft_class(cls, config) -> type[MTPDraft]:
@@ -164,7 +192,8 @@ class MTPProposer(Proposer):
         target_moe = {id(m) for m in iter_moe_layers(target_model)}
         if any(isinstance(m, OffloadMoELayer) or id(m) in target_moe for m in iter_moe_layers(self.draft)):
             raise RuntimeError(f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU")
-        self.lm_head = target_model.lm_head
+        # hot_ids[i] is the target's token id of the draft head's row i
+        self.lm_head, self.hot_ids = target_model.lm_head.kept_rows or (target_model.lm_head, None)
         self.mrope = config.model_config.model_is_mrope
         self._prefill_state: dict[int, tuple[int, int]] = {}  # table row -> (uid, first position not drafted yet)
         self._prefill_sink: _PrefillSink | None = None
@@ -248,7 +277,8 @@ class MTPProposer(Proposer):
             return self.draft.forward_hidden(embeds, prev_hidden)
 
     def _draft_token(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.lm_head.logits(self.draft.head_input(hidden)).argmax(dim=-1)
+        token = self.lm_head.logits(self.draft.head_input(hidden)).argmax(dim=-1)
+        return token if self.hot_ids is None else self.hot_ids[token]
 
     def _view(self, req, cached_len: int, device_len: int) -> _DraftReq:
         return _DraftReq(cached_len, device_len, req.table_idx, getattr(req, "mrope_delta", 0), getattr(req, "mrope_positions_full", None))

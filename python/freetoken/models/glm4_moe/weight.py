@@ -16,8 +16,6 @@ from freetoken.utils import cached_load_hf_config, download_hf_weight
 from tqdm import tqdm
 
 from .config import parse_config
-from .df11_embedding import compress_df11_embedding
-from .df11_linear import compress_df11_weight
 
 # routed experts go to the offload cache, not the dense model.
 _ROUTED_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
@@ -91,20 +89,6 @@ def _iter_nvfp4_resident(
         yield f"{dst_prefix}.input_scale", reader.get(f"{src_prefix}.input_scale").reshape(()).to(torch.float32)
 
 
-def _iter_attn_df11(
-    reader: _ShardReader, prefix: str, device: torch.device
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield DF11 buffers for an attention projection from its bf16 checkpoint weight.
-
-    qkvo are bf16 in the checkpoint; DF11 compresses them losslessly (~10.7 bits/weight) to
-    fit a 32 GB VRAM target, decoding bit-for-bit.
-    """
-    w = reader.get(f"{prefix}.weight").to(torch.bfloat16)
-    bundle = compress_df11_weight(w)
-    for name in ("low8", "bitstream", "chunk_start", "lut"):
-        yield f"{prefix}.{name}", bundle[name]
-
-
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -114,11 +98,10 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the resident (non routed-expert) weights for GLM-4 MoE.
 
-    - qkvo: lossless DF11 (+ bf16 .bias) so the ~25GB of bf16 attention fits a 32 GB VRAM target.
+    - qkvo (+ bias), embedding, router gate, norms, lm_head: bf16 as stored; the router's
+      e_score_correction_bias in fp32.
     - leading dense MLP layers + each MoE layer's shared expert: native NVFP4 (dequant in
       forward), faithful and smallest footprint.
-    - embedding: row-contiguous DF11, decode only looked-up rows. router gate (+
-      e_score_correction_bias), norms, lm_head pass through.
     - MTP layer (index num_layers) and routed experts are skipped.
     """
     assert not include_moe_experts, (
@@ -140,15 +123,13 @@ def iter_weights(
 
 
 def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch.Tensor]]:
-    device = reader._device
     L = config.num_layers
     dense = config.first_k_dense_replace
 
     for layer in tqdm(range(L), desc="Loading GLM dense weights", disable=not primary):
         a = f"model.layers.{layer}.self_attn"
-        # DF11 projections (+ qkv bias, bias-free o_proj).
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            yield from _iter_attn_df11(reader, f"{a}.{proj}", device)
+            yield f"{a}.{proj}.weight", reader.get(f"{a}.{proj}.weight").to(torch.bfloat16)
             bias_name = f"{a}.{proj}.bias"
             if reader.has(bias_name):
                 yield bias_name, reader.get(bias_name).to(torch.bfloat16)
@@ -178,14 +159,8 @@ def _iter_resident_weights(reader, config, primary) -> Iterator[tuple[str, torch
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 yield from _iter_nvfp4_resident(reader, f"{s}.{proj}", f"{s}.{proj}")
 
-    # bf16 embedding -> row-contiguous DF11 (~30% smaller), decode only looked-up rows.
-    embed = reader.get("model.embed_tokens.weight").to(torch.bfloat16)
-    for name, buf in compress_df11_embedding(embed).items():
-        yield f"model.embed_tokens.{name}", buf
-    del embed
+    yield "model.embed_tokens.weight", reader.get("model.embed_tokens.weight").to(torch.bfloat16)
     yield "model.norm.weight", reader.get("model.norm.weight")
-    # lm_head stays bf16: full-vocab matmul needs a decode scratch as big as the weight, so
-    # DF11 nets no savings (unlike the gathered embedding lookup).
     yield "lm_head.weight", reader.get("lm_head.weight")
 
 

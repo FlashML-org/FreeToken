@@ -10,6 +10,7 @@ from freetoken.kernel.triton.dsv4.compress import gated_pool
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace, fp4_act_quant_inplace
 from freetoken.kernel.triton.dsv4.hadamard import hadamard_transform
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
+from freetoken.layers.quantization import without_online
 
 from .args import DeepseekV4Args
 from .ops import apply_rotary_emb, apply_rotary_emb_decode
@@ -31,8 +32,10 @@ class Compressor(BaseOP):
 
         self.ape = torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
         # checkpoint stores these bf16; matmul upcasts on-chip (halves footprint + read).
-        self.wkv = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
-        self.wgate = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wgate")
+        # bf16_linear_fp32 reads these weights directly
+        raw = without_online(quant_config)
+        self.wkv = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=raw, prefix=f"{prefix}.wkv")
+        self.wgate = LinearReplicated(self.dim, coff * self.head_dim, has_bias=False, quant_config=raw, prefix=f"{prefix}.wgate")
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
         # Paged-KV binding (set on first forward). All addressing -- the compressed-KV pool view,
         # the per-window-page compress-state ring, the decode snapshot -- is reached through the

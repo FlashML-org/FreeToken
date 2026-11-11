@@ -52,11 +52,18 @@ class QuantMethod(ABC):
     kind: ClassVar[QuantKind]
     layer_kind: ClassVar[LayerKind]
     candidates: ClassVar[tuple[type, ...]] = ()
+    # declares the bf16 weight the checkpoint stores and converts it in finalize; the engine loads such weights to host first
+    online: ClassVar[bool] = False
 
     def __init__(self, cfg: Any, requested: str = "auto"):
         self.cfg = cfg
         self.requested = requested
         self.kernel = select_kernel(self.candidates, requested, cfg)
+
+    @classmethod
+    def refuses(cls, layer: Any) -> str | None:
+        """Why this online method leaves ``layer`` as the checkpoint stores it, or None when it converts it."""
+        return None
 
     @property
     def scheme(self):

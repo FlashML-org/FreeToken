@@ -31,6 +31,9 @@ class SpecRuntime(Protocol):
     def adjust_config(cls, config, override) -> None: ...
 
     @classmethod
+    def prepare_target(cls, config, model) -> None: ...
+
+    @classmethod
     def budget(cls, config) -> tuple[int, int]: ...
 
     @classmethod

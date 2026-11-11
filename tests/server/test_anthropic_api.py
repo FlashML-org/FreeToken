@@ -428,7 +428,7 @@ def test_stream_reasoning_as_thinking_block():
         "message_stop",
     ]
     blocks = [e[1] for e in collected if e[0] == "content_block_start"]
-    assert blocks[0]["content_block"]["type"] == "thinking"
+    assert blocks[0]["content_block"] == {"type": "thinking", "thinking": "", "signature": ""}
     assert blocks[0]["index"] == 0
     assert blocks[1]["content_block"]["type"] == "text"
     assert blocks[1]["index"] == 1
