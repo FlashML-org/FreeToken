@@ -110,6 +110,7 @@ class EngineConfig:
     speculative_algorithm: str | None = None
     speculative_num_steps: int = 0
     speculative_draft_model_path: str | None = None
+    speculative_token_map: str | None = None
     # the proposer's states on the target's linear-state slots, resolved by _adjust_config
     spec_slot_states: tuple[SlotStateSpec, ...] = ()
     max_seq_len_override: int | None = None

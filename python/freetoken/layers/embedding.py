@@ -91,10 +91,38 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.quant_method = quant_method_for(quant_config, self, prefix)
             self.quant_method.create_weights(self)
         self.bias = torch.empty(self.num_embeddings_tp) if bias else None
+        # set by keep_rows: a head over a subset of the rows, and the token id of each of its rows
+        self.kept_rows: tuple[ParallelLMHead, torch.Tensor] | None = None
 
     def finalize(self) -> None:
         if self.quant_method is not None:
             self.quant_method.finalize(self)
+
+    def keep_rows(self, ids: torch.Tensor, quant_config: QuantConfig | None) -> None:
+        """Set ``kept_rows`` to a head with its own weights over only the rows ``ids``, repeated up to a multiple of 128 rows.
+
+        Call after the weights load and before ``finalize_quant``: a kernel's finalize can rewrite the weights so that rows cannot be picked, and ``finalize_quant`` also finalizes the new head.
+        """
+        # scaled_mm needs N % 16, b12x N % 8, and the sm_120 GEMV's fast path N % 128; a repeated row maps to the same token
+        ids = ids[torch.arange(div_ceil(ids.numel(), 128) * 128) % ids.numel()]
+        rows = ids.numel()
+        with torch.device("meta"):
+            head = ParallelLMHead(rows, self.embedding_dim, self.has_bias, quant_config=quant_config, prefix=self.prefix)
+        full = self.state_dict()
+        ids = ids.to(next(iter(full.values())).device)
+        for name, want in head.state_dict().items():
+            have = full[name]
+            if want.dim() == 0:
+                kept = have.clone()
+            elif want.shape[0] >= rows and have.shape[1:] == want.shape[1:] and have.shape[0] - self.num_embeddings == want.shape[0] - rows:
+                kept = have.index_select(0, ids)
+                if want.shape[0] > rows:
+                    # ggml's kernels read past the last row and need zeros there
+                    kept = torch.cat([kept, kept.new_zeros(want.shape[0] - rows, *kept.shape[1:])])
+            else:
+                raise NotImplementedError(f"{self.prefix}.{name} is not stored by row (shape {list(have.shape)}), so the head cannot keep a subset of its rows")
+            setattr(head, name, kept)
+        self.kept_rows = head, ids
 
     def load_state_dict(
         self,
@@ -139,7 +167,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         return self.logits(x)
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Full-vocab logits of the rows of ``x``; reads no batch state."""
+        """``num_embeddings`` logits for each row of ``x``; reads no batch state."""
         if self.tied_embedding is not None:
             logits = self.tied_embedding.quant_method.logits(self.tied_embedding, x, self.bias)
         else:

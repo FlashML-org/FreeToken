@@ -89,6 +89,8 @@ class DFlashProposer(Proposer):
     @classmethod
     def adjust_config(cls, config, override) -> None:
         super().adjust_config(config, override)
+        if config.speculative_token_map:
+            raise ValueError("--speculative-token-map only works with --speculative-algorithm mtp")
         module, name = _draft_entry(config)
         path = config.speculative_draft_model_path
         if not path:

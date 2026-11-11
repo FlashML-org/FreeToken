@@ -54,6 +54,10 @@ class SpecRunner:
             )
 
     @classmethod
+    def prepare_target(cls, config, model) -> None:
+        proposer_class(config).prepare_target(config, model)
+
+    @classmethod
     def budget(cls, config) -> tuple[int, int]:
         return proposer_class(config).budget(config)
 
