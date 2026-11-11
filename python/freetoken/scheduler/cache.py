@@ -647,8 +647,11 @@ class CacheManager:
         """
         start = div_ceil(keep_len, self.page_size) * self.page_size
         end = div_ceil(drop_len, self.page_size) * self.page_size
-        assert not self.swa_paged, "rollback_tail frees no SWA slots; speculative decoding rejects SWA targets"
         if end > start:
+            # allocate_paged gave every dropped token a swa slot; without this the rejected
+            # verify rows leak ~k+1 swa slots per step until alloc_swa exhausts the pool.
+            if self.swa_paged:
+                self._free_swa(self.page_table[req.table_idx, start:end])
             self._free(self.page_table[req.table_idx, start:end])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
