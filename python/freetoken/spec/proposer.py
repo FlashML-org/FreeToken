@@ -57,6 +57,10 @@ class Proposer:
             )
 
     @classmethod
+    def prepare_target(cls, config, model) -> None:
+        """Called with the target's weights loaded, before its kernels finalize them."""
+
+    @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
         """(default, max) draft tokens per step; called after ``adjust_config``."""
         raise NotImplementedError

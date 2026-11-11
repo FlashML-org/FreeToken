@@ -43,6 +43,7 @@ from freetoken.layers.quantization.moe import Fp8BlockMoEMethod, Mxfp4MoEMethod,
 from freetoken.models import create_model
 from freetoken.models.gpt_oss.moe import GptOssMoELayer, GptOssOffloadMoELayer
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
+from freetoken.third_party import gguf
 from freetoken.utils.hf import sidecar_quantization_config
 from freetoken.utils.torch_utils import torch_dtype
 
@@ -463,6 +464,49 @@ def test_every_dialect_names_the_tensors_behind_its_schemes():
     for cls in dialects():
         for scheme in getattr(cls, "SCHEMES", {}).values():
             assert set(cls.STORAGE[scheme.kind]) >= scheme.roles, f"{cls.__name__} does not name every tensor of {scheme}"
+
+
+@pytest.mark.parametrize("make_scheme", [
+    lambda s: None,
+    lambda s: s.fp8_tensor_scheme("fp32", per_row=True, input_scale=True),
+    lambda s: s.mxfp8_scheme(),
+    lambda s: s.nvfp4_scheme(input_scale=True),
+    lambda s: s.gguf_scheme([gguf.GGMLQuantizationType.Q5_K]),
+    lambda s: s.gguf_scheme([gguf.GGMLQuantizationType.NVFP4], scaled=True),
+], ids=["bf16", "fp8_tensor", "mxfp8", "nvfp4", "gguf_q5k", "gguf_nvfp4"])
+def test_lm_head_keeps_the_requested_rows(make_scheme):
+    """Per-row tensors of the kept head are the full head's rows in the requested order, repeated up to a multiple of 128 rows; global scales are copied and ggml's padding rows are zero."""
+    from freetoken.layers.base import iter_ops
+    from freetoken.layers.embedding import ParallelLMHead
+    from freetoken.layers.quantization import scheme as schemes
+
+    class OneScheme(NoQuantConfig):
+        def scheme_for(self, prefix):
+            return make_scheme(schemes)
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    torch.manual_seed(0)
+    quant = OneScheme()
+    with torch_dtype(torch.bfloat16):
+        head = ParallelLMHead(1024, 2304, bias=True, quant_config=quant, prefix="lm_head")
+    full = {name: torch.randint(1, 200, t.shape).to(t.dtype) for name, t in head.state_dict().items()}
+    for name, t in full.items():
+        setattr(head, name, t)
+    ids = torch.randperm(1024)[:100]
+    head.keep_rows(ids, quant)
+    kept, kept_ids = head.kept_rows
+    assert kept_ids.numel() == 128 and torch.equal(kept_ids[:100], ids) and set(kept_ids.tolist()) == set(ids.tolist())
+    # finalize_quant finds the kept head through iter_ops
+    assert any(op is kept for op in iter_ops(head))
+    assert set(kept.state_dict()) == set(full)
+    for name, t in kept.state_dict().items():
+        assert t.dtype == full[name].dtype
+        if t.dim() == 0:
+            assert torch.equal(t.float(), full[name].float())
+        else:
+            assert torch.equal(t[:128].float(), full[name][kept_ids].float())
+            assert not t[128:].float().any()
 
 
 def test_compressed_tensors_target_classes_other_than_linear_fail_closed():
