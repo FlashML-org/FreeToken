@@ -257,25 +257,21 @@ def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, pat
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is None, reason="needs ROCm")
 @pytest.mark.parametrize("transpose", [False, True])
-def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool):
+@pytest.mark.parametrize("pack", [1, 4])
+def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool, pack: int):
     import triton
     import triton.language as tl
 
-    from freetoken.kernel.triton.attention import _gfx1201
-    from freetoken.kernel.triton.kv_rows import kv_tile_gfx12_bf16
+    from freetoken.kernel.triton.kv_rows import _gfx1201, kv_tile_rows
 
     if not _gfx1201(torch.cuda.current_device()):
         pytest.skip("packed KV conversion requires gfx1201")
 
     @triton.jit
-    def decode_codes(x, y, TRANSPOSE: tl.constexpr):
+    def decode_codes(x, y, TRANSPOSE: tl.constexpr, PACK: tl.constexpr):
         rows = tl.arange(0, 64)
-        words = tl.arange(0, 32)
-        if TRANSPOSE:
-            ptrs = x + rows[None, :] * 32 + words[:, None]
-        else:
-            ptrs = x + rows[:, None] * 32 + words[None, :]
-        values = kv_tile_gfx12_bf16(ptrs, tl.full(ptrs.shape, True, tl.int1), TRANSPOSE)
+        values = kv_tile_rows(x, rows, 0, 128, 128, tl.full((64,), True, tl.int1),
+                              128, 128, "fp8_per_token_head", PACK, TRANSPOSE)
         if TRANSPOSE:
             values = tl.trans(values)
         tl.store(y + rows[:, None] * 128 + tl.arange(0, 128)[None, :], values)
@@ -283,7 +279,7 @@ def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool):
     codes = torch.arange(256, dtype=torch.uint8).repeat(32)
     expected = codes.view(torch.float8_e4m3fn).bfloat16().cuda()
     actual = torch.empty_like(expected)
-    decode_codes[(1,)](codes.cuda().view(torch.uint32), actual, transpose, num_warps=2)
+    decode_codes[(1,)](codes.cuda(), actual, transpose, pack, num_warps=2)
     finite = expected.isfinite()
     # Integer comparison also checks signed zero and the byte order in each word.
     assert torch.equal(actual.view(torch.int16)[finite], expected.view(torch.int16)[finite])

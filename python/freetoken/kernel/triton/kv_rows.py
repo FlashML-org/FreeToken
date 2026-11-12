@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 from triton.language import target_info
 
 from freetoken.kernel.triton.e4m3_compat import (
+    FORCE_EMU,
     e4m3_f32_to_u8,
     e4m3_native_cx,
     e4m3_u8_to_f32,
@@ -13,6 +16,35 @@ from freetoken.kernel.triton.e4m3_compat import (
     round_e4m3,
 )
 from freetoken.kvcache.format import KVFormat
+
+
+@functools.lru_cache(maxsize=None)
+def _gfx1201(device_index: int) -> bool:
+    if torch.version.hip is None:
+        return False
+    return getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "").split(":")[0] == "gfx1201"
+
+
+def kv_decode_config(
+    fmt: KVFormat,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_n: int,
+    num_stages: int,
+    num_warps: int,
+) -> tuple[int, int, int, int]:
+    """Elements per packed load and launch geometry for the qualified KV reader."""
+    if (
+        fmt.name == "fp8_per_token_head" and not FORCE_EMU
+        and q.dtype == torch.bfloat16 and q.shape[2] == 128
+        and q.shape[0] == 1 and q.shape[1] // k_cache.shape[1] in (4, 8) and _gfx1201(q.device.index)
+        and k_cache.stride(-1) == v_cache.stride(-1) == 1
+        and k_cache.data_ptr() % 4 == 0 and v_cache.data_ptr() % 4 == 0
+        and all(s % 4 == 0 for s in (*k_cache.stride()[:2], *v_cache.stride()[:2]))
+    ):
+        return 4, 64, 1, 2
+    return 1, block_n, num_stages, num_warps
 
 
 @triton.jit
@@ -52,6 +84,34 @@ def kv_tile(ptrs, mask, FMT: tl.constexpr):
     elif FMT == "int8_per_token_head":
         tile = tl.load(ptrs, mask=mask, other=0).to(tl.bfloat16)
     return tile
+
+
+@triton.jit
+def kv_tile_rows(
+    ptr, slots, head, stride_slot, stride_head, row_mask,
+    D: tl.constexpr, BLOCK_D: tl.constexpr, FMT: tl.constexpr,
+    PACK: tl.constexpr, TRANSPOSE: tl.constexpr,
+):
+    """Load row-addressed K/V tiles through the selected reader, in dot-operand order."""
+    tl.static_assert(PACK == 1 or PACK == 4)
+    if PACK == 4:
+        tl.static_assert(FMT == "fp8_per_token_head" and D % 4 == 0)
+        base = (ptr + head * stride_head).to(tl.pointer_type(tl.uint32))
+        row_stride = stride_slot // 4
+    else:
+        base = ptr + head * stride_head
+        row_stride = stride_slot
+    dims = tl.arange(0, BLOCK_D // PACK)
+    if TRANSPOSE:
+        ptrs = base + slots[None, :] * row_stride + dims[:, None]
+        mask = row_mask[None, :] & (dims[:, None] < D // PACK)
+    else:
+        ptrs = base + slots[:, None] * row_stride + dims[None, :]
+        mask = row_mask[:, None] & (dims[None, :] < D // PACK)
+    if PACK == 4:
+        return kv_tile_gfx12_bf16(ptrs, mask, TRANSPOSE)
+    else:
+        return kv_tile(ptrs, mask, FMT)
 
 
 @triton.jit
