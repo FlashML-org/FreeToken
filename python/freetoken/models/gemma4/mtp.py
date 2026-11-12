@@ -23,7 +23,6 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.layers.quantization import finalize_quant
-from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.utils import torch_dtype
 
 from .model import Gemma4DecoderLayer
@@ -36,30 +35,8 @@ if TYPE_CHECKING:
 DRAFT_LAYERS = 4
 
 
-def draft_config(config: ModelConfig) -> ModelConfig:
-    """One full-attention group of ``DRAFT_LAYERS`` layers on the target's geometry.
-
-    The draft stores no KV, it reads the target's, so this config only exists to make the
-    shared machinery size no SWA pool for it; ``spec/mtp/shared_kv.py`` routes its layers to
-    the target slabs (llama.cpp maps SWA draft layers onto the target's last SWA layer and the
-    full one onto its last layer).
-    """
-    groups = [g for g in config.attention_groups if isinstance(g, FullAttentionGroupConfig)]
-    group = groups[0] if groups else config.default_full_attention_group()
-    return dataclasses.replace(
-        config,
-        num_layers=DRAFT_LAYERS,
-        attention_groups=(dataclasses.replace(group, layer_ids=tuple(range(DRAFT_LAYERS))),),
-        gemma4_e_args=None,
-    )
-
-
 class Gemma4MTPDraft(BaseOP):
     """``norm(layers(pre_projection(cat(target_embed(token), h))))``: the next token's draft hidden."""
-
-    # the proposer picks the single triton backend
-    attention_backend = None
-    draft_config = staticmethod(draft_config)
 
     @staticmethod
     def relay_width(config: ModelConfig) -> int:
@@ -168,16 +145,12 @@ class Gemma4MTPDraft(BaseOP):
     def embed_tokens(self) -> VocabParallelEmbedding:
         return self._embed_tokens
 
-    def forward_hidden(
-        self, embeds: torch.Tensor, prev_hidden: torch.Tensor, shared_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
-    ) -> torch.Tensor:
+    def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
         """The draft hidden of each row: ``embeds`` is the target's (sqrt-scaled) embedding of its token,
-        ``prev_hidden`` the target hidden in target width. ``shared_kv`` is None (the normal read-only
-        case): every draft layer attends the target's paged slabs through the proposer's view and
-        stores nothing."""
+        ``prev_hidden`` the target hidden in target width."""
         x = self.pre_projection.forward(torch.cat([embeds, prev_hidden], dim=-1))
         for layer in self.layers.op_list:
-            x = layer.forward(x, None, shared_kv)
+            x = layer.forward(x, None, None)
         return self.norm.forward(x)
 
     def draft_logits(self, normed: torch.Tensor) -> torch.Tensor:

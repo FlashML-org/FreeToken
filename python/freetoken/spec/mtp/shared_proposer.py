@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from itertools import accumulate
-from typing import TYPE_CHECKING, ClassVar, List, Protocol
+from typing import TYPE_CHECKING, List, Protocol
 
 import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
 from freetoken.spec.mtp.proposer import _DraftReq, _PrefillSink, _VerifySink, with_resident_moe
-from freetoken.spec.mtp.relay import HiddenRelay
 from freetoken.spec.mtp.shared_kv import ReadOnlyTargetKVView
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 
@@ -22,12 +21,6 @@ if TYPE_CHECKING:
 
 class SharedKVMTPDraft(Protocol):
     """The class a family registers as ``ModelSpec.spec_drafts["shared_kv_mtp"]``. It owns its vocab table and stores no KV."""
-
-    # None: the proposer picks the single triton backend
-    attention_backend: ClassVar[str | None]
-
-    @staticmethod
-    def draft_config(config: ModelConfig) -> ModelConfig: ...
 
     @staticmethod
     def relay_width(config: ModelConfig) -> int:
@@ -47,8 +40,8 @@ class SharedKVMTPDraft(Protocol):
         """The target's token embedding, which the draft shares."""
         ...
 
-    def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor, *, shared_kv=None) -> torch.Tensor:
-        """The proposer passes no ``shared_kv``: every draft layer reads the target's paged slabs through the view and stores nothing."""
+    def forward_hidden(self, embeds: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
+        """Every draft layer reads the target's paged slabs through the view and stores nothing."""
         ...
 
     def draft_logits(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -97,8 +90,8 @@ class SharedKVMTPProposer(Proposer):
     def budget(cls, config) -> tuple[int, int]:
         relay_bytes = cls._draft_class(config).relay_width(config.model_config) * config.dtype.itemsize
         rows = config.max_running_req + 1
-        # relay hidden and carry, and the verify hiddens; the draft reads the target's slabs and allocates no KV of its own
-        return rows * (config.speculative_num_steps + 3) * relay_bytes, 0
+        # the seed hidden and the verify hiddens; the draft reads the target's slabs and allocates no KV of its own
+        return rows * (config.speculative_num_steps + 2) * relay_bytes, 0
 
     @classmethod
     def target_may_be_windowed(cls, config) -> bool:
@@ -122,7 +115,6 @@ class SharedKVMTPProposer(Proposer):
         target_moe = {id(m) for m in iter_moe_layers(target_model)}
         if any(isinstance(m, OffloadMoELayer) or id(m) in target_moe for m in iter_moe_layers(self.draft)):
             raise RuntimeError(f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU")
-        self._prefill_state: dict[int, tuple[int, int]] = {}  # table row -> (uid, first position not drafted yet)
         self._prefill_sink: _PrefillSink | None = None
         self.kv = None
 
@@ -132,42 +124,34 @@ class SharedKVMTPProposer(Proposer):
         from freetoken.attention import create_attention_backend
 
         super().attach(ctx)
-        cfg = self.draft.draft_config(with_resident_moe(self.config.model_config))
+        cfg = self.draft.config
         rows = self.config.max_running_req + 1
         # a rebuild swaps the target pool, so the read-only view is rebuilt with every attach
         self.kv = ReadOnlyTargetKVView(ctx.kv_cache, self.draft.config, self.config.model_config)
         width = self.draft.relay_width(self.config.model_config)
-        self.relay = HiddenRelay(rows, width, self.dtype, ctx.device)
+        # the target hidden that seeds the next proposal, one row per table row
+        self.seed_hidden = torch.zeros(rows, width, dtype=self.dtype, device=ctx.device)
         self.verify_hidden = torch.zeros(rows * (self.k + 1), width, dtype=self.dtype, device=ctx.device)
-        fixed = self.draft.attention_backend
         # backends bind the context's KV pool when they are built; read-only draft forwards are
         # decode-shaped only, so one triton backend serves both roles
         with get_global_ctx().override(kv_cache=self.kv):
-            self.extend_backend = self.chain_backend = create_attention_backend(fixed or "triton", cfg)
+            self.chain_backend = create_attention_backend("triton", cfg)
 
     def detach(self, *, keep_kv: bool) -> None:
         self.kv = None  # a view over the old pool is dead once a rebuild swaps it, keep_kv included
-        self.relay = self.verify_hidden = None
-        self.extend_backend = self.chain_backend = None
-        self._prefill_state.clear()
+        self.seed_hidden = self.verify_hidden = None
+        self.chain_backend = None
         super().detach(keep_kv=keep_kv)
-
-    def release(self, req: Req) -> None:
-        self._prefill_state.pop(req.table_idx, None)
 
     # ------------------------------------------------------------------ draft forwards
 
-    def _draft_batch_ro(self, table_idxs: List[int], qs: List[int], backend) -> Batch:
-        """Decode-shaped batch for a read-only draft: row i sits at position q_i and gathers exactly
-        ``[0, q_i)`` - its own slot holds rolled-back or not-yet-computed data, and the draft writes
-        none (llama.cpp ``common/speculative.cpp:1849``, ``:1933-1936``)."""
+    def _draft_batch_ro(self, table_idxs: List[int], qs: List[int]) -> Batch:
+        """Decode-shaped batch for a read-only draft: row i sits at q_i and gathers ``[0, q_i)``, its own
+        slot rolled back or not yet computed; the draft writes none (llama.cpp ``common_speculative_impl_draft_mtp::draft``)."""
         reqs = [_DraftReq(q, q + 1, t) for t, q in zip(table_idxs, qs)]
         batch = Batch(reqs=reqs, phase="decode", rows_per_req=1)
         batch.padded_reqs = reqs
         batch.positions = make_device_tensor(qs, torch.int32, self.device)
-        rows = make_device_tensor(table_idxs, torch.int64, self.device)
-        # the slot this row would write is never written; the clamp keeps a full-context final row in range
-        batch.out_loc = self.ctx.page_table[rows, batch.positions.to(torch.int64).clamp(max=self.ctx.page_table.shape[1] - 1)]
         indptr = torch.tensor([0] + list(accumulate(qs)), dtype=torch.int32).pin_memory().to(self.device, non_blocking=True)
         indices = torch.cat([self.ctx.page_table[t, :q] for t, q in zip(table_idxs, qs)])
         from freetoken.attention.triton import TritonMetadata
@@ -204,16 +188,17 @@ class SharedKVMTPProposer(Proposer):
 
     def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
         cs = [r.cached_len for r in reqs]
-        token = self.relay.d1[rows]
-        hidden = self.relay.hidden[rows]
-        drafts = [token]
         table_idxs = [r.table_idx for r in reqs]
-        for j in range(1, self.k):
-            # a shared-memory draft decodes every step at position C, reading only the target's committed KV [0, C)
-            batch = self._draft_batch_ro(table_idxs, cs, self.chain_backend)
+        token = pending
+        hidden = self.seed_hidden[rows]
+        # one decode-shaped batch serves every step: the draft stores no KV, so only the carried
+        # token and hidden move and every step reads the same [0, cached_len) window.
+        batch = self._draft_batch_ro(table_idxs, cs)
+        drafts = []
+        for _ in range(self.k):
             out = self._forward(batch, self.chain_backend, self.draft.embed_tokens.forward(token), hidden)
-            hidden = self._relayed(out)
             token = self._draft_token(out)
+            hidden = self._relayed(out)
             drafts.append(token)
         return SpecProposal(torch.stack(drafts, dim=1))
 
@@ -224,49 +209,27 @@ class SharedKVMTPProposer(Proposer):
         return self._prefill_sink
 
     def post_verify(self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor) -> None:
-        """Relay each request's row at its last accepted position."""
+        """Stash each request's target hidden at its last accepted position; propose runs it as step 0."""
         k1 = self.k + 1
         bs = batch.size
-        # only the picked row is ever consumed: the pending token's row at the next free position,
-        # C+emitted+1 (cached_len is still pre-drain), reading [0, C+emitted+1) through the prev_hidden row
-        em = emitted[:bs]
-        table_idxs = [r.table_idx for r in batch.reqs]
-        qs = [r.cached_len + e + 1 for r, e in zip(batch.reqs, em.tolist())]
-        pick = torch.arange(bs, device=self.device) * k1 + em
-        tokens = out[torch.arange(bs, device=self.device), em]
-        ro = self._draft_batch_ro(table_idxs, qs, self.extend_backend)
-        hidden = self._forward(ro, self.extend_backend, self.draft.embed_tokens.forward(tokens), self.verify_hidden[pick])
-        table = make_device_tensor(table_idxs, torch.int64, self.device)
-        self.relay.hidden[table] = self._relayed(hidden)
-        self.relay.d1[table] = self._draft_token(hidden)
+        # the accepted row's target hidden is the next draft's prev_hidden; the pending token
+        # out[emitted] rides the token pool to cached_len, so nothing here needs the host
+        pick = torch.arange(bs, device=self.device) * k1 + emitted[:bs]
+        table = make_device_tensor([r.table_idx for r in batch.reqs], torch.int64, self.device)
+        self.seed_hidden[table] = self.verify_hidden[pick]
 
     def on_prefill(self, batch: Batch, next_tokens_gpu: torch.Tensor) -> None:
-        """Draft the chunk's positions: row p pairs token p+1 with the target hidden at p; a final chunk adds the sampled token's row and relays it."""
+        """Stash each request's target hidden at its last prompt position; propose runs the sampled token as step 0."""
         sink, self._prefill_sink = self._prefill_sink, None
         hidden = sink.hidden
-        # a read-only draft consumes only the final row of a finishing chunk; intermediate rows'
-        # outputs feed nothing (carry and prev are target hiddens), so compute that row alone
-        emb, prev, finals = [], [], []
+        # only the row that predicted the sampled token survives: it is the seed step's prev_hidden,
+        # and propose already owns everything after it
+        table, last = [], []
         offset = 0
-        for i, (req, (s, e)) in enumerate(zip(batch.reqs, sink.spans)):
-            rows = hidden[offset : offset + e - s]
+        for req, (s, e) in zip(batch.reqs, sink.spans):
             offset += e - s
-            row = req.table_idx
-            state = self._prefill_state.get(row)
-            frontier = state[1] if state is not None and state[0] == req.uid else s
-            final = e == req.prompt_len
-            end = e if final else e - 1
-            if final and frontier < end:
-                # the sampled token's row at position end, over the target's committed KV [0, end)
-                emb.append(self.draft.embed_tokens.forward(next_tokens_gpu[i : i + 1]))
-                prev.append(rows[-1:])
-                finals.append((row, end))
-            self.relay.carry[row] = rows[-1]
-            self._prefill_state[row] = (req.uid, max(frontier, end))
-        if not finals:
-            return
-        ro = self._draft_batch_ro([r for r, _ in finals], [p for _, p in finals], self.extend_backend)
-        out = self._forward(ro, self.extend_backend, torch.cat(emb), torch.cat(prev))
-        table = make_device_tensor([r for r, _ in finals], torch.int64, self.device)
-        self.relay.hidden[table] = self._relayed(out)
-        self.relay.d1[table] = self._draft_token(out)
+            table.append(req.table_idx)
+            last.append(offset - 1)
+        t = make_device_tensor(table, torch.int64, self.device)
+        i = make_device_tensor(last, torch.int64, self.device)
+        self.seed_hidden[t] = hidden[i]

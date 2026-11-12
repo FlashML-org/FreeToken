@@ -381,9 +381,9 @@ def _swa_per_req_swa_floor(config) -> int:
 
       - the trailing window the prefill-boundary commit locks -- window + retain gap, page-rounded
         (_cache_req_swa splits the committed node there so inc_lock pins that and no more);
-      - its own decode tail up to the first out-of-window free: the driver runs only every
-        _SWA_EVICTION_INTERVAL forwards and floors its frees at the committed length, so the
-        request grows window + 2 pages + one interval before it can reclaim anything.
+      - its own decode tail: window + 2 pages + interval * decode_rows_per_req +
+        decode_rows_per_req, the most that slides out between two frees plus one verify step's
+        rows;
 
     Neither is reachable by evict_swa, so the pool must hold both for every running request."""
     from freetoken.scheduler.cache import _SWA_EVICTION_INTERVAL, _SWA_RETAIN_GAP
@@ -391,9 +391,10 @@ def _swa_per_req_swa_floor(config) -> int:
     window = next(g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa)
     ps = config.page_size
     locked = ((window + _SWA_RETAIN_GAP + ps - 1) // ps) * ps
-    floor = locked + window + _SWA_EVICTION_INTERVAL + 2 * ps
+    rows = getattr(config, "decode_rows_per_req", 1)
+    floor = locked + window + _SWA_EVICTION_INTERVAL * rows + rows + 2 * ps
     if getattr(config, "special_token_ckpt", False):
-        floor += window + _SWA_RETAIN_GAP + _SWA_EVICTION_INTERVAL
+        floor += window + _SWA_RETAIN_GAP + _SWA_EVICTION_INTERVAL * rows
     return floor
 
 

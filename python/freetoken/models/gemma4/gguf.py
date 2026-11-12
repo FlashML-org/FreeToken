@@ -503,9 +503,8 @@ def iter_gguf_weights(
 
 
 # --------------------------------------------------------------------------------------
-# MTP draft: the gemma4-assistant sidecar (llama.cpp's gemma4-assistant.cpp). Four
-# KV-shared decoder layers over the target's hidden that read its cache and store nothing,
-# with the draft's own tied vocab table.
+# MTP draft: the gemma4-assistant sidecar (gemma4-assistant.cpp), four KV-shared decoder
+# layers that read the target's cache and store nothing, plus its own tied vocab table.
 # --------------------------------------------------------------------------------------
 
 ASSISTANT_ARCH = "gemma4-assistant"
@@ -560,6 +559,10 @@ def assistant_config(model_path: str) -> ModelConfig:
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
     swa_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if is_swa)
     full_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if not is_swa)
+    if not full_layer_ids or not swa_layer_ids:
+        raise ValueError(
+            f"{model_path}: attention.sliding_window_pattern must name at least one full and one sliding-window layer"
+        )
     kv_per_layer = g("attention.head_count_kv")
     if not isinstance(kv_per_layer, (list, tuple)):
         kv_per_layer = [kv_per_layer] * num_layers

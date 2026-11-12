@@ -1,10 +1,10 @@
 """The target's paged KV as a read-only pool for a draft that stores none of its own.
 
 llama.cpp gives the gemma4 assistant its draft KV from the target's cache without allocating any
-(``src/llama-model.cpp:3424-3437``): SWA draft layers alias the target's last SWA slab, the full
-draft layer aliases the target's last layer, and both slabs stay distinct. On an E-series target
-each alias resolves through the layer's KV-sharing source, the read that #882 will make the only
-populated one.
+(``llama_model::create_memory``'s KV-share callback): SWA draft layers alias the target's last SWA
+slab, the full draft layer aliases the target's last full layer, and both slabs stay distinct. On
+an E-series target each alias resolves through the layer's KV-sharing source, the layer the
+shared layers' rows originate from.
 """
 
 from __future__ import annotations
@@ -26,9 +26,11 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
         self._target = target
         swa_group = target_config.swa_attention_group()
         draft_swa = draft_config.swa_attention_group()
+        swa_ids = tuple(swa_group.layer_ids) if swa_group is not None else ()
+        full_ids = tuple(i for i in range(target_config.num_layers) if not target_config.is_swa_layer(i))
         if draft_swa is not None:
-            if swa_group is None:
-                raise RuntimeError(
+            if not swa_ids:
+                raise ValueError(
                     f"the draft has sliding-window layers but target {target_config.architectures[0]} has no "
                     "sliding-window attention group for them to read"
                 )
@@ -38,13 +40,19 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
                     f"the draft's sliding window ({draft_swa.sliding_window}) exceeds the target's "
                     f"({swa_group.sliding_window}); the draft would read slots the target has freed"
                 )
-        # llama.cpp's share callback: draft swa -> the target's last SWA layer, draft full -> its last layer
-        last_swa = max(swa_group.layer_ids) if swa_group is not None else target_config.num_layers - 1
+        if not full_ids and any(not draft_config.is_swa_layer(i) for i in range(draft_config.num_layers)):
+            raise ValueError(
+                f"the draft has full-attention layers but target {target_config.architectures[0]} has no "
+                "full-attention layer for them to read"
+            )
+        # llama.cpp's share callback: draft swa -> the target's last SWA layer, draft full -> its last full layer
+        last_swa = max(swa_ids) if swa_ids else None
+        last_full = max(full_ids) if full_ids else None
         e_args = getattr(target_config, "gemma4_e_args", None)
         self._route: list[int] = []
         for layer_id in range(draft_config.num_layers):
-            layer = last_swa if draft_config.is_swa_layer(layer_id) else target_config.num_layers - 1
-            # the hop is a no-op while shared target layers still copy their rows into their own slab
+            layer = last_swa if draft_config.is_swa_layer(layer_id) else last_full
+            # the hop is a no-op while shared target layers copy their rows into their own slab
             if e_args is not None and e_args.is_kv_shared(layer):
                 sources = [i for i in target_config.attention_group_for_layer(layer).layer_ids if i < e_args.first_kv_shared_layer]
                 if not sources:

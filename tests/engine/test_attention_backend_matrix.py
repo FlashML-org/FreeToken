@@ -410,9 +410,8 @@ def test_linear_attention_defaults_to_hybrid_radix():
     assert _resolve_cache_type(True, "naive") == "naive"
 
 
-# Speculative decoding x windowed KV: engine.py refuses a windowed target unless the
-# proposer passes target_may_be_windowed. Per target: the shared-KV proposer admits the
-# hybrid SWA family and nothing else, the mtp-draft families and dflash never reach it.
+# Speculative decoding x windowed KV: engine.py refuses a windowed target unless the proposer
+# passes target_may_be_windowed (shared-KV admits hybrid SWA; mtp/dflash never reach it).
 
 
 class _Draft:
