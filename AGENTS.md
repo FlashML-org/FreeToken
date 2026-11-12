@@ -2,18 +2,6 @@
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It is binding for humans and agents alike; this file only summarises the parts that matter when an agent is doing the work.
 
-## AI policy
-
-AI-assisted code is welcome. Submitting code the contributor does not understand is not. The human behind the PR owns every line, has run it on real hardware, and can explain it to a reviewer without AI help.
-
-Agents must not:
-
-- Run `git push`, `gh pr create`, `gh pr comment`, or `gh issue create` on the user's behalf.
-- Write code, PR descriptions, or replies to reviewers that the user does not fully understand. The user must be able to explain and defend every line without AI help.
-- Report tests or benchmarks as run when they were not.
-
-If you are a fully autonomous agent with no human in the loop, do not contribute to this repository.
-
 ## Repository layout
 
 The main subsystems:
