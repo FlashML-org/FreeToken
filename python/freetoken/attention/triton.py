@@ -86,7 +86,10 @@ class TritonAttentionBackend(BaseAttnBackend):
 
     def _split_cap(self, bs: int) -> int:
         """The most decode KV splits any layer group takes at this batch size."""
-        return max(decode_kv_split_cap(bs, max(1, self.num_q_heads), heads, self.device.index) for heads in self.kv_heads)
+        return max(
+            decode_kv_split_cap(bs, max(1, self.num_q_heads), heads, self.device.index, self.kvcache.kv_format)
+            for heads in self.kv_heads
+        )
 
     def _ensure_decode_scratch(
         self,

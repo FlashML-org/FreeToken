@@ -25,6 +25,19 @@ def _gfx1201(device_index: int) -> bool:
     return getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "").split(":")[0] == "gfx1201"
 
 
+@functools.lru_cache(maxsize=None)
+def _gfx11(device_index: int) -> bool:
+    if torch.version.hip is None:
+        return False
+    return getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "").startswith("gfx11")
+
+
+def kv_f16_reader(fmt: KVFormat, device_index: int) -> bool:
+    """Read E4M3 K/V as fp16 bit patterns on RDNA3, which has no fp8 converts and lowers every
+    fp32 -> bf16 cast to integer RNE code; the generic decode then dominates attention time."""
+    return fmt.name == "fp8_per_token_head" and not FORCE_EMU and _gfx11(device_index)
+
+
 def kv_decode_config(
     fmt: KVFormat,
     q: torch.Tensor,
@@ -84,6 +97,17 @@ def kv_tile(ptrs, mask, FMT: tl.constexpr):
     elif FMT == "int8_per_token_head":
         tile = tl.load(ptrs, mask=mask, other=0).to(tl.bfloat16)
     return tile
+
+
+@triton.jit
+def kv_tile_f16(ptrs, mask):
+    """E4M3FN codes as fp16 holding ``value / 256``: exact for every finite code (subnormals
+    land on fp16 subnormals), integer ops only. Callers fold the 256 into the row scales."""
+    codes = tl.load(ptrs, mask=mask, other=0).to(tl.uint16)
+    bits = ((codes & 0x80) << 8) | ((codes & 0x7F) << 7)
+    # pin the decode to the load layout so it runs once per element, not once per dot-operand replica
+    bits = tl.inline_asm_elementwise("v_mov_b32 $0, $1", "=v,v", [bits], dtype=tl.uint16, is_pure=False, pack=2)
+    return bits.to(tl.float16, bitcast=True)
 
 
 @triton.jit
@@ -266,6 +290,51 @@ def store_kv_rows(
         FMT=fmt.name,
         num_warps=1,
     )
+
+
+@triton.jit
+def _kv_dequant_rows_kernel(
+    k_src, v_src, k_scale, v_scale, k_dst, v_dst, indices, total,
+    stride_ks, stride_vs, stride_kss, stride_vss,
+    D: tl.constexpr, ROW: tl.constexpr, BLOCK: tl.constexpr,
+):
+    pos = tl.program_id(0).to(tl.int64)
+    if pos < tl.load(total):
+        slot = tl.load(indices + pos).to(tl.int64)
+        offs = tl.arange(0, BLOCK)
+        mask = offs < ROW
+        head = offs // D
+        k = kv_tile_f16(k_src + slot * stride_ks + offs, mask).to(tl.float32)
+        ks = tl.load(k_scale + slot * stride_kss + head, mask=mask, other=0.0) * 256.0
+        tl.store(k_dst + pos * ROW + offs, (k * ks).to(tl.bfloat16), mask=mask)
+        v = kv_tile_f16(v_src + slot * stride_vs + offs, mask).to(tl.float32)
+        vs = tl.load(v_scale + slot * stride_vss + head, mask=mask, other=0.0) * 256.0
+        tl.store(v_dst + pos * ROW + offs, (v * vs).to(tl.bfloat16), mask=mask)
+
+
+def dequant_kv_rows(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 K/V whose row ``i`` dequantizes E4M3 slot ``indices[i]``, for ``i < indptr[-1]``."""
+    n = indices.numel()
+    _, heads, head_dim = k_cache.shape
+    assert k_cache.stride(1) == v_cache.stride(1) == head_dim and k_cache.stride(2) == v_cache.stride(2) == 1
+    assert k_scale.stride(1) == v_scale.stride(1) == 1
+    k = torch.empty(n, heads, head_dim, dtype=torch.bfloat16, device=k_cache.device)
+    v = torch.empty_like(k)
+    if n:
+        _kv_dequant_rows_kernel[(n,)](
+            k_cache, v_cache, k_scale, v_scale, k, v, indices, indptr[-1:],
+            k_cache.stride(0), v_cache.stride(0), k_scale.stride(0), v_scale.stride(0),
+            D=head_dim, ROW=heads * head_dim, BLOCK=triton.next_power_of_2(heads * head_dim),
+            num_warps=2,
+        )
+    return k, v
 
 
 

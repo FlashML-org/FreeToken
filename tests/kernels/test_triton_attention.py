@@ -285,6 +285,84 @@ def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool, pack: 
     assert torch.equal(actual.view(torch.int16)[finite], expected.view(torch.int16)[finite])
 
 
+def _require_gfx11():
+    from freetoken.kernel.triton.kv_rows import _gfx11
+
+    if not _gfx11(torch.cuda.current_device()):
+        pytest.skip("the fp16-bit-pattern fp8 KV reader is RDNA3 only")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is None, reason="needs ROCm")
+def test_rdna3_kv_f16_reader_preserves_every_finite_fp8_code():
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.kv_rows import kv_tile_f16
+
+    _require_gfx11()
+
+    @triton.jit
+    def decode_codes(x, y):
+        offs = tl.arange(0, 256)
+        tl.store(y + offs, kv_tile_f16(x + offs, tl.full((256,), True, tl.int1)))
+
+    codes = torch.arange(256, dtype=torch.uint8)
+    expected = (codes.view(torch.float8_e4m3fn).float() / 256).half().cuda()
+    actual = torch.empty_like(expected)
+    decode_codes[(1,)](codes.cuda(), actual, num_warps=1)
+    finite = expected.isfinite()
+    # integer comparison also checks signed zero and the fp16 subnormals of the e4m3 subnormals
+    assert torch.equal(actual.view(torch.int16)[finite], expected.view(torch.int16)[finite])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is None, reason="needs ROCm")
+def test_rdna3_fp8_kv_paths_match_bf16_kernels_on_dequantized_rows():
+    from freetoken.kernel.triton.attention import decode_kv_split_cap, decode_paged_attention, extend_paged_attention
+    from freetoken.kernel.triton.kv_rows import dequant_kv_rows, store_kv_rows
+
+    _require_gfx11()
+    fmt = KV_FORMATS["fp8_per_token_head"]
+    torch.manual_seed(0)
+    slots, heads, kv_heads, head_dim, prefix, chunk = 4096, 8, 2, 256, 1500, 300
+    k = torch.randn(slots, kv_heads * head_dim, device="cuda").bfloat16()
+    v = torch.randn(slots, kv_heads * head_dim, device="cuda").bfloat16()
+    k_cache = torch.empty(slots, kv_heads, head_dim, dtype=torch.uint8, device="cuda")
+    v_cache = torch.empty_like(k_cache)
+    k_scale = torch.empty(slots, kv_heads, device="cuda")
+    v_scale = torch.empty_like(k_scale)
+    store_kv_rows(fmt, k, v, torch.arange(slots, device="cuda"), k_cache, v_cache, k_scale, v_scale)
+    rows = torch.randperm(slots, device="cuda")[: prefix + chunk].int()
+    indptr = torch.tensor([0, prefix + chunk], dtype=torch.int32, device="cuda")
+
+    k_ref = (k_cache.view(torch.float8_e4m3fn).float() * k_scale[..., None]).bfloat16()
+    v_ref = (v_cache.view(torch.float8_e4m3fn).float() * v_scale[..., None]).bfloat16()
+    k_rows, v_rows = dequant_kv_rows(k_cache, v_cache, k_scale, v_scale, rows, indptr)
+    assert torch.equal(k_rows, k_ref[rows.long()]) and torch.equal(v_rows, v_ref[rows.long()])
+
+    # prefill runs the bf16 kernel on the dequantized rows, so it matches that kernel exactly
+    q = torch.randn(chunk, heads, head_dim, device="cuda").bfloat16()
+    k_ext = k_ref[rows[prefix:].long()].contiguous()
+    v_ext = v_ref[rows[prefix:].long()].contiguous()
+    extend_args = (torch.tensor([0, chunk], dtype=torch.int32, device="cuda"), indptr, rows,
+                   torch.tensor([prefix], dtype=torch.int32, device="cuda"), chunk, head_dim ** -0.5)
+    actual = extend_paged_attention(q, k_cache, v_cache, *extend_args, k_extend=k_ext, v_extend=v_ext,
+                                    kv_format=fmt, k_scale=k_scale, v_scale=v_scale)
+    expected = extend_paged_attention(q, k_ref, v_ref, *extend_args, k_extend=k_ext, v_extend=v_ext)
+    assert torch.equal(actual, expected)
+
+    # decode reorders only fp16 vs bf16 operand rounding
+    for keys in (1, 33, prefix + chunk):
+        q = torch.randn(1, heads, head_dim, device="cuda").bfloat16()
+        splits = decode_kv_split_cap(1, heads, kv_heads, q.device.index, fmt)
+        scratch = (torch.empty(1, heads, splits, head_dim, device="cuda"), torch.empty(1, heads, splits, device="cuda"))
+        decode_args = (torch.tensor([0, keys], dtype=torch.int32, device="cuda"), rows[:keys].contiguous(),
+                       torch.tensor([keys - 1], dtype=torch.int32, device="cuda"), *scratch, head_dim ** -0.5)
+        actual = decode_paged_attention(q, k_cache, v_cache, *decode_args, kv_format=fmt, k_scale=k_scale,
+                                        v_scale=v_scale)
+        expected = decode_paged_attention(q, k_ref, v_ref, *decode_args)
+        torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 @pytest.mark.parametrize("path", ["paged", "decode", "extend", "split_extend"])
 def test_quantized_kv_attention_high_physical_slots(path: str):
@@ -1125,7 +1203,7 @@ def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(mon
 def test_triton_backend_replay_metadata_uses_capture_buffers(monkeypatch):
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
 
-    class FakeKVCache:
+    class FakeKVCache(_PlainKVStorage):
         def __init__(self, device: torch.device):
             self.device = device
 
