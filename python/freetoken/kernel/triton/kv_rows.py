@@ -16,6 +16,29 @@ from freetoken.kvcache.format import KVFormat
 
 
 @triton.jit
+def kv_tile_gfx12_bf16(ptrs, mask, TRANSPOSE: tl.constexpr):
+    # Each uint32 holds four E4M3FN codes. Force e64 for both word selectors.
+    codes = tl.load(ptrs, mask=mask, other=0, cache_modifier=".cg")
+    lo = tl.inline_asm_elementwise(
+        "v_cvt_pk_f32_fp8_e64 $0, $1 op_sel:[0,0]", "=v,v", [codes],
+        dtype=tl.uint64, is_pure=True, pack=1)
+    hi = tl.inline_asm_elementwise(
+        "v_cvt_pk_f32_fp8_e64 $0, $1 op_sel:[1,0]", "=v,v", [codes],
+        dtype=tl.uint64, is_pure=True, pack=1)
+    # Every finite E4M3FN value is exactly representable in BF16.
+    a = (lo >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    b = (lo >> 48).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    c = (hi >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    d = (hi >> 48).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    if TRANSPOSE:
+        a, b, c, d = tl.trans(a), tl.trans(b), tl.trans(c), tl.trans(d)
+    values = tl.interleave(tl.interleave(a, c), tl.interleave(b, d))
+    if TRANSPOSE:
+        values = tl.trans(values)
+    return values
+
+
+@triton.jit
 def kv_tile(ptrs, mask, FMT: tl.constexpr):
     """One K or V tile in the dtype ``tl.dot`` takes."""
     if FMT == "none":

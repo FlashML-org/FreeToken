@@ -6,7 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile, kv_tile_staged
+from freetoken.kernel.triton.e4m3_compat import FORCE_EMU
+from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile, kv_tile_gfx12_bf16, kv_tile_staged
 from freetoken.kvcache.format import NONE, KVFormat
 
 
@@ -63,6 +64,13 @@ def _optin_smem_bytes(device_index: int) -> int:
 @functools.lru_cache(maxsize=None)
 def _num_sms(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+@functools.lru_cache(maxsize=None)
+def _gfx1201(device_index: int) -> bool:
+    if torch.version.hip is None:
+        return False
+    return getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "").split(":")[0] == "gfx1201"
 
 
 def decode_kv_split_cap(batch: int, num_q_heads: int, num_kv_heads: int, device_index: int) -> int:
@@ -262,6 +270,7 @@ def _decode_grouped_stage1_kernel(
     SLIDING_WINDOW: tl.constexpr,
     KV_OFFSET_DTYPE: tl.constexpr,
     KV_FMT: tl.constexpr,
+    PACKED_GFX12_KV: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -316,12 +325,26 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
 
-            k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
+            if PACKED_GFX12_KV:
+                packed_d = tl.arange(0, BLOCK_D // 4)
+                k = kv_tile_gfx12_bf16(
+                    (k_ptr + kv_head * stride_kh).to(tl.pointer_type(tl.uint32))
+                    + slots[None, :] * (stride_ks // 4) + packed_d[:, None],
+                    mask_n[None, :] & (packed_d[:, None] < D // 4), True)
+            else:
+                k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
             scale_k = kv_row_scale(k_scale_ptr + slots * stride_kss + kv_head, mask_n, KV_FMT)
             scores = tl.dot(q, k) * sm_scale * scale_k[None, :]
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
+            if PACKED_GFX12_KV:
+                packed_dv = tl.arange(0, BLOCK_DV // 4)
+                v = kv_tile_gfx12_bf16(
+                    (v_ptr + kv_head * stride_vh).to(tl.pointer_type(tl.uint32))
+                    + slots[:, None] * (stride_vs // 4) + packed_dv[None, :],
+                    mask_n[:, None] & (packed_dv[None, :] < DV // 4), False)
+            else:
+                v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
             scale_v = kv_row_scale(v_scale_ptr + slots * stride_vss + kv_head, mask_n, KV_FMT)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
@@ -515,6 +538,18 @@ def decode_paged_attention(
     if kv_format.quantized:
         block_n, num_stages, num_warps = _quantized_decode_launch(block_d, block_n, num_stages)
 
+    packed_gfx12_kv = (
+        kv_format.name == "fp8_per_token_head" and not FORCE_EMU
+        and q.dtype == torch.bfloat16 and head_dim == 128
+        and batch == 1 and group in (4, 8) and _gfx1201(q.device.index)
+        and k_cache.stride(-1) == v_cache.stride(-1) == 1
+        and k_cache.data_ptr() % 4 == 0 and v_cache.data_ptr() % 4 == 0
+        and all(s % 4 == 0 for s in (*k_cache.stride()[:2], *v_cache.stride()[:2]))
+    )
+    if packed_gfx12_kv:
+        # Limit live conversion data while expanding packed KV tiles.
+        block_n, num_stages, num_warps = 64, 1, 2
+
     k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
     _decode_grouped_stage1_kernel[grid](
         q,
@@ -545,6 +580,7 @@ def decode_paged_attention(
         attn_lse.stride(2),
         KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
         KV_FMT=kv_format.name,
+        PACKED_GFX12_KV=packed_gfx12_kv,
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
