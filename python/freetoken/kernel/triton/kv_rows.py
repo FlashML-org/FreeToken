@@ -34,7 +34,7 @@ def kv_decode_config(
     num_stages: int,
     num_warps: int,
 ) -> tuple[int, int, int, int]:
-    """Elements per packed load and launch geometry for the qualified KV reader."""
+    """Elements per packed load and launch geometry for qualified gfx1201 decode."""
     if (
         fmt.name == "fp8_per_token_head" and not FORCE_EMU
         and q.dtype == torch.bfloat16 and q.shape[2] == 128
@@ -92,7 +92,7 @@ def kv_tile_rows(
     D: tl.constexpr, BLOCK_D: tl.constexpr, FMT: tl.constexpr,
     PACK: tl.constexpr, TRANSPOSE: tl.constexpr,
 ):
-    """Load row-addressed K/V tiles through the selected reader, in dot-operand order."""
+    """Row-addressed K/V reader used by the qualified gfx1201 decode path."""
     tl.static_assert(PACK == 1 or PACK == 4)
     if PACK == 4:
         tl.static_assert(FMT == "fp8_per_token_head" and D % 4 == 0)

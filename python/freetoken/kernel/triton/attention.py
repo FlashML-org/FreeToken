@@ -303,6 +303,8 @@ def _decode_grouped_stage1_kernel(
     acc = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)
 
     q_offsets = batch_id * stride_qt + q_heads[:, None] * stride_qh + offs_d[None, :]
+    k_base_offsets = kv_head * stride_kh + offs_d[:, None]
+    v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
 
     if split_end > split_start:
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
@@ -315,14 +317,21 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
 
-            k = kv_tile_rows(k_ptr, slots, kv_head, stride_ks, stride_kh, mask_n,
-                             D, BLOCK_D, KV_FMT, KV_PACK, True)
+            # Preserve the merged reader's address expressions on non-packed targets.
+            if KV_PACK == 4:
+                k = kv_tile_rows(k_ptr, slots, kv_head, stride_ks, stride_kh, mask_n,
+                                 D, BLOCK_D, KV_FMT, KV_PACK, True)
+            else:
+                k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
             scale_k = kv_row_scale(k_scale_ptr + slots * stride_kss + kv_head, mask_n, KV_FMT)
             scores = tl.dot(q, k) * sm_scale * scale_k[None, :]
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = kv_tile_rows(v_ptr, slots, kv_head, stride_vs, stride_vh, mask_n,
-                             DV, BLOCK_DV, KV_FMT, KV_PACK, False)
+            if KV_PACK == 4:
+                v = kv_tile_rows(v_ptr, slots, kv_head, stride_vs, stride_vh, mask_n,
+                                 DV, BLOCK_DV, KV_FMT, KV_PACK, False)
+            else:
+                v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
             scale_v = kv_row_scale(v_scale_ptr + slots * stride_vss + kv_head, mask_n, KV_FMT)
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
@@ -516,9 +525,11 @@ def decode_paged_attention(
     if kv_format.quantized:
         block_n, num_stages, num_warps = _quantized_decode_launch(block_d, block_n, num_stages)
 
-    kv_pack, block_n, num_stages, num_warps = kv_decode_config(
-        kv_format, q, k_cache, v_cache, block_n, num_stages, num_warps,
-    )
+    kv_pack = 1
+    if torch.version.hip is not None:
+        kv_pack, block_n, num_stages, num_warps = kv_decode_config(
+            kv_format, q, k_cache, v_cache, block_n, num_stages, num_warps,
+        )
 
     k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
     _decode_grouped_stage1_kernel[grid](
