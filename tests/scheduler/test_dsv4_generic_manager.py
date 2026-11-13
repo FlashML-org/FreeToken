@@ -70,7 +70,7 @@ def _lifecycle(cm, req, total_len, finished=True):
     while req.cached_len < total_len:
         req.append_host(torch.tensor([9000 + req.cached_len % 97], dtype=torch.int32))
         req.decode_batch_idx = i + 1
-        cm.maybe_free_swa_out_of_window([req], forward_iter=i)
+        cm.maybe_free_swa_out_of_window([req])
         cm.allocate_paged([req])
         req.complete_one()
         i += 1
@@ -267,7 +267,7 @@ def test_abort_anywhere_fuzz_conserves_and_isolates():
                 continue
             req.append_host(torch.tensor([rng.randint(1, 200)], dtype=torch.int32))
             req.decode_batch_idx += 1
-            cm.maybe_free_swa_out_of_window([req], forward_iter=it)
+            cm.maybe_free_swa_out_of_window([req])
             cm.allocate_paged([req])
             req.complete_one()
         elif live:                                # finish / ABORT at whatever state it is in

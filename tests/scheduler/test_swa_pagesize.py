@@ -19,6 +19,7 @@ import torch
 from freetoken.core import Req, SamplingParams
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.models.config import KVCacheGroupSpec
+from freetoken.scheduler import cache as cache_mod
 from freetoken.scheduler.cache import CacheManager
 
 DEVICE = torch.device("cpu")
@@ -76,7 +77,7 @@ def _run_lifecycle(cm: CacheManager, total_len: int, n_decode: int = 3,
     for i in range(steps):
         req.append_host(torch.tensor([9999], dtype=torch.int32))
         req.decode_batch_idx = i + 1
-        cm.maybe_free_swa_out_of_window([req], forward_iter=i)
+        cm.maybe_free_swa_out_of_window([req])
         cm.allocate_paged([req])
         req.complete_one()
     cm.cache_req(req, finished=True)
@@ -160,10 +161,11 @@ def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
     assert req.cache_handle.cached_len == 2 * ps
 
 
-def test_finish_retains_prompt_window_under_pressure():
+def test_finish_retains_prompt_window_under_pressure(monkeypatch):
     """Faithful scheduler order incl. the boundary commit: after finish + ambient evict_swa
     pressure, a follow-up request cutting exactly at the prompt end (the reasoning-dropped
     next turn) still reuses [0, P)."""
+    monkeypatch.setattr(cache_mod, "_SWA_EVICTION_INTERVAL", 1)  # window slides every step
     ps = 1
     prompt_len, n_decode = 6, 12
     cm = _mgr(ps, "swa_radix", num_pages=64)
@@ -179,7 +181,7 @@ def test_finish_retains_prompt_window_under_pressure():
     for i in range(n_decode):
         req.append_host(torch.tensor([9999], dtype=torch.int32))
         req.decode_batch_idx = i + 1
-        cm.maybe_free_swa_out_of_window([req], forward_iter=0)  # window slides every step
+        cm.maybe_free_swa_out_of_window([req])
         cm.allocate_paged([req])
         req.complete_one()
     cm.cache_req(req, finished=True)
