@@ -58,6 +58,7 @@ from freetoken.gpu_select import (
     gpu_identity,
     single_gpu_arg,
 )
+from freetoken.kernel.aot_models import fp8_block_scale_pad
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.moe.bench_profile import PROFILE_VERSION
 from freetoken.moe.cpu_executor import physical_core_cpus, resolve_threads_and_affinity
@@ -315,9 +316,10 @@ def _offload_bank_specs(fmt: str, H: int, I: int, opts: dict | None = None) -> d
     if fmt == "bf16":
         return {"gate_up": (2 * I * H, bf16), "down": (H * I, bf16)}
     if fmt == "fp8_block":
+        # pad the scale banks like the loader: an unaligned per-expert row (2560x640 down_scale, 200 B) disables the fused copy
         return {
-            "gate_up": (2 * I * H, f8), "gate_up_scale": ((2 * I // 128) * (H // 128), bf16),
-            "down": (H * I, f8), "down_scale": ((H // 128) * (I // 128), bf16),
+            "gate_up": (2 * I * H, f8), "gate_up_scale": ((2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128), bf16),
+            "down": (H * I, f8), "down_scale": ((H // 128) * fp8_block_scale_pad(H // 128, I // 128), bf16),
         }
     if fmt == "nvfp4":
         return {
@@ -388,9 +390,9 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = 
             return (n + 127) // 128
         b = {
             "gate_up": pin(E, 2 * I, H, dtype=torch.float8_e4m3fn),
-            "gate_up_scale": pin(E, nb(2 * I), nb(H), dtype=torch.bfloat16),
+            "gate_up_scale": pin(E, nb(2 * I), fp8_block_scale_pad(nb(2 * I), nb(H)), dtype=torch.bfloat16),
             "down": pin(E, H, I, dtype=torch.float8_e4m3fn),
-            "down_scale": pin(E, nb(H), nb(I), dtype=torch.bfloat16),
+            "down_scale": pin(E, nb(H), fp8_block_scale_pad(nb(H), nb(I)), dtype=torch.bfloat16),
         }
         # e4m3 0x00 is a clean zero and the scales are unit-ish, so nothing lands in
         # the fp32 denormal range (which would slow the GEMV and skew the timing).
