@@ -48,20 +48,12 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
         # llama.cpp's share callback: draft swa -> the target's last SWA layer, draft full -> its last full layer
         last_swa = max(swa_ids) if swa_ids else None
         last_full = max(full_ids) if full_ids else None
-        e_args = getattr(target_config, "gemma4_e_args", None)
+        # a KV-shared target layer owns no slab: read its source's, as the target's pool maps it
+        sources = dict(target_config.kv_shared_layers)
         self._route: list[int] = []
         for layer_id in range(draft_config.num_layers):
             layer = last_swa if draft_config.is_swa_layer(layer_id) else last_full
-            # the hop is a no-op while shared target layers copy their rows into their own slab
-            if e_args is not None and e_args.is_kv_shared(layer):
-                sources = [i for i in target_config.attention_group_for_layer(layer).layer_ids if i < e_args.first_kv_shared_layer]
-                if not sources:
-                    raise RuntimeError(
-                        f"target layer {layer} is KV-shared but its attention group has no source below the "
-                        f"sharing boundary {e_args.first_kv_shared_layer} to route draft layer {layer_id}"
-                    )
-                layer = max(sources)
-            self._route.append(layer)
+            self._route.append(sources.get(layer, layer))
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._target.k_cache(self._route[index])

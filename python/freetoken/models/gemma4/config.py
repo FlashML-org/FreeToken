@@ -58,17 +58,19 @@ class Gemma4EArgs:
     def is_kv_shared(self, layer_id: int) -> bool:
         return layer_id >= self.first_kv_shared_layer
 
-    def is_kv_source(self, layer_id: int, group_layer_ids: tuple[int, ...]) -> bool:
-        return layer_id == max((i for i in group_layer_ids if i < self.first_kv_shared_layer), default=None)
-
     def kv_shared_layers(self, *groups_layer_ids: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
-        """``ModelConfig.kv_shared_layers``: each shared layer paired with its group's source."""
+        """``ModelConfig.kv_shared_layers``: each shared layer paired with the last earlier layer of its group."""
         pairs = []
         for layer_ids in groups_layer_ids:
-            source = next((i for i in layer_ids if self.is_kv_source(i, layer_ids)), None)
-            # no earlier layer of this type: nothing to read, so those layers keep their own slabs
-            if source is not None:
-                pairs += [(i, source) for i in layer_ids if self.is_kv_shared(i)]
+            shared = [i for i in layer_ids if self.is_kv_shared(i)]
+            if not shared:
+                continue
+            source = max((i for i in layer_ids if i < self.first_kv_shared_layer), default=None)
+            if source is None:
+                raise NotImplementedError(
+                    "gemma4 KV-shared layers with no earlier layer of their attention type are not supported"
+                )
+            pairs += [(i, source) for i in shared]
         return tuple(sorted(pairs))
 
 
