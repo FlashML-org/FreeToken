@@ -65,7 +65,7 @@ class Gemma4DecoderLayer(BaseOP):
         self,
         x: torch.Tensor,
         per_layer_input: torch.Tensor | None,
-        shared_kv: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
         # --- attention sandwich ---
         residual = x
@@ -131,7 +131,7 @@ class Gemma4Model(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
         per_layer = self._per_layer_inputs(input_ids, x) if self._has_per_layer_inputs else None
-        shared_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for i, layer in enumerate(self.layers.op_list):
             x = layer.forward(x, None if per_layer is None else per_layer[:, i], shared_kv)
         return self.norm.forward(x)

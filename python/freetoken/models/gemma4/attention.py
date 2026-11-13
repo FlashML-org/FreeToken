@@ -19,8 +19,8 @@ class Gemma4Attention(BaseOP):
 
     On E2B / E4B the KV-shared tail projects q only and attends over the k, v of the last
     earlier layer of its attention type. That layer hands its rows over in ``shared_kv``, a
-    dict living for one forward, so a captured graph records the same tensors. Each shared
-    layer still stores them in its own KV slab; reading the source's slab would save that memory.
+    dict living for one forward, so a captured graph records the same tensors. The KV pool
+    maps a shared layer onto its source's slab and skips its store (``kv_shared_layers``).
     """
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
@@ -34,10 +34,13 @@ class Gemma4Attention(BaseOP):
         self.num_kv_heads = group.num_kv_heads
         self.num_qo_heads = config.num_qo_heads
         self.k_eq_v = isinstance(group, FullAttentionGroupConfig) and group.k_eq_v
+        # the pool maps the same pairs, so a shared layer reads the rows of the slab it maps onto
+        sources = dict(config.kv_shared_layers)
+        self.kv_source_layer = sources.get(layer_id)
+        self.kv_source = layer_id in sources.values()
         e_args = config.gemma4_e_args
-        self.kv_shared = e_args is not None and e_args.is_kv_shared(layer_id)
-        self.kv_source = e_args is not None and e_args.is_kv_source(layer_id, group.layer_ids)
-        self._group_name = group.name
+        # the MTP draft (first_kv_shared_layer 0) has no source of its own: it reads the target's slabs
+        self.kv_shared = self.kv_source_layer is not None or (e_args is not None and e_args.first_kv_shared_layer == 0)
 
         self.q_dim = self.num_qo_heads * self.head_dim
         self.kv_dim = self.num_kv_heads * self.head_dim
@@ -95,7 +98,7 @@ class Gemma4Attention(BaseOP):
         return q_view.view_as(q), k_view.view_as(k)
 
     @nvtx_annotate("MHA")
-    def forward(self, x: torch.Tensor, shared_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] | None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, shared_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None) -> torch.Tensor:
         ctx = get_global_ctx()
         positions = ctx.batch.positions
         T = x.shape[0]
@@ -106,7 +109,7 @@ class Gemma4Attention(BaseOP):
             # the rope kernels rotate a key along with the query: give them one head of zeros
             q, _ = self._apply_rope(positions, q, q.new_zeros(T, 1, self.head_dim))
             # absent means the read-only draft: it attends the target's paged slabs and contributes no rows
-            k, v = shared_kv[self._group_name] if shared_kv is not None else (None, None)
+            k, v = shared_kv[self.kv_source_layer] if shared_kv is not None else (None, None)
         else:
             qkv = self.qkv_proj.forward(x)
             q_lin, k_lin, v_lin = qkv.split(
@@ -127,7 +130,7 @@ class Gemma4Attention(BaseOP):
             k = k.reshape(T, self.num_kv_heads * self.head_dim)
             v = v.reshape(T, self.num_kv_heads * self.head_dim)
             if self.kv_source:
-                shared_kv[self._group_name] = (k, v)
+                shared_kv[self.layer_id] = (k, v)
         o = ctx.attn_backend.forward(
             q.contiguous(),
             None if k is None else k.contiguous(),

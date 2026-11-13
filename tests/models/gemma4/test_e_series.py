@@ -100,10 +100,56 @@ def test_kv_source_is_the_last_unshared_layer_of_each_attention_type():
     """E2B shares from layer 15: full attention hands over from 14, sliding from 13."""
     config = parse_config(_hf_config(E2B))
     full, swa = config.attention_groups
-    args = config.gemma4_e_args
+    sources = dict(config.kv_shared_layers)
 
-    assert [i for i in full.layer_ids if args.is_kv_source(i, full.layer_ids)] == [14]
-    assert [i for i in swa.layer_ids if args.is_kv_source(i, swa.layer_ids)] == [13]
+    assert sorted(sources) == list(range(15, config.num_layers))
+    assert {sources[i] for i in full.layer_ids if i in sources} == {14}
+    assert {sources[i] for i in swa.layer_ids if i in sources} == {13}
+
+
+def test_kv_shared_layers_with_no_earlier_source_are_refused():
+    from freetoken.models.gemma4.config import Gemma4EArgs
+
+    args = Gemma4EArgs(per_layer_hidden_size=256, per_layer_vocab_size=262144, first_kv_shared_layer=4, kv_shared_intermediate_size=1)
+    with pytest.raises(NotImplementedError, match="no earlier layer of their attention type"):
+        args.kv_shared_layers((0, 1, 2, 3), (4, 5))
+
+
+@pytest.mark.parametrize("kv_format", ["none", "int8_per_token_head"])
+@pytest.mark.parametrize("release, full_slabs, swa_slabs", [(E2B, 3, 12), (E4B, 4, 20)])
+def test_shared_layers_read_their_source_slab_and_own_none(release, full_slabs, swa_slabs, kv_format):
+    from freetoken.kvcache import create_kvcache_pool
+    from freetoken.kvcache.format import KV_FORMATS
+
+    config = parse_config(_hf_config(release))
+    pool = create_kvcache_pool(
+        model_config=config, num_pages=2, page_size=16, num_swa_tokens=8,
+        dtype=torch.bfloat16, device=torch.device("cpu"), kv_format=KV_FORMATS[kv_format],
+    )
+
+    assert pool.full_kv_pool.buffer.shape[1] == full_slabs
+    assert pool.swa_kv_pool.buffer.shape[1] == swa_slabs
+    for i, source in config.kv_shared_layers:
+        assert pool.k_cache(i).data_ptr() == pool.k_cache(source).data_ptr()
+        assert pool.v_cache(i).data_ptr() == pool.v_cache(source).data_ptr()
+        if kv_format != "none":
+            # a shared layer reading zero scales would only show up as worse 8-bit outputs
+            assert pool.k_scale(i).data_ptr() == pool.k_scale(source).data_ptr()
+            assert pool.v_scale(i).data_ptr() == pool.v_scale(source).data_ptr()
+
+
+@pytest.mark.parametrize("release", [E2B, E4B])
+def test_attention_reads_the_pairs_the_pool_maps(release):
+    """A shared layer attends over the rows of the source the pool maps its slab onto."""
+    config = parse_config(_hf_config(release))
+    sources = dict(config.kv_shared_layers)
+    model = _meta_model(config)
+
+    for i, layer in enumerate(model.model.layers.op_list):
+        attn = layer.self_attn
+        assert (attn.kv_shared, attn.kv_source_layer) == (i in sources, sources.get(i))
+        assert attn.kv_source == (i in sources.values())
+        assert hasattr(attn, "q_proj") == attn.kv_shared
 
 
 def test_model_shapes_match_the_e2b_checkpoint():
@@ -139,7 +185,8 @@ def test_loader_drops_shared_k_v_but_not_the_vision_towers(tmp_path, monkeypatch
     """The checkpoint ships k, v and k_norm for shared layers too; the tower's layers reuse those names and indices."""
     from freetoken.models.gemma4 import weight
 
-    release = dict(E2B, layers=3, shared=1, period=3)
+    # layers 0 and 2 slide, 1 is full; the shared layer 2 reads layer 0
+    release = dict(E2B, layers=3, shared=1, period=2)
     prefix = "model.language_model.layers"
     layers = {
         f"{prefix}.{i}.self_attn.{leaf}.weight": torch.zeros(2, 2)
@@ -230,7 +277,7 @@ def test_a_fused_qkv_file_gives_a_kv_shared_layer_its_q_rows(monkeypatch):
     from freetoken.models.gemma4 import gguf as gemma4_gguf
     import freetoken.utils
 
-    release = dict(E2B, layers=3, shared=1, period=3, hidden=8, ffn=16, double_wide=False)
+    release = dict(E2B, layers=3, shared=1, period=2, hidden=8, ffn=16, double_wide=False)
     config = parse_config(_hf_config(release, vocab_size=32, vocab_size_per_layer_input=32, hidden_size_per_layer_input=4))
     H, P, L, V = 8, 4, 3, 32
     index = {"token_embd.weight": _f32((H, V)), "output_norm.weight": _f32((H,)),
@@ -281,6 +328,7 @@ def _draft_view_config(target):
         target,
         num_layers=4,
         gemma4_e_args=None,
+        kv_shared_layers=(),
         attention_groups=(
             dataclasses.replace(swa, layer_ids=(0, 1, 2)),
             dataclasses.replace(full, layer_ids=(3,)),
@@ -310,3 +358,21 @@ def test_read_only_draft_view_routes_to_the_shared_target_slabs(release, overrid
     target = parse_config(_hf_config(release, **overrides))
     view = ReadOnlyTargetKVView(_SlabProbe(), _draft_view_config(target), target)
     assert [view.k_cache(i) for i in range(4)] == expected
+
+
+def test_draft_layers_project_q_only_and_hand_over_nothing():
+    """The sidecar's own e_args shares every layer from the first; it has no source of its own."""
+    import dataclasses
+
+    from freetoken.models.gemma4.attention import Gemma4Attention
+    from freetoken.models.gemma4.config import Gemma4EArgs
+    from freetoken.utils.torch_utils import torch_dtype
+
+    target = parse_config(_hf_config(E4B))
+    draft = dataclasses.replace(
+        _draft_view_config(target), gemma4_e_args=Gemma4EArgs(0, 0, 0, target.intermediate_size)
+    )
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        layers = [Gemma4Attention(draft, i, prefix=f"layers.{i}.self_attn") for i in range(4)]
+
+    assert [(a.kv_shared, a.kv_source, hasattr(a, "qkv_proj")) for a in layers] == [(True, False, False)] * 4
