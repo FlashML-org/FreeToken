@@ -190,11 +190,12 @@ def test_gguf_hash_constants_are_checked_against_the_file(tmp_path, key):
     write_tiny_gguf(path)
     good = load_gguf_metadata(path)[f"deepseek41.{key}"]
     gguf_engram_tables(path, parse_gguf_config(build_gguf_shim(path)).dsv41_args)
-    # primes also size the table, so a wrong one is caught by the same check through its own config
+    # primes also size the table, so a wrong one is caught by the same check through its own config;
+    # the config parse refuses the file, before any dense weight loads
     bad = str(tmp_path / "bad.gguf")
     write_tiny_gguf(bad, kv_over={key: [v + 1 if i == 1 else v for i, v in enumerate(good)]})
     with pytest.raises(ValueError, match=key):
-        gguf_engram_tables(bad, parse_gguf_config(build_gguf_shim(bad)).dsv41_args)
+        parse_gguf_config(build_gguf_shim(bad))
 
 
 @requires_cuda

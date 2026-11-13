@@ -158,4 +158,31 @@ def build_gguf_shim(model_path: str) -> GgufConfigShim:
     )
 
 
-__all__ = ["GgufConfigShim", "GGUF_ARCH_TO_REGISTRY", "GGUF_MMPROJ_TO_REGISTRY", "build_gguf_shim"]
+def uniform_swiglu_clamp(model_path: str, clamp_exp: Any, clamp_shexp: Any = None) -> float:
+    """The one SwiGLU clamp of the DeepSeek-V4 readers. The GGUF holds it per layer (scalar or array, the shared
+    expert's optional), the model takes one value, so anything non-uniform is refused instead of taking the first."""
+    values = [v for kv in (clamp_exp, clamp_shexp) if kv is not None for v in (kv if isinstance(kv, list) else [kv])]
+    if len(set(map(float, values))) != 1:
+        raise NotImplementedError(f"{model_path}: non-uniform swiglu_clamp_exp / swiglu_clamp_shexp is not served")
+    return float(values[0])
+
+
+def routed_expert_count(model_path: str, expert_count: Any, index: dict) -> int:
+    """``expert_count`` when every layer's expert tensors carry it. REAP exports prune experts per layer, as a
+    per-layer array or with the scalar kept but the tensors shrunk; llama.cpp refuses both, and so does this."""
+    if isinstance(expert_count, list):
+        raise NotImplementedError(f"{model_path}: a per-layer expert_count array (REAP-style prune) is not served")
+    n_experts = int(expert_count)
+    for name, info in index.items():
+        if name.endswith(".ffn_gate_exps.weight") and info.ne[-1] != n_experts:
+            raise NotImplementedError(
+                f"{model_path}: {name} carries {info.ne[-1]} experts but expert_count says "
+                f"{n_experts} (REAP-style per-layer prunes are not served)"
+            )
+    return n_experts
+
+
+__all__ = [
+    "GgufConfigShim", "GGUF_ARCH_TO_REGISTRY", "GGUF_MMPROJ_TO_REGISTRY", "build_gguf_shim",
+    "routed_expert_count", "uniform_swiglu_clamp",
+]

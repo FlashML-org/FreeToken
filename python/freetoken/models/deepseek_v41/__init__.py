@@ -10,9 +10,9 @@ from the offload cache. Images use the DeepSeek ViT; DSpark speculative decoding
 from .config import parse_config
 from .gguf import iter_gguf_weights, parse_gguf_config, to_gguf
 from .model import DeepseekV41ForCausalLM
-from .weight import ftw_side_files, iter_expert_pieces, iter_weights, iter_vision_weights
+from .weight import ftw_check_source, ftw_side_files, iter_expert_pieces, iter_weights, iter_vision_weights
 
 __all__ = [
     "DeepseekV41ForCausalLM", "parse_config", "iter_weights", "iter_vision_weights", "iter_expert_pieces", "ftw_side_files",
-    "iter_gguf_weights", "parse_gguf_config", "to_gguf",
+    "ftw_check_source", "iter_gguf_weights", "parse_gguf_config", "to_gguf",
 ]

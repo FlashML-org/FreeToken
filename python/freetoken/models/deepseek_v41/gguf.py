@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from freetoken.layers.quantization.ggml_types import row_bytes
+from freetoken.models.gguf.config import routed_expert_count, uniform_swiglu_clamp
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
 from freetoken.models.gguf.tensors import check_scales, dequantized_tensor, fused, matrix
 
@@ -64,7 +65,7 @@ def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
     return tuple(f"blk.{m.group(1)}.{leaf}" for leaf in _LAYER_LEAVES.get(m.group(2), ()))
 
 
-def _args_from_metadata(shim: GgufConfigShim) -> DeepseekV41Args:
+def _args_from_metadata(shim: GgufConfigShim, index: dict[str, GgufTensorInfo]) -> DeepseekV41Args:
     md, prefix, path = shim.metadata, shim.model_type, shim.model_path
 
     def kv(key: str, default=None):
@@ -89,10 +90,6 @@ def _args_from_metadata(shim: GgufConfigShim) -> DeepseekV41Args:
         raise NotImplementedError(f"{path}: attention key and value lengths differ")
     if int(kv("attention.head_count_kv", 1) or 1) != 1:
         raise NotImplementedError(f"{path}: more than one latent KV head is not served")
-    # the clamp is per-layer in the GGUF; the model takes one value
-    clamps = {float(v) for k in ("swiglu_clamp_exp", "swiglu_clamp_shexp") for v in need(k)}
-    if len(clamps) != 1:
-        raise NotImplementedError(f"{path}: non-uniform swiglu_clamp_exp / swiglu_clamp_shexp is not served")
 
     engram: dict = {}
     if (layers := kv("ple.layers")) is not None:
@@ -118,13 +115,13 @@ def _args_from_metadata(shim: GgufConfigShim) -> DeepseekV41Args:
         n_layers=int(need("block_count")),
         n_mtp_layers=0,  # the converter leaves the DSpark stage out
         n_heads=int(need("attention.head_count")),
-        n_routed_experts=int(need("expert_count")),
+        n_routed_experts=routed_expert_count(path, need("expert_count"), index),
         n_shared_experts=int(kv("expert_shared_count", 1) or 1),
         n_activated_experts=int(need("expert_used_count")),
         score_func="sqrtsoftplus",
         norm_topk_prob=bool(need("expert_weights_norm")),
         route_scale=float(need("expert_weights_scale")),
-        swiglu_limit=clamps.pop(),
+        swiglu_limit=uniform_swiglu_clamp(path, need("swiglu_clamp_exp"), need("swiglu_clamp_shexp")),
         q_lora_rank=int(need("attention.q_lora_rank")),
         head_dim=head_dim,
         rope_head_dim=int(need("rope.dimension_count")),
@@ -158,21 +155,53 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
     from dataclasses import replace
 
     check_scales(shim.model_path)
-    args = _args_from_metadata(shim)
     index = gguf_tensor_index(shim.model_path)
+    args = _args_from_metadata(shim, index)
     if not args.engram_layer_ids and (f"{shim.model_type}.engram.token_map" in shim.metadata or any(".engram_" in name for name in index)):
         raise NotImplementedError(f"{shim.model_path}: Engram tensors without {shim.model_type}.ple.layers, so not llama.cpp's deepseek41 layout (converted for an earlier branch?)")
-    # a metadata-only GGUF (an FTW dir's source_metadata.gguf) has no tensor table to check
-    if index:
-        if args.engram_layer_ids and _TABLE not in index:
-            raise NotImplementedError(f"{shim.model_path}: no {_TABLE} tensor, the Engram tables llama.cpp's converter writes")
-        for name, info in index.items():
-            if name.endswith(".ffn_gate_exps.weight") and info.ne[-1] != args.n_routed_experts:
-                raise NotImplementedError(
-                    f"{shim.model_path}: {name} carries {info.ne[-1]} experts but expert_count says {args.n_routed_experts} (per-layer prunes are not served)"
-                )
+    if args.engram_layer_ids:
+        _check_engram(shim, args, index)
     config = model_config_from_args(args, max_position=int(shim.metadata[f"{shim.model_type}.context_length"]))
     return replace(config, expert_quant="gguf")
+
+
+def _check_engram(shim: GgufConfigShim, args: DeepseekV41Args, index: dict[str, GgufTensorInfo]) -> None:
+    """Refuse a file whose Engram hash or table this build would read differently, before any weight loads.
+
+    The bucket primes and the multipliers derive from the config as on the HF path, so they are checked against the KVs llama.cpp hashes with."""
+    path, arch = shim.model_path, shim.model_type
+    hash = _engram_hash(shim.metadata, arch, args)
+    for key, derived in (
+        ("ple.head_offsets", _table_offsets(hash).flatten().tolist()),
+        ("ple.head_vocab_sizes", hash.primes.flatten().tolist()),
+        ("ple.layer_multipliers", hash.multipliers.flatten().tolist()),
+    ):
+        if [int(v) for v in shim.metadata[f"{arch}.{key}"]] != derived:
+            raise ValueError(f"{path}: {arch}.{key} differs from the Engram hash this build derives from the config")
+    # a metadata-only GGUF (an FTW dir's source_metadata.gguf) has no tensor table to check
+    if not index:
+        return
+    if _TABLE not in index:
+        raise NotImplementedError(f"{path}: no {_TABLE} tensor, the Engram tables llama.cpp's converter writes")
+    # check_scales lets an NVFP4 tensor's .scale through, and the table reader would decode without it
+    if _TABLE.replace(".weight", ".scale") in index:
+        raise NotImplementedError(f"{path}: an Engram table with a per-tensor .scale is not served")
+    head_dim, rows = index[_TABLE].ne
+    if head_dim != args.engram_head_dim or rows < sum(hash.rows_per_layer):
+        raise ValueError(f"{path}: {_TABLE} is {index[_TABLE].ne}, expected {args.engram_head_dim} values wide and at least {sum(hash.rows_per_layer)} rows")
+
+
+def _engram_hash(metadata: dict, arch: str, args: DeepseekV41Args) -> EngramHash:
+    return EngramHash(args, metadata[f"{arch}.engram.token_map"], args.engram_compressed_vocab_size)
+
+
+def _layer_starts(hash: EngramHash) -> list[int]:
+    """Each Engram layer's first row in the one table: the layers sit back to back."""
+    return [sum(hash.rows_per_layer[:i]) for i in range(len(hash.rows_per_layer))]
+
+
+def _table_offsets(hash: EngramHash) -> torch.Tensor:
+    return hash.offsets + torch.tensor(_layer_starts(hash)).unsqueeze(1)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -269,30 +298,16 @@ def iter_gguf_weights(
 def gguf_engram_tables(model_path: str, args: DeepseekV41Args) -> tuple[EngramHash, list[EngramRowSource]]:
     """The hash from the file's token map and one row source per Engram layer: each is a slice of the single ``per_layer_token_embd`` tensor.
 
-    The bucket primes and the multipliers derive from the config as on the HF path, so they are checked against the KVs llama.cpp hashes with."""
+    ``args`` comes from ``parse_gguf_config``, which has checked the hash constants and the table against the file."""
     from freetoken.models.gguf.reader import load_gguf_metadata
 
     md = load_gguf_metadata(model_path)
-    arch = md["general.architecture"]
-    hash = EngramHash(args, md[f"{arch}.engram.token_map"], args.engram_compressed_vocab_size)
-    starts = [sum(hash.rows_per_layer[:i]) for i in range(len(hash.rows_per_layer))]
-    offsets = (hash.offsets + torch.tensor(starts).unsqueeze(1)).flatten().tolist()
-    for key, derived in (
-        ("ple.head_offsets", offsets),
-        ("ple.head_vocab_sizes", hash.primes.flatten().tolist()),
-        ("ple.layer_multipliers", hash.multipliers.flatten().tolist()),
-    ):
-        if [int(v) for v in md[f"{arch}.{key}"]] != derived:
-            raise ValueError(f"{model_path}: {arch}.{key} differs from the Engram hash this build derives from the config")
-
+    hash = _engram_hash(md, md["general.architecture"], args)
     info = gguf_tensor_index(model_path)[_TABLE]
-    head_dim, rows = info.ne
-    if head_dim != args.engram_head_dim or rows < sum(hash.rows_per_layer):
-        raise ValueError(f"{model_path}: {_TABLE} is {info.ne}, expected {args.engram_head_dim} values wide and at least {sum(hash.rows_per_layer)} rows")
-    nbytes = row_bytes(info.ggml_type, head_dim)
+    nbytes = row_bytes(info.ggml_type, args.engram_head_dim)
     return hash, [
-        EngramRowSource(info.path, info.offset + start * nbytes, layer_rows, head_dim, None, info.ggml_type, nbytes)
-        for start, layer_rows in zip(starts, hash.rows_per_layer)
+        EngramRowSource(info.path, info.offset + start * nbytes, layer_rows, args.engram_head_dim, None, info.ggml_type, nbytes)
+        for start, layer_rows in zip(_layer_starts(hash), hash.rows_per_layer)
     ]
 
 

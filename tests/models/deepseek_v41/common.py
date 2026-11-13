@@ -235,9 +235,12 @@ def _write_gguf(path: str, kvs: list[tuple[str, int, object, int | None]], tenso
             f.write(blob)
 
 
-def write_tiny_gguf(path: str, seed: int = 0, *, table_type: str = "BF16", random_gate: bool = False, kv_over: dict | None = None, **over) -> dict[int, torch.Tensor]:
+def write_tiny_gguf(
+    path: str, seed: int = 0, *, table_type: str = "BF16", random_gate: bool = False, kv_over: dict | None = None,
+    extra_tensors: dict[str, torch.Tensor] | None = None, **over,
+) -> dict[int, torch.Tensor]:
     """The tiny checkpoint as llama.cpp's converter lays it out (conversion/deepseek41.py), every tensor float except an optional Q8_0 ``table_type`` table;
-    ``kv_over`` replaces array KVs. Returns each Engram layer's rows as they decode, keyed by layer."""
+    ``kv_over`` replaces KVs (a list writes an array, a scalar one value), ``extra_tensors`` adds tensors. Returns each Engram layer's rows as they decode, keyed by layer."""
     import numpy as np
 
     from freetoken.models.deepseek_v41.args import DeepseekV41Args
@@ -253,7 +256,13 @@ def write_tiny_gguf(path: str, seed: int = 0, *, table_type: str = "BF16", rando
     kvs: list[tuple[str, int, object, int | None]] = [("general.architecture", K.STRING, "deepseek41", None)]
 
     def add_kv(key, kind, value, sub=None):
-        kvs.append((f"deepseek41.{key}", kind, (kv_over or {}).get(key, value), sub))
+        value = (kv_over or {}).get(key, value)
+        # an override may turn a per-layer array into one value or back
+        if isinstance(value, list) and kind != K.ARRAY:
+            kind, sub = K.ARRAY, kind
+        elif not isinstance(value, list) and kind == K.ARRAY:
+            kind, sub = sub, None
+        kvs.append((f"deepseek41.{key}", kind, value, sub))
 
     for key, value in {
         "block_count": text["num_hidden_layers"], "context_length": text["max_position_embeddings"], "embedding_length": text["hidden_size"],
@@ -323,5 +332,7 @@ def write_tiny_gguf(path: str, seed: int = 0, *, table_type: str = "BF16", rando
         table = dict(zip(table, decoded.to(torch.bfloat16).split([t.shape[0] for t in table.values()])))
     else:
         add("per_layer_token_embd.weight", packed)
+    for name, t in (extra_tensors or {}).items():
+        add(name, t)
     _write_gguf(path, kvs, out)
     return table

@@ -16,7 +16,7 @@ from freetoken.models.deepseek_v41.config import parse_config
 from freetoken.models.register import get_model_spec
 from freetoken.utils.torch_utils import torch_dtype
 
-from .common import ENGRAM_LAYERS, INDEX_SOURCES, KV_SOURCES, N_LAYERS, RATIOS, tiny_hf_config, write_tiny_checkpoint, write_tiny_gguf
+from .common import ENGRAM_LAYERS, INDEX_SOURCES, KV_SOURCES, N_LAYERS, RATIOS, requires_cuda, tiny_hf_config, write_tiny_checkpoint, write_tiny_gguf
 
 
 def test_roles_follow_the_dsv41_mode_table():
@@ -200,3 +200,40 @@ def test_gguf_from_an_earlier_branch_is_refused(tmp_path):
     shim.metadata = {k: v for k, v in shim.metadata.items() if k != "deepseek41.ple.layers"}
     with pytest.raises(NotImplementedError, match="ple.layers"):
         parse_gguf_config(shim)
+
+
+def test_gguf_clamp_may_be_one_value_and_a_per_layer_expert_count_is_refused(tmp_path):
+    from freetoken.models.deepseek_v41.gguf import parse_gguf_config
+    from freetoken.models.gguf.config import build_gguf_shim
+
+    text = tiny_hf_config().text_config
+    scalar = str(tmp_path / "scalar.gguf")
+    write_tiny_gguf(scalar, kv_over={"swiglu_clamp_exp": float(text["swiglu_limit"])})
+    assert parse_gguf_config(build_gguf_shim(scalar)).dsv41_args.swiglu_limit == text["swiglu_limit"]
+    pruned = str(tmp_path / "pruned.gguf")
+    write_tiny_gguf(pruned, kv_over={"expert_count": [text["n_routed_experts"]] * N_LAYERS})
+    with pytest.raises(NotImplementedError, match="per-layer expert_count"):
+        parse_gguf_config(build_gguf_shim(pruned))
+
+
+def test_gguf_engram_table_with_a_scale_is_refused(tmp_path, monkeypatch):
+    """check_scales passes an NVFP4 table's .scale, which the table reader never applies."""
+    import freetoken.models.deepseek_v41.gguf as reader
+    from freetoken.models.gguf.config import build_gguf_shim
+
+    path = str(tmp_path / "scaled.gguf")
+    write_tiny_gguf(path, extra_tensors={"per_layer_token_embd.scale": torch.ones(1)})
+    monkeypatch.setattr(reader, "check_scales", lambda *a, **k: None)
+    with pytest.raises(NotImplementedError, match="per-tensor .scale"):
+        reader.parse_gguf_config(build_gguf_shim(path))
+
+
+@requires_cuda
+def test_ftw_conversion_refuses_a_gguf_before_writing(tmp_path):
+    from freetoken.checkpoint.convert import convert_checkpoint
+
+    path, out = str(tmp_path / "tiny.gguf"), tmp_path / "ftw"
+    write_tiny_gguf(path)
+    with pytest.raises(NotImplementedError, match="serve the .gguf directly"):
+        convert_checkpoint(path, str(out))
+    assert not out.exists()

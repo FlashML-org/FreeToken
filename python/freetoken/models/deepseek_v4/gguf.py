@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Iterator
 import numpy as np
 import torch
 
+from freetoken.models.gguf.config import routed_expert_count, uniform_swiglu_clamp
 from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index, gguf_tensor_names, load_gguf_metadata
 from freetoken.models.gguf.tensors import check_scales, dequantized_tensor as _float, fused, matrix
@@ -126,14 +127,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     # process nulls vision_n_layers on its copy, and None here is the same answer
     vc = parse_vision_config(shim)
 
-    # the clamp is per-layer in the GGUF (and the shared expert carries its own array); the model
-    # takes one value, so anything non-uniform is refused instead of silently taking the first
-    clamp = need("swiglu_clamp_exp")
-    clamp_vals = list(clamp) if isinstance(clamp, list) else [clamp]
-    clamp_shexp = kv("swiglu_clamp_shexp")
-    shexp_vals = list(clamp_shexp) if isinstance(clamp_shexp, list) else [clamp_shexp] if clamp_shexp is not None else []
-    if len(set(map(float, clamp_vals + shexp_vals))) != 1:
-        raise NotImplementedError(f"{shim.model_path}: non-uniform swiglu_clamp_exp / swiglu_clamp_shexp is not served")
+    swiglu_limit = uniform_swiglu_clamp(shim.model_path, need("swiglu_clamp_exp"), kv("swiglu_clamp_shexp"))
 
     from freetoken.third_party.gguf.constants import ExpertGatingFuncType
 
@@ -171,21 +165,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     num_layers = int(need("block_count"))
     index = gguf_tensor_index(shim.model_path)
 
-    # REAP exports prune experts per layer: as a per-layer expert_count array, or with the
-    # scalar kept but the expert tensors shrunk. llama.cpp builds every layer from one
-    # n_expert and refuses both shapes; the model has no per-layer expert count to express.
-    experts_kv = need("expert_count")
-    if isinstance(experts_kv, list):
-        raise NotImplementedError(
-            f"{shim.model_path}: a per-layer expert_count array (REAP-style prune) is not served"
-        )
-    n_experts = int(experts_kv)
-    for name, info in index.items():
-        if name.endswith(".ffn_gate_exps.weight") and info.ne[-1] != n_experts:
-            raise NotImplementedError(
-                f"{shim.model_path}: {name} carries {info.ne[-1]} experts but expert_count says "
-                f"{n_experts} (REAP-style per-layer prunes are not served)"
-            )
+    # llama.cpp builds every layer from one n_expert; the model has no per-layer expert count to express
+    n_experts = routed_expert_count(shim.model_path, need("expert_count"), index)
     args = DeepseekV4Args(
         max_batch_size=1,
         vocab_size=int(shim.vocab_size),
@@ -194,12 +175,12 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         n_layers=num_layers,
         n_hash_layers=int(kv("hash_layer_count", 0) or 0),
         n_heads=int(need("attention.head_count")),
-        n_routed_experts=int(need("expert_count")),
+        n_routed_experts=n_experts,
         n_shared_experts=int(kv("expert_shared_count", 1) or 1),
         n_activated_experts=int(need("expert_used_count")),
         score_func="sqrtsoftplus",
         route_scale=float(need("expert_weights_scale")),
-        swiglu_limit=float(clamp_vals[0]),
+        swiglu_limit=swiglu_limit,
         q_lora_rank=int(need("attention.q_lora_rank")),
         head_dim=head_dim,
         rope_head_dim=int(need("rope.dimension_count")),
