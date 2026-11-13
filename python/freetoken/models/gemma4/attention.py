@@ -95,7 +95,7 @@ class Gemma4Attention(BaseOP):
         return q_view.view_as(q), k_view.view_as(k)
 
     @nvtx_annotate("MHA")
-    def forward(self, x: torch.Tensor, shared_kv: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, shared_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] | None) -> torch.Tensor:
         ctx = get_global_ctx()
         positions = ctx.batch.positions
         T = x.shape[0]
@@ -105,7 +105,8 @@ class Gemma4Attention(BaseOP):
             q = self.q_norm.forward(q)
             # the rope kernels rotate a key along with the query: give them one head of zeros
             q, _ = self._apply_rope(positions, q, q.new_zeros(T, 1, self.head_dim))
-            k, v = shared_kv[self._group_name]
+            # absent means the read-only draft: it attends the target's paged slabs and contributes no rows
+            k, v = shared_kv[self._group_name] if shared_kv is not None else (None, None)
         else:
             qkv = self.qkv_proj.forward(x)
             q_lin, k_lin, v_lin = qkv.split(
@@ -129,8 +130,8 @@ class Gemma4Attention(BaseOP):
                 shared_kv[self._group_name] = (k, v)
         o = ctx.attn_backend.forward(
             q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
+            None if k is None else k.contiguous(),
+            None if v is None else v.contiguous(),
             self.layer_id,
             ctx.batch,
             attn_spec=self.attn_spec,

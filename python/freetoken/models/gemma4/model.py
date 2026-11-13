@@ -49,7 +49,8 @@ class Gemma4DecoderLayer(BaseOP):
         self.input_layernorm = GemmaRMSNorm(H, eps=eps)
         self.post_attention_layernorm = GemmaRMSNorm(H, eps=eps)
         self.pre_feedforward_layernorm = GemmaRMSNorm(H, eps=eps)
-        if config.gemma4_e_args is not None:
+        # a zero-width e_args (the MTP draft) shares attention only, with no per-layer table
+        if config.gemma4_e_args is not None and config.gemma4_e_args.per_layer_hidden_size:
             P = config.gemma4_e_args.per_layer_hidden_size
             self.per_layer_input_gate = LinearReplicated(
                 H, P, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.per_layer_input_gate"

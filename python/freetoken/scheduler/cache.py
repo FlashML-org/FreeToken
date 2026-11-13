@@ -12,7 +12,8 @@ from freetoken.utils import align_down, div_ceil
 if TYPE_CHECKING:
     from .utils import PendingReq
 
-# Proactive out-of-window free_swa runs every `interval` forwards (== sglang SWA_EVICTION_INTERVAL).
+# Proactive out-of-window free_swa runs on any decode step that has slid out `interval`
+# positions since the request's last free (== sglang SWA_EVICTION_INTERVAL).
 def _swa_eviction_interval() -> int:
     raw = os.environ.get("FREETOKEN_SWA_EVICTION_INTERVAL", "128")
     try:
@@ -181,16 +182,17 @@ class CacheManager:
             r.mamba_last_track_seqlen = a
             r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
 
-    def maybe_free_swa_out_of_window(self, reqs: List[Req], *, forward_iter: int) -> None:
+    def maybe_free_swa_out_of_window(self, reqs: List[Req]) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
         footprint to ~one window so a smaller-than-full swa pool (swa_full_tokens_ratio<1) stays
         viable. Mirrors sglang ``ScheduleBatch.maybe_evict_swa`` / ``free_swa_out_of_window_slots``:
-        evict every ``interval`` forwards; skip a request's first decode step (its extend forward
-        may still be in-flight under overlap); floor the frontier at the request's protected
-        (reused) prefix so it only frees its OWN slots, never the tree-shared prefix's swa; and keep
-        a ``window + page_size`` margin so the freed slots are out-of-window for every in-flight
-        forward."""
-        if not self.swa_paged or forward_iter % _SWA_EVICTION_INTERVAL != 0:
+        evict on any decode step that has slid out an interval since the request's last free
+        (per-request, so a prefill batch cannot skip the round); skip a request's first decode
+        step (its extend forward may still be in-flight under overlap); floor the frontier at
+        the request's protected (reused) prefix so it only frees its OWN slots, never the
+        tree-shared prefix's swa; and keep a ``window + page_size`` margin so the freed slots
+        are out-of-window for every in-flight forward."""
+        if not self.swa_paged:
             return
         window = self.sliding_window_size
         for req in reqs:
@@ -216,7 +218,7 @@ class CacheManager:
                     threshold = min(threshold, cap)
             new_evicted = align_down(threshold, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
-            if new_evicted > start:
+            if new_evicted >= start + _SWA_EVICTION_INTERVAL:
                 self._free_swa(self.page_table[req.table_idx, start:new_evicted])
                 req.swa_evicted_seqlen = new_evicted
 
@@ -647,8 +649,11 @@ class CacheManager:
         """
         start = div_ceil(keep_len, self.page_size) * self.page_size
         end = div_ceil(drop_len, self.page_size) * self.page_size
-        assert not self.swa_paged, "rollback_tail frees no SWA slots; speculative decoding rejects SWA targets"
         if end > start:
+            # allocate_paged gave every dropped token a swa slot; without this the rejected
+            # verify rows leak ~k+1 swa slots per step until alloc_swa exhausts the pool.
+            if self.swa_paged:
+                self._free_swa(self.page_table[req.table_idx, start:end])
             self._free(self.page_table[req.table_idx, start:end])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
