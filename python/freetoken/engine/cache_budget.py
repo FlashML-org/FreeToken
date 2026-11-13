@@ -83,9 +83,11 @@ def plan_cache_budget(
     kv_reserve_bytes = kv_reserve_pages * cache_per_page
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
+    # Overlap is optional: when the budget cannot fund its 2*num_experts floor beside the
+    # KV reserve, plan without it instead of clamping up past the budget.
+    if overlap and raw < 2 * num_experts:
+        overlap, lo = False, num_experts
     moe_cache_size = max(lo, min(raw, hi))
-    # A tiny budget may have forced moe_cache_size below 2*num_experts even with overlap on.
-    overlap = overlap and moe_cache_size >= 2 * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
     num_pages = max(remaining // cache_per_page, kv_reserve_pages)
