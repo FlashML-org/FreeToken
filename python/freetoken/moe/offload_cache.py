@@ -1276,12 +1276,27 @@ class OffloadMoeCache:
         # materialize stages rows of staging buffer 0; ensure stages slots local to the layer's pool
         whole = self._pending_whole_layer
         if self._copy_fused_ok:
+            from freetoken.decode_gather import decode_gather_config
+            from freetoken.kernel.decode_gather import decode_gather_jit
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
+            # Whole-layer materialize and the prefill hit gather stay on the LDG kernel.
+            gather = None if whole else decode_gather_config()
+            if gather is not None:
+                decode_gather_jit(
+                    self._copy_dst_ptrs_pool[self.pool_of_layer[layer_id]],
+                    self._copy_src_ptrs[layer_id],
+                    self._copy_feat_bytes[self.layer_layout[layer_id]],
+                    self.evict_slots,
+                    self.src_indices,
+                    self.num_indices,
+                    config=gather,
+                )
+                return
             fast_index_copy_multi_jit(
                 self._copy_dst_ptrs if whole else self._copy_dst_ptrs_pool[self.pool_of_layer[layer_id]],
                 self._copy_src_ptrs[layer_id],
