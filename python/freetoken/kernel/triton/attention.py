@@ -6,7 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile, kv_tile_staged
+from freetoken.kernel.triton.kv_rows import (
+    dequant_kv_rows, kv_decode_config, kv_f16_reader, kv_row_scale, kv_scale_args, kv_tile, kv_tile_f16,
+    kv_tile_rows, kv_tile_staged,
+)
 from freetoken.kvcache.format import NONE, KVFormat
 
 
@@ -20,6 +23,9 @@ _MIN_SPLITS = 8
 _MAX_KV_SPLITS = 64
 # stage 2 merges at most this many fp32 partial elements per step
 _STAGE2_TILE_ELEMS = 8192
+# the RDNA3 fp8 decode reads 16-key tiles with one stage: short splits and more programs hide its latency
+_F16_KV_MIN_SPLIT_LEN = 32
+_F16_KV_MAX_SPLITS = 256
 
 
 def _kv_offset_dtype(k_cache: torch.Tensor, v_cache: torch.Tensor):
@@ -65,10 +71,14 @@ def _num_sms(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
 
 
-def decode_kv_split_cap(batch: int, num_q_heads: int, num_kv_heads: int, device_index: int) -> int:
-    """Most KV splits per request for a decode batch: about four programs per SM, within [_MIN_SPLITS, _MAX_KV_SPLITS]."""
+def decode_kv_split_cap(
+    batch: int, num_q_heads: int, num_kv_heads: int, device_index: int, kv_format: KVFormat = NONE,
+) -> int:
+    """Most KV splits per request for a decode batch: about four programs per SM, within [_MIN_SPLITS, _MAX_KV_SPLITS]
+    (eight, within _F16_KV_MAX_SPLITS, for the RDNA3 fp8 reader)."""
     head_blocks = triton.cdiv(num_q_heads, min(16, max(1, num_q_heads // num_kv_heads)))
-    return max(_MIN_SPLITS, min(_MAX_KV_SPLITS, triton.cdiv(4 * _num_sms(device_index), batch * head_blocks)))
+    per_sm, max_splits = (8, _F16_KV_MAX_SPLITS) if kv_f16_reader(kv_format, device_index) else (4, _MAX_KV_SPLITS)
+    return max(_MIN_SPLITS, min(max_splits, triton.cdiv(per_sm * _num_sms(device_index), batch * head_blocks)))
 
 
 def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
@@ -262,6 +272,8 @@ def _decode_grouped_stage1_kernel(
     SLIDING_WINDOW: tl.constexpr,
     KV_OFFSET_DTYPE: tl.constexpr,
     KV_FMT: tl.constexpr,
+    KV_PACK: tl.constexpr,
+    F16_KV: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -309,6 +321,8 @@ def _decode_grouped_stage1_kernel(
         q = tl.load(q_ptr + q_offsets, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
         if KV_FMT == "none":
             q = q.to(k_ptr.dtype.element_ty)
+        elif F16_KV:
+            q = q.to(tl.float16)
 
         for rel_start in tl.range(split_start, split_end, BLOCK_N):
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
@@ -316,13 +330,30 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
 
-            k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
+            # Preserve the merged reader's address expressions on non-packed targets.
+            if KV_PACK == 4:
+                k = kv_tile_rows(k_ptr, slots, kv_head, stride_ks, stride_kh, mask_n,
+                                 D, BLOCK_D, KV_FMT, KV_PACK, True)
+            elif F16_KV:
+                k = kv_tile_f16(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None])
+            else:
+                k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
             scale_k = kv_row_scale(k_scale_ptr + slots * stride_kss + kv_head, mask_n, KV_FMT)
+            if F16_KV:
+                scale_k = scale_k * 256.0
             scores = tl.dot(q, k) * sm_scale * scale_k[None, :]
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
-            v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
+            if KV_PACK == 4:
+                v = kv_tile_rows(v_ptr, slots, kv_head, stride_vs, stride_vh, mask_n,
+                                 DV, BLOCK_DV, KV_FMT, KV_PACK, False)
+            elif F16_KV:
+                v = kv_tile_f16(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :])
+            else:
+                v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
             scale_v = kv_row_scale(v_scale_ptr + slots * stride_vss + kv_head, mask_n, KV_FMT)
+            if F16_KV:
+                scale_v = scale_v * 256.0
 
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
@@ -471,8 +502,9 @@ def decode_paged_attention(
     if sliding_window is not None and sliding_window <= 0:
         # the kernels treat a window <= 0 as no window
         sliding_window = None
+    f16_kv = kv_f16_reader(kv_format, q.device.index)
     if max_kv_splits is None:
-        max_kv_splits = decode_kv_split_cap(batch, num_q_heads, num_kv_heads, q.device.index)
+        max_kv_splits = decode_kv_split_cap(batch, num_q_heads, num_kv_heads, q.device.index, kv_format)
     if sliding_window:
         # no request attends more than the window, so programs past its splits would only exit
         max_kv_splits = min(max_kv_splits, _max_request_splits(sliding_window))
@@ -515,6 +547,16 @@ def decode_paged_attention(
     if kv_format.quantized:
         block_n, num_stages, num_warps = _quantized_decode_launch(block_d, block_n, num_stages)
 
+    kv_pack = 1
+    if torch.version.hip is not None:
+        kv_pack, block_n, num_stages, num_warps = kv_decode_config(
+            kv_format, q, k_cache, v_cache, block_n, num_stages, num_warps,
+        )
+    if f16_kv:
+        # a single stage: the pipeliner cannot predicate kv_tile_f16's asm pin
+        block_n, num_stages, num_warps = 16, 1, 2
+    min_split_len = _F16_KV_MIN_SPLIT_LEN if f16_kv else _MIN_SPLIT_LEN
+
     k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
     _decode_grouped_stage1_kernel[grid](
         q,
@@ -545,6 +587,8 @@ def decode_paged_attention(
         attn_lse.stride(2),
         KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
         KV_FMT=kv_format.name,
+        KV_PACK=kv_pack,
+        F16_KV=f16_kv,
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
@@ -553,7 +597,7 @@ def decode_paged_attention(
         BLOCK_H=block_h,
         VALID_BLOCK_H=valid_block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
-        MIN_SPLIT_LEN=_MIN_SPLIT_LEN,
+        MIN_SPLIT_LEN=min_split_len,
         MIN_SPLITS=_MIN_SPLITS,
         D=head_dim,
         DV=head_dim,
@@ -579,7 +623,7 @@ def decode_paged_attention(
         o.stride(0),
         o.stride(1),
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
-        MIN_SPLIT_LEN=_MIN_SPLIT_LEN,
+        MIN_SPLIT_LEN=min_split_len,
         MIN_SPLITS=_MIN_SPLITS,
         BLOCK_DV=block_dv,
         DV=head_dim,
@@ -978,6 +1022,12 @@ def extend_paged_attention(
 
     if block_ends is not None:
         assert block_ends.is_cuda and block_ends.dtype == torch.int32 and block_ends.numel() == num_q_tokens
+    if kv_f16_reader(kv_format, q.device.index):
+        # every query block re-decodes each key tile, which RDNA3 does far slower than it streams bf16:
+        # dequantize the batch's rows once and run the bf16 kernel on them
+        k_cache, v_cache = dequant_kv_rows(k_cache, v_cache, k_scale, v_scale, kv_indices, kv_indptr)
+        kv_indices = torch.arange(kv_indices.numel(), dtype=torch.int32, device=q.device)
+        kv_format, k_scale, v_scale = NONE, None, None
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
     block_ends_arg = block_ends if block_ends is not None else qo_indptr
