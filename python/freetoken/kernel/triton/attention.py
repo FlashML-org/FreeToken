@@ -8,6 +8,7 @@ import triton.language as tl
 
 from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile, kv_tile_staged
 from freetoken.kvcache.format import NONE, KVFormat
+from freetoken.utils.arch import is_rocm
 
 
 _MIN_BLOCK_KV = 32
@@ -54,27 +55,26 @@ def _quantized_decode_launch(block_d: int, block_n: int, num_stages: int) -> tup
 def _multi_row_decode_launch(m: int, block_d: int, quantized: bool, q_bytes: int, kv_bytes: int, smem: int) -> tuple[int, int, int]:
     """(block_n, num_stages, num_warps) of stage 1 for ``m`` > 1 query rows x heads per program.
 
-    On sm_120 quantized K/V spill at 4 warps and compute-dtype K/V at 8 (ptxas stops at 128 registers there); 2 stages never win.
+    Picked from a launch sweep on sm_120 among the variants that do not spill on sm_80 to sm_120 (with maxnreg); 2 stages never win.
     """
-    if quantized:
-        block_n, num_warps = (32 if block_d >= 512 else 64), 8
+    if quantized and block_d >= 512:
+        block_n, num_warps = 32, 8
     else:
-        block_n, num_warps = (32 if block_d >= 512 or (block_d <= 128 and m >= 32) else 64), 4
+        block_n, num_warps = (64 if m * block_d <= 4096 and not (quantized and block_d >= 256) else 32), 4
     # the Q tile stays in the compute dtype, quantized K and V tiles take one byte per element
     while smem and block_n > 16 and m * block_d * q_bytes + 2 * block_n * block_d * kv_bytes > smem:
         block_n //= 2
     return block_n, 3, num_warps
 
 
-def _decode_heads_per_program(group: int, rows: int, head_dim: int, quantized: bool) -> int:
+def _decode_heads_per_program(group: int, rows: int, head_dim: int) -> int:
     """Query heads per decode program: the whole GQA group within the cap, else its largest power-of-two divisor within the cap.
 
     A program never spans two kv heads and a split group wastes no tile lanes. The cap is 16 heads and, for several rows, an M budget of rows x heads per ``head_dim``.
     """
     cap = 16
     if rows > 1:
-        # quantized head_dim 512 spills above 8 on sm_120
-        max_m = 64 if head_dim <= 128 else 32 if head_dim <= 256 else 8 if quantized else 16
+        max_m = 64 if head_dim <= 128 else 32 if head_dim <= 256 else 16
         cap = min(16, max(1, max_m // rows))
     if group <= cap:
         return group
@@ -586,7 +586,7 @@ def decode_paged_attention(
     # valid_block_h = heads computed per program (drives the grid + head indexing); block_h =
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
-    valid_block_h = _decode_heads_per_program(group, rows, head_dim, kv_format.quantized)
+    valid_block_h = _decode_heads_per_program(group, rows, head_dim)
     block_h = triton.next_power_of_2(valid_block_h)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
@@ -663,6 +663,8 @@ def decode_paged_attention(
         SLIDING_WINDOW=sliding_window or 0,
         num_warps=num_warps,
         num_stages=num_stages,
+        # without .maxnreg ptxas holds multi-row tiles below their register need for occupancy and spills a few bytes
+        **({} if rows == 1 or is_rocm() else {"maxnreg": 255}),
     )
     split_tile, stage2_warps = _stage2_launch(max_kv_splits, block_dv)
     _decode_stage2_kernel[(batch, num_q_heads, rows)](
