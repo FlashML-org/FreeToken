@@ -1280,10 +1280,14 @@ def _gather_kv_indices_kernel(
     rows,
     indptr,
     out,
+    swa_map,
+    swa_out,
     pt_stride,
     indptr_stride,
     out_stride,
+    swa_out_stride,
     BLOCK: tl.constexpr,
+    HAS_SWA: tl.constexpr,
 ):
     batch_id = tl.program_id(1)
     indptr_row = indptr + tl.program_id(0) * indptr_stride
@@ -1291,14 +1295,32 @@ def _gather_kv_indices_kernel(
     n = tl.load(indptr_row + batch_id + 1) - start
     src = page_table + tl.load(rows + batch_id).to(tl.int64) * pt_stride
     dst = out + tl.program_id(0).to(tl.int64) * out_stride + start
+    swa_dst = swa_out + tl.program_id(0).to(tl.int64) * swa_out_stride + start
     for off in range(tl.program_id(2) * BLOCK, n, tl.num_programs(2) * BLOCK):
         cols = off + tl.arange(0, BLOCK)
         mask = cols < n
-        tl.store(dst + cols, tl.load(src + cols, mask=mask), mask=mask)
+        slot = tl.load(src + cols, mask=mask)
+        tl.store(dst + cols, slot, mask=mask)
+        if HAS_SWA:
+            # only the live slots are translated: dead capacity keeps its previous contents
+            swa = tl.load(swa_map + slot.to(tl.int64), mask=mask)
+            tl.store(swa_dst + cols, swa.to(tl.int32), mask=mask)
 
 
-def gather_kv_indices(page_table: torch.Tensor, rows: torch.Tensor, indptr: torch.Tensor, out: torch.Tensor) -> None:
-    """Flat KV slot lists of several decode batches, built on the device: ``out[s, indptr[s, i] + j] = page_table[rows[i], j]`` for ``j < indptr[s, i + 1] - indptr[s, i]``."""
+def gather_kv_indices(
+    page_table: torch.Tensor,
+    rows: torch.Tensor,
+    indptr: torch.Tensor,
+    out: torch.Tensor,
+    swa_map: torch.Tensor | None = None,
+    swa_out: torch.Tensor | None = None,
+) -> None:
+    """Flat KV slot lists of several decode batches, built on the device: ``out[s, indptr[s, i] + j] = page_table[rows[i], j]`` for ``j < indptr[s, i + 1] - indptr[s, i]``.
+
+    With ``swa_map``/``swa_out`` the same live slots are translated through the dense full->swa
+    table in the same pass, so a sliding-window layer's list costs no second pass over dead capacity.
+    """
+    assert (swa_map is None) == (swa_out is None)
     steps, batch = indptr.shape[0], indptr.shape[1] - 1
     # a fixed grid keeps the launch graph-capturable; long rows loop over it
     chunks = max(1, triton.cdiv(2 * _num_sms(page_table.device.index), steps * batch))
@@ -1307,8 +1329,12 @@ def gather_kv_indices(page_table: torch.Tensor, rows: torch.Tensor, indptr: torc
         rows,
         indptr,
         out,
+        swa_map if swa_map is not None else out,
+        swa_out if swa_out is not None else out,
         page_table.stride(0),
         indptr.stride(0),
         out.stride(0),
+        swa_out.stride(0) if swa_out is not None else 0,
         BLOCK=1024,
+        HAS_SWA=swa_map is not None,
     )

@@ -12,11 +12,16 @@ from freetoken.engine.sample import make_device_tensor
 from freetoken.spec.mtp.proposer import _DraftReq, _PrefillSink, _VerifySink, with_resident_moe
 from freetoken.spec.mtp.shared_kv import ReadOnlyTargetKVView
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
+from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
     from freetoken.core import Req
     from freetoken.layers.embedding import VocabParallelEmbedding
     from freetoken.models.config import ModelConfig
+
+    from .chain_graph import SharedDraftGraphs
+
+logger = init_logger(__name__)
 
 
 class SharedKVMTPDraft(Protocol):
@@ -117,6 +122,7 @@ class SharedKVMTPProposer(Proposer):
             raise RuntimeError(f"{draft_cls.__name__} must build its own MoE layers, resident on the GPU")
         self._prefill_sink: _PrefillSink | None = None
         self.kv = None
+        self.draft_graphs: SharedDraftGraphs | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -126,7 +132,9 @@ class SharedKVMTPProposer(Proposer):
         super().attach(ctx)
         cfg = self.draft.config
         rows = self.config.max_running_req + 1
-        # a rebuild swaps the target pool, so the read-only view is rebuilt with every attach
+        # a rebuild swaps the target pool, so the read-only view is rebuilt with every attach; the
+        # graphs bind this view, this page table and this backend, so they are re-captured after it
+        self.draft_graphs = None
         self.kv = ReadOnlyTargetKVView(ctx.kv_cache, self.draft.config, self.config.model_config)
         width = self.draft.relay_width(self.config.model_config)
         # the target hidden that seeds the next proposal, one row per table row
@@ -138,6 +146,9 @@ class SharedKVMTPProposer(Proposer):
             self.chain_backend = create_attention_backend("triton", cfg)
 
     def detach(self, *, keep_kv: bool) -> None:
+        # the baked kernel pointers would outlive the pool and page table; attach only drops the graphs,
+        # Engine._make_graph_runner re-captures after it
+        self.draft_graphs = None
         self.kv = None  # a view over the old pool is dead once a rebuild swaps it, keep_kv included
         self.seed_hidden = self.verify_hidden = None
         self.chain_backend = None
@@ -183,11 +194,20 @@ class SharedKVMTPProposer(Proposer):
     # ------------------------------------------------------------------ one step
 
     def capture_graphs(self, bs_list: List[int], pool) -> None:
-        # read-only drafts stay eager until token-identity is proven; capture is mechanical after that
-        return
+        from .chain_graph import SharedDraftGraphs
+
+        self.draft_graphs = None
+        if not bs_list:
+            return
+        self.draft_graphs = SharedDraftGraphs(self, bs_list, pool)
+        logger.info_rank0(f"speculative decoding: shared draft cuda graphs captured for bs {sorted(bs_list)}")
 
     def propose(self, reqs: List[Req], rows: torch.Tensor, pending: torch.Tensor) -> SpecProposal:
         cs = [r.cached_len for r in reqs]
+        if self.draft_graphs is not None:
+            drafts = self.draft_graphs.replay(reqs, cs, pending)
+            if drafts is not None:
+                return SpecProposal(drafts)
         table_idxs = [r.table_idx for r in reqs]
         token = pending
         hidden = self.seed_hidden[rows]
