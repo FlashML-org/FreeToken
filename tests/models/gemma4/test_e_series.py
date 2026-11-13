@@ -185,7 +185,8 @@ def test_loader_drops_shared_k_v_but_not_the_vision_towers(tmp_path, monkeypatch
     """The checkpoint ships k, v and k_norm for shared layers too; the tower's layers reuse those names and indices."""
     from freetoken.models.gemma4 import weight
 
-    release = dict(E2B, layers=3, shared=1, period=3)
+    # layers 0 and 2 slide, 1 is full; the shared layer 2 reads layer 0
+    release = dict(E2B, layers=3, shared=1, period=2)
     prefix = "model.language_model.layers"
     layers = {
         f"{prefix}.{i}.self_attn.{leaf}.weight": torch.zeros(2, 2)
@@ -276,7 +277,7 @@ def test_a_fused_qkv_file_gives_a_kv_shared_layer_its_q_rows(monkeypatch):
     from freetoken.models.gemma4 import gguf as gemma4_gguf
     import freetoken.utils
 
-    release = dict(E2B, layers=3, shared=1, period=3, hidden=8, ffn=16, double_wide=False)
+    release = dict(E2B, layers=3, shared=1, period=2, hidden=8, ffn=16, double_wide=False)
     config = parse_config(_hf_config(release, vocab_size=32, vocab_size_per_layer_input=32, hidden_size_per_layer_input=4))
     H, P, L, V = 8, 4, 3, 32
     index = {"token_embd.weight": _f32((H, V)), "output_norm.weight": _f32((H,)),
