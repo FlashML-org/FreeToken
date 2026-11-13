@@ -167,6 +167,13 @@ def _attend(path: str, q, k_cache, v_cache, indices, kv_args: dict, k_extend=Non
         lse = torch.empty(1, num_q_heads, 64, device=device, dtype=torch.float32)
         return decode_paged_attention(q, k_cache, v_cache, indptr, indices, q_positions, mid, lse, sm_scale, **kv_args)
     qo_indptr = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+    if path == "decode_rows":
+        mid = torch.empty(q_len, num_q_heads, 64, head_dim, device=device, dtype=torch.float32)
+        lse = torch.empty(q_len, num_q_heads, 64, device=device, dtype=torch.float32)
+        return decode_paged_attention(
+            q, k_cache, v_cache, indptr, indices, q_positions, mid, lse, sm_scale,
+            qo_indptr=qo_indptr, max_q_len=q_len, **kv_args,
+        )
     prefix_lens = torch.tensor([count - q_len], device=device, dtype=torch.int32)
     return extend_paged_attention(
         q, k_cache, v_cache, qo_indptr, indptr, indices, prefix_lens, q_len, sm_scale,
@@ -207,7 +214,8 @@ def test_store_kv_rows_round_trips_within_the_format_error_bound(fmt_name: str):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 @pytest.mark.parametrize("fmt_name", KV_QUANT_FORMATS)
 @pytest.mark.parametrize(("path", "num_q_heads"), [
-    ("paged", 4), ("decode", 4), ("decode", 8), ("decode", 16), ("extend", 4), ("split_extend", 4),
+    ("paged", 4), ("decode", 4), ("decode", 8), ("decode", 16),
+    ("decode_rows", 4), ("extend", 4), ("split_extend", 4),
 ])
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, path: str, num_q_heads: int, head_dim: int):
@@ -215,7 +223,7 @@ def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, pat
     device = torch.device("cuda")
     num_kv_heads = 2
     count, capacity = 66, 200
-    q_len = 2 if "extend" in path else 1
+    q_len = {"paged": 1, "decode": 1, "decode_rows": 3}.get(path, 2)
     row = num_kv_heads * head_dim
     # rows and heads of different magnitude, so a scale read from the wrong slot or head changes the result
     head_gain = torch.ones(row, device=device)
@@ -257,21 +265,21 @@ def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, pat
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is None, reason="needs ROCm")
 @pytest.mark.parametrize("transpose", [False, True])
-@pytest.mark.parametrize("pack", [1, 4])
-def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool, pack: int):
+def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool):
     import triton
     import triton.language as tl
 
-    from freetoken.kernel.triton.kv_rows import _gfx1201, kv_tile_rows
+    from freetoken.kernel.triton.kv_rows import kv_tile_rows
+    from freetoken.utils.arch import get_rocm_gfx_arch
 
-    if not _gfx1201(torch.cuda.current_device()):
+    if get_rocm_gfx_arch() != "gfx1201":
         pytest.skip("packed KV conversion requires gfx1201")
 
     @triton.jit
-    def decode_codes(x, y, TRANSPOSE: tl.constexpr, PACK: tl.constexpr):
+    def decode_codes(x, y, TRANSPOSE: tl.constexpr):
         rows = tl.arange(0, 64)
         values = kv_tile_rows(x, rows, 0, 128, 128, tl.full((64,), True, tl.int1),
-                              128, 128, "fp8_per_token_head", PACK, TRANSPOSE)
+                              128, 128, TRANSPOSE)
         if TRANSPOSE:
             values = tl.trans(values)
         tl.store(y + rows[:, None] * 128 + tl.arange(0, 128)[None, :], values)
@@ -279,7 +287,7 @@ def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool, pack: 
     codes = torch.arange(256, dtype=torch.uint8).repeat(32)
     expected = codes.view(torch.float8_e4m3fn).bfloat16().cuda()
     actual = torch.empty_like(expected)
-    decode_codes[(1,)](codes.cuda(), actual, transpose, pack, num_warps=2)
+    decode_codes[(1,)](codes.cuda(), actual, transpose, num_warps=4)
     finite = expected.isfinite()
     # Integer comparison also checks signed zero and the byte order in each word.
     assert torch.equal(actual.view(torch.int16)[finite], expected.view(torch.int16)[finite])
@@ -596,7 +604,7 @@ def test_decode_triton_attention_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
-@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), [(24, 4), (20, 4), (28, 4)])
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), [(24, 4), (20, 4), (28, 4), (48, 2)])
 def test_decode_triton_attention_non_pow2_group(num_q_heads: int, num_kv_heads: int):
     """GQA groups that are not a power of two (e.g. Qwen3.6-27B's 24/4 == 6). The grouped
     decode tiles the head axis to a power of two (tl.arange constraint) and masks the extra
@@ -743,6 +751,59 @@ def test_decode_triton_attention_splits_long_requests(
     expected = _reference_paged_attention(
         q, k_cache, v_cache, indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, sinks=sinks,
     )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_kv_heads", "head_dim", "cached_lens", "q_lens", "sliding_window", "scratch_splits", "use_sinks"),
+    [
+        (16, 2, 256, [0, 129, 1017, 8193], [4, 1, 8, 3], None, 64, False),
+        (16, 2, 256, [0, 129, 1017, 8193], [4, 1, 8, 3], None, 8, False),
+        (16, 2, 256, [300, 2000, 70], [4, 8, 2], 3, 64, True),
+        (24, 4, 256, [500, 33], [5, 2], 48, 64, False),
+        (8, 1, 512, [700, 64], [8, 8], None, 64, True),
+    ],
+)
+def test_decode_triton_attention_multi_row_matches_reference(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    cached_lens: list[int],
+    q_lens: list[int],
+    sliding_window: int | None,
+    scratch_splits: int,
+    use_sinks: bool,
+):
+    """Several causal query rows per request: rows that see no key of a split (1017 + 8 keys leave one key in the last split), a window shorter than the rows, short requests next to many-split ones, and fewer heads per program at head_dim 512."""
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    kv_lens = [c + r for c, r in zip(cached_lens, q_lens)]
+    total_kv = sum(kv_lens)
+    num_rows = sum(q_lens)
+    q = torch.randn(num_rows, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    indptr = torch.tensor([0, *kv_lens], device=device).cumsum(0).to(torch.int32)
+    qo_indptr = torch.tensor([0, *q_lens], device=device).cumsum(0).to(torch.int32)
+    indices = torch.randperm(total_kv, device=device).to(torch.int32)
+    q_positions = torch.cat([torch.arange(c, c + r, device=device) for c, r in zip(cached_lens, q_lens)])
+    q_to_req = torch.repeat_interleave(torch.arange(len(q_lens), device=device, dtype=torch.int32), torch.tensor(q_lens, device=device))
+    sinks = torch.randn(num_q_heads, dtype=torch.float32, device=device) if use_sinks else None
+    sm_scale = head_dim**-0.5
+    attn_logits = torch.empty(num_rows, num_q_heads, scratch_splits, head_dim, dtype=torch.float32, device=device)
+    attn_lse = torch.empty(num_rows, num_q_heads, scratch_splits, dtype=torch.float32, device=device)
+
+    actual = decode_paged_attention(
+        q, k_cache, v_cache, indptr, indices, q_positions, attn_logits, attn_lse, sm_scale,
+        sliding_window=sliding_window, sinks=sinks, qo_indptr=qo_indptr, max_q_len=max(q_lens),
+    )
+    expected = _reference_paged_attention(
+        q, k_cache, v_cache, indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, sinks=sinks,
+    )
+    assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 

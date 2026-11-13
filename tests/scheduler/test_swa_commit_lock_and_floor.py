@@ -56,8 +56,10 @@ def _cfg(window: int, page_size: int = 1, max_running_req: int = 4, **kw):
     )
     return SimpleNamespace(
         page_size=page_size, max_running_req=max_running_req,
+        decode_rows_per_req=kw.get("rows", 1),
         model_config=SimpleNamespace(kv_cache_group_specs=lambda: groups),
         swa_num_pages_override=kw.get("override"), swa_full_tokens_ratio=kw.get("ratio", 0.2),
+        special_token_ckpt=kw.get("ckpt", False),
     )
 
 
@@ -109,13 +111,13 @@ def _prefill(cm, pm, prompt_len: int, n_decode: int, base: int = 1):
 
 
 def _decode(cm, reqs, n: int):
-    """Shared decode loop over the scheduler's global forward counter, which is what drives the
-    out-of-window eviction cadence."""
+    """Shared decode loop in the scheduler's order: the out-of-window free runs on every
+    decode step and frees once the request has slid out a full eviction interval."""
     for i in range(n):
         for r in reqs:
             r.append_host(torch.tensor([9999], dtype=torch.int32))
             r.decode_batch_idx = i + 1
-        cm.maybe_free_swa_out_of_window(reqs, forward_iter=i + 1)
+        cm.maybe_free_swa_out_of_window(reqs)
         cm.allocate_paged(reqs)
         for r in reqs:
             r.complete_one()
@@ -175,8 +177,8 @@ def test_short_final_chunk_locks_no_more_than_a_window(monkeypatch):
 # --------------------------------------------------------------- what that buys at runtime
 @pytest.mark.parametrize("interval", [1, 128])
 def test_decode_survives_any_prompt_length(interval, monkeypatch):
-    """The pool holds the window working set and nothing chunk-sized, at both an every-forward
-    cadence and the shipped 128-forward one (where it must also absorb a full interval of decode
+    """The pool holds the window working set and nothing chunk-sized, at both an eviction every
+    position and the shipped 128-position one (where it must also absorb a full interval of decode
     growth before the first reclaim). The prompt length -- hence the final chunk's -- must not
     decide whether decode completes."""
     monkeypatch.setattr(cache_mod, "_SWA_EVICTION_INTERVAL", interval)
@@ -225,11 +227,18 @@ def test_a_per_request_sized_pool_cannot_hold_a_full_batch(monkeypatch):
 
 # --------------------------------------------------------------- the floor formula
 def test_floor_terms_and_page_rounding():
+    interval = cache_mod._SWA_EVICTION_INTERVAL
     for window in (8, 128, 1024):
         for ps in (1, 8, 64, 128):
-            locked = -(-(window + GAP) // ps) * ps       # what the commit locks
-            tail = window + 2 * ps + cache_mod._SWA_EVICTION_INTERVAL  # uncollected decode tail
-            assert _swa_per_req_swa_floor(_cfg(window, ps)) == locked + tail, (window, ps)
+            for rows in (1, 4):
+                for ckpt in (False, True):
+                    locked = -(-(window + GAP) // ps) * ps       # what the commit locks
+                    # uncollected decode tail: an interval of forward rows + one step's rows
+                    tail = window + 2 * ps + interval * rows + rows
+                    # the special-token checkpoint holds one more window + gap of positions
+                    extra = window + GAP + interval * rows if ckpt else 0
+                    assert _swa_per_req_swa_floor(_cfg(window, ps, rows=rows, ckpt=ckpt)) == locked + tail + extra, (
+                        window, ps, rows, ckpt)
 
 
 def test_pool_floor_scales_with_max_running_req():

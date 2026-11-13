@@ -6,8 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.kv_rows import kv_decode_config, kv_row_scale, kv_scale_args, kv_tile, kv_tile_rows, kv_tile_staged
+from freetoken.kernel.triton.e4m3_compat import FORCE_EMU
+from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile, kv_tile_rows, kv_tile_staged
 from freetoken.kvcache.format import NONE, KVFormat
+from freetoken.utils.arch import get_rocm_gfx_arch, is_rocm
 
 
 _MIN_BLOCK_KV = 32
@@ -18,6 +20,8 @@ _MIN_SPLIT_LEN = 128
 # a short request still takes up to this many splits of _MIN_BLOCK_KV keys, so tiny requests stay parallel
 _MIN_SPLITS = 8
 _MAX_KV_SPLITS = 64
+# requests with more query rows take the extend kernel
+MAX_DECODE_ROWS = 8
 # stage 2 merges at most this many fp32 partial elements per step
 _STAGE2_TILE_ELEMS = 8192
 
@@ -47,6 +51,48 @@ def _quantized_decode_launch(block_d: int, block_n: int, num_stages: int) -> tup
     if block_d >= 128 and block_n == 64:
         return block_n, num_stages, 8
     return block_n, num_stages, 4
+
+
+def _use_gfx12_fp8_reader(kv_format: KVFormat, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
+    return (
+        kv_format.name == "fp8_per_token_head" and not FORCE_EMU
+        and q.dtype == torch.bfloat16 and q.shape[2] == 128
+        and q.shape[0] == 1 and q.shape[1] // k_cache.shape[1] in (4, 8)
+        and get_rocm_gfx_arch() == "gfx1201"
+        and k_cache.stride(-1) == v_cache.stride(-1) == 1
+        # With only four-byte alignment, the packed load layout spills SGPRs.
+        and k_cache.data_ptr() % 16 == 0 and v_cache.data_ptr() % 16 == 0
+        and all(s % 16 == 0 for s in (*k_cache.stride()[:2], *v_cache.stride()[:2]))
+    )
+
+
+def _multi_row_decode_launch(m: int, block_d: int, quantized: bool, q_bytes: int, kv_bytes: int, smem: int) -> tuple[int, int, int]:
+    """(block_n, num_stages, num_warps) of stage 1 for ``m`` > 1 query rows x heads per program.
+
+    Picked from a launch sweep on sm_120 among the variants that do not spill on sm_80 to sm_120 (with maxnreg); 2 stages never win.
+    """
+    if quantized and block_d >= 512:
+        block_n, num_warps = 32, 8
+    else:
+        block_n, num_warps = (64 if m * block_d <= 4096 and not (quantized and block_d >= 256) else 32), 4
+    # the Q tile stays in the compute dtype, quantized K and V tiles take one byte per element
+    while smem and block_n > 16 and m * block_d * q_bytes + 2 * block_n * block_d * kv_bytes > smem:
+        block_n //= 2
+    return block_n, 3, num_warps
+
+
+def _decode_heads_per_program(group: int, rows: int, head_dim: int) -> int:
+    """Query heads per decode program: the whole GQA group within the cap, else its largest power-of-two divisor within the cap.
+
+    A program never spans two kv heads and a split group wastes no tile lanes. The cap is 16 heads and, for several rows, an M budget of rows x heads per ``head_dim``.
+    """
+    cap = 16
+    if rows > 1:
+        max_m = 64 if head_dim <= 128 else 32 if head_dim <= 256 else 16
+        cap = min(16, max(1, max_m // rows))
+    if group <= cap:
+        return group
+    return max(h for h in (1, 2, 4, 8, 16) if h <= cap and group % h == 0)
 
 
 def _max_request_splits(keys: int) -> int:
@@ -229,6 +275,7 @@ def _decode_grouped_stage1_kernel(
     sm_scale,
     indptr_ptr,
     indices_ptr,
+    qo_indptr_ptr,
     q_pos_ptr,
     mid_o_ptr,
     mid_lse_ptr,
@@ -249,6 +296,7 @@ def _decode_grouped_stage1_kernel(
     stride_lse_s,
     GROUP: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
+    ROWS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -268,14 +316,33 @@ def _decode_grouped_stage1_kernel(
     head_block_id = tl.program_id(1)
     split_id = tl.program_id(2)
 
-    # VALID_BLOCK_H == min(cap, GROUP) is the number of query heads actually handled per program;
+    # VALID_BLOCK_H, a divisor of GROUP of at most 16, is the number of query heads actually handled per program;
     # BLOCK_H is the power-of-two tile size for the head axis (tl.arange requires a power of two),
     # so a non-power-of-two GQA group (e.g. 24/4 == 6) rounds the tile up and masks the extra
     # lanes. Each kv head spans cdiv(GROUP, VALID_BLOCK_H) head blocks.
+    # The M axis is ROWS query rows x BLOCK_H heads, row-major.
     kv_head = head_block_id // tl.cdiv(GROUP, VALID_BLOCK_H)
-    q_heads = head_block_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
-    mask_h = q_heads < (head_block_id + 1) * VALID_BLOCK_H
-    mask_h = mask_h & (q_heads < NUM_Q_HEADS)
+    # one row keeps the head and row offsets in their single-query form: vector rows raise its register use
+    if ROWS == 1:
+        q_heads = head_block_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+        mask_h = q_heads < (head_block_id + 1) * VALID_BLOCK_H
+        mask_h = mask_h & (q_heads < NUM_Q_HEADS)
+        q_start = batch_id
+        q_row = batch_id * stride_qt
+        mid_row = batch_id * stride_mid_ob
+        lse_row = batch_id * stride_lse_b
+    else:
+        offs_m = tl.arange(0, ROWS * BLOCK_H)
+        rows = offs_m // BLOCK_H
+        lanes = offs_m % BLOCK_H
+        q_heads = head_block_id * VALID_BLOCK_H + lanes
+        q_start = tl.load(qo_indptr_ptr + batch_id)
+        q_len = tl.load(qo_indptr_ptr + batch_id + 1) - q_start
+        mask_h = (lanes < VALID_BLOCK_H) & (rows < q_len)
+        tokens = q_start + rows
+        q_row = tokens[:, None] * stride_qt
+        mid_row = tokens[:, None] * stride_mid_ob
+        lse_row = tokens * stride_lse_b
 
     offs_d = tl.arange(0, BLOCK_D)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -284,8 +351,13 @@ def _decode_grouped_stage1_kernel(
 
     kv_start = tl.load(indptr_ptr + batch_id)
     kv_len = tl.load(indptr_ptr + batch_id + 1) - kv_start
-    q_pos = tl.load(q_pos_ptr + batch_id)
-    effective_end = tl.minimum(kv_len, q_pos + 1)
+    q_pos = tl.load(q_pos_ptr + q_start)
+    if ROWS == 1:
+        last_pos = q_pos
+    else:
+        last_pos = tl.load(q_pos_ptr + q_start + q_len - 1)
+        row_pos = tl.load(q_pos_ptr + q_start + rows, mask=rows < q_len, other=0)
+    effective_end = tl.minimum(kv_len, last_pos + 1)
     effective_start = 0
     if SLIDING_WINDOW > 0:
         effective_start = tl.maximum(0, q_pos - SLIDING_WINDOW + 1)
@@ -298,11 +370,11 @@ def _decode_grouped_stage1_kernel(
     split_start = kv_len_per_split * split_id
     split_end = tl.minimum(split_start + kv_len_per_split, effective_len)
 
-    m_i = tl.zeros((BLOCK_H,), dtype=tl.float32) - float("inf")
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)
+    m_i = tl.zeros((ROWS * BLOCK_H,), dtype=tl.float32) - float("inf")
+    l_i = tl.zeros((ROWS * BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((ROWS * BLOCK_H, BLOCK_DV), dtype=tl.float32)
 
-    q_offsets = batch_id * stride_qt + q_heads[:, None] * stride_qh + offs_d[None, :]
+    q_offsets = q_row + q_heads[:, None] * stride_qh + offs_d[None, :]
     k_base_offsets = kv_head * stride_kh + offs_d[:, None]
     v_base_offsets = kv_head * stride_vh + offs_dv[None, :]
 
@@ -317,24 +389,34 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
 
-            # Preserve the merged reader's address expressions on non-packed targets.
+            # Keep the address math inline: moving it into a helper changes CUDA codegen.
             if KV_PACK == 4:
                 k = kv_tile_rows(k_ptr, slots, kv_head, stride_ks, stride_kh, mask_n,
-                                 D, BLOCK_D, KV_FMT, KV_PACK, True)
+                                 D, BLOCK_D, True)
             else:
                 k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
             scale_k = kv_row_scale(k_scale_ptr + slots * stride_kss + kv_head, mask_n, KV_FMT)
             scores = tl.dot(q, k) * sm_scale * scale_k[None, :]
-            scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
+            mask = mask_h[:, None] & mask_n[None, :]
+            if ROWS > 1:
+                # the span covers every row: each row sees only keys up to its own position and inside its own window
+                mask = mask & (logical_offs[None, :] <= row_pos[:, None])
+                if SLIDING_WINDOW > 0:
+                    mask = mask & ((logical_offs[None, :] + SLIDING_WINDOW) > row_pos[:, None])
+            scores = tl.where(mask, scores, -float("inf"))
 
             if KV_PACK == 4:
                 v = kv_tile_rows(v_ptr, slots, kv_head, stride_vs, stride_vh, mask_n,
-                                 DV, BLOCK_DV, KV_FMT, KV_PACK, False)
+                                 DV, BLOCK_DV, False)
             else:
                 v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
             scale_v = kv_row_scale(v_scale_ptr + slots * stride_vss + kv_head, mask_n, KV_FMT)
 
-            m_new = tl.maximum(tl.max(scores, axis=1), m_i)
+            row_max = tl.max(scores, axis=1)
+            if ROWS > 1:
+                # a row can see no key of a tile: -1e20 keeps exp() of its scores at 0 instead of nan
+                row_max = tl.where(row_max == -float("inf"), -1e20, row_max)
+            m_new = tl.maximum(row_max, m_i)
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
             acc = acc * alpha[:, None] + tl.dot((p * scale_v[None, :]).to(v.dtype), v)
@@ -342,8 +424,11 @@ def _decode_grouped_stage1_kernel(
             m_i = m_new
 
         out = acc / l_i[:, None]
+        if ROWS > 1:
+            # a row that sees no key of this split writes 0 with lse -inf, which stage 2 weighs by 0
+            out = tl.where(l_i[:, None] > 0.0, out, 0.0)
         mid_offsets = (
-            batch_id * stride_mid_ob
+            mid_row
             + q_heads[:, None] * stride_mid_oh
             + split_id * stride_mid_os
             + offs_dv[None, :]
@@ -351,7 +436,7 @@ def _decode_grouped_stage1_kernel(
         tl.store(mid_o_ptr + mid_offsets, out, mask=mask_h[:, None] & mask_dv[None, :])
 
         lse_offsets = (
-            batch_id * stride_lse_b
+            lse_row
             + q_heads * stride_lse_h
             + split_id * stride_lse_s
         )
@@ -364,6 +449,7 @@ def _decode_stage2_kernel(
     mid_lse_ptr,
     o_ptr,
     indptr_ptr,
+    qo_indptr_ptr,
     q_pos_ptr,
     max_kv_splits,
     sinks_ptr,
@@ -375,6 +461,7 @@ def _decode_stage2_kernel(
     stride_lse_s,
     stride_ot,
     stride_oh,
+    ROWS: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     MIN_SPLIT_LEN: tl.constexpr,
     MIN_SPLITS: tl.constexpr,
@@ -387,9 +474,22 @@ def _decode_stage2_kernel(
     batch_id = tl.program_id(0)
     q_head = tl.program_id(1)
 
+    if ROWS == 1:
+        token = batch_id
+        q_pos = tl.load(q_pos_ptr + batch_id)
+        last_pos = q_pos
+    else:
+        q_start = tl.load(qo_indptr_ptr + batch_id)
+        q_len = tl.load(qo_indptr_ptr + batch_id + 1) - q_start
+        row = tl.program_id(2)
+        if row >= q_len:
+            return
+        token = q_start + row
+        q_pos = tl.load(q_pos_ptr + q_start)
+        last_pos = tl.load(q_pos_ptr + q_start + q_len - 1)
+
     kv_len = tl.load(indptr_ptr + batch_id + 1) - tl.load(indptr_ptr + batch_id)
-    q_pos = tl.load(q_pos_ptr + batch_id)
-    effective_end = tl.minimum(kv_len, q_pos + 1)
+    effective_end = tl.minimum(kv_len, last_pos + 1)
     effective_start = 0
     if SLIDING_WINDOW > 0:
         effective_start = tl.maximum(0, q_pos - SLIDING_WINDOW + 1)
@@ -411,8 +511,8 @@ def _decode_stage2_kernel(
         l_i = 0.0
     acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
 
-    mid_base = batch_id * stride_mid_ob + q_head * stride_mid_oh
-    lse_base = batch_id * stride_lse_b + q_head * stride_lse_h
+    mid_base = token * stride_mid_ob + q_head * stride_mid_oh
+    lse_base = token * stride_lse_b + q_head * stride_lse_h
 
     # one load round trip per SPLIT_TILE splits
     for s0 in range(0, kv_splits, SPLIT_TILE):
@@ -435,7 +535,7 @@ def _decode_stage2_kernel(
 
     out = tl.where(l_i == 0.0, 0.0, acc / l_i)
     tl.store(
-        o_ptr + batch_id * stride_ot + q_head * stride_oh + offs_d,
+        o_ptr + token * stride_ot + q_head * stride_oh + offs_d,
         out.to(o_ptr.dtype.element_ty),
         mask=mask_d,
     )
@@ -458,25 +558,33 @@ def decode_paged_attention(
     kv_format: KVFormat = NONE,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    max_q_len: int = 1,
 ) -> torch.Tensor:
-    """SGLang-style split-k grouped decode attention for one query per request.
+    """SGLang-style split-k grouped decode attention for up to MAX_DECODE_ROWS causal query rows per request.
 
-    Each request takes ``max(ceil(keys / 128), min(8, ceil(keys / 32)))`` splits, capped by ``max_kv_splits`` (default :func:`decode_kv_split_cap`) and by the split dim of ``attn_logits`` / ``attn_lse``.
+    Request ``i`` owns query rows ``qo_indptr[i]:qo_indptr[i + 1]`` (one row each when ``qo_indptr`` is None); ``q_positions`` holds each row's key position.
+    Each request takes ``max(ceil(keys / 128), min(8, ceil(keys / 32)))`` splits, capped by ``max_kv_splits`` (default :func:`decode_kv_split_cap`) and by the split dim of ``attn_logits`` / ``attn_lse``, which hold one entry per query row.
     The kernels compute the split count on the device, so a captured graph serves any context length.
     """
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
-    batch, num_q_heads, head_dim = q.shape
+    num_rows, num_q_heads, head_dim = q.shape
+    batch = indptr.numel() - 1
     num_kv_heads = k_cache.shape[1]
-    assert batch == indptr.numel() - 1
+    if qo_indptr is None:
+        assert num_rows == batch and max_q_len == 1
+    else:
+        assert qo_indptr.numel() == batch + 1
+    assert 1 <= max_q_len <= MAX_DECODE_ROWS
     assert v_cache.shape[1] == num_kv_heads
     assert k_cache.shape[-1] == head_dim and v_cache.shape[-1] == head_dim
     assert num_q_heads % num_kv_heads == 0
-    assert attn_logits.shape[0] >= batch
+    assert attn_logits.shape[0] >= num_rows
     assert attn_logits.shape[1] >= num_q_heads
     assert attn_logits.shape[3] >= head_dim
-    assert attn_lse.shape[0] >= batch
+    assert attn_lse.shape[0] >= num_rows
     assert attn_lse.shape[1] >= num_q_heads
     if sliding_window is not None and sliding_window <= 0:
         # the kernels treat a window <= 0 as no window
@@ -484,8 +592,9 @@ def decode_paged_attention(
     if max_kv_splits is None:
         max_kv_splits = decode_kv_split_cap(batch, num_q_heads, num_kv_heads, q.device.index)
     if sliding_window:
-        # no request attends more than the window, so programs past its splits would only exit
-        max_kv_splits = min(max_kv_splits, _max_request_splits(sliding_window))
+        # no request attends more than the window plus its later rows, so programs past its splits would only exit
+        span = sliding_window + max_q_len - 1
+        max_kv_splits = min(max_kv_splits, _max_request_splits(span))
     max_kv_splits = min(max_kv_splits, attn_logits.shape[2], attn_lse.shape[2])
     if sinks is not None:
         assert sinks.is_cuda
@@ -495,11 +604,13 @@ def decode_paged_attention(
 
     o = out if out is not None else torch.empty_like(q)
     sinks_arg = sinks if sinks is not None else q
+    qo_indptr_arg = qo_indptr if qo_indptr is not None else indptr
+    rows = triton.next_power_of_2(max_q_len)
     group = num_q_heads // num_kv_heads
     # valid_block_h = heads computed per program (drives the grid + head indexing); block_h =
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
-    valid_block_h = min(16, group)
+    valid_block_h = _decode_heads_per_program(group, rows, head_dim)
     block_h = triton.next_power_of_2(valid_block_h)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
@@ -524,12 +635,14 @@ def decode_paged_attention(
     num_warps = 4
     if kv_format.quantized:
         block_n, num_stages, num_warps = _quantized_decode_launch(block_d, block_n, num_stages)
+    if rows > 1:
+        block_n, num_stages, num_warps = _multi_row_decode_launch(
+            rows * block_h, block_d, kv_format.quantized, elem, k_cache.element_size(), smem
+        )
 
     kv_pack = 1
-    if torch.version.hip is not None:
-        kv_pack, block_n, num_stages, num_warps = kv_decode_config(
-            kv_format, q, k_cache, v_cache, block_n, num_stages, num_warps,
-        )
+    if is_rocm() and rows == 1 and _use_gfx12_fp8_reader(kv_format, q, k_cache, v_cache):
+        kv_pack, block_n, num_stages, num_warps = 4, 64, 1, 4
 
     k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
     _decode_grouped_stage1_kernel[grid](
@@ -541,6 +654,7 @@ def decode_paged_attention(
         sm_scale,
         indptr,
         indices,
+        qo_indptr_arg,
         q_positions,
         attn_logits,
         attn_lse,
@@ -564,6 +678,7 @@ def decode_paged_attention(
         KV_PACK=kv_pack,
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
+        ROWS=rows,
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
         BLOCK_N=block_n,
@@ -577,13 +692,16 @@ def decode_paged_attention(
         SLIDING_WINDOW=sliding_window or 0,
         num_warps=num_warps,
         num_stages=num_stages,
+        # without .maxnreg ptxas holds multi-row tiles below their register need for occupancy and spills a few bytes
+        **({} if rows == 1 or is_rocm() else {"maxnreg": 255}),
     )
     split_tile, stage2_warps = _stage2_launch(max_kv_splits, block_dv)
-    _decode_stage2_kernel[(batch, num_q_heads)](
+    _decode_stage2_kernel[(batch, num_q_heads, rows)](
         attn_logits,
         attn_lse,
         o,
         indptr,
+        qo_indptr_arg,
         q_positions,
         max_kv_splits,
         sinks_arg,
@@ -595,6 +713,7 @@ def decode_paged_attention(
         attn_lse.stride(2),
         o.stride(0),
         o.stride(1),
+        ROWS=rows,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         MIN_SPLIT_LEN=_MIN_SPLIT_LEN,
         MIN_SPLITS=_MIN_SPLITS,

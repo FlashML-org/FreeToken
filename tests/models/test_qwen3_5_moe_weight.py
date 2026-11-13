@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import struct
+from collections.abc import Sequence
 from types import SimpleNamespace
 
 import pytest
@@ -685,6 +686,7 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
 
 
 F32, BF16, Q8_0 = 0, 30, int(gguf_lib.GGMLQuantizationType.Q8_0)
+KV_U32, KV_F32, KV_STRING, KV_ARRAY = 4, 6, 8, 9  # gguf metadata value types
 
 
 def _gguf_bytes(tensor: torch.Tensor, ggml_type: int) -> bytes:
@@ -695,17 +697,28 @@ def _gguf_bytes(tensor: torch.Tensor, ggml_type: int) -> bytes:
     raise KeyError(ggml_type)
 
 
-def _write_gguf(path, arch: str, kv: dict[str, object], tensors: dict[str, tuple[int, tuple[int, ...], bytes]]) -> None:
-    """A minimal GGUF: header, the given KVs (u32 / string) and tensors; the reader needs no more."""
+def _kv_field(value: object) -> tuple[int, bytes]:
+    if isinstance(value, str):
+        return KV_STRING, struct.pack("<Q", len(value)) + value.encode()
+    if isinstance(value, float):
+        return KV_F32, struct.pack("<f", value)
+    if isinstance(value, (list, tuple)):
+        # an array of u32: gemma4's sliding_window_pattern and per-layer head_count_kv
+        return KV_ARRAY, struct.pack("<IQ", KV_U32, len(value)) + b"".join(struct.pack("<I", int(v)) for v in value)
+    return KV_U32, struct.pack("<I", int(value))
+
+
+def _write_gguf(path, arch: str, kv: dict[str, int | float | str | Sequence[int]], tensors: dict[str, tuple[int, tuple[int, ...], bytes]]) -> None:
+    """A minimal GGUF: header, the given KVs (u32 / f32 / string / u32 array) and tensors; the reader needs no more."""
     out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv) + 1))
 
     def field(name: str, vtype: int, payload: bytes) -> None:
         key = name.encode()
         out.extend(struct.pack("<Q", len(key)) + key + struct.pack("<I", vtype) + payload)
 
-    field("general.architecture", 8, struct.pack("<Q", len(arch)) + arch.encode())
+    field("general.architecture", KV_STRING, struct.pack("<Q", len(arch)) + arch.encode())
     for name, value in kv.items():
-        field(f"{arch}.{name}", 4, struct.pack("<I", int(value)))
+        field(f"{arch}.{name}", *_kv_field(value))
 
     data = bytearray()
     infos = []
