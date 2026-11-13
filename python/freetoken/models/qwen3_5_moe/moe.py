@@ -3,11 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
     LinearReplicated,
     LinearRowParallel,
+    OffloadMoELayer,
     make_moe_layer,
     silu_and_mul,
 )
@@ -76,9 +78,25 @@ class Qwen3_5MoE(BaseOP):
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
         router_logits = self.gate.forward(hidden_states)
+        experts = self.experts
+        if (
+            isinstance(experts, OffloadMoELayer)
+            and not get_global_ctx().batch.is_prefill
+            and experts.can_overlap_shared(hidden_states)
+        ):
+            def shared_branch():
+                shared = self.shared_expert.forward(hidden_states)
+                return shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+
+            routed, shared = experts.forward_with_shared(
+                hidden_states, router_logits, shared_branch
+            )
+            return (routed + shared).view(num_tokens, hidden_dim)
+        # The fused MoE kernel may write hidden_states in place, so the shared
+        # expert has to read the original input first.
         shared = self.shared_expert.forward(hidden_states)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        routed = experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return (routed + shared).view(num_tokens, hidden_dim)
 
 

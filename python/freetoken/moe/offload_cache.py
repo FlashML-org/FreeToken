@@ -194,6 +194,13 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        # Default off. Created here, before CUDA-graph capture, when the flag is set.
+        self.decode_overlap = None
+        if self.device.type == "cuda":
+            from freetoken.decode_overlap import DecodeSharedOverlap, enabled
+
+            if enabled():
+                self.decode_overlap = DecodeSharedOverlap(torch.cuda, self.device)
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
