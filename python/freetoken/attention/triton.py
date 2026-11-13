@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
-from freetoken.kernel.triton.attention import decode_kv_split_cap
+from freetoken.kernel.triton.attention import MAX_DECODE_ROWS, decode_kv_split_cap
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -92,6 +92,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         self,
         metadata: TritonMetadata,
         bs: int,
+        rows: int,
         num_q_heads: int,
         head_dim: int,
     ) -> None:
@@ -99,7 +100,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         if (
             metadata.attn_logits is not None
             and metadata.attn_lse is not None
-            and metadata.attn_logits.shape[0] >= bs
+            and metadata.attn_logits.shape[0] >= rows
             and metadata.attn_logits.shape[1] >= num_q_heads
             and metadata.attn_logits.shape[2] >= splits
             and metadata.attn_logits.shape[3] >= head_dim
@@ -107,12 +108,12 @@ class TritonAttentionBackend(BaseAttnBackend):
             return
         scratch_head_dim = max(self.max_head_dim, head_dim)
         metadata.attn_logits = torch.empty(
-            (bs, num_q_heads, splits, scratch_head_dim),
+            (rows, num_q_heads, splits, scratch_head_dim),
             dtype=torch.float32,
             device=self.device,
         )
         metadata.attn_lse = torch.empty(
-            (bs, num_q_heads, splits),
+            (rows, num_q_heads, splits),
             dtype=torch.float32,
             device=self.device,
         )
@@ -155,9 +156,10 @@ class TritonAttentionBackend(BaseAttnBackend):
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
-        if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
+        if metadata.max_q_len <= MAX_DECODE_ROWS and block_ends is None and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
-            self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
+            rows = q.shape[0]
+            self._ensure_decode_scratch(metadata, bs, rows, q.shape[1], q.shape[-1])
             assert metadata.attn_logits is not None
             assert metadata.attn_lse is not None
             return decode_paged_attention(
@@ -167,11 +169,13 @@ class TritonAttentionBackend(BaseAttnBackend):
                 indptr=metadata.indptr,
                 indices=indices,
                 q_positions=metadata.q_positions,
-                attn_logits=metadata.attn_logits[:bs],
-                attn_lse=metadata.attn_lse[:bs],
+                attn_logits=metadata.attn_logits[:rows],
+                attn_lse=metadata.attn_lse[:rows],
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                qo_indptr=metadata.cu_seqlens_q_gpu,
+                max_q_len=metadata.max_q_len,
                 **kv_args,
             )
         if (
@@ -273,7 +277,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             self.device,
             num_q_heads=max(1, self.num_q_heads),
             max_head_dim=max(1, self.max_head_dim),
-            scratch_rows=max(bs * self._split_cap(bs) for bs in bs_list),
+            scratch_rows=max(bs * rows_per_req * self._split_cap(bs) for bs in bs_list),
             rows_per_req=rows_per_req,
         )
         self.capture_rows_per_req = rows_per_req
@@ -328,8 +332,9 @@ class TritonAttentionBackend(BaseAttnBackend):
     def _capture_scratch(self, bs: int) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.capture is not None
         splits, heads, dim = self._split_cap(bs), max(1, self.num_q_heads), max(1, self.max_head_dim)
-        logits = self.capture.attn_logits[: bs * heads * splits * dim].view(bs, heads, splits, dim)
-        lse = self.capture.attn_lse[: bs * heads * splits].view(bs, heads, splits)
+        rows = bs * self.capture_rows_per_req
+        logits = self.capture.attn_logits[: rows * heads * splits * dim].view(rows, heads, splits, dim)
+        lse = self.capture.attn_lse[: rows * heads * splits].view(rows, heads, splits)
         return logits, lse
 
     def prepare_for_capture(self, batch: Batch) -> None:
@@ -337,6 +342,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert bs in self.capture_bs and self.capture is not None
         capture = self.capture
         rows_per_req = self.capture_rows_per_req
+        attn_logits, attn_lse = self._capture_scratch(bs)
         if rows_per_req > 1:
             n = bs * rows_per_req
             # placeholders for a fresh request (kv rows == query rows, no prefix); replay overwrites both
@@ -351,10 +357,11 @@ class TritonAttentionBackend(BaseAttnBackend):
                 is_decode=False,
                 prefix_lens=capture.seq_lens[:bs],
                 max_q_len=rows_per_req,
+                attn_logits=attn_logits,
+                attn_lse=attn_lse,
                 swa_indices=self._capture_swa_indices(),
             )
             return
-        attn_logits, attn_lse = self._capture_scratch(bs)
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=capture.cu_seqlens_q[: bs + 1],
             indptr=capture.cu_seqlens_k[: bs + 1],
