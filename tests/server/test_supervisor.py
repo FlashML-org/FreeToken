@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import queue
+import subprocess
+import sys
 
 from queue import Empty as _Empty
 
@@ -237,6 +239,28 @@ def test_supervisor_silent_on_startup_death_during_shutdown():
     )
     assert "ready" not in seen
     assert "failure" not in seen  # silenced: expected exit during shutdown
+
+
+def test_backend_death_stops_the_server_through_its_own_signal_handler():
+    """The stop has to run the server's SIGTERM handler: its lifespan shutdown is what terminates
+    the remaining workers. On Windows os.kill on our own pid is TerminateProcess, which runs no
+    handler and leaves the workers running."""
+    # Python runs the handler on the main thread; the wakeup socket wakes it out of select when the
+    # signal arrives.
+    probe = (
+        "import os, select, signal, socket\n"
+        "from freetoken.server.api_server import _exit_after_backend_death\n"
+        "signal.signal(signal.SIGTERM, lambda signum, frame: os._exit(0))\n"
+        "reader, writer = socket.socketpair()\n"
+        "writer.setblocking(False)\n"
+        "signal.set_wakeup_fd(writer.fileno())\n"
+        "_exit_after_backend_death(0.0)\n"
+        "if select.select([reader], [], [], 60)[0]:\n"
+        "    reader.recv(1)\n"
+        "os._exit(1)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # ---------------------------------------------------------------------------
