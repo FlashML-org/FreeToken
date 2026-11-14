@@ -151,6 +151,7 @@ def _ensure_experts_hybrid_gpu(
     id_of_slot, usage = cache.pool_state(layer_id)
     num_slots = id_of_slot.numel()
     block_e = triton.next_power_of_2(cache.num_experts)
+    block_a = triton.next_power_of_2(max(1, expert_ids.numel()))
     chunk = min(_HYBRID_EVICT_CHUNK, triton.next_power_of_2(num_slots))
     # with 4 warps a 4096+ chunk spills on sm80-sm89
     num_warps = 8 if chunk >= 4096 else 4
@@ -179,6 +180,7 @@ def _ensure_experts_hybrid_gpu(
         num_slots,
         _HYBRID_FETCH_SEED,
         BLOCK_E=block_e,
+        BLOCK_A=block_a,
         CHUNK=chunk,
         SMALL=num_slots <= chunk,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
@@ -315,6 +317,7 @@ def _ensure_experts_hybrid_kernel(
     cache_size,
     seed,
     BLOCK_E: tl.constexpr,
+    BLOCK_A: tl.constexpr,
     CHUNK: tl.constexpr,
     SMALL: tl.constexpr,
     BY_RECENCY: tl.constexpr,
@@ -350,10 +353,10 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
+    off_a = tl.arange(0, BLOCK_A)
+    a_mask = off_a < num_active
+    e_vec = tl.load(expert_ids_ptr + off_a, mask=a_mask, other=0)
+    is_active = tl.histogram(e_vec, BLOCK_E, mask=a_mask) > 0
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
@@ -384,19 +387,19 @@ def _ensure_experts_hybrid_kernel(
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
-    # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
-    # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
-    # spans only [0, num_experts), so it can only break exact-recency ties).
-    if BY_RECENCY:
-        rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
-        score = tl.where(
-            is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
-        ).to(tl.int64)
-    else:
-        missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
-
     # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
     if num_fetch > 0:
+        # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
+        # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
+        # spans only [0, num_experts), so it can only break exact-recency ties). Only the
+        # fetch path reads it, so a nofetch step skips the 256-wide recency load.
+        if BY_RECENCY:
+            rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
+            score = tl.where(
+                is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
+            ).to(tl.int64)
+        else:
+            missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
         off_k = tl.arange(0, CHUNK)
         tl.debug_barrier()  # the scan below must see the hit stamps
         if SMALL:
@@ -434,17 +437,16 @@ def _ensure_experts_hybrid_kernel(
     tl.debug_barrier()  # Phase 3 reads slot_for_id entries written above
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e)
-        # every warp loads e, one thread stores below; a warp that loads after that store indexes with a slot id
-        tl.debug_barrier()
-        on_gpu = s >= 0
-        tl.store(cpu_ids_ptr + i, tl.where(on_gpu, -1, e))
-        tl.store(gpu_w_ptr + i, tl.where(on_gpu, tl.load(weights_ptr + i), 0.0))
-        if CLAMP:
-            s = tl.maximum(s, 0)
-        tl.store(expert_ids_ptr + i, s)
+    # e_vec is the pre-rewrite routing: Phase 2 only mutates slot state, and all routes
+    # are read below before the in-place store.
+    s_vec = tl.load(slot_for_id_ptr + base + e_vec, mask=a_mask, other=-1)
+    w_vec = tl.load(weights_ptr + off_a, mask=a_mask, other=0.0)
+    on_gpu = s_vec >= 0
+    tl.store(cpu_ids_ptr + off_a, tl.where(on_gpu, -1, e_vec), mask=a_mask)
+    tl.store(gpu_w_ptr + off_a, tl.where(on_gpu, w_vec, 0.0), mask=a_mask)
+    if CLAMP:
+        s_vec = tl.maximum(s_vec, 0)
+    tl.store(expert_ids_ptr + off_a, s_vec, mask=a_mask)
 
     # stats_ptr: (missing, fetched, active, calls); stats_layer_ptr: the same per layer, [num_layers, 4]
     if STATS:
