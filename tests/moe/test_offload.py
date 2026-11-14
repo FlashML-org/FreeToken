@@ -277,6 +277,78 @@ def test_prefill_overlap_prefetch_invalidates_borrowed_unified_cache_slots():
     assert torch.equal(cache.bank_caches["down"][:num_experts], down_source[0])
 
 
+def test_prefill_staging_unregisters_exactly_the_slots_it_overwrites():
+    # the staging buffers are byte ranges at the start of every bank, so with pools of several row widths a slot can straddle their end
+    # checked against the slot bytes, not the slot arithmetic: after a prefill a slot stays registered iff the staging left its bytes alone
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    torch.manual_seed(0)
+    L, E, wide = 4, 8, (1, 3)
+    # 512-byte gate_up rows; 96-byte down rows on the wide layers, 64-byte on the others: slot 7 of layer 0's pool straddles the staging end
+    sources = {
+        "gate_up": [torch.randn(E, 16, 8) for _ in range(L)],
+        "down": [torch.randint(1, 255, (E, 96), dtype=torch.uint8) if layer in wide else torch.randn(E, 4, 4) for layer in range(L)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=33, device=torch.device("cpu"),
+        prefill_overlap=True, pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10],
+    )
+    # the wide layers' kernel reads 20 bytes past a pool's last down row (an MMQ tail)
+    tail_bytes = {"gate_up": [0] * L, "down": [20 if layer in wide else 0 for layer in range(L)]}
+    cache.set_bank_sources(sources, row_tail_bytes=tail_bytes)
+
+    # the bytes a kernel reads past each pool's last row stay clear of the next pool's first row and of the bank's end
+    for k, (_, bank) in enumerate(cache.banks):
+        spans = []
+        for layer in range(L):
+            view = cache.pool_bank_views(layer)[k]
+            first = view.storage_offset() * view.element_size()
+            spans.append((first, first + view.numel() * view.element_size(), tail_bytes[cache.bank_schema[k]][layer], layer))
+        spans.sort()
+        for (_, end, tail, layer), nxt in zip(spans, [s[0] for s in spans[1:]] + [bank.numel() * bank.element_size()]):
+            assert end + tail <= nxt, (cache.bank_schema[k], layer, end, tail, nxt)
+
+    def slot_bytes(layer, s):
+        return [view[s].reshape(-1).view(torch.uint8).clone() for view in cache.pool_bank_views(layer)]
+
+    # stage the state decode would leave (its kernel is CUDA-only): every slot holds an expert row, the first E of each pool registered
+    before = []
+    for layer in range(L):
+        base = cache.pool_bases[cache.pool_of_layer[layer]]
+        for s in range(cache.pool_slots(layer)):
+            for (src, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                view[s].copy_(src[layer][s % E])
+            if s < E:
+                cache.id_of_slot[base + s] = layer * E + s
+                cache.slot_for_id[layer, s] = s
+                cache.usage[base + s] = s + 1
+        before.append([slot_bytes(layer, s) for s in range(cache.pool_slots(layer))])
+
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        cache.wait_prefill_layer(layer)
+        cache.release_prefill_layer(layer)
+
+    straddled = False
+    for layer in range(L):
+        size = cache.pool_slots(layer)
+        after = [slot_bytes(layer, s) for s in range(size)]
+        changed = [any(not torch.equal(a, b) for a, b in zip(before[layer][s], after[s])) for s in range(size)]
+        n = sum(changed)
+        # the staging area lies below the pool, so the slots it overwrites are its first n; hit-D2D trusts every slot from there on
+        assert changed == [True] * n + [False] * (size - n), (layer, changed)
+        assert cache._pool_stable_from[cache.pool_of_layer[layer]] == n, (layer, n)
+        registered = [s for s in cache.slot_for_id[layer].tolist() if s >= 0]
+        assert registered == [s for s in range(min(E, size)) if not changed[s]], (layer, registered, changed)
+        if n:
+            straddled |= any(not torch.equal(a[:16], b[:16]) and torch.equal(a[-16:], b[-16:]) for a, b in zip(before[layer][n - 1], after[n - 1]))
+    # a slot the staging only partly overwrites, or a floor in place of the ceiling would pass
+    assert straddled
+
+
 def test_prefill_overlap_waits_for_previous_prefill_release_after_begin(monkeypatch):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
