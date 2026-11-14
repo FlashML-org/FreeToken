@@ -6,9 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile, kv_tile_staged
+from freetoken.kernel.triton.e4m3_compat import FORCE_EMU
+from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_scale_args, kv_tile, kv_tile_rows, kv_tile_staged
 from freetoken.kvcache.format import NONE, KVFormat
-from freetoken.utils.arch import is_rocm
+from freetoken.utils.arch import get_rocm_gfx_arch, is_rocm
 
 
 _MIN_BLOCK_KV = 32
@@ -50,6 +51,19 @@ def _quantized_decode_launch(block_d: int, block_n: int, num_stages: int) -> tup
     if block_d >= 128 and block_n == 64:
         return block_n, num_stages, 8
     return block_n, num_stages, 4
+
+
+def _use_gfx12_fp8_reader(kv_format: KVFormat, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
+    return (
+        kv_format.name == "fp8_per_token_head" and not FORCE_EMU
+        and q.dtype == torch.bfloat16 and q.shape[2] == 128
+        and q.shape[0] == 1 and q.shape[1] // k_cache.shape[1] in (4, 8)
+        and get_rocm_gfx_arch() == "gfx1201"
+        and k_cache.stride(-1) == v_cache.stride(-1) == 1
+        # With only four-byte alignment, the packed load layout spills SGPRs.
+        and k_cache.data_ptr() % 16 == 0 and v_cache.data_ptr() % 16 == 0
+        and all(s % 16 == 0 for s in (*k_cache.stride()[:2], *v_cache.stride()[:2]))
+    )
 
 
 def _multi_row_decode_launch(m: int, block_d: int, quantized: bool, q_bytes: int, kv_bytes: int, smem: int) -> tuple[int, int, int]:
@@ -296,6 +310,7 @@ def _decode_grouped_stage1_kernel(
     SLIDING_WINDOW: tl.constexpr,
     KV_OFFSET_DTYPE: tl.constexpr,
     KV_FMT: tl.constexpr,
+    KV_PACK: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -374,7 +389,12 @@ def _decode_grouped_stage1_kernel(
             logical_offs = effective_start + rel_offs
             slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
 
-            k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
+            # Keep the address math inline: moving it into a helper changes CUDA codegen.
+            if KV_PACK == 4:
+                k = kv_tile_rows(k_ptr, slots, kv_head, stride_ks, stride_kh, mask_n,
+                                 D, BLOCK_D, True)
+            else:
+                k = kv_tile(k_ptr + slots[None, :] * stride_ks + k_base_offsets, mask_n[None, :] & mask_d[:, None], KV_FMT)
             scale_k = kv_row_scale(k_scale_ptr + slots * stride_kss + kv_head, mask_n, KV_FMT)
             scores = tl.dot(q, k) * sm_scale * scale_k[None, :]
             mask = mask_h[:, None] & mask_n[None, :]
@@ -385,7 +405,11 @@ def _decode_grouped_stage1_kernel(
                     mask = mask & ((logical_offs[None, :] + SLIDING_WINDOW) > row_pos[:, None])
             scores = tl.where(mask, scores, -float("inf"))
 
-            v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
+            if KV_PACK == 4:
+                v = kv_tile_rows(v_ptr, slots, kv_head, stride_vs, stride_vh, mask_n,
+                                 DV, BLOCK_DV, False)
+            else:
+                v = kv_tile(v_ptr + slots[:, None] * stride_vs + v_base_offsets, mask_n[:, None] & mask_dv[None, :], KV_FMT)
             scale_v = kv_row_scale(v_scale_ptr + slots * stride_vss + kv_head, mask_n, KV_FMT)
 
             row_max = tl.max(scores, axis=1)
@@ -616,6 +640,10 @@ def decode_paged_attention(
             rows * block_h, block_d, kv_format.quantized, elem, k_cache.element_size(), smem
         )
 
+    kv_pack = 1
+    if is_rocm() and rows == 1 and _use_gfx12_fp8_reader(kv_format, q, k_cache, v_cache):
+        kv_pack, block_n, num_stages, num_warps = 4, 64, 1, 4
+
     k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
     _decode_grouped_stage1_kernel[grid](
         q,
@@ -647,6 +675,7 @@ def decode_paged_attention(
         attn_lse.stride(2),
         KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
         KV_FMT=kv_format.name,
+        KV_PACK=kv_pack,
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         ROWS=rows,

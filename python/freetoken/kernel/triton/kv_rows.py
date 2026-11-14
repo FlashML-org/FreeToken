@@ -16,6 +16,30 @@ from freetoken.kvcache.format import KVFormat
 
 
 @triton.jit
+def _kv_tile_gfx12_bf16(ptrs, mask, TRANSPOSE: tl.constexpr):
+    # Force VOP3 (e64): LLVM's word-0 packed intrinsic selects an invalid VOP1 on gfx12.
+    # Recheck plain FP8 casts when upgrading Triton (triton-lang/triton#11809).
+    codes = tl.load(ptrs, mask=mask, other=0, cache_modifier=".cg")
+    lo = tl.inline_asm_elementwise(
+        "v_cvt_pk_f32_fp8_e64 $0, $1 op_sel:[0,0]", "=v,v", [codes],
+        dtype=tl.uint64, is_pure=True, pack=1)
+    hi = tl.inline_asm_elementwise(
+        "v_cvt_pk_f32_fp8_e64 $0, $1 op_sel:[1,0]", "=v,v", [codes],
+        dtype=tl.uint64, is_pure=True, pack=1)
+    # Every finite E4M3FN value is exactly representable in BF16.
+    a = (lo >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    b = (lo >> 48).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    c = (hi >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    d = (hi >> 48).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    if TRANSPOSE:
+        a, b, c, d = tl.trans(a), tl.trans(b), tl.trans(c), tl.trans(d)
+    values = tl.interleave(tl.interleave(a, c), tl.interleave(b, d))
+    if TRANSPOSE:
+        values = tl.trans(values)
+    return values
+
+
+@triton.jit
 def kv_tile(ptrs, mask, FMT: tl.constexpr):
     """One K or V tile in the dtype ``tl.dot`` takes."""
     if FMT == "none":
@@ -29,6 +53,25 @@ def kv_tile(ptrs, mask, FMT: tl.constexpr):
     elif FMT == "int8_per_token_head":
         tile = tl.load(ptrs, mask=mask, other=0).to(tl.bfloat16)
     return tile
+
+
+@triton.jit
+def kv_tile_rows(
+    ptr, slots, head, stride_slot, stride_head, row_mask,
+    D: tl.constexpr, BLOCK_D: tl.constexpr, TRANSPOSE: tl.constexpr,
+):
+    """Read four E4M3FN codes per uint32 load and return a BF16 K or V tile."""
+    tl.static_assert(D % 4 == 0)
+    base = (ptr + head * stride_head).to(tl.pointer_type(tl.uint32))
+    row_stride = stride_slot // 4
+    dims = tl.arange(0, BLOCK_D // 4)
+    if TRANSPOSE:
+        ptrs = base + slots[None, :] * row_stride + dims[:, None]
+        mask = row_mask[None, :] & (dims[:, None] < D // 4)
+    else:
+        ptrs = base + slots[:, None] * row_stride + dims[None, :]
+        mask = row_mask[:, None] & (dims[None, :] < D // 4)
+    return _kv_tile_gfx12_bf16(ptrs, mask, TRANSPOSE)
 
 
 @triton.jit

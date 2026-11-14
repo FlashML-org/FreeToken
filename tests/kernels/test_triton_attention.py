@@ -213,12 +213,15 @@ def test_store_kv_rows_round_trips_within_the_format_error_bound(fmt_name: str):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 @pytest.mark.parametrize("fmt_name", KV_QUANT_FORMATS)
-@pytest.mark.parametrize("path", ["paged", "decode", "decode_rows", "extend", "split_extend"])
+@pytest.mark.parametrize(("path", "num_q_heads"), [
+    ("paged", 4), ("decode", 4), ("decode", 8), ("decode", 16),
+    ("decode_rows", 4), ("extend", 4), ("split_extend", 4),
+])
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
-def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, path: str, head_dim: int):
+def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, path: str, num_q_heads: int, head_dim: int):
     torch.manual_seed(11)
     device = torch.device("cuda")
-    num_kv_heads, num_q_heads = 2, 4
+    num_kv_heads = 2
     count, capacity = 66, 200
     q_len = {"paged": 1, "decode": 1, "decode_rows": 3}.get(path, 2)
     row = num_kv_heads * head_dim
@@ -258,6 +261,36 @@ def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, pat
 
     # the bf16 output rounds large elements by more than a fixed tolerance, and elements near zero are cancellations
     torch.testing.assert_close(actual.float(), expected, atol=2e-2 * expected.abs().max().item(), rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is None, reason="needs ROCm")
+@pytest.mark.parametrize("transpose", [False, True])
+def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool):
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.kv_rows import kv_tile_rows
+    from freetoken.utils.arch import get_rocm_gfx_arch
+
+    if get_rocm_gfx_arch() != "gfx1201":
+        pytest.skip("packed KV conversion requires gfx1201")
+
+    @triton.jit
+    def decode_codes(x, y, TRANSPOSE: tl.constexpr):
+        rows = tl.arange(0, 64)
+        values = kv_tile_rows(x, rows, 0, 128, 128, tl.full((64,), True, tl.int1),
+                              128, 128, TRANSPOSE)
+        if TRANSPOSE:
+            values = tl.trans(values)
+        tl.store(y + rows[:, None] * 128 + tl.arange(0, 128)[None, :], values)
+
+    codes = torch.arange(256, dtype=torch.uint8).repeat(32)
+    expected = codes.view(torch.float8_e4m3fn).bfloat16().cuda()
+    actual = torch.empty_like(expected)
+    decode_codes[(1,)](codes.cuda(), actual, transpose, num_warps=4)
+    finite = expected.isfinite()
+    # Integer comparison also checks signed zero and the byte order in each word.
+    assert torch.equal(actual.view(torch.int16)[finite], expected.view(torch.int16)[finite])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
