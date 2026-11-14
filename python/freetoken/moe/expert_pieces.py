@@ -142,16 +142,26 @@ def _bf16_pieces(model_path: str, config, spec, *, layers: Collection[int] | Non
     return stacked_expert_pieces(tensors, config, layers=layers)
 
 
+def _shape_piece(piece: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {
+        role: tensor.reshape(1, -1) if role.endswith(("_global", "_input")) else tensor.unsqueeze(0)
+        for role, tensor in piece.items()
+    }
+
+
 def per_expert_pieces(
     tensors: Iterable[tuple[str, torch.Tensor]],
     locate: Callable[[str], tuple[int, int, str] | None],
     *,
     tensors_per_expert: int,
+    assemble: Callable[[int, int, dict[str, torch.Tensor]], dict[str, torch.Tensor]] | None = None,
 ) -> Iterator[Piece]:
     """Group per-expert tensors into one piece per expert, in whatever order they arrive.
 
     ``locate(name)`` -> ``(bank_layer, expert, role)`` or None to skip; a role tensor is one
     expert's ``[...]`` row and becomes the piece's ``[1, ...]`` entry. Globals and activation scales may be scalars.
+    ``assemble(layer, expert, raw)`` replaces the default shaping for sources whose roles need
+    more than an unsqueeze (e.g. decoding a stored scale pair back into the plain matrix).
     """
     pending: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
     for name, tensor in tensors:
@@ -160,10 +170,11 @@ def per_expert_pieces(
             continue
         bank_layer, expert, role = where
         piece = pending.setdefault((bank_layer, expert), {})
-        piece[role] = tensor.reshape(1, -1) if role.endswith(("_global", "_input")) else tensor.unsqueeze(0)
+        piece[role] = tensor
         if len(piece) == tensors_per_expert:
             del pending[(bank_layer, expert)]
-            yield bank_layer, expert, expert + 1, piece
+            shaped = _shape_piece(piece) if assemble is None else assemble(bank_layer, expert, piece)
+            yield bank_layer, expert, expert + 1, shaped
     if pending:
         missing = sorted(pending)[:8]
         raise ValueError(f"Incomplete expert tensors in checkpoint (layer, expert): {missing}")

@@ -20,6 +20,7 @@ from freetoken.layers import BaseOP, LinearReplicated, iter_moe_layers
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.hc import GatedResidual
+from freetoken.models.qwen4_exp.model import _resolve_ple_backend
 from freetoken.models.qwen4_exp.ple import GpuResidentTable, PLELayer, PLEMetadata
 
 from .common import EOS, hash_constants, requires_cuda, toy_hf_config
@@ -507,3 +508,12 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         decode_logits = model.forward()
     assert decode_logits.shape == (len(prompts), config.vocab_size)
     assert torch.isfinite(decode_logits.float()).all()
+
+
+def test_ple_backend_falls_back_to_pinned_for_nvfp4_tables():
+    """The disk row store streams native F8 rows; packed e2m1 (nvfp4) tables must go pinned."""
+    assert _resolve_ple_backend("disk", "nvfp4") == "pinned"
+    # fp8 tables keep the requested backend either way
+    assert _resolve_ple_backend("disk", "fp8") == "disk"
+    assert _resolve_ple_backend("pinned", "nvfp4") == "pinned"
+    assert _resolve_ple_backend("pinned", "fp8") == "pinned"
