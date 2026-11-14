@@ -211,6 +211,37 @@ def test_supervisor_silent_on_post_ready_death_during_shutdown():
     assert "failure" not in seen  # graceful stop: the death was not reported
 
 
+def test_supervisor_releases_the_ack_queue_once_the_backend_is_ready():
+    """Readiness is the ack queue's last read. A multiprocessing queue's semaphores are unlinked only when
+    it is collected, and a main process ended by a signal never collects it."""
+    import multiprocessing
+    import weakref
+
+    from freetoken.server.supervisor import run_backend_supervisor
+
+    class Proc:
+        name = "freetoken-TP0-scheduler"
+        alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    proc = Proc()
+    ack_queue = multiprocessing.get_context("spawn").Queue()
+    ack_queue.put("scheduler ready")
+    queue_at_ready = weakref.ref(ack_queue)
+    handle = BackendHandle(ack_queue=ack_queue, processes=[proc], expected_acks=1)
+    del ack_queue
+    seen: dict = {}
+
+    def on_ready() -> None:
+        seen["queue at ready"] = queue_at_ready()
+        proc.alive = False
+
+    run_backend_supervisor(handle, LoadProgress(), on_ready=on_ready, poll=0.01, is_shutting_down=lambda: True)
+    assert seen == {"queue at ready": None}
+
+
 def test_supervisor_silent_on_startup_death_during_shutdown():
     """A worker dying mid-load while an orderly stop is already in progress must not be
     reported as a load failure either."""

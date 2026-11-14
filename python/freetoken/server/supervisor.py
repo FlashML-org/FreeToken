@@ -55,6 +55,12 @@ class BackendHandle:
     processes: List[Any] = field(default_factory=list)
     expected_acks: int = 0
 
+    def release_acks(self) -> None:
+        """Drop the ack queue once readiness has read it for the last time. A multiprocessing queue's
+        semaphores are unlinked only when it is collected, and a main process that a signal ends never
+        collects it, so resource_tracker reports them as leaked."""
+        self.ack_queue = None
+
 
 class WorkerDied(Exception):
     def __init__(self, message: str) -> None:
@@ -172,6 +178,7 @@ def run_backend_supervisor(
             on_failure(exc.message)
         return
 
+    handle.release_acks()
     on_ready()
 
     while True:
