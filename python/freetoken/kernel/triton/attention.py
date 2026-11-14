@@ -93,6 +93,11 @@ def _optin_smem_bytes(device_index: int) -> int:
 
 
 @functools.lru_cache(maxsize=None)
+def _rocm_lds_bytes(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).shared_memory_per_block)
+
+
+@functools.lru_cache(maxsize=None)
 def _num_sms(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
 
@@ -612,8 +617,10 @@ def decode_paged_attention(
     if kv_format.quantized:
         block_n, num_stages, num_warps = _quantized_decode_launch(block_d, block_n, num_stages)
     if rows > 1:
+        # NOTE: torch reads 0 opt-in shared memory on ROCm, which the launch rule takes as no limit
+        smem_budget = _rocm_lds_bytes(q.device.index) if is_rocm() else smem
         block_n, num_stages, num_warps = _multi_row_decode_launch(
-            rows * block_h, block_d, kv_format.quantized, elem, k_cache.element_size(), smem
+            rows * block_h, block_d, kv_format.quantized, elem, k_cache.element_size(), smem_budget
         )
 
     k_scale_arg, v_scale_arg, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
