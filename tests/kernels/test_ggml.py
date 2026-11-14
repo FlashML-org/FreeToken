@@ -156,6 +156,33 @@ def test_q4_shared_q8_matches_internal_quantization(dtype):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+class _ReadsQ8_1:
+    def input_format(self, x):
+        return "q8_1"
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rows", [1, 4, 8])
+# 9600 values end in ggml's zero padding blocks
+@pytest.mark.parametrize("kernel, dim, groups", [("norm", 10240, 4), ("norm", 9600, 3), ("silu", 320, 4)])
+def test_hc_kernels_write_quantize_q8_1(dtype, rows, kernel, dim, groups):
+    from freetoken.kernel.triton.hc import grouped_gemma_rmsnorm, hc_silu
+
+    torch.manual_seed(rows * dim)
+    for scale in (1e-3, 1.0, 300.0):
+        x = (torch.randn(rows, dim, device="cuda") * scale).to(dtype)
+        if kernel == "norm":
+            weight = torch.randn(dim, device="cuda", dtype=dtype)
+            run = lambda to: grouped_gemma_rmsnorm(x, weight, 1e-6, groups, to=to)
+        else:
+            run = lambda to: hc_silu(x, groups, to=to)
+        y, none = run(None)
+        y_fused, yq = run(_ReadsQ8_1())
+        assert none is None
+        torch.testing.assert_close(y_fused, y, atol=0, rtol=0)
+        assert torch.equal(yq, ggml.quantize_q8_1(y))
+
+
 def test_q4_nondefault_stream():
     w, ref = _q4_weights((64, 256))
     torch.cuda.synchronize()

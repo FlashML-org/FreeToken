@@ -47,8 +47,12 @@ class _LinearTPImpl(BaseOP):
     def finalize(self) -> None:
         self.quant_method.finalize(self)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.quant_method.apply(self, x)
+    def input_format(self, x: torch.Tensor) -> str | None:
+        """Name of the quantized copy of ``x`` that ``forward`` takes as ``xq``, for the kernel in front to write; None if there is none."""
+        return self.quant_method.input_format(self, x)
+
+    def forward(self, x: torch.Tensor, xq: torch.Tensor | None = None) -> torch.Tensor:
+        return self.quant_method.apply(self, x, xq)
 
 
 class LinearReplicated(_LinearTPImpl):
@@ -149,8 +153,8 @@ class LinearOProj(_LinearTPImpl):
             quant_config=quant_config, prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.quant_method.apply(self, x)
+    def forward(self, x: torch.Tensor, xq: torch.Tensor | None = None) -> torch.Tensor:
+        y = self.quant_method.apply(self, x, xq)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
@@ -176,8 +180,8 @@ class LinearRowParallel(_LinearTPImpl):
             quant_config=quant_config, prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.quant_method.apply(self, x)
+    def forward(self, x: torch.Tensor, xq: torch.Tensor | None = None) -> torch.Tensor:
+        y = self.quant_method.apply(self, x, xq)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y

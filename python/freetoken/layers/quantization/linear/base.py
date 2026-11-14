@@ -47,6 +47,10 @@ class LinearKernel(ABC):
     def finalize(self, layer: Any) -> None:
         pass
 
+    def input_format(self, layer: Any, x: torch.Tensor) -> str | None:
+        """Name of the quantized copy of ``x`` that ``apply`` takes as ``xq``; None if ``apply`` has no ``xq``."""
+        return None
+
     @abstractmethod
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor: ...
 
@@ -60,5 +64,8 @@ class LinearMethod(QuantMethod):
     def finalize(self, layer: Any) -> None:
         self.kernel.finalize(layer)
 
-    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
-        return self.kernel.apply(layer, x)
+    def input_format(self, layer: Any, x: torch.Tensor) -> str | None:
+        return self.kernel.input_format(layer, x)
+
+    def apply(self, layer: Any, x: torch.Tensor, xq: torch.Tensor | None = None) -> torch.Tensor:
+        return self.kernel.apply(layer, x) if xq is None else self.kernel.apply(layer, x, xq=xq)

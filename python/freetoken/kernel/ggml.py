@@ -79,13 +79,13 @@ def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tens
 def quantize_q8_1(x: torch.Tensor) -> torch.Tensor:
     """``x[M, K]`` as the vector kernel's q8_1 blocks, to share among GEMVs that read the same ``x``."""
     m, k = x.shape
-    out = torch.empty(m, _q8_1_row_bytes(k), dtype=torch.uint8, device=x.device)
+    out = torch.empty(m, q8_1_row_bytes(k), dtype=torch.uint8, device=x.device)
     _module().quantize_q8_1(x.contiguous(), out)
     return out
 
 
 @functools.cache
-def _q8_1_row_bytes(k: int) -> int:
+def q8_1_row_bytes(k: int) -> int:
     return _module().q8_1_row_bytes(k)
 
 
