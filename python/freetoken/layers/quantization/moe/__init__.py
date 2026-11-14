@@ -1,4 +1,4 @@
-from .base import BankSpec, ExpertView, MoEConfig, MoEKernel, MoEMethod
+from .base import BankSpec, ExpertView, MoEConfig, MoEKernel, MoEMethod, RoutedExperts
 from . import fp8_block, gguf, mxfp4, mxfp8, nvfp4, unquantized
 from .fp8_block import Fp8BlockMoEMethod
 from .mxfp4 import Mxfp4MoEMethod
@@ -8,7 +8,7 @@ from .unquantized import UnquantizedMoEMethod
 from .gguf import GGUFMoEMethod
 
 __all__ = [
-    "BankSpec", "ExpertView", "MoEConfig", "MoEKernel", "MoEMethod",
+    "BankSpec", "ExpertView", "MoEConfig", "MoEKernel", "MoEMethod", "RoutedExperts",
     "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod", "GGUFMoEMethod",
     "fp8_block", "gguf", "mxfp4", "mxfp8", "nvfp4", "unquantized",
 ]
