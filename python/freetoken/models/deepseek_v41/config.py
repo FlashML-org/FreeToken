@@ -31,15 +31,8 @@ class VisionConfig:
     max_wh_ratio: float | None = None
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
-    args = DeepseekV41Args.from_hf(hf_config)
-    text = getattr(hf_config, "text_config", None) or hf_config
-    max_position = int(getattr(text, "max_position_embeddings", 0) or getattr(hf_config, "max_position_embeddings", 0) or 0)
-    if max_position <= 0:
-        max_position = int(args.original_seq_len * args.rope_factor)
-    vc = getattr(hf_config, "vision_config", None)
-    vision = VisionConfig(**{f.name: getattr(vc, f.name, f.default) for f in fields(VisionConfig)}) if vc is not None else None
-
+def model_config_from_args(args: DeepseekV41Args, *, max_position: int, vision: VisionConfig | None = None, image_token_id: int | None = None) -> ModelConfig:
+    """The ModelConfig of a DeepSeek-V4.1 text tower, from the HF config or a GGUF's metadata."""
     return ModelConfig(
         num_layers=args.n_layers,
         num_qo_heads=args.n_heads,
@@ -78,7 +71,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_sm_scale=args.head_dim**-0.5,
         dsv41_args=args,
         vision_config=vision,
-        image_token_id=getattr(hf_config, "image_token_id", None),
+        image_token_id=image_token_id,
         attention_groups=(
             DSV4AttentionGroupConfig(
                 name="dsv41",
@@ -92,4 +85,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+def parse_config(hf_config: Any) -> ModelConfig:
+    args = DeepseekV41Args.from_hf(hf_config)
+    text = getattr(hf_config, "text_config", None) or hf_config
+    max_position = int(getattr(text, "max_position_embeddings", 0) or getattr(hf_config, "max_position_embeddings", 0) or 0)
+    if max_position <= 0:
+        max_position = int(args.original_seq_len * args.rope_factor)
+    vc = getattr(hf_config, "vision_config", None)
+    vision = VisionConfig(**{f.name: getattr(vc, f.name, f.default) for f in fields(VisionConfig)}) if vc is not None else None
+    return model_config_from_args(args, max_position=max_position, vision=vision, image_token_id=getattr(hf_config, "image_token_id", None))
+
+
+__all__ = ["model_config_from_args", "parse_config"]

@@ -343,6 +343,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         # the routed experts share DSV4's ds_fp4 bank layout (hidden 5120, intermediate 2304).
         name="deepseek-ai/DeepSeek-V4.1-Flash",
         architecture="DeepseekV41ForCausalLM",
+        # llama.cpp deepseek41 GGUF (unsloth 1017 GGUF; text only)
+        arch_aliases=("DeepseekV41GGUFForCausalLM",),
         hidden_size=5120,
         kv_groups=(),
         top_k=6,

@@ -175,6 +175,14 @@ def engram_table_names(layer_id: int) -> tuple[str, str]:
     return f"layers.{layer_id}.engram.embed.weight", f"layers.{layer_id}.engram.embed.scale"
 
 
+def ftw_check_source(model_path: str) -> None:
+    """``convert_checkpoint`` asks this before writing anything: a GGUF keeps the Engram tables in the .gguf, which an FTW does not carry."""
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if gguf_config_source(model_path) is not None:
+        raise NotImplementedError(f"{model_path}: an FTW of a DeepSeek-V4.1 GGUF has no Engram table to read; serve the .gguf directly")
+
+
 def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     """Copy the checkpoint shards holding the Engram tables (fp8 rows + ue8m0 scales) next to an FTW
     checkpoint. The tables are never FTW entries: ``load_host_tables`` maps them in place from whatever

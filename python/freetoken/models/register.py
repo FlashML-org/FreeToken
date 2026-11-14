@@ -302,8 +302,17 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=(("model.layers", "layers"), ("model.embed", "embed"), ("model.norm", "norm")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
         unquantized_modules=(
-            "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.wk", "*.indexer.weights_proj", "vision.*", "aligner.*",
+            "embed", "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.wk", "*.indexer.weights_proj", "vision.*", "aligner.*",
         ),
+    ),
+    # llama.cpp deepseek41 GGUF (text; unsloth DeepSeek-V4.1-Flash-1017-GGUF): the same model classes with every tensor in its packed ggml type
+    "DeepseekV41GGUFForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v41",
+        "DeepseekV41ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        # the GGUF scheme reads expert types in (gate, up, down) order
+        packed_modules_mapping=_EXPERTS_W132_PACKED,
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",

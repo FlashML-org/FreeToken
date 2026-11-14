@@ -11,7 +11,7 @@ import torch
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 from freetoken.models.deepseek_v41.engram import EngramHash, bucket_primes, hash_multipliers
 
-from .common import VOCAB, requires_cuda, tiny_hf_config, write_tiny_checkpoint
+from .common import ENGRAM_ROWS, VOCAB, requires_cuda, tiny_hf_config, write_tiny_checkpoint, write_tiny_gguf
 
 
 def _args(**over) -> DeepseekV41Args:
@@ -121,6 +121,81 @@ def test_disk_table_matches_the_dequantized_shard(tmp_path):
     table.flush(signal=table.wait_sync)
     torch.cuda.synchronize()
     assert torch.equal(out, oracle(dec_rows))
+
+
+@requires_cuda
+@pytest.mark.parametrize("table_type", ["BF16", "Q8_0"])
+def test_gguf_tables_read_their_slices_of_the_one_tensor(tmp_path, table_type):
+    """Two Engram layers back to back in ``per_layer_token_embd``: each table reads its own rows, eagerly and from a captured graph."""
+    from freetoken.kernel.row_store import alloc_sync_flag, probe_wait_sync
+    from freetoken.models.deepseek_v41.engram_table import EngramDiskTable
+    from freetoken.models.deepseek_v41.gguf import gguf_engram_tables, parse_gguf_config
+    from freetoken.models.gguf.config import build_gguf_shim
+
+    over = dict(engram_layer_ids=[1, 3], engram_num_embeddings=[ENGRAM_ROWS, ENGRAM_ROWS])
+    path = str(tmp_path / "tiny.gguf")
+    refs = write_tiny_gguf(path, table_type=table_type, **over)
+    args = parse_gguf_config(build_gguf_shim(path)).dsv41_args
+    hash, sources = gguf_engram_tables(path, args)
+    assert [s.num_rows for s in sources] == hash.rows_per_layer and sources[1].base - sources[0].base == hash.rows_per_layer[0] * sources[0].row_bytes
+    ids = torch.randint(3, VOCAB, (24,), generator=torch.Generator().manual_seed(3))
+    rows = hash.row_ids(ids)
+    wait_sync = probe_wait_sync("auto", torch.device("cuda"))
+    for l, (layer, source) in enumerate(zip((1, 3), sources)):
+        table = EngramDiskTable(source, hash.n_cols, torch.device("cuda"), max_graph_rows=4, max_extend_tokens=32)
+        oracle = refs[layer][rows[:, l].flatten()].view(rows.shape[0], -1).cuda()
+        table.stage(rows[:, l], graph=False)
+        table.flush(signal=False)
+        assert torch.equal(table.lookup(rows.shape[0]), oracle)
+        table.wait_sync = wait_sync
+        if wait_sync:
+            table.flag = alloc_sync_flag()
+        out = torch.empty(1, hash.n_cols * 32, dtype=torch.bfloat16, device="cuda")
+        graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            if not wait_sync:
+                table.stage(rows[-1:, l], graph=True)
+                table.flush(signal=False)
+            with torch.cuda.graph(graph, stream=stream):
+                out.copy_(table.lookup(1))
+        torch.cuda.synchronize()
+        graph.replay()
+        table.stage(rows[-1:, l], graph=True)
+        table.flush(signal=wait_sync)
+        torch.cuda.synchronize()
+        assert torch.equal(out, oracle[-1:])
+
+
+def test_gguf_hash_uses_the_token_map_in_the_file(tmp_path):
+    """Ids the file's map merges hash to the same rows: nothing but the file knows the map."""
+    from freetoken.models.deepseek_v41.gguf import gguf_engram_tables, parse_gguf_config
+    from freetoken.models.gguf.config import build_gguf_shim
+
+    token_map = [i // 2 for i in range(VOCAB)]
+    path = str(tmp_path / "merged.gguf")
+    write_tiny_gguf(path, kv_over={"engram.token_map": token_map}, engram_compressed_vocab_size=max(token_map) + 1)
+    hash, _ = gguf_engram_tables(path, parse_gguf_config(build_gguf_shim(path)).dsv41_args)
+    rows = lambda *ids: hash.row_ids(torch.tensor(ids))
+    assert torch.equal(rows(10, 20), rows(11, 21))
+    assert not torch.equal(rows(10, 20), rows(12, 20))
+
+
+@pytest.mark.parametrize("key", ["ple.head_offsets", "ple.head_vocab_sizes", "ple.layer_multipliers"])
+def test_gguf_hash_constants_are_checked_against_the_file(tmp_path, key):
+    from freetoken.models.deepseek_v41.gguf import gguf_engram_tables, parse_gguf_config
+    from freetoken.models.gguf.config import build_gguf_shim
+    from freetoken.models.gguf.reader import load_gguf_metadata
+
+    path = str(tmp_path / "good.gguf")
+    write_tiny_gguf(path)
+    good = load_gguf_metadata(path)[f"deepseek41.{key}"]
+    gguf_engram_tables(path, parse_gguf_config(build_gguf_shim(path)).dsv41_args)
+    # primes also size the table, so a wrong one is caught by the same check through its own config;
+    # the config parse refuses the file, before any dense weight loads
+    bad = str(tmp_path / "bad.gguf")
+    write_tiny_gguf(bad, kv_over={key: [v + 1 if i == 1 else v for i, v in enumerate(good)]})
+    with pytest.raises(ValueError, match=key):
+        parse_gguf_config(build_gguf_shim(bad))
 
 
 @requires_cuda

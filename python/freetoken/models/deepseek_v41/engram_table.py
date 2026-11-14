@@ -66,13 +66,15 @@ def _tensor_extent(folder: str, name: str) -> _TensorExtent:
 
 @dataclass(frozen=True)
 class EngramRowSource:
-    """The fp8 table tensor in its shard (one extent) and its host-resident scales."""
+    """One layer's table in one file extent: fp8 rows with host-resident scales, or a GGUF's rows of ``ggml_type``."""
 
     path: str
     base: int
     num_rows: int
     head_dim: int
-    scales: torch.Tensor  # [num_rows, head_dim // 32] uint8 (e8m0 codes), CPU
+    scales: torch.Tensor | None  # [num_rows, head_dim // 32] uint8 (e8m0 codes), CPU; None for a GGUF table
+    ggml_type: int | None = None
+    row_bytes: int = 0  # a GGUF row's bytes on disk
 
 
 def engram_row_source(folder: str, layer_id: int) -> EngramRowSource:
@@ -105,12 +107,15 @@ class EngramDiskTable:
         self.head_dim = source.head_dim
         self.n_cols = n_cols
         self.num_rows = source.num_rows
-        self.row_bytes = FP8_E8M0_B32.row_bytes(source.head_dim)  # values | scales
+        self.ggml_type = source.ggml_type
+        # staged rows: values | scales for fp8, the file's bytes for a GGUF
+        self.row_bytes = FP8_E8M0_B32.row_bytes(source.head_dim) if source.ggml_type is None else source.row_bytes
         self.scales = source.scales
         self.device = device
+        stored = source.head_dim if source.ggml_type is None else source.row_bytes
         self.store = RowStore(
             paths=[source.path], extent_file=[0], extent_base=[source.base], rows_per_extent=source.num_rows,
-            row_bytes=source.head_dim, row_stride=source.head_dim, use_io_uring=use_io_uring,
+            row_bytes=stored, row_stride=stored, use_io_uring=use_io_uring,
         )
         # the graph staging is allocated up front (pinned alloc inside capture is illegal) and
         # outlives any one capture so a re-capture keeps the same pointers; the eager staging
@@ -160,15 +165,18 @@ class EngramDiskTable:
         ids = row_ids.reshape(-1).to(torch.int64).contiguous()
         rows = pinned[: n * self.row_bytes].view(n, self.row_bytes)
         self.store.stage_rows(ids.data_ptr(), n, rows.data_ptr(), self.row_bytes)
-        rows[:, self.head_dim :].copy_(self.scales.index_select(0, ids))
+        if self.scales is not None:
+            rows[:, self.head_dim :].copy_(self.scales.index_select(0, ids))
 
     def flush(self, *, signal: bool) -> None:
         self.store.flush(self.flag.data_ptr() if signal else 0)
 
     # ----- device (EngramTable protocol) -----
     def lookup(self, num_tokens: int) -> torch.Tensor:
+        from freetoken.kernel import ggml
         from freetoken.kernel.row_store import wait_reset
         from freetoken.kernel.triton.dsv41.pack import unpack_rows
+        from freetoken.layers.quantization.ggml_types import float_dtype
 
         stream = torch.cuda.current_stream(self.device)
         capturing = torch.cuda.is_current_stream_capturing()
@@ -180,7 +188,14 @@ class EngramDiskTable:
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
         if not capturing:
             self._eager_read[self._eager_slot].record(stream)
-        values = unpack_rows(dev[:nbytes].view(n, self.row_bytes), FP8_E8M0_B32, self.head_dim)
+        rows = dev[:nbytes].view(n, self.row_bytes)
+        if self.ggml_type is None:
+            values = unpack_rows(rows, FP8_E8M0_B32, self.head_dim)
+        elif (dtype := float_dtype(self.ggml_type)) is not None:
+            # copy=True: bf16 rows must not alias the staging buffer the next copy overwrites
+            values = rows.view(dtype).to(torch.bfloat16, copy=True)
+        else:
+            values = ggml.dequantize(rows, self.ggml_type, self.head_dim)
         return values.view(num_tokens, self.n_cols * self.head_dim)
 
 

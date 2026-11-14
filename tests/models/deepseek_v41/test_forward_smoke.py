@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from .common import VOCAB, requires_cuda, write_tiny_checkpoint
+from .common import VOCAB, requires_cuda, write_tiny_checkpoint, write_tiny_gguf
 
 pytestmark = requires_cuda
 
@@ -37,6 +37,32 @@ def test_prefill_and_decode(checkpoint):
     for step in range(5):  # batched decode over two requests at different positions
         out = eng.decode([r0, r1], [10 + step, 20 + step])
         assert out.shape == (2, VOCAB) and torch.isfinite(out).all()
+
+
+def test_gguf_forward_matches_the_checkpoint(tmp_path):
+    """The same bf16 weights through the GGUF reader and the HF reader give the same logits, with non-zero Engram rows and random q / k gate weights so the file's stored product and ``wkv`` count."""
+    from .harness import TinyEngine
+
+    class Rows:
+        def __init__(self, width):
+            self.rows = torch.randn(600, width, generator=torch.Generator().manual_seed(9)).to(torch.bfloat16).cuda()
+
+        def lookup(self, num_tokens):
+            return self.rows[:num_tokens]
+
+    folder, path = str(tmp_path / "hf"), str(tmp_path / "tiny.gguf")
+    write_tiny_checkpoint(folder, random_gate=True)
+    write_tiny_gguf(path, random_gate=True)
+    engines = [TinyEngine(c, max_seq_len=1024, max_running_req=2, swa_decoder_replay="exact", engram_table=Rows(192)) for c in (folder, path)]
+    reqs = [e.new_request(0, _tokens(300, 1)) for e in engines]
+    logits = [e.prefill([r]) for e, r in zip(engines, reqs)]
+    assert torch.equal(*logits)
+    for e, r in zip(engines, reqs):
+        e.finish_prefill([r])
+    # the bf16 fused and ggml decode kernels round differently; allow 2^-7 of the largest logit
+    for step in range(4):
+        hf, ggml = [e.decode([r], [10 + step]).float() for e, r in zip(engines, reqs)]
+        assert (hf - ggml).abs().max() <= 2**-7 * hf.abs().max()
 
 
 def test_chunked_prefill_matches_single_shot(checkpoint):

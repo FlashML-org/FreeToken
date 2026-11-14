@@ -214,6 +214,16 @@ def convert_checkpoint(
 
     from freetoken.utils.progress import byte_bar, count_bar
 
+    # a family refuses a source it has no FTW form for before the writer creates out_dir
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        check_source = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_check_source")
+    except (AttributeError, KeyError, ValueError):
+        check_source = None
+    if check_source is not None:
+        check_source(model_path)
+
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     n_weight = n_bank = n_alpha = 0
 
@@ -233,8 +243,6 @@ def convert_checkpoint(
         _progress("dense", dense_bytes, 0)
 
     # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table)
-    from freetoken.models.register import _load_attr, get_model_spec
-
     try:
         side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
     except (AttributeError, KeyError, ValueError):

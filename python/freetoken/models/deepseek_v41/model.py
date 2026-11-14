@@ -135,7 +135,7 @@ class Transformer(BaseOP):
     def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         args: DeepseekV41Args = config.dsv41_args
         self.args = args
-        self.embed = VocabParallelEmbedding(num_embeddings=args.vocab_size, embedding_dim=args.dim)
+        self.embed = VocabParallelEmbedding(num_embeddings=args.vocab_size, embedding_dim=args.dim, quant_config=config.quant, prefix=f"{prefix}.embed")
         self.layers = OPList([Block(config, i, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, args.norm_eps)
 
@@ -227,7 +227,7 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
         return [b.engram for b in self.model.layers.op_list if b.engram is not None]
 
     def load_host_tables(self, engine_config) -> int:
-        """Attach the Engram tables (streamed from the checkpoint shards; zeros for dummy weights)
+        """Attach the Engram tables (streamed from the checkpoint shards or the GGUF; zeros for dummy weights)
         and take over ``forward_host_ctx`` so every dispatch stages its rows. Returns the pinned
         host bytes the engine reserves from its pin budget."""
         import os
@@ -242,24 +242,33 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
             for layer in layers:
                 layer.attach_table(ZeroEngramTable(layer.width, device))
             return 0
-        from freetoken.utils import download_hf_weight
-        from transformers import AutoTokenizer
+        from freetoken.models.gguf.reader import gguf_config_source
 
-        from .engram import EngramHash, build_compressed_token_map
         from .engram_table import EngramDiskTable, EngramHost, engram_row_source
 
-        folder = download_hf_weight(engine_config.model_path)
-        token_map, compressed_vocab = build_compressed_token_map(AutoTokenizer.from_pretrained(folder, trust_remote_code=True))
-        hash = EngramHash(self._args, token_map, compressed_vocab)
+        if (gguf_src := gguf_config_source(engine_config.model_path)) is not None:
+            from .gguf import gguf_engram_tables
+
+            hash, sources = gguf_engram_tables(gguf_src, self._args)
+        else:
+            from freetoken.utils import download_hf_weight
+            from transformers import AutoTokenizer
+
+            from .engram import EngramHash, build_compressed_token_map
+
+            folder = download_hf_weight(engine_config.model_path)
+            token_map, compressed_vocab = build_compressed_token_map(AutoTokenizer.from_pretrained(folder, trust_remote_code=True))
+            hash = EngramHash(self._args, token_map, compressed_vocab)
+            sources = [engram_row_source(folder, layer.layer_id) for layer in layers]
         graph_rows = max(engine_config.max_running_req, engine_config.cuda_graph_max_bs or 0, 1)
         tables = [
             EngramDiskTable(
-                engram_row_source(folder, layer.layer_id), hash.n_cols, device,
+                source, hash.n_cols, device,
                 max_graph_rows=graph_rows,
                 max_extend_tokens=engine_config.max_extend_tokens,
                 use_io_uring=os.getenv("FREETOKEN_ENGRAM_IO_URING", "1") != "0",
             )
-            for layer in layers
+            for source in sources
         ]
         for layer, table in zip(layers, tables):
             layer.attach_table(table)
