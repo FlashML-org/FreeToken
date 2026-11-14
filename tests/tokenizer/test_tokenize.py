@@ -390,6 +390,23 @@ def test_generic_template_folds_system_messages_without_mutating_input(initial_s
     assert tools == original_tools
 
 
+# Qwen3's template drops a developer message, Qwen3.8's raises on it; gpt-oss's names the role.
+@pytest.mark.parametrize("template,expected_role", [
+    ("{% for m in messages %}{{ m.content }}{% endfor %}", "system"),
+    ("{% if messages[0].role == 'developer' %}{{ messages[0].content }}{% endif %}", "developer"),
+])
+def test_developer_role_renders_as_system_unless_the_template_names_it(template, expected_role):
+    tokenizer = FakeTokenizer()
+    tokenizer.chat_template = template
+    manager = TokenizeManager(tokenizer)
+    messages = [{"role": "developer", "content": "Answer in French."}, {"role": "user", "content": "hi"}]
+    manager.tokenize([TokenizeMsg(uid=1, text=messages, sampling_params=SamplingParams())])
+    assert tokenizer.chat_template_messages == [
+        {"role": expected_role, "content": "Answer in French."},
+        {"role": "user", "content": "hi"},
+    ]
+
+
 class FakeDsv4Tokenizer:
     chat_template = None
 

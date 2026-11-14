@@ -145,6 +145,11 @@ class TokenizeManager:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs, images=images
             )
+        if any(m.get("role") == "developer" for m in messages):
+            # OpenAI's "developer" is the newer spelling of "system". Templates that do not
+            # name it drop it, raise on it, or render it as a role the model never saw.
+            if "developer" not in str(self.tokenizer.chat_template):
+                messages = [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
         # Broadcast the effort in every spelling the ecosystem's templates read
         # (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
         # variables) -- the same rule the thinking toggles use. An explicit
