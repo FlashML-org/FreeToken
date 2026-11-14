@@ -68,7 +68,7 @@ const TypeInfo * type_infos() {
     return t;
 }
 
-const TypeInfo & type_info(ggml_type type) {
+const TypeInfo & type_info_of(ggml_type type) {
     if (type < 0 || type >= GGML_TYPE_COUNT || type_infos()[type].name == nullptr) {
         throw std::invalid_argument("unknown ggml type " + std::to_string((int) type));
     }
@@ -122,13 +122,13 @@ void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
     va_end(args);
 }
 
-int64_t ggml_blck_size(enum ggml_type type) { return type_info(type).blck_size; }
+int64_t ggml_blck_size(enum ggml_type type) { return type_info_of(type).blck_size; }
 
-size_t ggml_type_size(enum ggml_type type) { return type_info(type).type_size; }
+size_t ggml_type_size(enum ggml_type type) { return type_info_of(type).type_size; }
 
-const char * ggml_type_name(enum ggml_type type) { return type_info(type).name; }
+const char * ggml_type_name(enum ggml_type type) { return type_info_of(type).name; }
 
-bool ggml_is_quantized(enum ggml_type type) { return type_info(type).quantized; }
+bool ggml_is_quantized(enum ggml_type type) { return type_info_of(type).quantized; }
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) { return ggml_type_size(type) * ne / ggml_blck_size(type); }
 
