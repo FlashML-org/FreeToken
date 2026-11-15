@@ -6,7 +6,7 @@ from typing import ClassVar, Sequence
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.config import KVCacheGroupSpec
-from freetoken.utils import align_ceil, div_even
+from freetoken.utils import align_ceil, div_ceil, div_even
 
 from .base import BaseKVCachePool, WindowPoolSpec
 from .format import NONE, ROW_SCALE_FORMATS, KVFormat
@@ -30,7 +30,7 @@ class _KVGroupStorage:
 
 
 class HybridSWAKVCache(BaseKVCachePool):
-    """SGLang-style wrapper for hybrid full/SWA attention KV storage."""
+    """SGLang-style wrapper for SWA attention KV storage, with optional full-attention layers."""
 
     kv_formats: ClassVar[frozenset[str]] = ROW_SCALE_FORMATS
 
@@ -47,8 +47,14 @@ class HybridSWAKVCache(BaseKVCachePool):
     ) -> None:
         self.kv_format = kv_format
         specs = {group.name: group for group in groups if group.num_layers > 0}
-        if set(specs) != {"full", "swa"}:
-            raise ValueError(f"HybridSWAKVCache requires full and swa groups, got {sorted(specs)}")
+        if "swa" not in specs or set(specs) - {"full", "swa"}:
+            raise ValueError(f"HybridSWAKVCache requires swa and optional full groups, got {sorted(specs)}")
+        if "full" not in specs:
+            # A zero-layer slab preserves the page geometry without allocating full-attention KV.
+            specs["full"] = KVCacheGroupSpec(
+                name="full", layer_ids=(), num_kv_heads=specs["swa"].num_kv_heads,
+                head_dim=specs["swa"].head_dim, sliding_window=None,
+            )
 
         self._num_layers = num_layers
         self._device = device
@@ -330,6 +336,19 @@ class HybridSWAKVCache(BaseKVCachePool):
             # geometry, atomic with the buffer realloc. The fresh empty SWA radix tree built
             # by CacheManager.rebuild is then consistent by construction (idle-only).
             self._init_swa_paged_state()
+
+    @classmethod
+    def solve_num_pages(cls, config, available_memory: int) -> int:
+        if (
+            config.num_page_override is None
+            and (config.cache_type == "naive" or config.swa_num_pages_override is not None)
+            and all(spec.is_swa for spec in config.model_config.kv_cache_group_specs())
+        ):
+            # With no full KV and a fixed window pool, spare VRAM would buy only slot mappings.
+            max_pages = config.max_running_req * div_ceil(config.max_seq_len, config.page_size)
+            page_bytes, fixed_bytes, _, _ = cls.kv_cost(config)
+            available_memory = min(available_memory, fixed_bytes + max_pages * page_bytes)
+        return super().solve_num_pages(config, available_memory)
 
     @classmethod
     def window_spec(cls, config) -> WindowPoolSpec | None:
