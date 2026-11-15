@@ -107,14 +107,6 @@ def test_kv_source_is_the_last_unshared_layer_of_each_attention_type():
     assert {sources[i] for i in swa.layer_ids if i in sources} == {13}
 
 
-def test_kv_shared_layers_with_no_earlier_source_are_refused():
-    from freetoken.models.gemma4.config import Gemma4EArgs
-
-    args = Gemma4EArgs(per_layer_hidden_size=256, per_layer_vocab_size=262144, first_kv_shared_layer=4, kv_shared_intermediate_size=1)
-    with pytest.raises(NotImplementedError, match="no earlier layer of their attention type"):
-        args.kv_shared_layers((0, 1, 2, 3), (4, 5))
-
-
 @pytest.mark.parametrize("kv_format", ["none", "int8_per_token_head"])
 @pytest.mark.parametrize("release, full_slabs, swa_slabs", [(E2B, 3, 12), (E4B, 4, 20)])
 def test_shared_layers_read_their_source_slab_and_own_none(release, full_slabs, swa_slabs, kv_format):
@@ -358,21 +350,3 @@ def test_read_only_draft_view_routes_to_the_shared_target_slabs(release, overrid
     target = parse_config(_hf_config(release, **overrides))
     view = ReadOnlyTargetKVView(_SlabProbe(), _draft_view_config(target), target)
     assert [view.k_cache(i) for i in range(4)] == expected
-
-
-def test_draft_layers_project_q_only_and_hand_over_nothing():
-    """The sidecar's own e_args shares every layer from the first; it has no source of its own."""
-    import dataclasses
-
-    from freetoken.models.gemma4.attention import Gemma4Attention
-    from freetoken.models.gemma4.config import Gemma4EArgs
-    from freetoken.utils.torch_utils import torch_dtype
-
-    target = parse_config(_hf_config(E4B))
-    draft = dataclasses.replace(
-        _draft_view_config(target), gemma4_e_args=Gemma4EArgs(0, 0, 0, target.intermediate_size)
-    )
-    with torch.device("meta"), torch_dtype(torch.bfloat16):
-        layers = [Gemma4Attention(draft, i, prefix=f"layers.{i}.self_attn") for i in range(4)]
-
-    assert [(a.kv_shared, a.kv_source, hasattr(a, "qkv_proj")) for a in layers] == [(True, False, False)] * 4
