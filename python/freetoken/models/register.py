@@ -52,6 +52,11 @@ _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
     ("gate_up_proj", ("gate_proj", "up_proj")),
 )
+# A DFlash 2 draft GGUF is a draft source, never a servable target, so it stays out of the registry.
+_DFLASH_GGUF_DRAFT = ModelSpec(
+    "freetoken.models.dflash", "DFlash2DraftModel",
+    parse_config="parse_gguf_config", iter_weights="iter_gguf_weights", packed_modules_mapping=_DENSE_PACKED,
+)
 # per-expert checkpoints: probe the first expert's projections for the experts container
 _EXPERTS_PACKED = (("experts", ("experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj")),)
 _EXPERTS_W123_PACKED = (("experts", ("experts.0.w1", "experts.0.w2", "experts.0.w3")),)
