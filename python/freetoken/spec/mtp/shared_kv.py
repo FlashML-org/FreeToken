@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from freetoken.kvcache.base import BaseKVCachePool
+from freetoken.kvcache.format import KVFormat
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -69,6 +70,12 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
     def v_cache(self, index: int) -> torch.Tensor:
         return self._target.v_cache(self._route[index])
 
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return self._target.k_scale(self._route[index])
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return self._target.v_scale(self._route[index])
+
     def store_kv(self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int) -> None:
         raise RuntimeError(f"the read-only draft view stores nothing, but layer {layer_id} tried to write KV")
 
@@ -91,6 +98,10 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
     @property
     def dtype(self) -> torch.dtype:
         return self._target.dtype
+
+    @property
+    def kv_format(self) -> KVFormat:
+        return self._target.kv_format
 
     @property
     def num_layers(self) -> int:
