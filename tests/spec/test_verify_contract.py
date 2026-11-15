@@ -1,7 +1,7 @@
 """A k+1-row verify step commits exactly what k+1 decode steps would: with drafts taken from a plain greedy run and wrong at a different place each step (so every accept count occurs), speculative decoding must reproduce that run token for token.
 
 Tiny hybrid models with dummy weights, served end to end through the scheduler: qwen3_5 (GatedDeltaNet + attention) and qwen4_exp (GatedDeltaNet + QSA, PLE, hyper-connections). The drafts come from a stub proposer, so this pins the target side alone; a second run drafts with a DFlash 2 draft of random weights, whose wrong drafts must leave the target's output alone through its ring, window and graphs; a third drafts with the target's own MTP layer of random weights, which needs the tiny target materialized as a real checkpoint since MTP rejects dummy weights.
-A gemma4 target runs the same contract on a windowed KV pool: its oracle case asserts the out-of-window frees and the verify rollback fired, and its mtp case drafts from a tiny gemma4-assistant GGUF, which keeps no KV and reads the target's through the read-only view.
+A gemma4 target runs the same contract on a windowed KV pool: its oracle case asserts the out-of-window frees and the verify rollback fired, and its mtp case drafts from a tiny gemma4-assistant GGUF, which keeps no KV and reads the target's through the read-only view; a random-weight variant of that assistant then checks every replayed draft against the eager draft computed on the same inputs, since the identity ignores them.
 A verify row and a decode step run different GEMM and attention shapes, so their logits can differ by an ulp: the runs may part at a near tie, and the test checks they part only there. fp16 keeps such ties rare (bf16 has 3 fewer mantissa bits), and fan-in scaled dummy weights keep the activations O(1), so ulp noise does not grow through the layers.
 """
 
@@ -57,6 +57,10 @@ model, out, reference, kwargs = sys.argv[1], sys.argv[2], sys.argv[3], json.load
 dump_weights, use_dummy_weight = kwargs.pop("dump_weights", None), kwargs.pop("use_dummy_weight", True)
 dump_prefix, norm_ones = kwargs.pop("dump_prefix", ""), kwargs.pop("norm_ones", False)
 family = kwargs.pop("family", "")
+draft_graphs = kwargs.pop("draft_graphs", True)
+if not draft_graphs:
+    # the eager twin's subprocess: capture is a no-op, so every proposal runs the eager draft
+    SharedKVMTPProposer.capture_graphs = lambda self, bs_list, pool: None
 prompt_texts = kwargs.pop("prompts", None) or ["The capital of France is", "1, 2, 3, 4,", "def fibonacci(n):"]
 TAPS, H = (1, 2), 256
 
@@ -126,17 +130,19 @@ for _name, _key in (("maybe_free_swa_out_of_window", "decode"), ("free_swa_out_o
 
 # the draft side: whether the drafts came from the draft's own head reading the target's slabs
 from freetoken.models.gemma4.mtp import Gemma4MTPDraft
+from freetoken.spec.mtp.chain_graph import SharedDraftGraphs
 from freetoken.spec.mtp.shared_kv import ReadOnlyTargetKVView
 
-draft = {"head_calls": 0, "reads": {}, "top3": []}
+draft = {"head_calls": 0, "reads": {}, "stashed": []}
 draft_logits = Gemma4MTPDraft.draft_logits
 
 
 def counting_draft_logits(self, hidden):
     draft["head_calls"] += 1
     logits = draft_logits(self, hidden)
+    # tensors are stashed, never listed here: a host sync inside this head would poison graph capture
     top = logits.float().topk(3, dim=-1)
-    draft["top3"].append((top.indices.tolist(), top.values.tolist()))
+    draft["stashed"].append((top.indices, top.values))
     return logits
 
 
@@ -152,17 +158,48 @@ def counting_k_cache(self, index):
 
 ReadOnlyTargetKVView.k_cache = counting_k_cache
 
+# a replayed draft graph runs no python, so its proposals are invisible to the wrappers above: count
+# the replays themselves to pin that the graphs served the run
+draft_graph_replays = 0
+replay_orig = SharedDraftGraphs.replay
+
+
+def counting_replay(self, reqs, cs, pending):
+    global draft_graph_replays
+    out = replay_orig(self, reqs, cs, pending)
+    draft_graph_replays += out is not None
+    return out
+
+
+SharedDraftGraphs.replay = counting_replay
+
 # the identity sidecar's drafts are known exactly, so record each proposal to pin the seed row
 propose_orig = SharedKVMTPProposer.propose
 proposals = []
 
 
 def recording_propose(self, reqs, rows, pending):
+    graphs = self.draft_graphs
+    before = len(draft["stashed"])
     proposal = propose_orig(self, reqs, rows, pending)
-    # this call's k head calls: per request row, one [ids, vals] top-3 per step
-    tops = draft["top3"][len(draft["top3"]) - self.k:]
+    # this call's k head calls: per request row, one [ids, vals] top-3 per step; a replayed graph
+    # runs no head, so its proposals carry only the drafts
+    fresh = draft["stashed"][before:]
+    same = None
+    if graphs is not None and not fresh:
+        # the replay's inputs: the same reqs, seed hidden and pending token, drafted eagerly on the
+        # spot, so a graph that reads the wrong attention inputs has nowhere to hide
+        self.draft_graphs = None
+        try:
+            eager = propose_orig(self, reqs, rows, pending)
+        finally:
+            self.draft_graphs = graphs
+        fresh = draft["stashed"][before:]
+        same = eager.draft_token_ids.tolist()
+    tops = [(i.tolist(), v.tolist()) for i, v in fresh[-self.k:]] if len(fresh) >= self.k else []
+    drafted = proposal.draft_token_ids.tolist()
     proposals.append([
-        (r.uid, p, [[ids[i], vals[i]] for ids, vals in tops])
+        (r.uid, p, [[ids[i], vals[i]] for ids, vals in tops], drafted[i], None if same is None else same[i])
         for r, p, i in zip(reqs, pending.tolist(), range(len(reqs)))
     ])
     return proposal
@@ -337,6 +374,8 @@ penalties = (0.0, 0.6, 0.0)
 params = [SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True, presence_penalty=p, frequency_penalty=p)
           for n, p in zip((48, 37, 41), penalties)]
 res = llm.generate(prompts, params)
+proposer = getattr(getattr(llm.engine, "spec", None), "proposer", None)
+graphs_of = getattr(proposer, "draft_graphs", None)
 pool = llm.engine.linear_state_pool
 window = list(pool.slot_state("dflash_window").shape) if pool is not None and pool.has_slot_state("dflash_window") else None
 cache = llm.cache_manager
@@ -345,6 +384,8 @@ json.dump({"outputs": [r["token_ids"] for r in res], "top3": [[u, i, *t] for (u,
            "swa_window": cache.sliding_window_size, "swa": cache.swa_paged, "rows": llm.config.decode_rows_per_req,
            "prompt_lens": [len(p) for p in prompts], "penalties": list(penalties),
            "evict": evict, "proposals": proposals,
+           "draft_graphs": sorted(graphs_of.graphs) if graphs_of is not None else [],
+           "draft_graph_replays": draft_graph_replays,
            "draft": {"head_calls": draft["head_calls"], "reads": sorted(draft["reads"].items())}}, open(out, "w"))
 """
 
@@ -446,13 +487,15 @@ def _tiny_draft(path: str) -> str:
     return path
 
 
-def _tiny_mtp_draft(path: str, target: str, family: str = "qwen3_5") -> str:
+def _tiny_mtp_draft(path: str, target: str, family: str = "qwen3_5", random_weights: bool = False) -> str:
     """The tiny target's own MTP draft as a checkpoint.
 
     qwen3_5: one draft attention layer over random fan-in scaled weights, written in the pre-fusion HF names
     iter_mtp_weights consumes (q_proj carries the output gate). gemma4: the assistant sidecar GGUF, whose four
     KV-shared layers are the identity and whose head is twice the target's tied table, so the draft still
-    reads the target's slabs and its own head predicts the target's greedy token.
+    reads the target's slabs and its own head predicts the target's greedy token. ``random_weights`` writes
+    fan-in scaled fusion, q/o and FFN matrices instead, so the drafts depend on the target window, the
+    pending token and the embedding rather than the seed hidden alone.
     """
     from safetensors.torch import load_file, save_file
 
@@ -472,24 +515,34 @@ def _tiny_mtp_draft(path: str, target: str, family: str = "qwen3_5") -> str:
         def zeros(*shape):
             return torch.zeros(*shape)
 
+        generator = torch.Generator().manual_seed(0)
+
+        def randn(*shape):
+            return torch.randn(*shape, generator=generator) * shape[-1] ** -0.5
+
+        dense = randn if random_weights else zeros
         # twice the target's head: the same argmax, and a value only the draft's own table can produce
         put("token_embd.weight", 2 * embed)
         freqs = torch.full((full_hd // 2,), 1e30)
         freqs[: full_hd // 8] = 1.0  # partial rotary 0.25, as the full layer's rope_freqs
         put("rope_freqs.weight", freqs, F32)
-        pre = zeros(hidden, 2 * hidden)
-        pre[:, hidden:] = torch.eye(hidden)  # keep the target hidden, drop the token embedding
+        if random_weights:
+            pre = randn(hidden, 2 * hidden)
+        else:
+            pre = zeros(hidden, 2 * hidden)
+            pre[:, hidden:] = torch.eye(hidden)  # keep the target hidden, drop the token embedding
         put("nextn.pre_projection.weight", pre)
         put("nextn.post_projection.weight", torch.eye(hidden))
         put("output_norm.weight", torch.ones(hidden), F32)
         for layer in range(DRAFT_LAYERS):
             hd = full_hd if layer == 3 else swa_hd
             blk = f"blk.{layer}"
-            put(f"{blk}.attn_q.weight", zeros(heads * hd, hidden))
-            put(f"{blk}.attn_output.weight", zeros(hidden, heads * hd))
-            put(f"{blk}.ffn_gate.weight", zeros(ffn, hidden))
-            put(f"{blk}.ffn_up.weight", zeros(ffn, hidden))
-            put(f"{blk}.ffn_down.weight", zeros(hidden, ffn))
+            # the KV-shared assistant has q and o only: its k/v are the target's, read through the view
+            put(f"{blk}.attn_q.weight", dense(heads * hd, hidden))
+            put(f"{blk}.attn_output.weight", dense(hidden, heads * hd))
+            put(f"{blk}.ffn_gate.weight", dense(ffn, hidden))
+            put(f"{blk}.ffn_up.weight", dense(ffn, hidden))
+            put(f"{blk}.ffn_down.weight", dense(hidden, ffn))
             for name, width in (("attn_norm", hidden), ("post_attention_norm", hidden), ("ffn_norm", hidden),
                                 ("post_ffw_norm", hidden), ("attn_q_norm", hd)):
                 put(f"{blk}.{name}.weight", torch.ones(width), F32)
@@ -591,11 +644,53 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, monkeypatch,
         _run(model, str(tmp_path / "materialize.json"), "-", dump_weights=os.path.join(target, "model.safetensors"),
              dump_prefix="model.language_model." if family == "gemma4" else "", **kwargs)
         draft = {"speculative_draft_model_path": _tiny_mtp_draft(str(tmp_path / "draft"), target, family)}
+        if family == "gemma4":
+            random_draft = {"speculative_draft_model_path": _tiny_mtp_draft(
+                str(tmp_path / "draft-random"), target, family, random_weights=True)}
         extra = {"use_dummy_weight": False}
         model = target
-    spec = _run(model, str(tmp_path / "spec.json"), decode, speculative_algorithm=algorithm, speculative_num_steps=K,
-                **draft, **extra, **kwargs)
     if algorithm == "mtp" and family == "gemma4":
+        # the strict pins below read the eager draft's per-step logits and head calls, which a replay
+        # hides; no-op capture_graphs in this subprocess keeps every proposal eager
+        eager_run = {"draft_graphs": False}
+    else:
+        eager_run = {}
+    spec = _run(model, str(tmp_path / "spec.json"), decode, speculative_algorithm=algorithm, speculative_num_steps=K,
+                **eager_run, **draft, **extra, **kwargs)
+    if algorithm == "mtp" and family == "gemma4":
+        graph_run = _run(model, str(tmp_path / "spec-graphs.json"), decode, speculative_algorithm=algorithm,
+                         speculative_num_steps=K, **draft, **extra, **kwargs)
+        assert spec["draft_graphs"] == [] and graph_run["draft_graphs"], (spec["draft_graphs"], graph_run["draft_graphs"])
+        # every proposal of the graphs run replayed a captured draft, or the graphs prove nothing
+        assert graph_run["draft_graph_replays"] == graph_run["verify_steps"], graph_run
+        assert graph_run["outputs"] == spec["outputs"] and graph_run["verify_steps"] == spec["verify_steps"], (
+            "the draft graphs changed the run")
+        # rejection sampling can hide a draft difference behind an identical output, so compare the
+        # drafts per step: across runs within the eager head's top-3, and against the eager draft the
+        # recorder drafted on the replay's own inputs, where the same kernels must agree exactly
+        assert len(graph_run["proposals"]) == len(spec["proposals"]), (len(graph_run["proposals"]), len(spec["proposals"]))
+        for call, replayed in zip(spec["proposals"], graph_run["proposals"]):
+            eager = {uid: (pending, steps, drafts) for uid, pending, steps, drafts, _ in call}
+            graph = {uid: (pending, steps, drafts, same) for uid, pending, steps, drafts, same in replayed}
+            assert eager.keys() == graph.keys(), (eager.keys(), graph.keys())
+            for uid, (pending, steps, drafts) in eager.items():
+                assert graph[uid][0] == pending, (uid, pending, graph[uid][0])
+                same_steps, same = graph[uid][1], graph[uid][3]
+                assert same is not None, (uid, "a proposal did not replay")
+                for step, (a, b) in enumerate(zip(drafts, graph[uid][2])):
+                    ids, vals = steps[step]
+                    ulp = 2.0 ** (math.floor(math.log2(abs(vals[0]) or 1.0)) - 10)
+                    by_id = dict(zip(ids, vals))
+                    pair = {a, b}
+                    assert pair <= set(by_id) and max(by_id[t] for t in pair) - min(by_id[t] for t in pair) <= 2 * ulp, (
+                        uid, step, a, b, ids, vals)
+                    if b != same[step]:
+                        ids, vals = same_steps[step]
+                        ulp = 2.0 ** (math.floor(math.log2(abs(vals[0]) or 1.0)) - 10)
+                        by_id = dict(zip(ids, vals))
+                        pair = {b, same[step]}
+                        assert pair <= set(by_id) and max(by_id[t] for t in pair) - min(by_id[t] for t in pair) <= 2 * ulp, (
+                            uid, step, b, same[step], ids, vals)
         # the draft must earn its keep: its own head produced every draft (k per proposal), and each
         # forward read the target's slabs through the view (3 SWA layers -> 2, the full layer -> 3)
         assert spec["proposals"] and spec["draft"]["head_calls"] == len(spec["proposals"]) * K, spec["draft"]
@@ -605,7 +700,7 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, monkeypatch,
         # not be that row's argmax, and a row whose candidates sit within two fp16 ulps may still
         # flip under the head's own tiling
         for call in spec["proposals"]:
-            for uid, pending, steps in call:
+            for uid, pending, steps, _, _ in call:
                 if spec["penalties"][uid]:
                     continue
                 for ids, vals in steps:
@@ -618,24 +713,61 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, monkeypatch,
         last_swa, last_full = max(swa), cfg["num_hidden_layers"] - 1
         reads = dict(spec["draft"]["reads"])
         assert set(reads) == {last_swa, last_full} and reads[last_swa] == (DRAFT_LAYERS - 1) * reads[last_full], reads
-    agreed = 0
-    for uid, (want, got) in enumerate(zip(reference["outputs"], spec["outputs"])):
-        assert len(got) == len(want)
-        split = next((i for i, (a, b) in enumerate(zip(want, got)) if a != b), len(want))
-        agreed += split
-        if split < len(want):
-            # same prefix, so both runs must hold the two tokens inside one top-3 tie within two fp16
-            # ulps: verify's differently-shaped GEMMs can reorder a third candidate an ulp behind
-            pair = {want[split], got[split]}
-            for run in (reference, spec):
-                a, b, c, va, vb, vc = next(t[2:] for t in run["top3"] if t[:2] == [uid, split])
-                ulp = 2.0 ** (math.floor(math.log2(abs(va) or 1.0)) - 10)
-                by_id = {a: va, b: vb, c: vc}
-                assert pair <= set(by_id) and max(by_id[t] for t in pair) - min(by_id[t] for t in pair) <= 2 * ulp, (
-                    f"request {uid} parts at {split}: top-3 {(a, va), (b, vb), (c, vc)}")
-    # most of the run must still be compared, or a tie early in every request would hide a bug
-    assert agreed >= 0.5 * sum(map(len, reference["outputs"]))
-    assert spec["verify_steps"] > 0
+        # a random-weight assistant: unlike the identity it drafts from the target window, the pending
+        # token and the embedding, so a replay that reads the wrong attention inputs cannot pass
+        rand = _run(model, str(tmp_path / "spec-random.json"), decode, speculative_algorithm=algorithm,
+                    speculative_num_steps=K, draft_graphs=False, **random_draft, **extra, **kwargs)
+        rand_graphs = _run(model, str(tmp_path / "spec-random-graphs.json"), decode, speculative_algorithm=algorithm,
+                           speculative_num_steps=K, **random_draft, **extra, **kwargs)
+        assert rand["draft_graphs"] == [] and rand_graphs["draft_graphs"], (rand["draft_graphs"], rand_graphs["draft_graphs"])
+        assert rand_graphs["draft_graph_replays"] == rand_graphs["verify_steps"], rand_graphs
+        assert rand_graphs["outputs"] == rand["outputs"] and rand_graphs["verify_steps"] == rand["verify_steps"], (
+            "the random-weight draft graphs changed the run")
+        assert len(rand_graphs["proposals"]) == len(rand["proposals"])
+        for replayed in rand_graphs["proposals"]:
+            for uid, pending, steps, drafts, same in replayed:
+                assert same is not None, (uid, "a random-weight proposal did not replay")
+                for step, (a, b) in enumerate(zip(drafts, same)):
+                    if a == b:
+                        continue
+                    # the same kernels on the same inputs only part at an argmax tie, which the eager
+                    # head's own top-3 at that step has to show within two fp16 ulps
+                    ids, vals = steps[step]
+                    ulp = 2.0 ** (math.floor(math.log2(abs(vals[0]) or 1.0)) - 10)
+                    by_id = dict(zip(ids, vals))
+                    pair = {a, b}
+                    assert pair <= set(by_id) and max(by_id[t] for t in pair) - min(by_id[t] for t in pair) <= 2 * ulp, (
+                        uid, step, a, b, ids, vals)
+        # the two assistants share the embedding, the output table and every norm, so only the tensors
+        # random_weights writes make the random drafts differ; if a writer change dropped them the
+        # random run would be a clone of the identity run and every check above would still pass.
+        # compare the first proposal's draft ids (every request row's k drafts): a clone makes them equal
+        identity_ids = [t for call in spec["proposals"][:1] for _, _, _, drafts, _ in call for t in drafts]
+        random_ids = [t for call in rand["proposals"][:1] for _, _, _, drafts, _ in call for t in drafts]
+        assert len(identity_ids) == len(random_ids) > 0, (identity_ids, random_ids)
+        assert any(a != b for a, b in zip(identity_ids, random_ids)), (identity_ids, random_ids)
+    compared = [(spec, "spec")]
+    if algorithm == "mtp" and family == "gemma4":
+        compared.append((rand, "random"))
+    for result, label in compared:
+        agreed = 0
+        for uid, (want, got) in enumerate(zip(reference["outputs"], result["outputs"])):
+            assert len(got) == len(want)
+            split = next((i for i, (a, b) in enumerate(zip(want, got)) if a != b), len(want))
+            agreed += split
+            if split < len(want):
+                # same prefix, so both runs must hold the two tokens inside one top-3 tie within two fp16
+                # ulps: verify's differently-shaped GEMMs can reorder a third candidate an ulp behind
+                pair = {want[split], got[split]}
+                for run in (reference, result):
+                    a, b, c, va, vb, vc = next(t[2:] for t in run["top3"] if t[:2] == [uid, split])
+                    ulp = 2.0 ** (math.floor(math.log2(abs(va) or 1.0)) - 10)
+                    by_id = {a: va, b: vb, c: vc}
+                    assert pair <= set(by_id) and max(by_id[t] for t in pair) - min(by_id[t] for t in pair) <= 2 * ulp, (
+                        f"{label} request {uid} parts at {split}: top-3 {(a, va), (b, vb), (c, vc)}")
+        # most of the run must still be compared, or a tie early in every request would hide a bug
+        assert agreed >= 0.5 * sum(map(len, reference["outputs"]))
+        assert result["verify_steps"] > 0
     if algorithm == "dflash":
         # the draft's context window rides the target's GDN slots: per slot, rows of the draft width covering its 16-position window and a block
         window = spec["window"]

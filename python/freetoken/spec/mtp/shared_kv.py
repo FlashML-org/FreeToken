@@ -80,6 +80,11 @@ class ReadOnlyTargetKVView(BaseKVCachePool):
         return self._target.translate_loc_from_full_to_swa(out_loc)
 
     @property
+    def full_to_swa_map(self) -> torch.Tensor:
+        """The dense full->swa slot table, which the draft's gather reads in the graph (paged SWA targets only)."""
+        return self._target.full_to_swa_index_mapping
+
+    @property
     def device(self) -> torch.device:
         return self._target.device
 
