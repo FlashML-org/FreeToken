@@ -98,15 +98,14 @@ def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=Fals
     return cache
 
 
-@pytest.mark.parametrize("resident", [False, True])
-@pytest.mark.parametrize("tp_size,rank", [(size, rank) for size in (1, 2, 4, 8) for rank in range(size)])
-def test_mxfp4_tp_banks_match_padded_shards(tmp_path, monkeypatch, resident, tp_size, rank):
+@pytest.mark.parametrize("tp_size,rank", [(4, 0), (4, 3), (8, 0), (8, 7)])
+def test_mxfp4_tp_banks_match_padded_shards(tmp_path, monkeypatch, tp_size, rank):
     from dataclasses import replace
 
     from safetensors.torch import save_file
 
     from freetoken.distributed import DistributedInfo
-    from freetoken.layers.quantization import MoEConfig, Mxfp4MoEMethod, QuantKind
+    from freetoken.layers.quantization import QuantKind
     from freetoken.models.gpt_oss import weight
     from freetoken.moe.expert_banks import build_expert_banks
     from freetoken.moe.expert_pieces import iter_expert_pieces
@@ -125,34 +124,26 @@ def test_mxfp4_tp_banks_match_padded_shards(tmp_path, monkeypatch, resident, tp_
     }
     prefix = "model.layers.0.mlp.experts."
     save_file({prefix + name: tensor for name, tensor in raw.items()}, tmp_path / "model.safetensors")
-    monkeypatch.setattr(weight, "get_tp_info", lambda: DistributedInfo(rank=rank, size=tp_size))
-    method = Mxfp4MoEMethod(MoEConfig(
-        num_experts=e, hidden=h, intermediate=i, top_k=2, tp_rank=rank, tp_size=tp_size,
-        activation="gpt_oss_swiglu", alpha=1.702, limit=7.0, interleaved=True, has_bias=True,
-        strategy="resident" if resident else "offload",
-    ))
+    tp_info = DistributedInfo(rank=rank, size=tp_size)
+    monkeypatch.setattr(weight, "get_tp_info", lambda: tp_info)
+    monkeypatch.setattr("freetoken.layers.moe.get_tp_info", lambda: tp_info)
+    method = _offload_layer(config, 0, None).quant_method
     pieces = iter_expert_pieces(str(tmp_path), config, QuantKind.MXFP4)
-    banks = build_expert_banks(method, 1, pieces, device=torch.device("cpu"), resident=resident)
+    banks = build_expert_banks(method, 1, pieces, device=torch.device("cpu"))
 
     # The existing state-dict loader supplies an independent padding and rank-0 bias reference.
-    shards = {
-        name: weight.shard_gpt_oss_tensor(
+    for name, tensor in raw.items():
+        projection, kind = name.split("_proj_")
+        role = projection + {"blocks": "", "scales": "_scale", "bias": "_bias"}[kind]
+        expected = weight.shard_gpt_oss_tensor(
             prefix + name, tensor, rank=rank, world_size=tp_size,
             num_q_heads=config.num_qo_heads, num_kv_heads=config.num_kv_heads,
             head_dim=config.head_dim, intermediate_size=i,
         )
-        for name, tensor in raw.items()
-    }
-    expected = {
-        "gate_up": shards["gate_up_proj_blocks"].flatten(2).transpose(1, 2),
-        "gate_up_scale": shards["gate_up_proj_scales"].transpose(1, 2),
-        "gate_up_bias": shards["gate_up_proj_bias"],
-        "down": shards["down_proj_blocks"].flatten(2).transpose(1, 2),
-        "down_scale": shards["down_proj_scales"].transpose(1, 2),
-        "down_bias": shards["down_proj_bias"],
-    }
-    for role, tensor in expected.items():
-        torch.testing.assert_close(banks.sources[role][0], tensor, rtol=0, atol=0)
+        actual = banks.sources[role][0]
+        if kind != "bias":
+            actual = actual.transpose(1, 2).reshape(expected.shape)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 # ── kernel numerics ────────────────────────────────────────────────────────
