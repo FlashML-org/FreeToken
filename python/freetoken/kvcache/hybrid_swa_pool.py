@@ -87,6 +87,7 @@ class HybridSWAKVCache(BaseKVCachePool):
             "swa": self.swa_kv_pool,
         }
         self.layers_mapping = self._build_layers_mapping(num_layers, specs)
+        self._shared_layers = frozenset(layer_id for spec in specs.values() for layer_id, _ in spec.shared_layers)
         if self._swa_paged:
             self._init_swa_paged_state()
 
@@ -116,6 +117,11 @@ class HybridSWAKVCache(BaseKVCachePool):
                 if mapping[layer_id] is not None:
                     raise ValueError(f"KV layer id {layer_id} appears in more than one group")
                 mapping[layer_id] = _LayerRef(group=group_name, index=local_index)
+        for group_name in ("full", "swa"):
+            for layer_id, source in specs[group_name].shared_layers:
+                if source not in specs[group_name].layer_ids or mapping[layer_id] is not None:
+                    raise ValueError(f"KV-shared layer {layer_id} cannot read layer {source}'s {group_name} slab")
+                mapping[layer_id] = mapping[source]
 
         missing = [layer_id for layer_id, ref in enumerate(mapping) if ref is None]
         if missing:
@@ -220,6 +226,8 @@ class HybridSWAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
+        if layer_id in self._shared_layers:
+            return  # its source layer stored these rows earlier in the same forward
         ref = self.layers_mapping[layer_id]
         storage = self._storages[ref.group]
         indices = out_loc
