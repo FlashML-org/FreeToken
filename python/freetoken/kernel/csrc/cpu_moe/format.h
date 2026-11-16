@@ -20,9 +20,10 @@ namespace freetoken::cpu_moe {
 // One worker per *physical* core, pinned, is the sweet spot; SMT oversubscription
 // thrashes the spin-barrier. Deferred (not worth it here / for this workload):
 //   - AMX-bf16: a GEMM tile engine; decode is M=1 GEMV so tiles sit idle. It would
-//     only pay off in a grouped/batched (dedup) path.
-//   - expert dedup for bs>1: read each distinct expert once and GEMM its tokens.
-//     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
+//     only pay off in a grouped/batched (multi-token) path.
+//   - multi-token kernels for bs>1: the executor groups a step's routes by expert, so a
+//     shared expert's block comes from DRAM once, but each token still decodes it. Decoding
+//     once for several tokens only pays off where decode, not bandwidth, bounds the GEMV.
 //   - NUMA: a single node is assumed. Multi-socket machines would split each
 //     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int kRowBlock = 32;
