@@ -61,6 +61,7 @@ _LAYER_TENSORS = {
     "ffn_down.weight": "mlp.down_proj.weight",
 }
 _CODEBOOKS = ("candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook")
+_PACKED = (("qkv_proj", ("q_proj", "k_proj", "v_proj")), ("gate_up_proj", ("gate_proj", "up_proj")))
 
 
 def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
@@ -108,9 +109,6 @@ def parse_gguf_config(model_path: str) -> DFlashDraftConfig:
     scaling = sorted(key for key in md if key.startswith("dflash.rope.scaling."))
     if scaling:
         raise ValueError(f"{model_path}: DFlash drafts with rope scaling ({scaling[0]}) are not supported")
-    sections = md.get("dflash.rope.dimension_sections")
-    if sections is not None and any(int(s) for s in sections):
-        raise ValueError(f"{model_path}: DFlash drafts with rope dimension sections {list(sections)} are not supported")
 
     taps = [int(i) for i in g("target_layers")]
     if not taps:
@@ -126,6 +124,10 @@ def parse_gguf_config(model_path: str) -> DFlashDraftConfig:
     if codebook is None:
         raise ValueError(f"{model_path}: GGUF lacks the selector_predecessor codebook")
     head_dim = int(g("attention.key_length"))
+    sections = [int(s) for s in md.get("dflash.rope.dimension_sections", ())]
+    # llama.cpp writes [head_dim / 2, 0, 0, 0] for an M-RoPE target; for text that is plain NeoX rope
+    if any(sections) and sections != [head_dim // 2] + [0] * (len(sections) - 1):
+        raise ValueError(f"{model_path}: DFlash drafts with rope dimension sections {sections} are not supported")
     if "dflash.rope.dimension_count" in md:
         dimension_count = int(md["dflash.rope.dimension_count"])
         if dimension_count <= 0:
@@ -229,11 +231,12 @@ def kv_context_weights(model_path: str, config: DFlashDraftConfig, device: torch
     return torch.stack(rows).to(device=device, dtype=dtype)
 
 
-def gguf_quant(model_path: str):
-    """The file's GGUFConfig under this family's names; the draft spec stays out of the servable registry."""
-    from freetoken.models.register import _DFLASH_GGUF_DRAFT, checkpoint_quant_config
+def gguf_quant(model_path: str) -> GGUFConfig:
+    """The draft's quant over its own tensor table."""
+    from freetoken.layers.quantization import GGUFConfig, NameMap
 
-    return checkpoint_quant_config(model_path, SimpleNamespace(model_path=model_path), _DFLASH_GGUF_DRAFT)
+    types = {name: info.ggml_type for name, info in gguf_tensor_index(model_path).items()}
+    return GGUFConfig(types, to_gguf, name_map=NameMap(packed=_PACKED))
 
 
 __all__ = ["gguf_quant", "iter_gguf_weights", "kv_context_weights", "parse_gguf_config", "to_gguf"]

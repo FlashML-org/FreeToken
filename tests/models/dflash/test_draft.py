@@ -102,19 +102,21 @@ def _draft_tensor_names() -> dict[str, str]:
 _DRAFT_TENSORS = _draft_tensor_names()
 
 
-def _tiny_gguf(directory, plain: dict[str, torch.Tensor], *, q8: bool):
+def _tiny_gguf(directory, plain: dict[str, torch.Tensor], *, q8: bool, fc_q8: bool = False, rope_sections=None):
     """Write the tiny draft as a GGUF under the real file's names; returns its path and the tensor-name map.
 
     ``q8`` quantizes every matrix (the codebooks too) and leaves norms and conv bases F32. The context
-    projection stays BF16 so the block test's exact context-row assertion compares like with like. Only the q
-    and gate parts are Q4_0 (k, v and up stay Q8_0), so those fused modules split into ``weight`` / ``weight_1``."""
+    projection stays BF16 unless ``fc_q8``, so the block test's exact context-row assertion compares like with
+    like while the oracle test can run it through ggml. Only the q and gate parts are Q4_0 (k, v and up stay
+    Q8_0), so those fused modules split into ``weight`` / ``weight_1``."""
     directory.mkdir(parents=True, exist_ok=True)
     model_path = str(directory / "draft.gguf")
     tensors = {gguf: plain[hf] for gguf, hf in _DRAFT_TENSORS.items()}
     rank = plain["candidate_selector.predecessor_codebook"].shape[1]
     if q8:
         types = {name: _writer.F32 if name.endswith(("norm.weight", "conv_base")) else _writer.Q8_0 for name in tensors}
-        types["fc.weight"] = _writer.BF16
+        if not fc_q8:
+            types["fc.weight"] = _writer.BF16
         types["blk.0.attn_q.weight"] = _writer.Q4_0
         types["blk.1.ffn_gate.weight"] = _writer.Q4_0
     else:
@@ -131,17 +133,19 @@ def _tiny_gguf(directory, plain: dict[str, torch.Tensor], *, q8: bool):
         "target_layers": [3, 2], "tokenizer.ggml.tokens": [f"t{i}" for i in range(VOCAB)],
         "tokenizer.ggml.mask_token_id": MASK,
     }
+    if rope_sections is not None:
+        metadata["rope.dimension_sections"] = rope_sections
     _writer._write_gguf(directory / "draft.gguf", "dflash", metadata, {
         name: (types[name], tuple(reversed(t.shape)), _writer._gguf_bytes(t, types[name])) for name, t in tensors.items()})
     return model_path, _DRAFT_TENSORS
 
 
-def _quantized_weights(directory, w: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _quantized_weights(directory, w: dict[str, torch.Tensor], *, fc_q8: bool = False) -> dict[str, torch.Tensor]:
     """The tiny Q8_0 GGUF's own values as a float state dict, for an oracle that holds no pre-quantization weights."""
     from freetoken.models.gguf.reader import gguf_tensor_index
     from freetoken.models.gguf.tensors import dequantized_tensor
 
-    path, names = _tiny_gguf(directory, {n: t for n, t in w.items() if not n.startswith("target.")}, q8=True)
+    path, names = _tiny_gguf(directory, {n: t for n, t in w.items() if not n.startswith("target.")}, q8=True, fc_q8=fc_q8)
     index = gguf_tensor_index(path)
     out = {hf: dequantized_tensor(index[gguf]) for gguf, hf in names.items()}
     out.update({n: t for n, t in w.items() if n.startswith("target.")})
@@ -161,8 +165,8 @@ def _load_draft(tmp_path, w: dict[str, torch.Tensor], dtype=torch.bfloat16, sour
     path.mkdir(parents=True)
     plain = {name: t for name, t in w.items() if not name.startswith("target.")}
     rank = plain["candidate_selector.predecessor_codebook"].shape[1]
-    if source in ("gguf", "gguf-q8"):
-        model_path, _names = _tiny_gguf(path, plain, q8=source == "gguf-q8")
+    if source in ("gguf", "gguf-q8", "gguf-q8-fc"):
+        model_path, _names = _tiny_gguf(path, plain, q8=source != "gguf", fc_q8=source == "gguf-q8-fc")
         config = parse_gguf_config(model_path)
         assert config.target_layer_ids == (2, 1) and config.mask_token_id == MASK
         assert config.num_target_layers is None and config.vocab_size == VOCAB
@@ -277,6 +281,25 @@ class _Reference:
         return torch.stack(tokens, 1), torch.stack(qs, 1)
 
 
+@pytest.mark.parametrize("sections, accepted", [
+    # llama.cpp records an M-RoPE target's text-only layout this way; for text it is plain NeoX rope
+    ([HEAD_DIM // 2, 0, 0, 0], True),
+    # a split into nonzero parts needs the M-RoPE path the draft does not have
+    ([HEAD_DIM // 4, HEAD_DIM // 4, 0, 0], False),
+])
+def test_gguf_rope_dimension_sections(tmp_path, sections, accepted):
+    """The draft's GGUF accepts the degenerate sections llama.cpp writes for an M-RoPE target's text, and still refuses a genuinely split head."""
+    from freetoken.models.dflash import parse_gguf_config
+
+    plain = {name: t for name, t in _weights().items() if not name.startswith("target.")}
+    model_path, _ = _tiny_gguf(tmp_path, plain, q8=False, rope_sections=sections)
+    if accepted:
+        assert parse_gguf_config(model_path).head_dim == HEAD_DIM
+    else:
+        with pytest.raises(ValueError, match="rope dimension sections"):
+            parse_gguf_config(model_path)
+
+
 @pytest.mark.parametrize("dtype, source, tol", [
     (torch.float32, "safetensors", 2**-6),
     (torch.bfloat16, "safetensors", 2**-2),
@@ -355,11 +378,13 @@ def test_sample_path_walks_the_selector_lattice(tmp_path, source):
     assert not torch.isclose(q[3].sum(-1), torch.ones(block - 1, device=DEV)).any()
 
 
-def test_a_quantized_gguf_load_matches_the_dequantized_float_draft(tmp_path):
-    """The Q8_0/Q4_0 draft against a safetensors draft holding the GGUF's own dequantized tensors, an oracle that never sees the pre-quantization weights: the K/V rows and codebooks must match bitwise, and one block forward must stay within 15% L2, the 8-bit activation blocks (1/254 of each block's max) rounding through the draft's layers."""
+@pytest.mark.parametrize("fc_q8", [False, True])
+def test_a_quantized_gguf_load_matches_the_dequantized_float_draft(tmp_path, fc_q8):
+    """The Q8_0/Q4_0 draft against a safetensors draft holding the GGUF's own dequantized tensors, an oracle that never sees the pre-quantization weights: the K/V rows and codebooks must match bitwise, and one block forward must stay within 15% L2, the 8-bit activation blocks (1/254 of each block's max) rounding through the draft's layers. With ``fc_q8`` the context projection is Q8_0 too, so its ggml kernel runs against the oracle's float fc."""
+    source = "gguf-q8-fc" if fc_q8 else "gguf-q8"
     w = _weights(Q8_RANK, Q8_SEED)
-    quantized = _load_draft(tmp_path, w, torch.bfloat16, "gguf-q8")
-    floated = _load_draft(tmp_path / "float", _quantized_weights(tmp_path / "oracle", w), torch.bfloat16, "safetensors")
+    quantized = _load_draft(tmp_path, w, torch.bfloat16, source)
+    floated = _load_draft(tmp_path / "float", _quantized_weights(tmp_path / "oracle", w, fc_q8=fc_q8), torch.bfloat16, "safetensors")
     assert torch.equal(quantized._kv_all, floated._kv_all)
     for name in ("predecessor_codebook", "successor_codebook"):
         assert torch.equal(getattr(quantized.candidate_selector, name), getattr(floated.candidate_selector, name))

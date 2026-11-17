@@ -165,11 +165,9 @@ class DFlashProposer(Proposer):
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._inject_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         state = self.draft.state_dict()
-        # a GGUF with packed linears: numel counts bytes, so label it as packed instead of params
-        size = sum(t.numel() for t in state.values())
-        unit = "packed bytes" if any(t.dtype is torch.uint8 for t in state.values()) else "params"
+        size = sum(t.nbytes for t in state.values()) / 2**20
         logger.info_rank0(
-            f"speculative decoding: DFlash 2 draft {path} resident ({size / 1e6:.0f}M {unit}, {c.num_layers} layers, "
+            f"speculative decoding: DFlash 2 draft {path} resident ({size:.0f} MiB, {c.num_layers} layers, "
             f"window {c.window}, block {self.block}, top-{c.selector_top_k} selector, features of target layers {list(self.taps)})"
         )
 

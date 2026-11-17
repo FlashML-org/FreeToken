@@ -15,7 +15,7 @@ from freetoken.kernel.backend import is_flashinfer_installed
 from freetoken.kernel.triton.dflash import grouped_conv, norm_rope_store, ring_attention, ring_attention_workspace, selector_walk
 from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
 from freetoken.layers.base import BaseOP
-from freetoken.layers.quantization import NoQuantConfig, QuantConfig, finalize_quant
+from freetoken.layers.quantization import NoQuantConfig, QuantConfig, QuantKind, finalize_quant
 from freetoken.models.blocks import GatedMLP
 from freetoken.models.gguf.reader import is_gguf_path
 from freetoken.utils import cached_load_hf_config, torch_dtype
@@ -130,8 +130,9 @@ class DFlash2DraftModel(BaseOP):
         with torch.device("meta"), torch_dtype(dtype):
             draft = cls(config, target_model, quant)
         expected = draft.state_dict()
-        # all layers' q|k|v weights in one tensor: each layer uses its own slice, the context projection the K/V rows of every layer; a GGUF fuses q|k|v itself, at the file's ggml types
-        qkv = None if gguf else torch.empty(config.num_layers, *expected["layers.0.self_attn.qkv_proj.weight"].shape, dtype=dtype, device=device)
+        float_qkv = all(layer.self_attn.qkv_proj.quant_method.kind is QuantKind.NONE for layer in draft.layers.op_list)
+        # all layers' q|k|v weights in one tensor: each layer uses its own slice, the context projection the K/V rows of every layer; a quantized GGUF fuses q|k|v at the file's ggml types, so only a float qkv shares the buffer
+        qkv = torch.empty(config.num_layers, *expected["layers.0.self_attn.qkv_proj.weight"].shape, dtype=dtype, device=device) if float_qkv else None
         qkv_slices = {} if qkv is None else {f"layers.{i}.self_attn.qkv_proj.weight": w for i, w in enumerate(qkv)}
         loaded = {}
         for name, tensor in weights:
@@ -148,7 +149,7 @@ class DFlash2DraftModel(BaseOP):
         for op in (draft.fc, draft.layers, draft.candidate_selector):
             finalize_quant(op)
         layers = draft.layers.op_list
-        draft._kv_all = kv_context_weights(model_path, config, device, dtype) if gguf else qkv[:, layers[0].self_attn.q_size :]
+        draft._kv_all = qkv[:, layers[0].self_attn.q_size :] if float_qkv else kv_context_weights(model_path, config, device, dtype)
         draft._k_norms = torch.stack([layer.self_attn.k_norm.weight for layer in layers]).contiguous()
         draft._mask_embedding = draft._embed_tokens.forward(torch.tensor([config.mask_token_id], device=device))[0]
         return draft
