@@ -39,8 +39,15 @@ def test_prefill_and_decode(checkpoint):
         assert out.shape == (2, VOCAB) and torch.isfinite(out).all()
 
 
-def test_gguf_forward_matches_the_checkpoint(tmp_path):
-    """The same bf16 weights through the GGUF reader and the HF reader give the same logits, with non-zero Engram rows and random q / k gate weights so the file's stored product and ``wkv`` count."""
+@pytest.mark.parametrize("wo_a_type", ["BF16", "Q8_0"])
+def test_gguf_forward_matches_the_checkpoint(tmp_path, wo_a_type):
+    """The same bf16 weights through the GGUF reader and the HF reader give the same logits, with non-zero Engram rows and random q / k gate weights so the file's stored product and ``wkv`` count.
+
+    A Q8_0 ``wo_a`` stays packed: decode runs its groups as ggml experts (MMVQ), the 300-token prefill dequantizes it for the einsum. The HF
+    side reads the values its blocks decode to, so prefill matches exactly and decode differs only by the q8_1 rounding of the activation."""
+    from safetensors.torch import load_file, save_file
+
+    from .common import _pack_q8_0
     from .harness import TinyEngine
 
     class Rows:
@@ -52,7 +59,11 @@ def test_gguf_forward_matches_the_checkpoint(tmp_path):
 
     folder, path = str(tmp_path / "hf"), str(tmp_path / "tiny.gguf")
     write_tiny_checkpoint(folder, random_gate=True)
-    write_tiny_gguf(path, random_gate=True)
+    write_tiny_gguf(path, random_gate=True, wo_a_type=wo_a_type)
+    if wo_a_type == "Q8_0":
+        shard = f"{folder}/model-00001-of-00001.safetensors"
+        tensors = load_file(shard)
+        save_file({k: _pack_q8_0(v)[1].to(v.dtype) if k.endswith(".attn.wo_a.weight") else v for k, v in tensors.items()}, shard)
     engines = [TinyEngine(c, max_seq_len=1024, max_running_req=2, swa_decoder_replay="exact", engram_table=Rows(192)) for c in (folder, path)]
     reqs = [e.new_request(0, _tokens(300, 1)) for e in engines]
     logits = [e.prefill([r]) for e, r in zip(engines, reqs)]

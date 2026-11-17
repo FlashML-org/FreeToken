@@ -31,7 +31,8 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import GEMV_MAX_M, dequant_block_fp8, grouped_w8a16_gemv
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.quantization import QuantKind
-from freetoken.layers.quantization.scheme import fp8_block_size
+from freetoken.layers.quantization.ggml_types import row_bytes
+from freetoken.layers.quantization.scheme import fp8_block_size, gguf_types
 
 from .args import DeepseekV41Args, LayerRole, Mode
 from .compressor import Compressor
@@ -63,10 +64,15 @@ class DSV41Attention(BaseOP):
         # bf16 copy in VRAM. An unquantized checkpoint ships it bf16.
         wo_a_scheme = quant_config.scheme_for(f"{prefix}.wo_a") if quant_config is not None else None
         self._wo_a_block = fp8_block_size(wo_a_scheme) if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.FP8_BLOCK else None
+        # A quantized GGUF wo_a keeps its packed ggml rows the same way: decode multiplies the groups as experts in ggml's MMVQ
+        self._wo_a_ggml = gguf_types(wo_a_scheme)[0] if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.GGUF else None
+        self._wo_a_ids: torch.Tensor | None = None
         rows, cols = args.o_groups * args.o_lora_rank, args.n_heads * args.head_dim // args.o_groups
         if self._wo_a_block is not None:
             self.wo_a = torch.empty(rows, cols, dtype=torch.float8_e4m3fn)
             self.wo_a_scale = torch.empty(rows // self._wo_a_block, cols // self._wo_a_block, dtype=torch.float8_e8m0fnu)
+        elif self._wo_a_ggml is not None:
+            self.wo_a = torch.empty(rows, row_bytes(self._wo_a_ggml, cols), dtype=torch.uint8)
         else:
             self.wo_a = torch.empty(rows, cols, dtype=torch.bfloat16)
         self.wo_b = LinearReplicated(args.o_groups * args.o_lora_rank, args.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
@@ -91,6 +97,8 @@ class DSV41Attention(BaseOP):
     def bind(self, device: torch.device, tables: dict | None = None) -> None:
         """Attach the RoPE table; ``tables`` (key -> table) lets the model share one table per key
         instead of every layer holding its own ``[max_seq_len, rd // 2]`` copy."""
+        if self._wo_a_ggml is not None:
+            self._wo_a_ids = torch.arange(self.n_groups, dtype=torch.int32, device=device).unsqueeze(0)
         if tables is not None and self.freqs_key in tables:
             self._freqs = tables[self.freqs_key]
             return
@@ -114,13 +122,26 @@ class DSV41Attention(BaseOP):
         return self.kv_norm.forward(self.wkv.forward(x))
 
     def _wo(self, o: torch.Tensor) -> torch.Tensor:
-        """``wo_b(wo_a(o))``: up to ``GEMV_MAX_M`` rows the grouped W8A16 GEMV over the fp8 payload, else the
-        reference's grouped einsum over the bf16 (or dequantized) ``wo_a``."""
+        """``wo_b(wo_a(o))``: while the vector kernels take the rows, a quantized ``wo_a`` is read in place (the grouped W8A16
+        GEMV over the fp8 payload, or ggml's ``mul_mat_id`` MMVQ over a GGUF's blocks with group ``g`` as expert ``g``);
+        above that, the reference's grouped einsum over the bf16 (or dequantized) ``wo_a``."""
         t = o.shape[0]
         o = o.reshape(t, self.n_groups, -1)
         if self._wo_a_block is not None and t <= GEMV_MAX_M:
             return self.wo_b.forward(grouped_w8a16_gemv(o, self.wo_a, self.wo_a_scale, block=self._wo_a_block))
-        wo_a = self.wo_a if self._wo_a_block is None else dequant_block_fp8(self.wo_a, self.wo_a_scale, block=self._wo_a_block)
+        wo_a = self.wo_a
+        if self._wo_a_ggml is not None:
+            from freetoken.kernel import ggml
+
+            if t <= ggml.mmvq_max_tokens(self._wo_a_ggml):
+                assert self._wo_a_ids is not None, "attention layer is not bound (call bind first)"
+                ids = self._wo_a_ids.expand(t, -1).contiguous()
+                w = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
+                return self.wo_b.forward(ggml.mul_mat_id(w, self._wo_a_ggml, o, ids).flatten(1))
+            # above that, dequantize for the reference einsum: MMQ over 8 groups wins only on short chunks, not prefill-sized ones
+            wo_a = ggml.dequantize(self.wo_a, self._wo_a_ggml, o.shape[-1])
+        elif self._wo_a_block is not None:
+            wo_a = dequant_block_fp8(self.wo_a, self.wo_a_scale, block=self._wo_a_block)
         return self.wo_b.forward(torch.einsum("tgd,grd->tgr", o, wo_a.view(self.n_groups, self.o_lora_rank, -1)).flatten(1))
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
