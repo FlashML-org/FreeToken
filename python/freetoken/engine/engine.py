@@ -241,23 +241,8 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
         )
 
 
-def _resolve_model_kv_format(config, override, fmt: KVFormat) -> None:
-    """Map ``auto`` to the model's own packed KV layout ``fmt``; any other value is an error."""
-    requested = getattr(config, "kv_cache_dtype", "auto")
-    if requested == fmt.name:
-        return
-    if requested != "auto":
-        raise ValueError(f"--kv-cache-dtype {requested}: {fmt.model} stores its KV cache only as {fmt.name}; pass {fmt.name} or auto")
-    override("kv_cache_dtype", fmt.name)
-    logger.info_rank0(f"{fmt.model} KV cache format: {fmt.name}")
-
-
 def _validate_kv_format(config, model_config) -> None:
     kv_format = getattr(config, "kv_format", NONE)
-    if kv_format.model is not None:
-        if kv_format.name not in resolve_pool_class(model_config).kv_formats:
-            raise ValueError(f"--kv-cache-dtype {kv_format.name} is the {kv_format.model} KV layout; this model does not store it")
-        return
     if not kv_format.quantized:
         return
     pool_cls = resolve_pool_class(model_config)
@@ -1641,7 +1626,8 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     args.max_seq_len = config.max_seq_len
     args.max_batch_size = config.max_running_req + 1  # +1 dummy
     args.swa_decoder_replay = config.swa_decoder_replay
-    _resolve_model_kv_format(config, override, NVFP4_DS_MLA)
+    if getattr(config, "kv_cache_dtype", "auto") == "auto":
+        override("kv_cache_dtype", NVFP4_DS_MLA.name)
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(
@@ -1673,7 +1659,8 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     model_config = config.model_config
     if (dtype := getattr(config, "dtype", None)) is not None and dtype != torch.bfloat16:
         raise ValueError(f"DeepSeek-V4 runs in bfloat16 only, got --dtype {dtype}")
-    _resolve_model_kv_format(config, override, FP8_DS_MLA)
+    if getattr(config, "kv_cache_dtype", "auto") == "auto":
+        override("kv_cache_dtype", FP8_DS_MLA.name)
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
