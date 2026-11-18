@@ -33,11 +33,11 @@ def _ctx(pool):
     return ctx
 
 
-def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192):
+def _stack(swa_decoder_replay="exact", num_pages=32, max_seq_len=8192, index_sources=()):
     from freetoken.attention.dsv41_sparse import DSV41SparseAttnBackend
 
     args = DeepseekV41Args(n_layers=len(RATIOS), head_dim=512, index_head_dim=128, window_size=P, compress_ratios=RATIOS,
-                           kv_source_layers=SOURCES, swa_decoder_replay=swa_decoder_replay)
+                           kv_source_layers=SOURCES, index_source_layers=index_sources, swa_decoder_replay=swa_decoder_replay)
     pool = DSV41PagedKVCache(dsv41_pool_sizes(num_pages + 1, args, 1.0, P), args, DEVICE, n_scratch=MRR + 1)
     pool._init_paged_state(MRR, True)
     pt = torch.zeros(MRR + 1, max_seq_len, dtype=torch.int32)
@@ -108,6 +108,70 @@ def test_prefill_metadata_short_prompt_runs_the_decoder_everywhere():
     md = batch.attn_metadata
     assert [(d.offset, d.n, d.start_pos, d.window_floor) for d in md.decoder_segments] == [(0, 50, 0, 0)]
     assert not md.decoder_pad and md.last_indices.tolist() == [49]
+
+
+def test_prefill_metadata_encoder_replay_extends_the_encoder_segment_only():
+    """An encoder bounded replay (``enc_replay_lo`` below the hit): the ENCODER segment starts at the
+    replay start, floored there, with the hit as its publish floor; the decoder pass and
+    last_indices are exactly the no-replay ones (the admission cap keeps the prompt's last window
+    past the hit, so the decoder never touches the replayed rows)."""
+    backend, _, _ = _stack("bounded")
+    req = _req(2, 384, 216, prompt_len=600)  # hit 384, chunk reaches the prompt end 600
+    req.enc_replay_lo = 384 - P
+    batch = _prefill_batch([req])
+    backend.prepare_metadata(batch)
+    md = batch.attn_metadata
+    assert [(s.offset, s.n, s.table_idx, s.start_pos, s.window_floor, s.publish_floor) for s in md.segments] == [
+        (0, 344, 2, 256, 256, 384)]
+    assert [(d.offset, d.n, d.table_idx, d.start_pos, d.window_floor) for d in md.decoder_segments] == [
+        (0, 128, 2, 472, 472)]
+    assert md.decoder_rows.tolist() == list(range(216, 344))
+    assert not md.decoder_pad and md.last_indices.tolist() == [127]
+
+
+def test_prefill_metadata_encoder_replay_under_exact_decoder_shares_the_segment():
+    """Exact decoder + bounded encoder replay: the decoder runs every chunk token, sharing the
+    replay segment; the window_floor masks reads below the replay start, which is what makes the
+    shared segment safe (those slots are dead)."""
+    backend, _, _ = _stack("exact")
+    req = _req(2, 384, 216, prompt_len=600)
+    req.enc_replay_lo = 384 - P
+    batch = _prefill_batch([req])
+    backend.prepare_metadata(batch)
+    md = batch.attn_metadata
+    assert [(s.start_pos, s.window_floor, s.publish_floor) for s in md.segments] == [(256, 256, 384)]
+    assert md.decoder_segments is md.segments and md.decoder_rows is None
+    assert md.last_indices.tolist() == [343]
+
+
+def test_publish_prefill_masks_groups_below_the_publish_floor():
+    """A replay segment re-sends the hit's last window; its groups below the hit (the publish floor)
+    must not be re-published: those shared global rows are read as-is, and the floor is group-aligned
+    (page-aligned floor, page % ratio == 0), so no group straddles it."""
+    from freetoken.attention.dsv41_sparse import PrefillSegment
+    from freetoken.models.deepseek_v41.attention import DSV41Attention
+
+    backend, pool, pt = _stack("bounded", index_sources=SOURCES)
+    args = backend.config.dsv41_args
+    get_global_ctx().attn_backend = backend  # the model layer resolves its backend per access
+    pt[2, :512] = torch.arange(512, dtype=torch.int32)  # the hit's pages
+    layer = DSV41Attention(args, args.roles[1])  # the ratio-2 Full source
+    layer._freqs = torch.ones(1024, args.rope_head_dim // 2, dtype=torch.complex64)  # CPU stand-in table
+    layer.compressor.norm.forward = lambda t: t  # the fused RMSNorm is CUDA-only; values don't matter here
+    layer.indexer.k_norm.forward = lambda t: t
+    stored = []
+    backend.compressed_rows_of = lambda ti, starts, ratio: starts  # row == group start (identity)
+    backend.store_main = lambda latent, src, rows: stored.append(("main", rows.tolist()))
+    backend.store_index = lambda k, src, rows: stored.append(("idx", rows.tolist()))
+    layer.publish_prefill(torch.randn(344, args.dim), [PrefillSegment(0, 344, 2, 256, window_floor=256, publish_floor=384)])
+    assert stored == [
+        ("idx", list(range(384, 600, 2))),  # groups [384, 600): published, keys before main
+        ("main", list(range(384, 600, 2))),
+    ]
+    # without a floor every group of the segment publishes (the pre-replay behavior)
+    stored.clear()
+    layer.publish_prefill(torch.randn(88, args.dim), [PrefillSegment(0, 88, 2, 256)])
+    assert stored == [("idx", list(range(256, 344, 2))), ("main", list(range(256, 344, 2)))]
 
 
 def test_private_window_layers_address_per_request_rings():

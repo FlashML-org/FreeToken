@@ -90,13 +90,38 @@ def test_batch_rows_follow_the_reqs_in_batch_order():
     from types import SimpleNamespace
 
     # req 1: 6 tokens, image on [2, 5); req 2: chunk [4, 10) of a prompt whose image spans [3, 8)
-    a = SimpleNamespace(uid=1, mm_items=[_item(7, [[2, 5]])], cached_len=0, device_len=6, extend_len=6)
-    b = SimpleNamespace(uid=2, mm_items=[_item(8, [[3, 8]])], cached_len=4, device_len=10, extend_len=6)
+    a = SimpleNamespace(uid=1, mm_items=[_item(7, [[2, 5]])], cached_len=0, device_len=6, extend_len=6, chunk_lo=0)
+    b = SimpleNamespace(uid=2, mm_items=[_item(8, [[3, 8]])], cached_len=4, device_len=10, extend_len=6, chunk_lo=4)
     jobs, plan, rows, block_ends = plan_mm_batch([a, b], None)
     assert [j.hash for j in jobs] == [7, 8]
     assert plan == [(1, 7, 0, 3, 3, 2), (2, 8, 1, 5, 5, 0)]
     assert rows == [2, 3, 4, 6, 7, 8, 9]  # req 2 starts at batch row 6; its image rows 1..5 land on its first four tokens
     assert block_ends == [0, 0, 5, 5, 5, 0, 8, 8, 8, 8, 0, 0]  # every image row carries its span's end in request positions
+
+
+def test_an_encoder_replay_chunk_re_gathers_image_rows_from_the_cached_item():
+    """A replay chunk starts below the hit (chunk_lo < cached_len): the rows of an image span
+    inside the replay region -- including one crossing the replay start -- are re-gathered from
+    the encoder cache item the admission registered at mm_rows_after(item, chunk_lo), with no
+    re-encode; rows and block_ends key off chunk_lo, not cached_len."""
+    from types import SimpleNamespace
+
+    cache = EncoderCache(storage="cpu")
+    item = _item(7, [[16, 26], [28, 34]])  # span A crosses the replay start 20; span B sits above it
+    req = SimpleNamespace(uid=3, mm_items=[item], cached_len=32, device_len=44, extend_len=24, chunk_lo=20)
+    cache.register(item.hash, req.uid, mm_rows_after(item, 20))
+    cache.put(item.hash, torch.ones(16, 8))
+    assert mm_rows_after(item, 20) == 12  # exactly the rows the re-gather reads
+
+    jobs, plan, rows, block_ends = plan_mm_batch([req], cache)
+    assert jobs == []  # the feature is cached: the replay re-gathers, it never re-encodes
+    assert plan == [(3, 7, 4, 10, 16, 0), (3, 7, 10, 16, 16, 8)]
+    assert rows == [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13]
+    assert block_ends == [26] * 6 + [0, 0] + [34] * 6 + [0] * 10
+
+    jobs, _, _, _ = plan_mm_batch([req], None)
+    assert [j.hash for j in jobs] == [7]  # without the cache the item would encode again
+
 
 
 def test_chunk_end_never_lands_inside_an_image_span():

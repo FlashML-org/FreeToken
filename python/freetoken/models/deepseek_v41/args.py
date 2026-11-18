@@ -125,6 +125,10 @@ class DeepseekV41Args:
     # "bounded": the decoder runs on the prompt's last window_size tokens with the sliding window
     # truncated there (Decoder SWA Bounded Replay, tech report sec. 3.2.2); "exact": on every token.
     swa_decoder_replay: Literal["bounded", "exact"] = "bounded"
+    # "bounded": a prefix hit deeper than its live encoder window KV keeps the full global-KV match
+    # and replays the hit's last window_size tokens through the encoder; "exact": the hit truncates
+    # to the windowed-safe boundary and re-prefills the tail exactly.
+    swa_encoder_replay: Literal["bounded", "exact"] = "bounded"
     roles: tuple[LayerRole, ...] = field(default_factory=tuple, repr=False)
 
     def __post_init__(self) -> None:
@@ -205,7 +209,8 @@ class DeepseekV41Args:
             raw = text.to_dict()
         else:
             raw = vars(text)
-        names = {f.name for f in cls.__dataclass_fields__.values()} - {"roles", "max_seq_len", "max_batch_size", "swa_decoder_replay"}
+        names = {f.name for f in cls.__dataclass_fields__.values()} - {
+            "roles", "max_seq_len", "max_batch_size", "swa_decoder_replay", "swa_encoder_replay"}
         kwargs: dict[str, Any] = {}
         for key, value in raw.items():
             key = _HF_TO_ARGS.get(key, key)

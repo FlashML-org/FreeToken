@@ -1,8 +1,9 @@
 # Vendored from https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash (inference/model.py), MIT License
 # (see LICENSE next to this file). FreeToken keeps this copy as the numerical ORACLE its port is tested
 # against. Edits, all marked "FreeToken:", are limited to (1) local imports with the tilelang kernels
-# replaced by the pure-torch transcriptions in kernel.py, and (2) forward_bounded(), a Decoder SWA
-# Bounded Replay oracle built from the unmodified layer math.
+# replaced by the pure-torch transcriptions in kernel.py, (2) forward_bounded(), a Decoder SWA
+# Bounded Replay oracle built from the unmodified layer math, and (3) forward_replay(), the
+# Encoder SWA Bounded Replay oracle built the same way.
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -887,6 +888,67 @@ class Attention(nn.Module):
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return self.wo_b(o.flatten(2))
 
+    # FreeToken: Encoder SWA Bounded Replay oracle. Queries are the tail rows [s, s+n) with the
+    # sliding window truncated at s (forward_tail's window handling); a kv source compresses only
+    # x_pub = the rows [pub_lo, pub_lo+m) -- the global tiers below pub_lo are read from the
+    # caches the prefix forward() populated and are never re-published.
+    def forward_replay(self, x: torch.Tensor, s: int, x_pub: torch.Tensor | None, pub_lo: int):
+        bsz, n, _ = x.size()
+        win, rd, ratio = self.window_size, self.rope_head_dim, self.compress_ratio
+        freqs_cis = self.freqs_cis[s : s + n]
+
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        apply_rotary_emb(q[..., -rd:], freqs_cis)
+
+        kv = self.kv_norm(self.wkv(x))
+        apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
+        for i in range(max(0, n - win), n):
+            self.window_kv_cache[:bsz, (s + i) % win] = kv[:, i]
+        topk_idxs = get_window_topk_idxs(win, bsz, n, 0).to(x.device)
+
+        if ratio:
+            end = s + n
+            compress_len = end // ratio
+            latent = None
+            if self.is_kv_source:
+                assert x_pub is not None, "the kv source compresses the publish span"
+                latent = self.compressor(x_pub, 0)
+                shared_attn.compress_kv = self.compress_kv_cache
+                if self.indexer is not None:
+                    if self.indexer.freqs_cis is None:
+                        self.indexer.freqs_cis = self.freqs_cis
+                    L = pub_lo + x_pub.size(1)
+                    k = self.indexer.k_norm(self.indexer.wk(latent))
+                    apply_rotary_emb(k[..., -rd:], self.freqs_cis[pub_lo : L - L % ratio : ratio])
+                    fp4_act_quant(k, fp4_block_size, True)
+                    self.indexer.k_cache[:bsz, pub_lo // ratio : pub_lo // ratio + k.size(1)] = k
+                    shared_attn.index_k = self.indexer.k_cache
+            if not self.is_index_source:
+                idxs = shared_attn.topk_idxs
+            elif compress_len == 0:
+                idxs = torch.empty(bsz, n, 0, dtype=torch.int32, device=x.device)
+            else:
+                if self.indexer.freqs_cis is None:
+                    self.indexer.freqs_cis = self.freqs_cis
+                idxs = self.indexer.forward_tail(x, qr, s, n, kv.size(1))
+                shared_attn.topk_idxs = idxs
+            if latent is not None:
+                L = pub_lo + x_pub.size(1)
+                apply_rotary_emb(latent[..., -rd:], self.freqs_cis[pub_lo : L - L % ratio : ratio])
+                fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
+                self.compress_kv_cache[:bsz, pub_lo // ratio : pub_lo // ratio + latent.size(1)] = latent
+            kv = torch.cat([kv, shared_attn.compress_kv[:bsz, :compress_len]], dim=1)
+            topk_idxs = torch.cat([topk_idxs, idxs], dim=-1)
+
+        o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        o = o.view(bsz, n, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        return self.wo_b(o.flatten(2))
+
 
 class Gate(nn.Module):
     """MoE gating. The correction bias steers expert selection only; the routing weights come from the
@@ -1107,6 +1169,28 @@ class Block(nn.Module):
             attn_pre, attn_post, attn_comb = self.hc_mixes(h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
             x = self.attn_norm(self.hc_pre(h, pre_mix))
             x = self.attn.forward_tail(x, s)
+        x = self.hc_post(x, residual, attn_post, attn_comb)
+
+        residual = x
+        ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        x = self.hc_pre(x, attn_pre)
+        x = self.ffn_norm(x)
+        x = self.ffn(x, None)
+        x = self.hc_post(x, residual, ffn_post, ffn_comb)
+        return x, ffn_pre
+
+
+    # FreeToken: Encoder SWA Bounded Replay oracle. ``h`` / ``pre_mix`` are the tail streams
+    # [s, end); a kv source publishes its global tiers from ``pub_lo`` only, and ``row_lo``
+    # narrows the attention / FFN rows to [row_lo, end) (the CED decoder source).
+    def forward_replay(self, h, s: int, pre_mix, pub_lo: int | None = None, row_lo: int | None = None):
+        attn_pre, attn_post, attn_comb = self.hc_mixes(h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        x_all = self.attn_norm(self.hc_pre(h, pre_mix))
+        head = 0 if row_lo is None else row_lo - s
+        pub = 0 if pub_lo is None else pub_lo - s
+        residual = h[:, head:]
+        attn_pre, attn_post, attn_comb = attn_pre[:, head:], attn_post[:, head:], attn_comb[:, head:]
+        x = self.attn.forward_replay(x_all[:, head:], s + head, x_all[:, pub:], s + pub)
         x = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = x
@@ -1417,6 +1501,45 @@ class Transformer(nn.Module):
                 h, pre_mix = layer.forward_tail(None, s, None, h_all=h, pre_mix_all=pre_mix)
             else:
                 h, pre_mix = layer.forward_tail(h, s, pre_mix)
+        h = layer.hc_pre(h, pre_mix)
+        return self.head(self.norm(h))
+
+    # FreeToken: Encoder SWA Bounded Replay oracle (roadmap swa-encoder-bounded-replay). The
+    # prefix forward() plays the original prefill a radix hit keeps: its GLOBAL tiers are read
+    # as-is below the hit F = len(prefix) and never re-published. The encoder then runs one
+    # bounded replay over [max(0, F - n_win), N) with every query's window truncated there; the
+    # decoder follows forward_bounded's rule (the prompt's last window), or with ``exact_decoder``
+    # runs every replay-chunk row (windows still truncated at the replay start).
+    @torch.inference_mode()
+    def forward_replay(self, prefix_ids: torch.Tensor, suffix_ids: torch.Tensor, n_win: int,
+                       exact_decoder: bool = False):
+        F = prefix_ids.size(1)
+        self.forward(prefix_ids, 0)
+        ids = torch.cat([prefix_ids, suffix_ids], dim=1)
+        N = ids.size(1)
+        s = max(0, F - n_win)  # the encoder replay start (every window truncated at s)
+        d = s if exact_decoder else max(0, N - n_win)  # the decoder's first row
+        assert s <= d <= N
+        engram_hashes = self.engram_hash(ids, 0, None) if self.engram_hash is not None else None
+        h = self.embed(ids[:, s:]).unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        pre_mix = make_identity_pre_mix(h, self.hc_mult)
+        dec_start = max(i for i, layer in enumerate(self.layers) if layer.attn.is_kv_source)
+        for i, layer in enumerate(self.layers):
+            if layer.engram is not None:
+                assert i < dec_start, "Engram sits in the encoder"
+                h = layer.engram(h, engram_hashes[:, s:][:, :, layer.engram.layer_hash_index, :], None)
+            if i < dec_start:
+                h, pre_mix = layer.forward_replay(h, s, pre_mix, pub_lo=F)
+            elif i == dec_start:
+                if exact_decoder:
+                    # the CED runs every replay-chunk row, publishing from F only
+                    h, pre_mix = layer.forward_replay(h, s, pre_mix, pub_lo=F, row_lo=s)
+                else:
+                    # the CED publishes from F (rows [F, N)) and narrows to the decoder tail [d, N)
+                    h, pre_mix = layer.forward_replay(
+                        h[:, F - s:], F, pre_mix[:, F - s:], pub_lo=F, row_lo=d)
+            else:
+                h, pre_mix = layer.forward_tail(h, d, pre_mix)
         h = layer.hc_pre(h, pre_mix)
         return self.head(self.norm(h))
 
