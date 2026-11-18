@@ -25,11 +25,12 @@ class DFlashDraftConfig:
     selector_rank: int
     conv_kernel_size: int
     conv_group_size: int
-    num_target_layers: int
+    # the target's depth; None when the checkpoint (a GGUF) does not record it
+    num_target_layers: int | None
 
 
-def parse_config(hf_config: Any) -> DFlashDraftConfig:
-    """The draft's ``config.json``; only the DFlash 2 shape (non-causal, all sliding, conv + selector, default rope) is served."""
+def parse_config(hf_config: Any, *, allow_unknown_depth: bool = False) -> DFlashDraftConfig:
+    """The draft's ``config.json``; only the DFlash 2 shape (non-causal, all sliding, conv + selector, default rope) is served. ``allow_unknown_depth`` is for GGUF metadata, which does not record the target depth."""
     archs = list(getattr(hf_config, "architectures", None) or [])
     if archs != ["DFlash2DraftModel"]:
         raise ValueError(f"expected a DFlash2DraftModel checkpoint, got architectures {archs}")
@@ -74,6 +75,12 @@ def parse_config(hf_config: Any) -> DFlashDraftConfig:
     # each tap fills its own column block of the feature buffer
     if not taps or len(set(taps)) != len(taps) or min(taps) < 0:
         raise ValueError(f"target_layer_ids {list(taps)} must be non-empty, distinct and >= 0")
+    if not hasattr(hf_config, "num_target_layers"):
+        raise ValueError("DFlash draft configs need num_target_layers (the target's depth)")
+    raw_depth = hf_config.num_target_layers
+    if raw_depth is None and not allow_unknown_depth:
+        raise ValueError("DFlash draft configs need num_target_layers (the target's depth)")
+    num_target_layers = None if raw_depth is None else int(raw_depth)
     return DFlashDraftConfig(
         hidden_size=hidden,
         num_layers=int(hf_config.num_hidden_layers),
@@ -93,5 +100,5 @@ def parse_config(hf_config: Any) -> DFlashDraftConfig:
         selector_rank=sizes["selector_rank"],
         conv_kernel_size=int(dc["conv_kernel_size"]),
         conv_group_size=group,
-        num_target_layers=int(hf_config.num_target_layers),
+        num_target_layers=num_target_layers,
     )

@@ -1,8 +1,10 @@
-"""DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint: context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates."""
+"""DFlash2DraftModel against an fp32 torch reference of the sglang DFlash 2 math, on a synthetic bf16 draft checkpoint (safetensors, a float GGUF, or a Q8_0/Q4_0 GGUF read through the ggml kernels): context rows into the per-layer K/V ring, the block forward (window mask, grouped convs, residual norms) and the selector walk over the target head's candidates."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -10,11 +12,21 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
+# tests/ is not a package, so a plain `pytest` run cannot import a sibling test by name
+_spec = importlib.util.spec_from_file_location(
+    "_qwen_gguf_writer", os.path.join(os.path.dirname(__file__), "..", "test_qwen3_5_moe_weight.py"))
+_writer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_writer)
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 DEV = torch.device("cuda")
 H, LAYERS, HEADS, KV_HEADS, HEAD_DIM, INTER = 64, 2, 4, 2, 64, 128
 GROUP_SIZE, TAPS, RANK, TOP_K, WINDOW, VOCAB, MASK = 16, (1, 2), 8, 4, 16, 64, 61
+# Q8_0 blocks are 32 values, so only the quantized fixture uses a rank its codebook rows divide
+Q8_RANK = 32
+# the q8 fixture's own draw: its wider rank already moves the stream, and this seed keeps the fixed bf16 tolerances
+Q8_SEED = 4
 RING = WINDOW + 64
 THETA, EPS = 10000.0, 1e-6
 CONFIG = {
@@ -29,9 +41,9 @@ CONFIG = {
 }
 
 
-def _weights() -> dict[str, torch.Tensor]:
+def _weights(rank: int = RANK, seed: int = 0) -> dict[str, torch.Tensor]:
     """A fan-in scaled bf16 draft plus the target's embedding and head (``target.*``, not part of the checkpoint)."""
-    g = torch.Generator().manual_seed(0)
+    g = torch.Generator().manual_seed(seed)
 
     def mat(*shape):
         return (torch.randn(*shape, generator=g) * shape[-1] ** -0.5).to(torch.bfloat16)
@@ -40,8 +52,8 @@ def _weights() -> dict[str, torch.Tensor]:
         return (1 + 0.1 * torch.randn(n, generator=g)).to(torch.bfloat16)
 
     w = {"fc.weight": mat(H, len(TAPS) * H), "hidden_norm.weight": gain(H), "norm.weight": gain(H),
-         "candidate_selector.hidden_projection.weight": mat(RANK, H),
-         "candidate_selector.predecessor_codebook": mat(VOCAB, RANK), "candidate_selector.successor_codebook": mat(VOCAB, RANK),
+         "candidate_selector.hidden_projection.weight": mat(rank, H),
+         "candidate_selector.predecessor_codebook": mat(VOCAB, rank), "candidate_selector.successor_codebook": mat(VOCAB, rank),
          "target.embed": mat(VOCAB, H), "target.head": mat(VOCAB, H)}
     for i in range(LAYERS):
         p = f"layers.{i}"
@@ -56,26 +68,121 @@ def _weights() -> dict[str, torch.Tensor]:
     return w
 
 
-def _load_draft(tmp_path, w: dict[str, torch.Tensor], dtype=torch.bfloat16):
+def _draft_tensor_names() -> dict[str, str]:
+    """GGUF tensor name -> the state-dict name the tiny draft stores it under (the real file's names)."""
+    names = {
+        "fc.weight": "fc.weight", "enc.output_norm.weight": "hidden_norm.weight",
+        "output_norm.weight": "norm.weight",
+        "selector_hidden.weight": "candidate_selector.hidden_projection.weight",
+        "selector_predecessor.weight": "candidate_selector.predecessor_codebook",
+        "selector_successor.weight": "candidate_selector.successor_codebook",
+    }
+    for i in range(LAYERS):
+        p, b = f"layers.{i}", f"blk.{i}"
+        names.update({
+            f"{b}.attn_norm.weight": f"{p}.input_layernorm.weight",
+            f"{b}.ffn_norm.weight": f"{p}.post_attention_layernorm.weight",
+            f"{b}.attn_q.weight": f"{p}.self_attn.q_proj.weight",
+            f"{b}.attn_k.weight": f"{p}.self_attn.k_proj.weight",
+            f"{b}.attn_v.weight": f"{p}.self_attn.v_proj.weight",
+            f"{b}.attn_output.weight": f"{p}.self_attn.o_proj.weight",
+            f"{b}.attn_q_norm.weight": f"{p}.self_attn.q_norm.weight",
+            f"{b}.attn_k_norm.weight": f"{p}.self_attn.k_norm.weight",
+            f"{b}.attn_conv_proj.weight": f"{p}.attention_conv.kernel_projection.weight",
+            f"{b}.attn_conv_base": f"{p}.attention_conv.base_kernel",
+            f"{b}.ffn_conv_proj.weight": f"{p}.mlp_conv.kernel_projection.weight",
+            f"{b}.ffn_conv_base": f"{p}.mlp_conv.base_kernel",
+            f"{b}.ffn_gate.weight": f"{p}.mlp.gate_proj.weight",
+            f"{b}.ffn_up.weight": f"{p}.mlp.up_proj.weight",
+            f"{b}.ffn_down.weight": f"{p}.mlp.down_proj.weight",
+        })
+    return names
+
+
+_DRAFT_TENSORS = _draft_tensor_names()
+
+
+def _tiny_gguf(directory, plain: dict[str, torch.Tensor], *, q8: bool, fc_q8: bool = False, rope_sections=None):
+    """Write the tiny draft as a GGUF under the real file's names; returns its path and the tensor-name map.
+
+    ``q8`` quantizes every matrix (the codebooks too) and leaves norms and conv bases F32. The context
+    projection stays BF16 unless ``fc_q8``, so the block test's exact context-row assertion compares like with
+    like while the oracle test can run it through ggml. Only the q and gate parts are Q4_0 (k, v and up stay
+    Q8_0), so those fused modules split into ``weight`` / ``weight_1``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    model_path = str(directory / "draft.gguf")
+    tensors = {gguf: plain[hf] for gguf, hf in _DRAFT_TENSORS.items()}
+    rank = plain["candidate_selector.predecessor_codebook"].shape[1]
+    if q8:
+        types = {name: _writer.F32 if name.endswith(("norm.weight", "conv_base")) else _writer.Q8_0 for name in tensors}
+        if not fc_q8:
+            types["fc.weight"] = _writer.BF16
+        types["blk.0.attn_q.weight"] = _writer.Q4_0
+        types["blk.1.ffn_gate.weight"] = _writer.Q4_0
+    else:
+        types = {name: _writer.F32 if name.endswith(("norm.weight", "conv_base")) else _writer.BF16 for name in tensors}
+    metadata = {
+        "block_count": LAYERS, "embedding_length": H, "feed_forward_length": INTER,
+        "attention.head_count": HEADS, "attention.head_count_kv": KV_HEADS,
+        "attention.causal": False, "attention.key_length": HEAD_DIM, "attention.value_length": HEAD_DIM,
+        "attention.sliding_window": WINDOW, "attention.sliding_window_pattern": [True] * LAYERS,
+        "attention.layer_norm_rms_epsilon": EPS, "rope.freq_base": THETA,
+        "block_size": 8, "conv_kernel_size": 2, "conv_group_size": GROUP_SIZE,
+        "selector_rank": rank, "selector_top_k": TOP_K,
+        # non-monotonic 1-based, so a sort or a dropped -1 fails the parsed-order assertion below
+        "target_layers": [3, 2], "tokenizer.ggml.tokens": [f"t{i}" for i in range(VOCAB)],
+        "tokenizer.ggml.mask_token_id": MASK,
+    }
+    if rope_sections is not None:
+        metadata["rope.dimension_sections"] = rope_sections
+    _writer._write_gguf(directory / "draft.gguf", "dflash", metadata, {
+        name: (types[name], tuple(reversed(t.shape)), _writer._gguf_bytes(t, types[name])) for name, t in tensors.items()})
+    return model_path, _DRAFT_TENSORS
+
+
+def _quantized_weights(directory, w: dict[str, torch.Tensor], *, fc_q8: bool = False) -> dict[str, torch.Tensor]:
+    """The tiny Q8_0 GGUF's own values as a float state dict, for an oracle that holds no pre-quantization weights."""
+    from freetoken.models.gguf.reader import gguf_tensor_index
+    from freetoken.models.gguf.tensors import dequantized_tensor
+
+    path, names = _tiny_gguf(directory, {n: t for n, t in w.items() if not n.startswith("target.")}, q8=True, fc_q8=fc_q8)
+    index = gguf_tensor_index(path)
+    out = {hf: dequantized_tensor(index[gguf]) for gguf, hf in names.items()}
+    out.update({n: t for n, t in w.items() if n.startswith("target.")})
+    return out
+
+
+def _load_draft(tmp_path, w: dict[str, torch.Tensor], dtype=torch.bfloat16, source="safetensors"):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers import ParallelLMHead, VocabParallelEmbedding
     from freetoken.layers.quantization import finalize_quant
-    from freetoken.models.dflash import DFlash2DraftModel, parse_config
+    from freetoken.models.dflash import DFlash2DraftModel, parse_config, parse_gguf_config
     from freetoken.utils import cached_load_hf_config, torch_dtype
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     path = tmp_path / "draft"
-    path.mkdir()
-    (path / "config.json").write_text(json.dumps(CONFIG))
-    save_file({name: t for name, t in w.items() if not name.startswith("target.")}, str(path / "model.safetensors"))
+    path.mkdir(parents=True)
+    plain = {name: t for name, t in w.items() if not name.startswith("target.")}
+    rank = plain["candidate_selector.predecessor_codebook"].shape[1]
+    if source in ("gguf", "gguf-q8", "gguf-q8-fc"):
+        model_path, _names = _tiny_gguf(path, plain, q8=source != "gguf", fc_q8=source == "gguf-q8-fc")
+        config = parse_gguf_config(model_path)
+        assert config.target_layer_ids == (2, 1) and config.mask_token_id == MASK
+        assert config.num_target_layers is None and config.vocab_size == VOCAB
+    else:
+        model_path = str(path)
+        config_json = {**CONFIG, "dflash_config": {**CONFIG["dflash_config"], "selector_rank": rank}}
+        (path / "config.json").write_text(json.dumps(config_json))
+        save_file(plain, str(path / "model.safetensors"))
+        config = parse_config(cached_load_hf_config(model_path))
     with torch.device("meta"), torch_dtype(dtype):
         embed, head = VocabParallelEmbedding(VOCAB, H), ParallelLMHead(VOCAB, H)
     for op, name in ((embed, "target.embed"), (head, "target.head")):
         op.load_state_dict({"weight": w[name].to(DEV, dtype)})
         finalize_quant(op)
     target = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed), lm_head=head)
-    return DFlash2DraftModel.load(parse_config(cached_load_hf_config(str(path))), target, str(path), DEV, dtype)
+    return DFlash2DraftModel.load(config, target, model_path, DEV, dtype)
 
 
 class _Reference:
@@ -174,12 +281,37 @@ class _Reference:
         return torch.stack(tokens, 1), torch.stack(qs, 1)
 
 
-@pytest.mark.parametrize("dtype, tol", [(torch.float32, 2**-6), (torch.bfloat16, 2**-2)])
+@pytest.mark.parametrize("sections, accepted", [
+    # llama.cpp records an M-RoPE target's text-only layout this way; for text it is plain NeoX rope
+    ([HEAD_DIM // 2, 0, 0, 0], True),
+    # a split into nonzero parts needs the M-RoPE path the draft does not have
+    ([HEAD_DIM // 4, HEAD_DIM // 4, 0, 0], False),
+])
+def test_gguf_rope_dimension_sections(tmp_path, sections, accepted):
+    """The draft's GGUF accepts the degenerate sections llama.cpp writes for an M-RoPE target's text, and still refuses a genuinely split head."""
+    from freetoken.models.dflash import parse_gguf_config
+
+    plain = {name: t for name, t in _weights().items() if not name.startswith("target.")}
+    model_path, _ = _tiny_gguf(tmp_path, plain, q8=False, rope_sections=sections)
+    if accepted:
+        assert parse_gguf_config(model_path).head_dim == HEAD_DIM
+    else:
+        with pytest.raises(ValueError, match="rope dimension sections"):
+            parse_gguf_config(model_path)
+
+
+@pytest.mark.parametrize("dtype, source, tol", [
+    (torch.float32, "safetensors", 2**-6),
+    (torch.bfloat16, "safetensors", 2**-2),
+    (torch.bfloat16, "gguf", 2**-2),
+    (torch.bfloat16, "gguf-q8", 2**-2),
+])
 @pytest.mark.parametrize("block", [4, 8])
-def test_block_forward_matches_reference(tmp_path, block, dtype, tol):
-    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 draft pins the math (tf32 dots); the bf16 draft, the serving dtype, is held to bf16 noise. A ring rebuilt from only the window rows gives the same hidden, bitwise."""
-    w = _weights()
-    draft, ref = _load_draft(tmp_path, w, dtype), _Reference(w)
+def test_block_forward_matches_reference(tmp_path, block, dtype, source, tol):
+    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 safetensors draft pins the math (tf32 dots); every bf16 draft, the serving dtype, is held to bf16 noise. A ring rebuilt from only the window rows gives the same hidden, bitwise. The GGUF fixtures repeat the run from the real file's tensor names, so a wrong leaf, k/v order, gate/up order or conv-base orientation cannot hide behind the safetensors reader; the Q8_0 one reads its layer matrices through the ggml kernels against the file's own dequantized values."""
+    w = _weights(Q8_RANK, Q8_SEED) if source == "gguf-q8" else _weights()
+    ref_w = _quantized_weights(tmp_path / "oracle", w) if source == "gguf-q8" else w
+    draft, ref = _load_draft(tmp_path, w, dtype, source), _Reference(ref_w)
     dflash_ring = draft.make_dflash_ring(max_rows=3, block=block, ring_len=RING, max_position=4096, device=DEV)
     torch.manual_seed(1)
     lengths, rows = (5, 100), (2, 1)
@@ -216,12 +348,15 @@ def test_block_forward_matches_reference(tmp_path, block, dtype, tol):
     assert torch.equal(draft.forward_block(bonus, starts, rows_t, dflash_ring), hidden)
 
 
-def test_sample_path_walks_the_selector_lattice(tmp_path):
-    """Greedy and sampled requests follow the fp32 walk (same uniforms); a request whose scores all tie takes the first candidate; a NaN hidden yields in-range ids and a q that is no distribution, without disturbing the other requests."""
-    w = _weights()
-    draft, ref = _load_draft(tmp_path, w), _Reference(w)
+@pytest.mark.parametrize("source", ["safetensors", "gguf", "gguf-q8"])
+def test_sample_path_walks_the_selector_lattice(tmp_path, source):
+    """Greedy and sampled requests follow the fp32 walk (same uniforms); a request whose scores all tie takes the first candidate; a NaN hidden yields in-range ids and a q that is no distribution, without disturbing the other requests. Every checkpoint form is walked, so a predecessor/successor swap in the reader changes the path."""
+    w = _weights(Q8_RANK, Q8_SEED) if source == "gguf-q8" else _weights()
+    ref_w = _quantized_weights(tmp_path / "oracle", w) if source == "gguf-q8" else w
+    draft, ref = _load_draft(tmp_path, w, source=source), _Reference(ref_w)
     block, bs = 4, 4
-    torch.manual_seed(3)
+    # the q8 fixture's wider rank moves the walk's CDF margins, so it draws with its own seed
+    torch.manual_seed(0 if source == "gguf-q8" else 3)
     hidden = torch.randn(bs * block, H, device=DEV, dtype=torch.bfloat16)
     hidden.view(bs, block, H)[2] = 0
     hidden.view(bs, block, H)[3] = float("nan")
@@ -241,3 +376,26 @@ def test_sample_path_walks_the_selector_lattice(tmp_path):
     assert torch.equal(tokens[2], cand[2, :, 0]) and torch.equal(q[2], F.one_hot(torch.zeros(block - 1, dtype=torch.int64, device=DEV), TOP_K).float())
     assert ((tokens >= 0) & (tokens < VOCAB)).all() and ((cand >= 0) & (cand < VOCAB)).all()
     assert not torch.isclose(q[3].sum(-1), torch.ones(block - 1, device=DEV)).any()
+
+
+@pytest.mark.parametrize("fc_q8", [False, True])
+def test_a_quantized_gguf_load_matches_the_dequantized_float_draft(tmp_path, fc_q8):
+    """The Q8_0/Q4_0 draft against a safetensors draft holding the GGUF's own dequantized tensors, an oracle that never sees the pre-quantization weights: the K/V rows and codebooks must match bitwise, and one block forward must stay within 15% L2, the 8-bit activation blocks (1/254 of each block's max) rounding through the draft's layers. With ``fc_q8`` the context projection is Q8_0 too, so its ggml kernel runs against the oracle's float fc."""
+    source = "gguf-q8-fc" if fc_q8 else "gguf-q8"
+    w = _weights(Q8_RANK, Q8_SEED)
+    quantized = _load_draft(tmp_path, w, torch.bfloat16, source)
+    floated = _load_draft(tmp_path / "float", _quantized_weights(tmp_path / "oracle", w, fc_q8=fc_q8), torch.bfloat16, "safetensors")
+    assert torch.equal(quantized._kv_all, floated._kv_all)
+    for name in ("predecessor_codebook", "successor_codebook"):
+        assert torch.equal(getattr(quantized.candidate_selector, name), getattr(floated.candidate_selector, name))
+    torch.manual_seed(5)
+    features = torch.randn(1, len(TAPS) * H, device=DEV, dtype=torch.bfloat16)
+    zero = torch.zeros(1, dtype=torch.int64, device=DEV)
+
+    def run(draft):
+        dflash_ring = draft.make_dflash_ring(max_rows=1, block=1, ring_len=RING, max_position=4096, device=DEV)
+        draft.store_context(draft.context_rows(features), zero, zero, dflash_ring)
+        return draft.forward_block(torch.tensor([3], device=DEV), torch.tensor([1], device=DEV), zero, dflash_ring)
+
+    got, want = run(quantized).float(), run(floated).float()
+    assert (got - want).norm() <= 0.15 * want.norm(), ((got - want).norm() / want.norm()).item()

@@ -12,6 +12,7 @@ import torch
 from freetoken.attention.linear import gdn_slot
 from freetoken.engine.sample import make_device_tensor
 from freetoken.kernel.triton.dflash import ring_attention_workspace
+from freetoken.models.gguf.reader import is_gguf_path
 from freetoken.spec.dflash.window import DFlashWindow
 from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.utils import cached_load_hf_config, init_logger
@@ -96,14 +97,15 @@ class DFlashProposer(Proposer):
         if not path:
             raise ValueError("--speculative-algorithm dflash needs --speculative-draft-model-path: a DFlash 2 draft checkpoint")
         check_draft_path(path)
-        archs = list(getattr(cached_load_hf_config(path), "architectures", None) or [])
-        if archs[:1] != [name]:
-            raise ValueError(f"{path}: expected a {name} checkpoint, got architectures {archs}")
+        if not is_gguf_path(path):
+            archs = list(getattr(cached_load_hf_config(path), "architectures", None) or [])
+            if archs[:1] != [name]:
+                raise ValueError(f"{path}: expected a {name} checkpoint, got architectures {archs}")
         draft, target, arch = cls._draft_config(config), config.model_config, config.hf_config.architectures[0]
-        if draft.num_target_layers != target.num_layers or max(draft.target_layer_ids) >= target.num_layers:
-            raise ValueError(
-                f"{path} reads layers {list(draft.target_layer_ids)} of a {draft.num_target_layers}-layer target, but {arch} has {target.num_layers} layers"
-            )
+        if max(draft.target_layer_ids) >= target.num_layers:
+            raise ValueError(f"{path} reads target layers {list(draft.target_layer_ids)}, but {arch} has {target.num_layers} layers")
+        if draft.num_target_layers is not None and draft.num_target_layers != target.num_layers:
+            raise ValueError(f"{path} is a draft for a {draft.num_target_layers}-layer target, but {arch} has {target.num_layers} layers")
         if (draft.hidden_size, draft.vocab_size) != (target.hidden_size, target.vocab_size) or draft.mask_token_id >= target.vocab_size:
             raise ValueError(
                 f"{path} (hidden {draft.hidden_size}, vocab {draft.vocab_size}, mask token {draft.mask_token_id}) does not fit "
@@ -120,7 +122,10 @@ class DFlashProposer(Proposer):
         from freetoken.models.register import _load_attr
 
         module, _ = _draft_entry(config)
-        return _load_attr(module, "parse_config")(cached_load_hf_config(config.speculative_draft_model_path))
+        path = config.speculative_draft_model_path
+        if is_gguf_path(path):
+            return _load_attr(module, "parse_gguf_config")(path)
+        return _load_attr(module, "parse_config")(cached_load_hf_config(path))
 
     @classmethod
     def budget(cls, config) -> tuple[int, int]:
@@ -159,9 +164,10 @@ class DFlashProposer(Proposer):
         self.dflash_ring = self.window = self.aux_buf = None
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._inject_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
-        params = sum(t.numel() for t in self.draft.state_dict().values())
+        state = self.draft.state_dict()
+        size = sum(t.nbytes for t in state.values()) / 2**20
         logger.info_rank0(
-            f"speculative decoding: DFlash 2 draft {path} resident ({params / 1e6:.0f}M params, {c.num_layers} layers, "
+            f"speculative decoding: DFlash 2 draft {path} resident ({size:.0f} MiB, {c.num_layers} layers, "
             f"window {c.window}, block {self.block}, top-{c.selector_top_k} selector, features of target layers {list(self.taps)})"
         )
 

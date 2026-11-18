@@ -23,6 +23,7 @@ from freetoken.models.qwen3_5_moe.config import parse_config
 from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces, iter_weights, nvfp4_expert_spec
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
 from freetoken.third_party import gguf as gguf_lib
+from freetoken.third_party.gguf import quants
 from freetoken.utils import cached_load_hf_config
 
 H, V = 128, 256  # hidden_size (every block-fp8 projection needs in/out multiples of 128), vocab
@@ -685,8 +686,8 @@ def test_mtp_head_fills_the_draft_and_its_experts(checkpoint):
 # --------------------------------------------------------------------------- the trunk's nextn block (GGUF)
 
 
-F32, BF16, Q8_0 = 0, 30, int(gguf_lib.GGMLQuantizationType.Q8_0)
-KV_U32, KV_F32, KV_STRING, KV_ARRAY = 4, 6, 8, 9  # gguf metadata value types
+F32, BF16, Q4_0, Q8_0 = 0, 30, int(gguf_lib.GGMLQuantizationType.Q4_0), int(gguf_lib.GGMLQuantizationType.Q8_0)
+KV_U32, KV_F32, KV_BOOL, KV_STRING, KV_ARRAY = 4, 6, 7, 8, 9  # gguf metadata value types
 
 
 def _gguf_bytes(tensor: torch.Tensor, ggml_type: int) -> bytes:
@@ -694,7 +695,8 @@ def _gguf_bytes(tensor: torch.Tensor, ggml_type: int) -> bytes:
         return tensor.float().numpy().tobytes()
     if ggml_type == BF16:
         return tensor.to(torch.bfloat16).view(torch.uint16).numpy().tobytes()
-    raise KeyError(ggml_type)
+    # the packed types quantize from the float32 rows in torch order (the row's last dim is the block dim)
+    return quants.quantize(tensor.float().numpy(), gguf_lib.GGMLQuantizationType(ggml_type)).tobytes()
 
 
 def _kv_field(value: object) -> tuple[int, bytes]:
@@ -702,14 +704,23 @@ def _kv_field(value: object) -> tuple[int, bytes]:
         return KV_STRING, struct.pack("<Q", len(value)) + value.encode()
     if isinstance(value, float):
         return KV_F32, struct.pack("<f", value)
+    if isinstance(value, bool):
+        return KV_BOOL, bytes([int(value)])
     if isinstance(value, (list, tuple)):
-        # an array of u32: gemma4's sliding_window_pattern and per-layer head_count_kv
+        if value and isinstance(value[0], str):
+            # the tokenizer tables
+            return KV_ARRAY, struct.pack("<IQ", KV_STRING, len(value)) + b"".join(
+                struct.pack("<Q", len(v)) + v.encode() for v in value)
+        if value and isinstance(value[0], bool):
+            # a bool array: dflash's sliding_window_pattern
+            return KV_ARRAY, struct.pack("<IQ", KV_BOOL, len(value)) + bytes(int(v) for v in value)
+        # an array of u32: dflash's target_layers and per-layer head_count_kv
         return KV_ARRAY, struct.pack("<IQ", KV_U32, len(value)) + b"".join(struct.pack("<I", int(v)) for v in value)
     return KV_U32, struct.pack("<I", int(value))
 
 
-def _write_gguf(path, arch: str, kv: dict[str, int | float | str | Sequence[int]], tensors: dict[str, tuple[int, tuple[int, ...], bytes]]) -> None:
-    """A minimal GGUF: header, the given KVs (u32 / f32 / string / u32 array) and tensors; the reader needs no more."""
+def _write_gguf(path, arch: str, kv: dict[str, int | float | bool | str | Sequence[int] | Sequence[str]], tensors: dict[str, tuple[int, tuple[int, ...], bytes]]) -> None:
+    """A minimal GGUF: header, the given KVs (u32 / f32 / bool / string / arrays) and tensors; the reader needs no more."""
     out = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv) + 1))
 
     def field(name: str, vtype: int, payload: bytes) -> None:
@@ -718,7 +729,7 @@ def _write_gguf(path, arch: str, kv: dict[str, int | float | str | Sequence[int]
 
     field("general.architecture", KV_STRING, struct.pack("<Q", len(arch)) + arch.encode())
     for name, value in kv.items():
-        field(f"{arch}.{name}", *_kv_field(value))
+        field(name if name.startswith("tokenizer.") else f"{arch}.{name}", *_kv_field(value))
 
     data = bytearray()
     infos = []
