@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.dsv4.v41_row_format import FP4_E8M0_B32
+from freetoken.kvcache.dsv4.row_format import FP4_E8M0_B32
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -20,7 +20,7 @@ RATIO = 2
 
 
 def _setup(b, s, t, seed):
-    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
 
     torch.manual_seed(seed)
     keys = torch.randn(ROWS, D, device="cuda", dtype=torch.bfloat16)
@@ -81,7 +81,7 @@ def test_full_range_matches_reference_with_causal_live():
 
 def test_quantized_queries_preserve_reference_score_rounding():
     from freetoken.kernel.triton.dsv41.indexer import indexer_logits_packed
-    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
 
     torch.manual_seed(23)
     t, s, topk = 4096, 32, 512

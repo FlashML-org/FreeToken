@@ -9,7 +9,11 @@ ROW = -1  # one scale per row
 
 @dataclass(frozen=True)
 class KVFormat:
-    """How one K or V row is stored in the KV pool; the encoding lives in the ``kv_rows.py`` arms of the same name."""
+    """How one K or V row is stored in the KV pool; the encoding lives in the ``kv_rows.py`` arms of the same name.
+
+    A format with ``model`` set is that model's own packed layout: its pool does the encoding and the
+    elem / scale fields stay unset, so ``quantized`` is False for it.
+    """
 
     name: str  # --kv-cache-dtype value and the kernels' KV_FMT
     elem_dtype: torch.dtype | None  # logical element type; None follows the compute dtype
@@ -17,6 +21,7 @@ class KVFormat:
     scale_dtype: torch.dtype | None = None  # logical scale type; None means no scale tensor
     scale_store_dtype: torch.dtype | None = None  # dtype of the scale tensor
     scale_group: int = ROW  # channels per scale
+    model: str | None = None  # set for a model's own packed layout; that model's pool owns the encoding
 
     def __post_init__(self) -> None:
         if (self.elem_dtype is None) != (self.elem_store_dtype is None):
@@ -76,7 +81,13 @@ INT8_PER_TOKEN_HEAD = KVFormat(
     scale_store_dtype=torch.float32,
 )
 
-KV_FORMATS: dict[str, KVFormat] = {fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD)}
+# per-tier layouts in kvcache/dsv4/row_format.py; names follow vLLM
+FP8_DS_MLA = KVFormat("fp8_ds_mla", elem_dtype=None, elem_store_dtype=None, model="DeepSeek-V4")
+NVFP4_DS_MLA = KVFormat("nvfp4_ds_mla", elem_dtype=None, elem_store_dtype=None, model="DeepSeek-V4.1")
+
+KV_FORMATS: dict[str, KVFormat] = {
+    fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, FP8_DS_MLA, NVFP4_DS_MLA)
+}
 # what a pool with per-row scale tensors and a reader built on kv_rows.py can declare
 ROW_SCALE_FORMATS = frozenset({NONE.name, FP8_PER_TOKEN_HEAD.name, INT8_PER_TOKEN_HEAD.name})
 

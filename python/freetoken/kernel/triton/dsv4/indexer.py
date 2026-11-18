@@ -23,6 +23,10 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kvcache.dsv4.row_format import RowFormat
+
+from .row_format import load_rows
+
 
 @triton.jit
 def _indexer_logits_kernel(
@@ -121,18 +125,19 @@ def _indexer_decode_logits_kernel(
     N_STAGE, RATIO,
     stride_qb, stride_qh, stride_qd,
     stride_wb, stride_wh,
-    stride_pr, stride_pd,
     stride_sb, stride_sw,
     stride_ob, stride_ot,
     H: tl.constexpr,
     D: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    FMT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     """One decode query per row, gathering its own compressed keys.
 
     Same head-reduced score as ``_indexer_logits_kernel``, but the keys are gathered from the
-    paged ``idx_pool`` inside the kernel (block b lives at row ``full_snap[row, b*RATIO] //
+    packed paged ``idx_pool`` inside the kernel (block b lives at row ``full_snap[row, b*RATIO] //
     RATIO``), and the number of blocks to score is read from DEVICE memory (``valid_ptr``), so
     a captured graph's work tracks the live position instead of the staged width. Tiles past
     the live count store ``-inf`` and return -- the top-k downstream still sees a full row.
@@ -161,8 +166,7 @@ def _indexer_decode_logits_kernel(
                    mask=t_mask, other=0)
     rows = tl.maximum(snap, 0) // RATIO
 
-    k = tl.load(pool_ptr + rows[:, None] * stride_pr + offs_d[None, :] * stride_pd,
-                mask=t_mask[:, None], other=0.0)
+    k = load_rows(pool_ptr, rows, t_mask, offs_d, D, ROW_BYTES, FMT).to(tl.bfloat16)
     q = tl.load(q_ptr + pid_b * stride_qb + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd,
                 mask=h_mask[:, None], other=0.0)
     w = tl.load(w_ptr + pid_b * stride_wb + offs_h * stride_wh, mask=h_mask, other=0.0).to(tl.float32)
@@ -178,7 +182,8 @@ def _indexer_decode_logits_kernel(
 def indexer_decode_logits(
     q: torch.Tensor,          # [B, H, D]  bf16, one query per request
     weights: torch.Tensor,    # [B, H]
-    idx_pool: torch.Tensor,   # [R, D]     bf16, this layer's paged indexer keys
+    idx_pool: torch.Tensor,   # [R, row_bytes] uint8, this layer's paged indexer keys in ``fmt``
+    fmt: RowFormat,
     full_snap: torch.Tensor,  # [B, W]     int64, the decode full-loc snapshot
     valid: torch.Tensor,      # [B]        live compressed block count per row
     n_stage: int,             # static staged width (the buffer the top-k scans)
@@ -190,7 +195,7 @@ def indexer_decode_logits(
     Equivalent to the reference chain
 
         full_at = full_snap[rows[:, None], (arange(n_stage) * ratio)[None, :]]
-        idx_kv  = idx_pool[cmp_rows(full_at, ratio).clamp_min(0)]
+        idx_kv  = unpack_rows(idx_pool, fmt, D, cmp_rows(full_at, ratio).clamp_min(0))
         score   = einsum("bhd,btd->bht", q, idx_kv).relu_() * weights[..., None]
         where(arange(n_stage) < valid, score.sum(1), -inf)
 
@@ -199,11 +204,11 @@ def indexer_decode_logits(
     """
     B, H, D = q.shape
     assert weights.shape == (B, H), (weights.shape, (B, H))
-    assert idx_pool.shape[1] == D, (idx_pool.shape, D)
+    assert idx_pool.dtype == torch.uint8 and idx_pool.shape[1] == fmt.row_bytes(D) and idx_pool.is_contiguous(), (idx_pool.shape, D)
     assert D == triton.next_power_of_2(D), f"index_head_dim must be pow2, got {D}"
 
     if out is None:
-        out = torch.empty((B, n_stage), dtype=idx_pool.dtype, device=q.device)
+        out = torch.empty((B, n_stage), dtype=q.dtype, device=q.device)
     if n_stage == 0:
         return out
 
@@ -213,10 +218,9 @@ def indexer_decode_logits(
         n_stage, ratio,
         q.stride(0), q.stride(1), q.stride(2),
         weights.stride(0), weights.stride(1),
-        idx_pool.stride(0), idx_pool.stride(1),
         full_snap.stride(0), full_snap.stride(1),
         out.stride(0), out.stride(1),
-        H=H, D=D,
+        H=H, D=D, ROW_BYTES=fmt.row_bytes(D), FMT=fmt.code,
         BLOCK_H=triton.next_power_of_2(H), BLOCK_T=BLOCK_T,
         num_warps=4, num_stages=2,
     )

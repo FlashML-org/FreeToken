@@ -32,7 +32,7 @@ from typing import Sequence
 import torch
 from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
-from freetoken.kvcache.dsv4.v41_row_format import FP8_E8M0_B32
+from freetoken.kvcache.dsv4.row_format import FP8_E8M0_B32
 from freetoken.utils import init_logger
 
 from .engram import EngramHash
@@ -175,7 +175,7 @@ class EngramDiskTable:
     def lookup(self, num_tokens: int) -> torch.Tensor:
         from freetoken.kernel import ggml
         from freetoken.kernel.row_store import wait_reset
-        from freetoken.kernel.triton.dsv41.pack import unpack_rows
+        from freetoken.kernel.triton.dsv4.pack import unpack_rows
         from freetoken.layers.quantization.ggml_types import float_dtype
 
         stream = torch.cuda.current_stream(self.device)

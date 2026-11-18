@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.dsv4.v41_row_format import BF16, FP4_E4M3_B16, FP8_E8M0_B32
+from freetoken.kvcache.dsv4.row_format import BF16, FP4_E4M3_B16, FP8_E8M0_B32
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -43,7 +43,7 @@ def _reference(q, win, cmp, sink, idx, n_window, scale, counts):
 
 
 def _pools(win_fmt, cmp_fmt, seed):
-    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
 
     torch.manual_seed(seed)
     win_vals = torch.randn(N_WIN_SLOTS, D, device="cuda", dtype=torch.bfloat16)

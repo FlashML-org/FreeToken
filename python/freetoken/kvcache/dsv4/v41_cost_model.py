@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .v41_row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
+from .row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
 from .window_tier import reserved_window_pages
 
 _INT64_BYTES = 8

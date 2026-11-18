@@ -100,8 +100,8 @@ class DSV4AttnMetadata(BaseAttnMetadata):
         Computed FRESH on every call -- NEVER cached on the metadata. Under CUDA-graph capture
         the GraphRunner runs a warm forward and then the captured forward on the SAME batch and
         metadata; a cached tensor would leave these gathers out of the captured graph, freezing
-        every replay at the capture-time ring slots (-1 fills included -> kernel/index_copy_
-        OOB on the first real step). Reads the snapshot rather than the live map, so a
+        every replay at the capture-time ring slots (-1 fills included -> the window store
+        drops its writes on the first real step). Reads the snapshot rather than the live map, so a
         concurrent allocate_paged cannot redirect an in-flight replay; runs inside the captured
         graph (its inputs -- the snapshot and ``positions`` -- are graph buffers), which is why
         it takes ``pos`` instead of reading it off the batch.
@@ -261,7 +261,7 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
 
         pool = self.pool
         # ratio-0 layers have no compressed pool; the kernel never reads it there (n_window ==
-        # topk), so alias the window pool to keep the two-pool stride assert happy.
+        # topk), so alias the window pool to keep the two-pool shape assert happy.
         cmp = pool.cmp_pool[layer_id] if has_compression else pool.window_pool[layer_id]
         return sparse_attn_paged(
             q, pool.window_pool[layer_id], cmp, attn_sink,

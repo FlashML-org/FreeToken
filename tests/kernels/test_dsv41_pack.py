@@ -1,5 +1,5 @@
-"""Packed KV row formats (``kvcache/dsv4/v41_row_format.py`` + ``kernel/triton/dsv41/pack.py``) against a torch
-transcription of the reference quantizers in DeepSeek-V4.1's ``inference/kernel.py``: the round-tripped
+"""Packed KV row formats (``kvcache/dsv4/row_format.py`` + ``kernel/triton/dsv4/pack.py``) against a torch
+transcription of the reference quantizers in DeepSeek-V4 / V4.1's ``inference/kernel.py``: the round-tripped
 value the pool hands back must equal what the reference bakes into its bf16 cache, bit for bit."""
 
 from __future__ import annotations
@@ -7,7 +7,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from freetoken.kvcache.dsv4.v41_row_format import BF16, FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32, RowFormat
+from freetoken.kvcache.dsv4.row_format import (
+    BF16,
+    FP4_E4M3_B16,
+    FP4_E8M0_B32,
+    FP8_E8M0_B32,
+    FP8_E8M0_B64_ROPE,
+    RowFormat,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -36,9 +43,10 @@ def reference_roundtrip(x: torch.Tensor, fmt: RowFormat) -> torch.Tensor:
     m, d = x.shape
     if fmt is BF16:
         return x.to(torch.bfloat16)
-    g = x.float().view(m, d // fmt.group, fmt.group)
+    cols = d - fmt.rope
+    g = x[:, :cols].float().view(m, cols // fmt.group, fmt.group)
     amax = g.abs().amax(dim=-1)
-    if fmt is FP8_E8M0_B32:
+    if fmt is FP8_E8M0_B32 or fmt is FP8_E8M0_B64_ROPE:
         s = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-4) / 448.0)))
         q = (g / s[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
     elif fmt is FP4_E8M0_B32:
@@ -49,13 +57,14 @@ def reference_roundtrip(x: torch.Tensor, fmt: RowFormat) -> torch.Tensor:
         q = _round_fp4((g / s[..., None]).clamp(-6.0, 6.0))
     else:
         raise AssertionError(fmt)
-    return (q * s[..., None]).view(m, d).to(torch.bfloat16)
+    out = (q * s[..., None]).view(m, cols).to(torch.bfloat16)
+    return torch.cat([out, x[:, cols:].to(torch.bfloat16)], dim=1)
 
 
-@pytest.mark.parametrize("fmt", [BF16, FP8_E8M0_B32, FP4_E4M3_B16, FP4_E8M0_B32], ids=lambda f: f.name)
+@pytest.mark.parametrize("fmt", [BF16, FP8_E8M0_B32, FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B64_ROPE], ids=lambda f: f.name)
 @pytest.mark.parametrize("dim", [128, 512])
 def test_roundtrip_matches_the_reference_quantizer(fmt: RowFormat, dim: int):
-    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
 
     torch.manual_seed(0)
     m = 300
@@ -73,8 +82,32 @@ def test_roundtrip_matches_the_reference_quantizer(fmt: RowFormat, dim: int):
     assert torch.equal(got, want), f"{fmt.name}: {(got.float() - want.float()).abs().max().item()}"
 
 
+@pytest.mark.parametrize("fmt, dim", [(FP8_E8M0_B64_ROPE, 512), (FP4_E8M0_B32, 128)], ids=lambda v: getattr(v, "name", v))
+def test_dsv4_pack_matches_its_in_place_round_trip(fmt: RowFormat, dim: int):
+    """pack_rows + unpack_rows equals the in-place quant kernels: act_quant_fp8_inplace on the non-rope channels, fp4_act_quant_inplace for fp4."""
+    from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace, fp4_act_quant_inplace
+    from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
+
+    torch.manual_seed(2)
+    m = 2048
+    x = torch.randn(m, dim, device="cuda") * torch.logspace(-8, 4, m, device="cuda")[:, None]
+    x[0] = 0
+    x[1, :70] = 0
+    x[2] = 1e-30
+    x[3] = 3e38
+    x[4, ::7] = -448.0 * 2**5
+    x = x.to(torch.bfloat16)
+    want = x.clone()
+    if fmt is FP8_E8M0_B64_ROPE:
+        act_quant_fp8_inplace(want[:, : dim - fmt.rope], fmt.group)
+    else:
+        fp4_act_quant_inplace(want, fmt.group)
+    got = unpack_rows(pack_rows(x, fmt), fmt, dim)
+    assert torch.equal(got, want)
+
+
 def test_scatter_into_pool_rows_and_gather_back():
-    from freetoken.kernel.triton.dsv41.pack import pack_rows, unpack_rows
+    from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
 
     torch.manual_seed(1)
     fmt, dim, rows = FP4_E4M3_B16, 512, 64

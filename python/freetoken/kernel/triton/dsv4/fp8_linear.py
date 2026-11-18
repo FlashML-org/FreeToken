@@ -15,9 +15,8 @@ via IEEE bit ops -> matches ``fast_round_scale``), ``x_fp8 = round_e4m3(clamp(x/
 +-448))``, scale stored e8m0. The GEMM accumulates ``sum_k (A_fp8 @ B_fp8) * s_a * s_b``
 per ``block``-K slab in FP32.
 
-Also provides ``act_quant_fp8_inplace`` -- the fused FP8 quant+dequant round-trip the
-reference applies in-place to the window / compressor KV (``act_quant(..., 64, ...,
-inplace=True)``), returning BF16.
+Also provides ``act_quant_fp8_inplace`` -- the reference ``act_quant(..., inplace=True)``
+FP8 quant+dequant round-trip, returning BF16.
 
 Assumes ``K % block == 0`` and ``N % block == 0`` (true for every DeepSeek-V4 / V4.1 projection).
 """

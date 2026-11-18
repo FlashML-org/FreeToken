@@ -26,10 +26,10 @@ class CompressorBackendMixin:
     # DSV4_RING_CHECK=1 -> assert the ring read-back equals what was written. Off by default.
     _RING_CHECK = os.environ.get("DSV4_RING_CHECK", "0") == "1"
 
-    # tier -> (KV-pool, state-ring, scratch-base) attribute names on the pool.
+    # tier -> (KV-pool, state-ring, scratch-base, store method) attribute names on the pool.
     _TIER_ATTRS = {
-        "attn": ("cmp_pool", "state_ring", "cmp_scratch_base"),
-        "idx": ("idx_pool", "indexer_state_ring", "idx_scratch_base"),
+        "attn": ("cmp_pool", "state_ring", "cmp_scratch_base", "store_compressed"),
+        "idx": ("idx_pool", "indexer_state_ring", "idx_scratch_base", "store_indexer"),
     }
 
     # ----- pool views ------------------------------------------------------------------
@@ -57,8 +57,8 @@ class CompressorBackendMixin:
         OWN scratch row when this step did not finish a block.
 
         Reads the decode SNAPSHOT (not the live map) so a concurrent allocate_paged cannot
-        redirect the write; scratch keeps the masked store free of negative indices (which
-        ``index_copy_`` would treat as out of bounds) and collision-free across rows.
+        redirect the write; scratch keeps the masked store free of negative indices (``pack_rows``
+        skips them) and collision-free across rows.
         """
         row_of_block = self.pool.cmp_rows(self.snapshot()[rows, pos], ratio)
         scratch = rows + self.compress_scratch_base(layer_id, tier)
@@ -67,8 +67,7 @@ class CompressorBackendMixin:
     def scatter_compressed(
         self, layer_id: int, tier: str, rows: torch.Tensor, kv: torch.Tensor
     ) -> None:
-        pool = self.compress_pool(layer_id, tier)
-        pool.index_copy_(0, rows, kv.to(pool.dtype))
+        getattr(self.pool, self._TIER_ATTRS[tier][3])(kv, layer_id, rows)
 
     # ----- compress-state ring ---------------------------------------------------------
     def carry_state_loc(self, window_slot: int, ring_size: int) -> torch.Tensor:

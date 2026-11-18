@@ -26,9 +26,9 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kvcache.dsv4.v41_row_format import RowFormat
+from freetoken.kvcache.dsv4.row_format import RowFormat
 
-from .row_format import load_rows
+from freetoken.kernel.triton.dsv4.row_format import load_rows
 
 BLOCK_H = 16
 BLOCK_T = 32

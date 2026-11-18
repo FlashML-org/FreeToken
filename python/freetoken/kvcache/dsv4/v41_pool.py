@@ -26,6 +26,7 @@ import torch
 
 from freetoken.utils import init_logger
 
+from ..format import NVFP4_DS_MLA
 from .v41_cost_model import (
     IDX_FMT,
     MAIN_FMT,
@@ -44,6 +45,8 @@ logger = init_logger(__name__)
 
 
 class DSV41PagedKVCache(WindowTierPagedPool):
+    kv_format = NVFP4_DS_MLA
+    kv_formats = frozenset({kv_format.name})
     win_fmt = WIN_FMT
     main_fmt = MAIN_FMT
     idx_fmt = IDX_FMT
@@ -247,33 +250,33 @@ class DSV41PagedKVCache(WindowTierPagedPool):
 
     # ----- writes (quantize + scatter) -----
     def store_window(self, kv: torch.Tensor, layer_id: int, window_slot: torch.Tensor) -> None:
-        from freetoken.kernel.triton.dsv41.pack import pack_rows
+        from freetoken.kernel.triton.dsv4.pack import pack_rows
 
         pack_rows(kv, self.win_fmt, pool=self.window_pool[layer_id], row_ids=window_slot)
 
     def store_main(self, latent: torch.Tensor, source: int, rows: torch.Tensor) -> None:
-        from freetoken.kernel.triton.dsv41.pack import pack_rows
+        from freetoken.kernel.triton.dsv4.pack import pack_rows
 
         pack_rows(latent, self.main_fmt, pool=self.main_pool[source], row_ids=rows)
 
     def store_index(self, k: torch.Tensor, source: int, rows: torch.Tensor) -> None:
-        from freetoken.kernel.triton.dsv41.pack import pack_rows
+        from freetoken.kernel.triton.dsv4.pack import pack_rows
 
         pack_rows(k, self.idx_fmt, pool=self.idx_pool[source], row_ids=rows)
 
     # ----- reads (gather + dequantize; tests and torch reference paths) -----
     def read_window(self, layer_id: int, window_slot: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.dsv41.pack import unpack_rows
+        from freetoken.kernel.triton.dsv4.pack import unpack_rows
 
         return unpack_rows(self.window_pool[layer_id], self.win_fmt, self.head_dim, window_slot)
 
     def read_main(self, source: int, rows: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.dsv41.pack import unpack_rows
+        from freetoken.kernel.triton.dsv4.pack import unpack_rows
 
         return unpack_rows(self.main_pool[source], self.main_fmt, self.head_dim, rows)
 
     def read_index(self, source: int, rows: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.dsv41.pack import unpack_rows
+        from freetoken.kernel.triton.dsv4.pack import unpack_rows
 
         return unpack_rows(self.idx_pool[source], self.idx_fmt, self.index_head_dim, rows)
 

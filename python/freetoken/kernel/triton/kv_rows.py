@@ -75,7 +75,7 @@ def kv_tile_rows(
 
 
 @triton.jit
-def _stage(x):
+def stage_tile(x):
     if target_info.is_hip():
         return x
     # Triton moves a dot operand's conversion back to its load past any side-effect-free op, so every warp would decode the whole tile; this asm stops that
@@ -96,7 +96,7 @@ def kv_tile_staged(ptrs, mask, FMT: tl.constexpr):
                 x = e4m3_u8_to_f32(codes)
         else:
             x = codes.to(tl.float32)
-        tile = _stage(x).to(tl.bfloat16)
+        tile = stage_tile(x).to(tl.bfloat16)
     return tile
 
 

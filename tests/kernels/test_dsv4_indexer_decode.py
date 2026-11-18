@@ -13,18 +13,23 @@ import pytest
 import torch
 
 from freetoken.kernel.triton.dsv4.indexer import indexer_decode_logits
+from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
+from freetoken.kvcache.dsv4.row_format import BF16, FP4_E8M0_B32
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 H, D, RATIO = 64, 128, 4
 POOL_ROWS = 1 << 14
 TOL = dict(atol=5e-2, rtol=5e-2)
+FMT = FP4_E8M0_B32
 
 
 @pytest.fixture(scope="module")
 def pool():
+    """The packed indexer-key pool and its dequantized values for the reference."""
     g = torch.Generator(device="cuda").manual_seed(3)
-    return torch.randn(POOL_ROWS, D, device="cuda", dtype=torch.bfloat16, generator=g)
+    packed = pack_rows(torch.randn(POOL_ROWS, D, device="cuda", dtype=torch.bfloat16, generator=g), FMT)
+    return packed, unpack_rows(packed, FMT, D)
 
 
 def _build(positions, n_stage, seed=0):
@@ -54,9 +59,10 @@ def _reference(q, w, pool, snap, valid, n_stage):
 
 
 def _check(pool, positions, n_stage, seed=0):
+    packed, keys = pool
     q, w, snap, valid = _build(positions, n_stage, seed)
-    got = indexer_decode_logits(q, w, pool, snap, valid, n_stage, RATIO).float()
-    ref = _reference(q, w, pool, snap, valid, n_stage)
+    got = indexer_decode_logits(q, w, packed, FMT, snap, valid, n_stage, RATIO).float()
+    ref = _reference(q, w, keys, snap, valid, n_stage)
     assert torch.equal(torch.isfinite(got), torch.isfinite(ref)), "live/-inf column set differs"
     live = torch.isfinite(ref)
     if live.any():
@@ -66,6 +72,15 @@ def _check(pool, positions, n_stage, seed=0):
 
 def test_basic(pool):
     _check(pool, [800], 2048)
+
+
+def test_packed_matches_bf16_rows(pool):
+    """Dequantizing in-kernel gives the same logits, bit for bit, as reading bf16 rows of the same keys."""
+    packed, keys = pool
+    q, w, snap, valid = _build([40, 8000], 2048)
+    got = indexer_decode_logits(q, w, packed, FMT, snap, valid, 2048, RATIO)
+    want = indexer_decode_logits(q, w, pack_rows(keys, BF16), BF16, snap, valid, 2048, RATIO)
+    assert torch.equal(got, want)
 
 
 def test_live_prefix_only(pool):
@@ -100,10 +115,11 @@ def test_per_row_valid(pool):
 
 def test_cuda_graph_follows_valid(pool):
     """A captured graph must read the bound from device memory, not from capture time."""
+    packed, keys = pool
     n_stage = 2048
     q, w, snap, valid = _build([800], n_stage)
-    out = torch.empty((1, n_stage), dtype=pool.dtype, device="cuda")
-    call = lambda: indexer_decode_logits(q, w, pool, snap, valid, n_stage, RATIO)
+    out = torch.empty((1, n_stage), dtype=q.dtype, device="cuda")
+    call = lambda: indexer_decode_logits(q, w, packed, FMT, snap, valid, n_stage, RATIO)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -117,7 +133,7 @@ def test_cuda_graph_follows_valid(pool):
         valid.fill_(live)
         graph.replay()
         torch.cuda.synchronize()
-        ref = _reference(q, w, pool, snap, valid, n_stage)
+        ref = _reference(q, w, keys, snap, valid, n_stage)
         got = out.float()
         assert torch.equal(torch.isfinite(got), torch.isfinite(ref)), f"live={live}"
         mask = torch.isfinite(ref)
