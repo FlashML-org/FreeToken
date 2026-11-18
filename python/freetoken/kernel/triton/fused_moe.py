@@ -282,9 +282,8 @@ def fused_moe_kernel(
             )
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        # We accumulate along the K dimension.
-
-        accumulator += tl.dot(a, b)
+        # Offloaded experts are stored in bf16 even when the model runs in fp16.
+        accumulator += tl.dot(a, b.to(a.dtype))
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
