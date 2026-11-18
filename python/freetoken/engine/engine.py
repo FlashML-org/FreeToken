@@ -982,10 +982,19 @@ class Engine:
                     f"expert banks hold experts of several formats ({sorted(set(banks.layer_formats))}) but the model "
                     f"binds {method.kind} / {method.kernel.name} on every MoE layer; reconvert the checkpoint"
                 )
-            if banks.kind is not None and (banks.kind, banks.kernel) != (method.kind, method.kernel.name):
+            from freetoken.moe.legacy_format import legacy_format_for
+
+            if banks.kind is not None and legacy_format_for(method.kind, method.kernel.name) != banks.quant_format:
                 raise ValueError(
                     f"expert banks were packed for {banks.kind} / {banks.kernel} but the model "
                     f"binds {method.kind} / {method.kernel.name}; reconvert or select that kernel"
+                )
+            if any(spec.resident for spec in method.layout().values()) and (
+                banks.gate_up_alpha is None or banks.down_alpha is None
+            ):
+                raise ValueError(
+                    f"the {method.kernel.name} {method.kind} MoE kernel needs gate_up_alpha and down_alpha, "
+                    "which the expert banks do not carry"
                 )
             # GGUF layers keep their own ggml types, so the cache reads each layer's layout off its banks
             layout = None if method.kind is QuantKind.GGUF else method.layout()
@@ -1874,26 +1883,37 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
     """--quant-backend with an FTW checkpoint's packed expert kernel filled in where the flag leaves that table automatic.
 
     An entry that names another kernel is refused here, before any bank is read."""
-    from freetoken.checkpoint.ftw import ftw_quant_format
-    from freetoken.moe.legacy_format import kind_kernel_for
+    from freetoken.checkpoint.ftw import ftw_has_expert_alphas, ftw_quant_format, is_ftw_checkpoint
+    from freetoken.moe.legacy_format import kernels_for, kind_kernel_for
 
     with _weight_load_context():
         fmt = ftw_quant_format(model_path) if model_path else None
+        has_alphas = ftw_has_expert_alphas(model_path) if fmt is not None and is_ftw_checkpoint(model_path) else True
     if fmt is None:
         return quant_backend
     try:
         kind, kernel = kind_kernel_for(fmt)
     except KeyError:
         return quant_backend
+    all_for_fmt = kernels_for(fmt)
+    compatible = tuple(k for k in all_for_fmt if k != "w4a4" or has_alphas)
     requested = quant_backend.select(LayerKind.MOE, kind)
-    if requested == kernel:
+    if requested in compatible:
         return quant_backend
     if requested != "auto":
+        if requested in all_for_fmt:
+            raise ValueError(
+                f"the FTW checkpoint's expert banks were converted without gate_up_alpha and down_alpha, so "
+                f"--quant-backend cannot use {requested}; drop the entry, or reconvert an input-scaled checkpoint "
+                f"with ft checkpoint --quant-backend moe.{kind}={requested}"
+            )
         raise ValueError(
             f"the FTW checkpoint's expert banks were packed for {kind} / {kernel} but --quant-backend asks for "
             f"{requested}; drop the entry, or reconvert with ft checkpoint --quant-backend moe.{kind}={requested}"
         )
-    return QuantBackend(quant_backend.items + (((LayerKind.MOE, kind), kernel),))
+    if len(compatible) == 1:
+        return QuantBackend(quant_backend.items + (((LayerKind.MOE, kind), compatible[0]),), quant_backend.allowed)
+    return quant_backend.restrict((LayerKind.MOE, kind), compatible)
 
 
 def offload_layer_methods(model) -> list | None:

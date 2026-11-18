@@ -127,6 +127,13 @@ def ftw_quant_format(path: str) -> str | None:
         return json.load(f).get("quant_format")
 
 
+def ftw_has_expert_alphas(path: str) -> bool:
+    """Whether an FTW checkpoint's index lists both ``gate_up_alpha`` and ``down_alpha`` expert bank entries."""
+    if not is_ftw_checkpoint(path):
+        return False
+    return set(_ALPHA_NAMES) <= set(ftw_tensor_names(path, "experts_bank"))
+
+
 # ============================== writer ==============================
 class FTWWriter:
     """Stream tensors into the FTW, rolling shard files at ``shard_limit``.
