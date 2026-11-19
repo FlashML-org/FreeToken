@@ -371,3 +371,75 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+NULL_TOOL_CALL_FORMATS = [
+    ("qwen3_coder", "<tool_call><function=get_weather><parameter=city>{value}</parameter></function></tool_call>"),
+    ("glm47", "<tool_call>get_weather<arg_key>city</arg_key><arg_value>{value}</arg_value></tool_call>"),
+    ("minimax", '<minimax:tool_call><invoke name="get_weather"><parameter name="city">{value}</parameter></invoke></minimax:tool_call>'),
+]
+
+
+@pytest.mark.parametrize("parser_name, template", NULL_TOOL_CALL_FORMATS)
+@pytest.mark.parametrize("schema, value, expected", [
+    ({"type": "string"}, "null", "null"),
+    ({"type": "string"}, "NULL", "NULL"),
+    ({"type": "string", "enum": ["null"]}, "null", "null"),
+    ({"type": "null"}, "null", None),
+])
+@pytest.mark.parametrize("chunk_size", [None, 1, 7], ids=["one-shot", "one-character", "seven-characters"])
+def test_schema_string_null_stays_a_string(parser_name, template, schema, value, expected, chunk_size):
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": schema}},
+        },
+    }]
+    parser = FunctionCallParser(tools, tool_call_parser=parser_name)
+    text = template.format(value=value)
+    if chunk_size is None:
+        result = parser.parse_non_stream(text)
+        assert result.normal_text == ""
+        calls = result.calls
+    else:
+        texts, calls = _feed(parser, [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)])
+        calls.extend(parser.finalize_stream())
+        assert "".join(texts) + parser.finish_stream() == ""
+    assert [call.name for call in calls if call.name is not None] == ["get_weather"]
+    assert json.loads("".join(call.parameters for call in calls)) == {"city": expected}
+
+
+@pytest.mark.parametrize("parser_name, template", NULL_TOOL_CALL_FORMATS)
+@pytest.mark.parametrize("properties", [
+    pytest.param({}, id="undeclared"),
+    pytest.param({"city": {}}, id="untyped"),
+    pytest.param({"city": True}, id="boolean-true-schema"),
+    pytest.param({"city": False}, id="boolean-false-schema"),
+    pytest.param({"city": {"enum": [None]}}, id="null-enum"),
+    pytest.param({"city": {"const": None}}, id="null-const"),
+    pytest.param({"city": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}, id="nullable-integer"),
+    pytest.param({"city": {"oneOf": [{"type": "string"}, {"type": "null"}]}}, id="nullable-string"),
+    pytest.param({"city": {"type": ["string", "null"]}}, id="nullable-type-array"),
+    pytest.param({"city": {"$ref": "#/$defs/Nullable"}}, id="nullable-ref"),
+    pytest.param({"city": {"$ref": "#/$defs/String"}}, id="string-ref"),
+])
+def test_buffered_null_without_explicit_string_type_keeps_existing_conversion(parser_name, template, properties):
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "$defs": {
+                    "Nullable": {"type": ["integer", "null"]},
+                    "String": {"type": "string"},
+                },
+            },
+        },
+    }]
+    result = FunctionCallParser(tools, tool_call_parser=parser_name).parse_non_stream(template.format(value="null"))
+
+    assert result.normal_text == ""
+    assert [(call.name, json.loads(call.parameters)) for call in result.calls] == [("get_weather", {"city": None})]
