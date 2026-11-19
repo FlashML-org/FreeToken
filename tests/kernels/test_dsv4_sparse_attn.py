@@ -12,13 +12,16 @@ from __future__ import annotations
 import pytest
 import torch
 
+from freetoken.kernel.triton.dsv4.pack import pack_rows, unpack_rows
 from freetoken.kernel.triton.dsv4.sparse_attn import sparse_attn_paged, split_count
+from freetoken.kvcache.dsv4.row_format import FP8_E8M0_B64_ROPE
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 # m == 1 is a decode launch (split-k), m == 2 a prefill one (single program per head block).
 MS = (1, 2)
-D, H, N_WINDOW = 64, 8, 32
+D, H, N_WINDOW = 128, 8, 32
+FMT = FP8_E8M0_B64_ROPE
 N_WIN_SLOTS, N_CMP = 256, 512
 # wide enough that a decode launch really splits (see test_split_count_follows_shape)
 N_CMP_COLS = 256
@@ -78,19 +81,19 @@ def _build(b=2, m=1, n_cmp_cols=N_CMP_COLS, cmp_valid=None, win_valid=N_WINDOW, 
 
 @pytest.fixture(scope="module")
 def pools():
+    """Packed window / compressed pools, the sink, and the dequantized pools for the reference."""
     g = torch.Generator(device="cuda").manual_seed(7)
-    return (
-        torch.randn(N_WIN_SLOTS, D, device="cuda", dtype=torch.bfloat16, generator=g),
-        torch.randn(N_CMP, D, device="cuda", dtype=torch.bfloat16, generator=g),
-        torch.randn(H, device="cuda", dtype=torch.float32, generator=g),
-    )
+    win = pack_rows(torch.randn(N_WIN_SLOTS, D, device="cuda", dtype=torch.bfloat16, generator=g), FMT)
+    cmp = pack_rows(torch.randn(N_CMP, D, device="cuda", dtype=torch.bfloat16, generator=g), FMT)
+    sink = torch.randn(H, device="cuda", dtype=torch.float32, generator=g)
+    return win, cmp, sink, unpack_rows(win, FMT, D), unpack_rows(cmp, FMT, D)
 
 
 def _check(pools, q, idx, counts):
-    win, cmp, sink = pools
+    win, cmp, sink, win_ref, cmp_ref = pools
     scale = D ** -0.5
     got = sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale, cmp_counts=counts)
-    ref = _reference(q, win, cmp, sink, idx, N_WINDOW, scale, counts)
+    ref = _reference(q, win_ref, cmp_ref, sink, idx, N_WINDOW, scale, counts)
     torch.testing.assert_close(got.float(), ref, **TOL)
     return got
 
@@ -102,6 +105,21 @@ def test_split_count_follows_shape():
     assert split_count(b=2, m=2, h=H, topk=N_WINDOW + N_CMP_COLS, device=dev) == 0
     assert split_count(b=2, m=1, h=H, topk=N_WINDOW + N_CMP_COLS, device=dev) > 1
     assert split_count(b=1, m=1, h=H, topk=N_WINDOW + 8, device=dev) == 0
+
+
+@pytest.mark.parametrize("m", MS)
+def test_model_width(m):
+    """DeepSeek-V4's 512-wide rows (448 e4m3 + 64 rope channels): the width the kernel's shared memory must fit."""
+    d = 512
+    g = torch.Generator(device="cuda").manual_seed(11)
+    win = pack_rows(torch.randn(N_WIN_SLOTS, d, device="cuda", dtype=torch.bfloat16, generator=g), FMT)
+    cmp = pack_rows(torch.randn(N_CMP, d, device="cuda", dtype=torch.bfloat16, generator=g), FMT)
+    sink = torch.randn(H, device="cuda", dtype=torch.float32, generator=g)
+    q = torch.randn(2, m, H, d, device="cuda", dtype=torch.bfloat16, generator=g)
+    _, idx, counts = _build(m=m, cmp_valid=[N_CMP_COLS, 40], holes=True)
+    got = sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, d ** -0.5, cmp_counts=counts)
+    ref = _reference(q, unpack_rows(win, FMT, d), unpack_rows(cmp, FMT, d), sink, idx, N_WINDOW, d ** -0.5, counts)
+    torch.testing.assert_close(got.float(), ref, **TOL)
 
 
 @pytest.mark.parametrize("m", MS)
@@ -150,12 +168,12 @@ def test_empty_row_is_finite(pools, m):
 def test_counts_bound_the_loop(pools, m):
     """counts -- not the -1 padding -- is what stops the walk: leave VALID slots past the live
     width and they must still be ignored. This is the property a captured graph relies on."""
-    win, cmp, sink = pools
+    win, cmp, sink, win_ref, cmp_ref = pools
     scale = D ** -0.5
     q, idx, counts = _build(b=1, m=m, cmp_valid=[N_CMP_COLS])
     counts = torch.full_like(counts, 24)
     got = sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale, cmp_counts=counts)
-    ref = _reference(q, win, cmp, sink, idx, N_WINDOW, scale, counts)
+    ref = _reference(q, win_ref, cmp_ref, sink, idx, N_WINDOW, scale, counts)
     torch.testing.assert_close(got.float(), ref, **TOL)
     # ... and it really differs from walking the full buffer
     full = sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale)
@@ -165,7 +183,7 @@ def test_counts_bound_the_loop(pools, m):
 @pytest.mark.parametrize("m", MS)
 def test_cuda_graph_follows_counts(pools, m):
     """The captured graph must read its loop bound from device memory, not from capture time."""
-    win, cmp, sink = pools
+    win, cmp, sink, win_ref, cmp_ref = pools
     scale = D ** -0.5
     q, idx, counts = _build(b=1, m=m, cmp_valid=[N_CMP_COLS])
     call = lambda: sparse_attn_paged(q, win, cmp, sink, idx, N_WINDOW, scale,
@@ -184,5 +202,5 @@ def test_cuda_graph_follows_counts(pools, m):
         counts.fill_(live)
         graph.replay()
         torch.cuda.synchronize()
-        ref = _reference(q, win, cmp, sink, idx, N_WINDOW, scale, counts)
+        ref = _reference(q, win_ref, cmp_ref, sink, idx, N_WINDOW, scale, counts)
         torch.testing.assert_close(out.float(), ref, **TOL)

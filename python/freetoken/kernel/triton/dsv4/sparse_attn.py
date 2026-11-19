@@ -6,9 +6,12 @@ only to the softmax denominator). KV is a single shared latent head of width
 ``head_dim`` (MLA: K == V), broadcast across all query heads.
 
 The gather is PAGED: the candidate KV lives in two GLOBAL pools -- the window-ring
-pool ``window_pool[n_win_slots, d]`` and the compressed pool ``cmp_pool[n_cmp, d]``
-(both batch-less, addressed by physical slot). Per (request, query) the top-k is a
-list of GLOBAL slots laid out ``[window part | compressed part]``: entry ``topk[j]``
+pool ``window_pool[n_win_slots, row_bytes]`` and the compressed pool ``cmp_pool[n_cmp, row_bytes]``
+(both batch-less, addressed by physical slot, both holding ``fp8_e8m0_b64_rope`` rows). Each tile
+is dequantized in-kernel to bf16 (``row_format.load_rope_split``, exact) once per CTA, and both dots
+take bf16 operands with fp32 accumulation, like the reference ``sparse_attn`` kernel. The bf16 rope
+channels are dotted separately, continuing the k loop of the full-width dot whose rope channels read
+as zero. Per (request, query) the top-k is a list of GLOBAL slots laid out ``[window part | compressed part]``: entry ``topk[j]``
 loads from ``window_pool`` when ``j < n_window`` else from ``cmp_pool`` (``-1`` is
 masked). This mirrors sglang's FlashMLA backend, which takes global page indices
 directly -- no per-forward ``index_select`` staging slab.
@@ -28,7 +31,7 @@ Two implementations, picked from the launch shape -- there is no knob:
     (4 at bs=1), leaving nearly every SM idle. Falls back to the prefill kernel when the
     candidate list is too short to slice. NOT bit-identical (the reduction order differs).
 
-Shapes: ``q[b, m, h, d]``, ``window_pool[n_win, d]``, ``cmp_pool[n_cmp, d]``,
+Shapes: ``q[b, m, h, d]``, ``window_pool[n_win, row_bytes]``, ``cmp_pool[n_cmp, row_bytes]`` uint8,
 ``topk_idxs[b, m, topk]`` int32 (global slots, window-first), ``attn_sink[h]`` fp32
 -> ``o[b, m, h, d]``. ``n_window`` (int) splits the top-k into its two pool halves.
 """
@@ -39,10 +42,12 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kvcache.dsv4.row_format import FP8_E8M0_B64_ROPE
+
+from .row_format import ROPE_DIM, load_rope_split
+
 BLOCK_H = 16
-# The gather has exactly ONE tl.load site (the pool base is selected per column), so it stages
-# a single [BLOCK_T, D] KV tile -- 67968 B at BLOCK_T=32, num_stages=2, which fits the ~99KB
-# consumer-Blackwell (sm_120, e.g. RTX 5090) budget. (BLOCK_T=64 would need ~103KB.)
+# BLOCK_T=32, num_stages=2 keeps the staged KV tiles inside the ~99KB sm_120 (e.g. RTX 5090) shared-memory budget.
 BLOCK_T = 32
 MAX_SPLITS = 32
 MIN_TILES_PER_SPLIT = 4
@@ -54,12 +59,11 @@ def _sparse_attn_paged_kernel(
     scale,
     H, TOPK, N_WINDOW,
     stride_qb, stride_qm, stride_qh, stride_qd,
-    stride_wn, stride_wd,
-    stride_cn, stride_cd,
     stride_ob, stride_om, stride_oh, stride_od,
     stride_ib, stride_im, stride_it,
     stride_nb, stride_nm,
     D: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
@@ -73,7 +77,12 @@ def _sparse_attn_paged_kernel(
     offs_d = tl.arange(0, D)
 
     q_ptrs = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0).to(tl.float32)  # [BLOCK_H, D]
+    q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0)  # [BLOCK_H, D] bf16
+    NOPE: tl.constexpr = D - ROPE_DIM
+    offs_r = tl.arange(0, ROPE_DIM)
+    q_r_ptrs = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh + (NOPE + offs_r)[None, :] * stride_qd
+    q_r = tl.load(q_r_ptrs, mask=h_mask[:, None], other=0.0)  # [BLOCK_H, ROPE_DIM]
+    acc_r = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
 
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -91,20 +100,15 @@ def _sparse_attn_paged_kernel(
         t_mask = offs_t < n_active
         idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
         valid = idxs >= 0
-        # Window-first partition: top-k column j < N_WINDOW reads window_pool, else cmp_pool.
-        # Both pools are contiguous [*, D] with identical strides (asserted in the wrapper), so we
-        # select the per-column pool BASE pointer and issue a SINGLE gather load. Keeping exactly
-        # one ``tl.load`` site (rather than a two-pool ``tl.where`` over two loaded tiles, or an
-        # if/elif/else with several load sites) stops Triton's software pipeliner from staging
-        # multiple KV tiles in shared memory. Result is bit-identical to the two-pool form -- each
-        # column still reads from the same pool/slot.
+        # Column j < N_WINDOW reads window_pool, else cmp_pool. Selecting the base per column, not loading a tile from each pool, keeps the pipeliner from staging two KV tiles in shared memory.
         is_win = offs_t < N_WINDOW
         # The select drops the pools' 16-byte alignment (asserted in the wrapper); without this hint Triton 3.8 gathers in 2-byte loads.
         base = tl.multiple_of(tl.where(is_win, win_ptr, cmp_ptr), 16)  # [BLOCK_T] per-column pool base pointer
-        kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
-        kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)  # [BLOCK_T, D]
-
-        scores = tl.dot(q, tl.trans(kv)) * scale  # [BLOCK_H, BLOCK_T]
+        row_ptr = base + tl.maximum(idxs, 0).to(tl.int64) * ROW_BYTES
+        # bf16 operands, fp32 accumulation (the reference sparse_attn's precision); kv has its rope
+        # channels zeroed and the rope dot continues the full-width dot's k loop
+        kv, kv_r = load_rope_split(row_ptr, valid, offs_d, D)  # [BLOCK_T, D], [BLOCK_T, ROPE_DIM] bf16
+        scores = tl.dot(q_r, tl.trans(kv_r), tl.dot(q, tl.trans(kv))) * scale  # [BLOCK_H, BLOCK_T]
         scores = tl.where(valid[None, :], scores, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -115,6 +119,7 @@ def _sparse_attn_paged_kernel(
         p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        acc_r = acc_r * alpha[:, None] + tl.dot(p.to(kv_r.dtype), kv_r)
         m_i = m_new
 
     sink = tl.load(sink_ptr + offs_h, mask=h_mask, other=0.0).to(tl.float32)
@@ -122,7 +127,10 @@ def _sparse_attn_paged_kernel(
     o = acc / l_i[:, None]
 
     o_ptrs = o_ptr + pid_b * stride_ob + pid_m * stride_om + offs_h[:, None] * stride_oh + offs_d[None, :] * stride_od
-    tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty), mask=h_mask[:, None])
+    tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty), mask=h_mask[:, None] & (offs_d < NOPE)[None, :])
+    o_r = acc_r / l_i[:, None]
+    o_r_ptrs = o_ptr + pid_b * stride_ob + pid_m * stride_om + offs_h[:, None] * stride_oh + (NOPE + offs_r)[None, :] * stride_od
+    tl.store(o_r_ptrs, o_r.to(o_ptr.dtype.element_ty), mask=h_mask[:, None])
 
 
 @triton.jit
@@ -131,13 +139,12 @@ def _sparse_attn_paged_splitk_kernel(
     scale,
     H, TOPK, N_WINDOW,
     stride_qb, stride_qm, stride_qh, stride_qd,
-    stride_wn, stride_wd,
-    stride_cn, stride_cd,
     stride_mb, stride_mm, stride_mh, stride_ms, stride_md,
     stride_lb, stride_lm, stride_lh, stride_ls,
     stride_ib, stride_im, stride_it,
     stride_nb, stride_nm,
     D: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
@@ -168,13 +175,21 @@ def _sparse_attn_paged_splitk_kernel(
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, D), dtype=tl.float32)
+    NOPE: tl.constexpr = D - ROPE_DIM
+    offs_r = tl.arange(0, ROPE_DIM)
+    acc_r = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
 
     if split_end > split_start:
         q_ptrs = (
             q_ptr + pid_b * stride_qb + pid_m * stride_qm
             + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
         )
-        q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0).to(tl.float32)
+        q = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0)
+        q_r_ptrs = (
+            q_ptr + pid_b * stride_qb + pid_m * stride_qm
+            + offs_h[:, None] * stride_qh + (NOPE + offs_r)[None, :] * stride_qd
+        )
+        q_r = tl.load(q_r_ptrs, mask=h_mask[:, None], other=0.0)
         idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
 
         for start in range(split_start, split_end, BLOCK_T):
@@ -184,10 +199,9 @@ def _sparse_attn_paged_splitk_kernel(
             valid = idxs >= 0
             is_win = offs_t < N_WINDOW
             base = tl.multiple_of(tl.where(is_win, win_ptr, cmp_ptr), 16)
-            kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
-            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
-
-            scores = tl.dot(q, tl.trans(kv)) * scale
+            row_ptr = base + tl.maximum(idxs, 0).to(tl.int64) * ROW_BYTES
+            kv, kv_r = load_rope_split(row_ptr, valid, offs_d, D)
+            scores = tl.dot(q_r, tl.trans(kv_r), tl.dot(q, tl.trans(kv))) * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -195,6 +209,7 @@ def _sparse_attn_paged_splitk_kernel(
             p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+            acc_r = acc_r * alpha[:, None] + tl.dot(p.to(kv_r.dtype), kv_r)
             m_i = m_new
 
     # Normalized partial + its lse; an empty (or all-masked) split reports lse = -inf so the
@@ -206,7 +221,13 @@ def _sparse_attn_paged_splitk_kernel(
         mid_o_ptr + pid_b * stride_mb + pid_m * stride_mm
         + offs_h[:, None] * stride_mh + split_id * stride_ms + offs_d[None, :] * stride_md
     )
-    tl.store(mid_base, out, mask=h_mask[:, None])
+    tl.store(mid_base, out, mask=h_mask[:, None] & (offs_d < NOPE)[None, :])
+    out_r = tl.where(l_i[:, None] == 0.0, 0.0, acc_r / l_i[:, None])
+    mid_r = (
+        mid_o_ptr + pid_b * stride_mb + pid_m * stride_mm
+        + offs_h[:, None] * stride_mh + split_id * stride_ms + (NOPE + offs_r)[None, :] * stride_md
+    )
+    tl.store(mid_r, out_r, mask=h_mask[:, None])
     lse_base = (
         mid_lse_ptr + pid_b * stride_lb + pid_m * stride_lm
         + offs_h * stride_lh + split_id * stride_ls
@@ -283,8 +304,8 @@ def split_count(b: int, m: int, h: int, topk: int, device) -> int:
 
 def sparse_attn_paged(
     q: torch.Tensor,            # [b, m, h, d]
-    window_pool: torch.Tensor,  # [n_win_slots, d]  GLOBAL window-ring pool (this layer)
-    cmp_pool: torch.Tensor,     # [n_cmp, d]        GLOBAL compressed pool (this layer)
+    window_pool: torch.Tensor,  # [n_win_slots, row_bytes] uint8  GLOBAL window-ring pool (this layer)
+    cmp_pool: torch.Tensor,     # [n_cmp, row_bytes] uint8        GLOBAL compressed pool (this layer)
     attn_sink: torch.Tensor,    # [h]
     topk_idxs: torch.Tensor,    # [b, m, topk] int32, GLOBAL slots, layout [window | compressed]
     n_window: int,              # # of window entries (the first n_window cols of topk)
@@ -304,7 +325,9 @@ def sparse_attn_paged(
     """
     b, m, h, d = q.shape
     topk = topk_idxs.shape[-1]
-    assert window_pool.shape[1] == d and cmp_pool.shape[1] == d, (window_pool.shape, cmp_pool.shape, d)
+    row_bytes = FP8_E8M0_B64_ROPE.row_bytes(d)
+    assert window_pool.dtype == cmp_pool.dtype == torch.uint8, (window_pool.dtype, cmp_pool.dtype)
+    assert window_pool.shape[1] == row_bytes and cmp_pool.shape[1] == row_bytes, (window_pool.shape, cmp_pool.shape, row_bytes)
     assert 0 <= n_window <= topk, (n_window, topk)
     q = q.contiguous()
     window_pool = window_pool.contiguous()
@@ -312,9 +335,6 @@ def sparse_attn_paged(
     idx = topk_idxs.contiguous().to(torch.int32)
     sink = attn_sink.contiguous().to(torch.float32)
     o = torch.empty_like(q)
-    # The kernel selects one pool base per column and gathers with a single stride pair, so both
-    # pools must share strides. Guaranteed here by .contiguous() on their [*, D] shape.
-    assert window_pool.stride() == cmp_pool.stride(), (window_pool.stride(), cmp_pool.stride())
     assert window_pool.data_ptr() % 16 == 0 and cmp_pool.data_ptr() % 16 == 0, (window_pool.data_ptr(), cmp_pool.data_ptr())
 
     has_counts = cmp_counts is not None
@@ -338,12 +358,11 @@ def sparse_attn_paged(
         float(softmax_scale),
         h, topk, int(n_window),
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        window_pool.stride(0), window_pool.stride(1),
-        cmp_pool.stride(0), cmp_pool.stride(1),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         idx.stride(0), idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D=d,
+        ROW_BYTES=row_bytes,
         BLOCK_H=BLOCK_H,
         BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts,
@@ -366,13 +385,12 @@ def _sparse_attn_paged_splitk(
         float(softmax_scale),
         h, topk, int(n_window),
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        window_pool.stride(0), window_pool.stride(1),
-        cmp_pool.stride(0), cmp_pool.stride(1),
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
         mid_lse.stride(0), mid_lse.stride(1), mid_lse.stride(2), mid_lse.stride(3),
         idx.stride(0), idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D=d,
+        ROW_BYTES=FP8_E8M0_B64_ROPE.row_bytes(d),
         BLOCK_H=BLOCK_H,
         BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts,

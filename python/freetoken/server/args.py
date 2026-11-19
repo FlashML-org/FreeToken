@@ -515,7 +515,9 @@ def parse_args(
         help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
         "element plus one scale per token and head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
         "attention backends read "
-        "them. They need --dtype bfloat16 and no tensor parallelism. An mtp draft stores its KV in the same format.",
+        "them. They need --dtype bfloat16 and no tensor parallelism. An mtp draft stores its KV in the same format. "
+        "DeepSeek-V4 stores only fp8_ds_mla and DeepSeek-V4.1 only nvfp4_ds_mla (their own packed fp8 / fp4 layouts, "
+        "named as in vLLM); 'auto' picks them there.",
     )
 
     parser.add_argument(

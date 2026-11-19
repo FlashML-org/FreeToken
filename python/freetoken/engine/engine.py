@@ -36,7 +36,7 @@ from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .spec_protocol import SpecRuntime
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
-from freetoken.kvcache.format import NONE, KVFormat
+from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
@@ -1626,6 +1626,8 @@ def _adjust_dsv41_config(config: EngineConfig, override) -> None:
     args.max_seq_len = config.max_seq_len
     args.max_batch_size = config.max_running_req + 1  # +1 dummy
     args.swa_decoder_replay = config.swa_decoder_replay
+    if getattr(config, "kv_cache_dtype", "auto") == "auto":
+        override("kv_cache_dtype", NVFP4_DS_MLA.name)
     P = args.window_size
     override("page_size", P)
     logger.info_rank0(
@@ -1655,6 +1657,10 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     the DSV4 decode batch size.
     """
     model_config = config.model_config
+    if (dtype := getattr(config, "dtype", None)) is not None and dtype != torch.bfloat16:
+        raise ValueError(f"DeepSeek-V4 runs in bfloat16 only, got --dtype {dtype}")
+    if getattr(config, "kv_cache_dtype", "auto") == "auto":
+        override("kv_cache_dtype", FP8_DS_MLA.name)
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);

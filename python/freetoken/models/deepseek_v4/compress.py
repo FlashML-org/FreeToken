@@ -7,7 +7,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.compress import gated_pool
-from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace, fp4_act_quant_inplace
+from freetoken.kernel.triton.dsv4.fp8_linear import fp4_act_quant_inplace
 from freetoken.kernel.triton.dsv4.hadamard import hadamard_transform
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.quantization import without_online
@@ -177,9 +177,6 @@ class Compressor(BaseOP):
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         if self.rotate:
             kv = hadamard_transform(kv)
-            fp4_act_quant_inplace(kv, 32)
-        else:
-            act_quant_fp8_inplace(kv[..., :-rd], 64)
         # Scatter compressed blocks [0, seqlen//ratio) to the paged cmp_pool: block b -> row
         # full_loc(b*ratio) // ratio (arithmetic; block b starts at abs position b*ratio).
         block_starts = torch.arange(0, cutoff, ratio, device=self._device)
@@ -280,9 +277,6 @@ class Compressor(BaseOP):
         apply_rotary_emb(reduced[..., -rd:], freqs_cis)
         if self.rotate:
             reduced = hadamard_transform(reduced)
-            fp4_act_quant_inplace(reduced, 32)
-        else:
-            act_quant_fp8_inplace(reduced[..., :-rd], 64)
         # Scatter the new compressed blocks (abs positions [start_pos, start_pos+cutoff)) to their
         # arithmetic rows full_loc(b*ratio) // ratio.
         block_starts = torch.arange(start_pos, start_pos + cutoff, ratio, device=self._device)
@@ -348,9 +342,6 @@ class Compressor(BaseOP):
         apply_rotary_emb_decode(compressed[..., -rd:], freqs_t)
         if self.rotate:
             compressed = hadamard_transform(compressed)
-            fp4_act_quant_inplace(compressed, 32)
-        else:
-            act_quant_fp8_inplace(compressed[..., :-rd], 64)
         # Scatter the just-completed compressed block to cmp_pool, per row, only where the block
         # finished (``should``). Rows that did not complete a block scatter to their OWN reserved
         # scratch row (``scratch_base + row``, a discarded write) so the masked per-row write is

@@ -147,10 +147,17 @@ def _dsv4_adjust_cfg(**over):
         moe_cpu_layers = None
         num_page_override = None
         num_token_override = None
+        kv_cache_dtype = "auto"
 
         @property
         def model_config(self):
             return model_config
+
+        @property
+        def kv_format(self):
+            from freetoken.kvcache.format import resolve_kv_format
+
+            return resolve_kv_format(self.kv_cache_dtype)
 
     cfg = Cfg()
     for k, v in over.items():

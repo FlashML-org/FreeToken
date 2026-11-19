@@ -11,8 +11,8 @@ Two pure (device-free) functions:
   tier), NOT a fixed multiple of window pages.
 
 Byte conventions:
-  kv bytes    = head_dim       * 2  (bf16)
-  index bytes = index_head_dim * 2  (bf16)
+  kv bytes    = KV_FMT.row_bytes(head_dim)         (584 at head_dim 512)
+  index bytes = IDX_FMT.row_bytes(index_head_dim)  (68 at index_head_dim 128)
   state bytes = 2*(1+overlap)*head_dim * 4  (fp32);  overlap = (ratio == 4)
   ring_size   = 8 (ratio 4) / 128 (ratio 128)
 """
@@ -23,7 +23,12 @@ import os
 
 from dataclasses import dataclass, field
 
-_BF16_BYTES = 2
+from .row_format import FP4_E8M0_B32, FP8_E8M0_B64_ROPE
+
+# row formats of the window / compressed KV and the indexer keys (--kv-cache-dtype fp8_ds_mla)
+KV_FMT = FP8_E8M0_B64_ROPE
+IDX_FMT = FP4_E8M0_B32
+
 _FP32_BYTES = 4
 
 
@@ -46,11 +51,11 @@ def ring_size_for_ratio(ratio: int) -> int:
 
 
 def _kv_bytes(args) -> int:
-    return args.head_dim * _BF16_BYTES
+    return KV_FMT.row_bytes(args.head_dim)
 
 
 def _index_bytes(args) -> int:
-    return args.index_head_dim * _BF16_BYTES
+    return IDX_FMT.row_bytes(args.index_head_dim)
 
 
 def _state_bytes(args, ratio: int) -> int:
@@ -142,7 +147,7 @@ class DSV4PoolSizes:
     P: int
     swa_ratio: float
     full_token: int  # num_pages * P  (the budget anchor)
-    n_win_slots: int  # global window pool rows (bf16 kv)
+    n_win_slots: int  # global window pool rows (KV_FMT packed rows)
     n_win_pages: int  # n_win_slots // P
     cmp_blocks: list[int | None] = field(default_factory=list)
     idx_blocks: list[int | None] = field(default_factory=list)

@@ -1,4 +1,4 @@
-"""Quantize rows into a packed pool and read them back (DeepSeek-V4.1 KV storage formats).
+"""Quantize rows into a packed pool and read them back (DeepSeek-V4 / V4.1 KV storage formats).
 
 ``pack_rows`` reproduces the reference quantizers (``inference/kernel.py``) exactly:
 
@@ -7,12 +7,14 @@
 * fp4_e4m3_b16  ``fp4_act_quant(x, 16, scale_dtype=e4m3)``: ``s = e4m3(max(amax, 6 * 2^-9) / 6)`` (round to
                 nearest e4m3), ``q = round_e2m1(clamp(x / s, +-6))``
 * fp4_e8m0_b32  ``fp4_act_quant(x, 32)``: ``s = 2**ceil(log2(max(amax, 6 * 2^-126) / 6))``, same e2m1 rounding
+* fp8_e8m0_b64_rope  DeepSeek-V4 ``act_quant(x[:, :-64], 64, "ue8m0", e8m0)`` on the non-rope channels; the rope channels are
+                stored as bf16
 * bf16          a plain byte copy
 
 Rows land at ``pool[row_ids[m]]`` (or ``pool[m]`` without ids), so the same launch serves the KV write
 path (scatter into slots) and plain buffer conversion. ``unpack_rows`` is the inverse gather + dequant
-(bf16-rounded like the reference cache); the attention / indexer kernels use the same device helper
-(``row_format.load_rows``) in-line instead of materializing rows.
+(bf16-rounded like the reference cache); the kernels decode in-line instead of materializing rows:
+``row_format.load_rows``, or ``row_format.load_rope_split`` for fp8_e8m0_b64_rope in the DeepSeek-V4 attention kernel.
 """
 
 from __future__ import annotations
@@ -23,9 +25,9 @@ import triton.language as tl
 
 from freetoken.kernel.triton.dsv4.fp8_linear import _log2_ceil, _round_fp4
 from freetoken.kernel.triton.e4m3_compat import e4m3_f32_to_u8, e4m3_native_cx, f32_to_e4m3, round_e4m3
-from freetoken.kvcache.dsv4.v41_row_format import BF16, RowFormat
+from freetoken.kvcache.dsv4.row_format import BF16, RowFormat
 
-from .row_format import fp4_f32_to_nibble, load_rows
+from .row_format import ROPE_DIM, fp4_f32_to_nibble, load_rows
 
 
 @triton.jit
@@ -47,14 +49,26 @@ def _e4m3_round(q):
 
 
 @triton.jit
+def _fp8_e8m0_groups(x):
+    """``[NG, GROUP]`` fp32 -> (e4m3 codes, ue8m0 exponents per group), as ``act_quant(..., "ue8m0")``."""
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
+    e = _log2_ceil(amax * (1.0 / 448.0))
+    s = tl.exp2(e.to(tl.float32))
+    q = tl.clamp(tl.math.div_rn(x, s[:, None]), -448.0, 448.0)
+    return _e4m3_codes(q), e
+
+
+@triton.jit
 def _pack_rows_kernel(
     x_ptr, out_ptr, idx_ptr, stride_xm,
     D: tl.constexpr, GROUP: tl.constexpr, ROW_BYTES: tl.constexpr, FMT: tl.constexpr, HAS_IDX: tl.constexpr,
 ):
-    """One program per input row ``m``; writes packed bytes to pool row ``idx[m]`` (or ``m``)."""
+    """One program per input row ``m``; writes packed bytes to pool row ``idx[m]`` (or ``m``). Negative ids are skipped."""
     m = tl.program_id(0).to(tl.int64)
     if HAS_IDX:
         row = tl.load(idx_ptr + m).to(tl.int64)
+        if row < 0:
+            return
     else:
         row = m
     dst = out_ptr + row * ROW_BYTES
@@ -69,13 +83,21 @@ def _pack_rows_kernel(
         NG: tl.constexpr = D // GROUP
         offs_d = tl.arange(0, D)
         offs_g = tl.arange(0, NG)
-        x = tl.reshape(tl.load(src + offs_d).to(tl.float32), [NG, GROUP])
-        amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-        e = _log2_ceil(amax * (1.0 / 448.0))
-        s = tl.exp2(e.to(tl.float32))
-        q = tl.clamp(tl.math.div_rn(x, s[:, None]), -448.0, 448.0)
-        tl.store(dst + offs_d, tl.reshape(_e4m3_codes(q), [D]))
+        codes, e = _fp8_e8m0_groups(tl.reshape(tl.load(src + offs_d).to(tl.float32), [NG, GROUP]))
+        tl.store(dst + offs_d, tl.reshape(codes, [D]))
         tl.store(dst + D + offs_g, (e + 127).to(tl.uint8))
+    elif FMT == 4:
+        # the rope channels form the last group: quantize all D / GROUP groups, then store that one raw
+        NOPE: tl.constexpr = D - ROPE_DIM
+        offs_d = tl.arange(0, D)
+        offs_g = tl.arange(0, D // GROUP)
+        xr = tl.load(src + offs_d)
+        codes, e = _fp8_e8m0_groups(tl.reshape(xr.to(tl.float32), [D // GROUP, GROUP]))
+        tl.store(dst + offs_d, tl.reshape(codes, [D]), mask=offs_d < NOPE)
+        rope_dst = (dst + NOPE).to(tl.pointer_type(tl.bfloat16))
+        tl.store(rope_dst + (offs_d - NOPE), xr.to(tl.bfloat16), mask=offs_d >= NOPE)
+        # the rope group's scale slot is the first pad byte (the only one at D = 512); write 0 there
+        tl.store(dst + NOPE + 2 * ROPE_DIM + offs_g, tl.where(offs_g < NOPE // GROUP, e + 127, 0).to(tl.uint8))
     else:
         # e2m1 pairs: even channels from one strided load, odd from another, so a byte is (lo | hi << 4)
         NG: tl.constexpr = D // GROUP
@@ -140,12 +162,14 @@ def pack_rows(
     fmt.validate_dim(d)
     row_bytes = fmt.row_bytes(d)
     assert d & (d - 1) == 0 and d >= 16, f"pack_rows wants a power-of-two D >= 16, got {d}"
+    assert fmt.rope in (0, fmt.group), f"pack_rows stores the rope channels as the last scale group, got {fmt}"
     if pool is None:
         assert row_ids is None
         pool = torch.empty((m, row_bytes), dtype=torch.uint8, device=x.device)
     else:
         assert pool.dtype == torch.uint8 and pool.shape[1] == row_bytes and pool.is_contiguous(), (pool.shape, row_bytes)
         assert row_ids is not None and row_ids.shape == (m,), (None if row_ids is None else row_ids.shape, m)
+        row_ids = row_ids.contiguous()
     if m == 0:
         return pool
     if x.stride(1) != 1:

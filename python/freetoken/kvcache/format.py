@@ -76,7 +76,13 @@ INT8_PER_TOKEN_HEAD = KVFormat(
     scale_store_dtype=torch.float32,
 )
 
-KV_FORMATS: dict[str, KVFormat] = {fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD)}
+# DeepSeek-V4 / V4.1 layouts, encoded by their own pools (per-tier formats in kvcache/dsv4/row_format.py); names follow vLLM
+FP8_DS_MLA = KVFormat("fp8_ds_mla", elem_dtype=None, elem_store_dtype=None)
+NVFP4_DS_MLA = KVFormat("nvfp4_ds_mla", elem_dtype=None, elem_store_dtype=None)
+
+KV_FORMATS: dict[str, KVFormat] = {
+    fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, FP8_DS_MLA, NVFP4_DS_MLA)
+}
 # what a pool with per-row scale tensors and a reader built on kv_rows.py can declare
 ROW_SCALE_FORMATS = frozenset({NONE.name, FP8_PER_TOKEN_HEAD.name, INT8_PER_TOKEN_HEAD.name})
 

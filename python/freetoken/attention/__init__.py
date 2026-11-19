@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
-from freetoken.kvcache.format import ROW_SCALE_FORMATS
+from freetoken.kvcache.format import FP8_DS_MLA, NVFP4_DS_MLA, ROW_SCALE_FORMATS
 from freetoken.utils import Registry, init_logger
 
 from .base import AttentionSpec, AttnType, BaseAttnBackend, BaseAttnMetadata, HybridBackend
@@ -103,7 +103,7 @@ def create_triton_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsv4_sparse",
-    BackendInfo(supported_types=frozenset({AttnType.DSV4})),
+    BackendInfo(supported_types=frozenset({AttnType.DSV4}), kv_formats=frozenset({FP8_DS_MLA.name})),
 )
 def create_dsv4_sparse_backend(config: ModelConfig):
     from .dsv4_sparse import DSV4SparseAttnBackend
@@ -113,7 +113,7 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsv41_sparse",
-    BackendInfo(supported_types=frozenset({AttnType.DSV41})),
+    BackendInfo(supported_types=frozenset({AttnType.DSV41}), kv_formats=frozenset({NVFP4_DS_MLA.name})),
 )
 def create_dsv41_sparse_backend(config: ModelConfig):
     from .dsv41_sparse import DSV41SparseAttnBackend

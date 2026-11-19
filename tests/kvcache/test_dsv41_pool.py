@@ -15,7 +15,7 @@ from freetoken.kvcache.dsv4.v41_cost_model import (
     dsv41_window_unit_bytes,
 )
 from freetoken.kvcache.dsv4.v41_pool import DSV41PagedKVCache
-from freetoken.kvcache.dsv4.v41_row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
+from freetoken.kvcache.dsv4.row_format import FP4_E4M3_B16, FP4_E8M0_B32, FP8_E8M0_B32
 from freetoken.models.deepseek_v41.args import DeepseekV41Args
 
 DEVICE = torch.device("cpu")

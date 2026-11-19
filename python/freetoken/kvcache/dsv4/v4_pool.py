@@ -8,9 +8,9 @@ Four buffer families, sized from a budget (the cost model) not ``num_requests``:
 * ``state_ring[L]``   -- ratio>0 layers; the per-window-page compress-state ring
   (fp32, ``kv|score`` split), with index ``-1`` a permanent scratch slot.
 
-The KV/compressed/indexer pools are bf16 (the fp8/fp4 quant is an in-place round-trip already
-baked into the bf16 value, so ``index_select`` staging is byte-exact); only the compress-state
-ring is fp32.
+The KV/compressed/indexer pools hold packed bytes (``--kv-cache-dtype fp8_ds_mla``): window and
+compressed rows in ``kv_fmt``, indexer keys in ``idx_fmt`` (``row_format.py``). ``pack_rows`` quantizes
+on store; the attention / indexer kernels dequantize in-line. Only the compress-state ring is fp32.
 
 ``state_loc`` is DERIVED from a window slot, never stored:
     state_loc = where(ws < 0, -1, (ws // P) * ring_size + ws % ring_size)
@@ -23,7 +23,10 @@ import torch
 
 from freetoken.utils import init_logger
 
+from ..format import FP8_DS_MLA
 from .v4_cost_model import (
+    IDX_FMT,
+    KV_FMT,
     DSV4PoolSizes,
     dsv4_kv_unit_bytes,
     dsv4_window_unit_bytes,
@@ -39,6 +42,11 @@ logger = init_logger(__name__)
 
 
 class DSV4PagedKVCache(WindowTierPagedPool):
+    kv_format = FP8_DS_MLA
+    kv_formats = frozenset({kv_format.name})
+    kv_fmt = KV_FMT
+    idx_fmt = IDX_FMT
+
     def __init__(
         self,
         sizes: DSV4PoolSizes,
@@ -48,7 +56,12 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         P: int = 128,
         n_scratch: int = 1,
     ) -> None:
-        assert dtype == torch.bfloat16, "KV pools are bf16 (fp4/fp8 is an in-place round-trip)"
+        if dtype != torch.bfloat16:
+            raise ValueError(f"DeepSeek-V4 runs in bfloat16 only, got {dtype}")
+        if args.rope_head_dim != self.kv_fmt.rope:
+            raise ValueError(f"{self.kv_fmt.name} keeps {self.kv_fmt.rope} rope channels, the model has {args.rope_head_dim}")
+        self.kv_fmt.validate_dim(args.head_dim)
+        self.idx_fmt.validate_dim(args.index_head_dim)
         self.args = args
         self.sizes = sizes
         self._device = device
@@ -72,7 +85,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         # slots; cmp/idx rows derive arithmetically (full_loc // ratio), the state ring off the
         # window slot. Unmapped = -1. The trailing row is a PERMANENT -1 sentinel, so a fancy-index
         # gather at -1 lands on it and returns -1 (gather-safe); scatter paths must never see a
-        # negative (index_copy_ raises OOB, it does not wrap).
+        # negative (pack_rows skips a -1 row, so that write is lost).
         for ratio in set(self.compress_ratios):
             assert ratio == 0 or P % ratio == 0, f"P={P} must be divisible by ratio {ratio}"
         self._paged_params: tuple[int, bool] | None = None  # (_init_paged_state args, for rebuild)
@@ -82,7 +95,9 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         """(Re)allocate every physical buffer for the CURRENT ``self.sizes``. Shared by __init__
         and the in-place ``rebuild`` (identity-preserving, like HybridSWAKVCache.rebuild -- the
         CacheManager/engine/ctx all hold THIS object)."""
-        sizes, device, dtype = self.sizes, self._device, self._dtype
+        sizes, device = self.sizes, self._device
+        kv_bytes = self.kv_fmt.row_bytes(self.head_dim)
+        idx_bytes = self.idx_fmt.row_bytes(self.index_head_dim)
         self.cmp_scratch_base = []
         self.idx_scratch_base = []
         self.full_to_window = torch.full(
@@ -96,7 +111,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
 
         # Window KV: every layer.
         self.window_pool: list[torch.Tensor] = [
-            torch.zeros(sizes.n_win_slots, self.head_dim, device=device, dtype=dtype)
+            torch.zeros(sizes.n_win_slots, kv_bytes, device=device, dtype=torch.uint8)
             for _ in range(self._n_layers)
         ]
 
@@ -122,7 +137,7 @@ class DSV4PagedKVCache(WindowTierPagedPool):
             self.cmp_scratch_base.append(sizes.cmp_blocks[L])
             self.cmp_pool.append(
                 torch.zeros(
-                    sizes.cmp_blocks[L] + self.n_scratch, self.head_dim, device=device, dtype=dtype
+                    sizes.cmp_blocks[L] + self.n_scratch, kv_bytes, device=device, dtype=torch.uint8
                 )
             )
             if ratio == 4:
@@ -130,9 +145,9 @@ class DSV4PagedKVCache(WindowTierPagedPool):
                 self.idx_pool.append(
                     torch.zeros(
                         sizes.idx_blocks[L] + self.n_scratch,
-                        self.index_head_dim,
+                        idx_bytes,
                         device=device,
-                        dtype=dtype,
+                        dtype=torch.uint8,
                     )
                 )
                 # Indexer compressor ring: index_head_dim, overlap, ring_size=8.
@@ -310,19 +325,31 @@ class DSV4PagedKVCache(WindowTierPagedPool):
         assert ring is not None, f"layer {layer_id} (ratio 0) has no compress-state ring"
         ring.set(state_loc, kv_score)
 
-    # ----- specialized writes -----
+    # ----- specialized writes (quantize + scatter) -----
     def store_window(self, k: torch.Tensor, layer_id: int, window_slot: torch.Tensor) -> None:
-        self.window_pool[layer_id].index_copy_(0, window_slot, k.to(self._dtype))
+        from freetoken.kernel.triton.dsv4.pack import pack_rows
+
+        pack_rows(k, self.kv_fmt, pool=self.window_pool[layer_id], row_ids=window_slot)
 
     def store_compressed(self, kv: torch.Tensor, layer_id: int, cmp_slot: torch.Tensor) -> None:
+        from freetoken.kernel.triton.dsv4.pack import pack_rows
+
         pool = self.cmp_pool[layer_id]
         assert pool is not None, f"layer {layer_id} (ratio 0) has no compressed pool"
-        pool.index_copy_(0, cmp_slot, kv.to(self._dtype))
+        pack_rows(kv, self.kv_fmt, pool=pool, row_ids=cmp_slot)
 
     def store_indexer(self, k: torch.Tensor, layer_id: int, idx_slot: torch.Tensor) -> None:
+        from freetoken.kernel.triton.dsv4.pack import pack_rows
+
         pool = self.idx_pool[layer_id]
         assert pool is not None, f"layer {layer_id} has no indexer pool (only ratio-4)"
-        pool.index_copy_(0, idx_slot, k.to(self._dtype))
+        pack_rows(k, self.idx_fmt, pool=pool, row_ids=idx_slot)
+
+    # ----- reads (gather + dequantize) -----
+    def read_indexer(self, layer_id: int, idx_slot: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.dsv4.pack import unpack_rows
+
+        return unpack_rows(self.idx_pool[layer_id], self.idx_fmt, self.index_head_dim, idx_slot)
 
     def total_bytes(self) -> int:
         n = self.full_to_window.numel() * self.full_to_window.element_size()

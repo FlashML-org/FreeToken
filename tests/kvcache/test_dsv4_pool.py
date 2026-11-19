@@ -1,4 +1,4 @@
-"""DSV4 paged KV pool (CPU, no model). Sections:
+"""DSV4 paged KV pool (CPU unless noted, no model). Sections:
   * pool construction / tier presence + state-ring layout;
   * state_loc derivation (scratch routing, page-disjoint ring blocks, boundary straddles);
   * full-loc -> physical-tier translation (bind/unbind, -1 gather-only sentinel, cmp_rows
@@ -32,11 +32,11 @@ def _args(**over):
     return DeepseekV4Args(**base)
 
 
-def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1):
+def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1, device=DEVICE):
     args = _args()
     sizes = dsv4_pool_sizes(num_pages=num_pages, args=args, swa_ratio=swa_ratio, P=P)
     pool = DSV4PagedKVCache(
-        sizes=sizes, args=args, device=DEVICE, dtype=torch.bfloat16, P=P, n_scratch=n_scratch
+        sizes=sizes, args=args, device=device, dtype=torch.bfloat16, P=P, n_scratch=n_scratch
     )
     return pool, sizes, args
 
@@ -47,19 +47,19 @@ def _pool(num_pages=8, swa_ratio=0.5, n_scratch=1):
 def test_pool_tiers_present_per_ratio():
     pool, sizes, _ = _pool()
     for L, ratio in enumerate(RATIOS):
-        assert pool.window_pool[L].shape == (sizes.n_win_slots, 512)
-        assert pool.window_pool[L].dtype == torch.bfloat16
+        assert pool.window_pool[L].shape == (sizes.n_win_slots, 584)
+        assert pool.window_pool[L].dtype == torch.uint8
         if ratio == 0:
             assert pool.cmp_pool[L] is None
             assert pool.idx_pool[L] is None
             assert pool.state_ring[L] is None
         else:
             assert pool.cmp_pool[L] is not None
-            assert pool.cmp_pool[L].shape[1] == 512
+            assert pool.cmp_pool[L].shape[1] == 584
             assert pool.state_ring[L] is not None
             if ratio == 4:
                 assert pool.idx_pool[L] is not None
-                assert pool.idx_pool[L].shape[1] == 128
+                assert pool.idx_pool[L].shape[1] == 68
             else:
                 assert pool.idx_pool[L] is None
 
@@ -234,27 +234,36 @@ def test_get_state_negative_returns_scratch():
 # --------------------------------------------------------------------------- #
 # specialized writes
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="packed writes run through triton")
 def test_store_window_scatters():
-    pool, sizes, _ = _pool()
+    from freetoken.kernel.triton.dsv4.pack import pack_rows
+
+    pool, _, _ = _pool(device=torch.device("cuda"))
     L = 0
-    slots = torch.tensor([0, 3, 7], dtype=torch.int64)
-    k = torch.randn(3, 512, dtype=torch.bfloat16)
+    slots = torch.tensor([0, 3, 7], device="cuda")
+    k = torch.randn(3, 512, device="cuda", dtype=torch.bfloat16)
     pool.store_window(k, L, slots)
-    assert torch.equal(pool.window_pool[L][slots], k)
+    assert torch.equal(pool.window_pool[L][slots], pack_rows(k, pool.kv_fmt))
+    # store_kv shim writes the window pool
+    pool.store_kv(-k[:2], -k[:2], slots[:2], 1)
+    assert torch.equal(pool.window_pool[1][slots[:2]], pack_rows(-k[:2], pool.kv_fmt))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="packed writes run through triton")
 def test_store_compressed_and_indexer():
-    pool, sizes, _ = _pool()
-    L = 2  # ratio 4 -> has both cmp + idx
-    cmp_slots = torch.tensor([1, 4], dtype=torch.int64)
-    cmp = torch.randn(2, 512, dtype=torch.bfloat16)
-    pool.store_compressed(cmp, L, cmp_slots)
-    assert torch.equal(pool.cmp_pool[L][cmp_slots], cmp)
+    from freetoken.kernel.triton.dsv4.pack import pack_rows
 
-    idx_slots = torch.tensor([0, 2], dtype=torch.int64)
-    idxk = torch.randn(2, 128, dtype=torch.bfloat16)
+    pool, _, _ = _pool(device=torch.device("cuda"))
+    L = 2  # ratio 4 -> has both cmp + idx
+    cmp_slots = torch.tensor([1, 4], device="cuda")
+    cmp = torch.randn(2, 512, device="cuda", dtype=torch.bfloat16)
+    pool.store_compressed(cmp, L, cmp_slots)
+    assert torch.equal(pool.cmp_pool[L][cmp_slots], pack_rows(cmp, pool.kv_fmt))
+
+    idx_slots = torch.tensor([0, 2], device="cuda")
+    idxk = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
     pool.store_indexer(idxk, L, idx_slots)
-    assert torch.equal(pool.idx_pool[L][idx_slots], idxk)
+    assert torch.equal(pool.idx_pool[L][idx_slots], pack_rows(idxk, pool.idx_fmt))
 
 
 def test_store_indexer_rejects_ratio128_layer():
@@ -275,11 +284,6 @@ def test_abc_kv_aliases_window_and_total_bytes():
     assert pool.device == DEVICE
     assert pool.dtype == torch.bfloat16
     assert pool.total_bytes() > 0
-    # store_kv shim writes the window pool
-    k = torch.randn(2, 512, dtype=torch.bfloat16)
-    out_loc = torch.tensor([1, 2], dtype=torch.int64)
-    pool.store_kv(k, k, out_loc, 0)
-    assert torch.equal(pool.window_pool[0][out_loc], k)
 
 
 def test_compress_state_ring_overlap_widths():
@@ -299,7 +303,7 @@ def test_compress_state_ring_overlap_widths():
 # compressed/indexer rows are pure arithmetic (`full_loc // ratio`), the state ring
 # derives from the window slot. Sentinel rules (C2-verified): -1 is GATHER-only-safe
 # (the mapping keeps a permanent -1 last row, so a fancy-index wrap reads -1); no
-# scatter/index_copy_ path may ever receive a negative slot (OOB raise, not a wrap).
+# store path may ever receive a negative slot (pack_rows does not bounds-check; a -1 row writes before the pool).
 # --------------------------------------------------------------------------- #
 def test_mapping_shape_and_initially_unmapped():
     pool, sizes, _ = _pool(num_pages=16)
@@ -412,7 +416,7 @@ def test_decode_cmp_scatter_masking_mirror():
     cmp_row = pool.cmp_rows(snap[rows, pos], ratio)
     scratch = rows + scratch_base
     cmp_dst = torch.where(should, cmp_row, scratch)
-    assert (cmp_dst >= 0).all()  # NEVER a negative store index (index_copy_ would OOB)
+    assert (cmp_dst >= 0).all()  # NEVER a negative store index (pack_rows would write before the pool)
     assert cmp_dst[0].item() == (3 * P + 3) // ratio  # completed -> arithmetic row (< scratch)
     assert cmp_dst[0].item() < scratch_base
     assert cmp_dst[1].item() == scratch_base + 1  # incomplete -> own scratch row

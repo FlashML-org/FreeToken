@@ -1,10 +1,10 @@
 """Small math ops for DeepSeek-V4 (pure torch, faithful to the reference).
 
 These are cheap, low-arithmetic ops kept in torch (the heavy GEMM/attention paths
-are Triton). The reference's FP8/FP4 *activation* quant simulations and the
-Hadamard rotation are applied on the compressor/attention paths via the dsv4
-Triton kernels (``fp8_linear.act_quant_fp8_inplace`` / ``fp4_act_quant_inplace``
-and ``hadamard.hadamard_transform``; see ``compress.py`` / ``attention.py``), so
+are Triton). The reference's FP8/FP4 KV quant is the packed KV pool's store
+(``kvcache/dsv4/v4_pool.py``), the indexer query's FP4 quant simulation is
+``fp8_linear.fp4_act_quant_inplace`` and the Hadamard rotation is
+``hadamard.hadamard_transform`` (see ``compress.py`` / ``attention.py``), so
 precision matches the reference.
 """
 

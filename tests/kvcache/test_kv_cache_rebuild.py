@@ -309,7 +309,7 @@ def test_dsv4_rebuild_from_config_builds_the_pool_sizes_and_attaches_the_table()
     P, mrr = 128, 1
     args = DeepseekV4Args(
         n_layers=4, compress_ratios=(0, 4, 128, 4), max_seq_len=512,
-        head_dim=64, index_head_dim=32, window_size=P,
+        head_dim=128, index_head_dim=32, window_size=P,
     )
     config = SimpleNamespace(
         max_seq_len=512, page_size=P, max_running_req=mrr, cache_type="swa_radix",

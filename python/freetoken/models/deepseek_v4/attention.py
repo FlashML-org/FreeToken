@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import get_global_ctx
-from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
 
@@ -262,7 +261,6 @@ class Attention(BaseOP):
         kv = self.wkv.forward(x)
         kv = self.kv_norm.forward(kv)
         apply_rotary_emb(kv[..., -rd:], freqs)
-        act_quant_fp8_inplace(kv[..., :-rd], 64)
 
         # Per-request: persistent window write + window/compressed top-k + stateful compressor/
         # indexer carry. Each request owns disjoint window/cmp/idx slots + ring blocks.
@@ -369,7 +367,6 @@ class Attention(BaseOP):
         kv = self.wkv.forward(x)
         kv = self.kv_norm.forward(kv)
         apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
-        act_quant_fp8_inplace(kv[..., :-rd], 64)
         # Persistent window write: each row's new token to its own window slot (swa_ratio=1).
         self.attn.store_window(kv.view(B, -1), self.layer_id, window_slots)
         # prev_window_slots (compressor rolling carry, read from the previous token's window page)
