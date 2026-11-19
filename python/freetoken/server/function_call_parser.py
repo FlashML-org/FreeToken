@@ -13,6 +13,7 @@
 
 import ast
 import json
+import math
 import os
 import logging
 import re
@@ -153,9 +154,25 @@ def _is_complete_json(input_str: str) -> bool:
         return False
 
 
+def _reject_constant(value: str) -> None:
+    raise ValueError(f"function.arguments contains a non-finite JSON number: {value}")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        _reject_constant(value)
+    return parsed
+
+
+def _loads_finite_json(value: str) -> Any:
+    # parse_constant alone misses exponent overflow, including inside containers.
+    return json.loads(value, parse_constant=_reject_constant, parse_float=_parse_finite_float)
+
+
 def _parse_loose_json_value(value: str) -> Any:
     try:
-        return json.loads(value)
+        return _loads_finite_json(value)
     except (json.JSONDecodeError, TypeError, ValueError):
         if value.lower() == "true":
             return True
@@ -222,7 +239,7 @@ def _parse_gemma_value(value: str) -> Any:
     except ValueError:
         pass
     try:
-        return float(value)
+        return _parse_finite_float(value)
     except ValueError:
         return value
 
@@ -314,15 +331,17 @@ class BaseFormatDetector(ABC):
                 if not _should_forward_unknown_tool(name):
                     continue
 
-            results.append(
-                ToolCallItem(
-                    tool_index=tool_indices.get(name, -1),
-                    name=name,
-                    parameters=json.dumps(
-                        act.get("parameters") or act.get("arguments", {}),
-                        ensure_ascii=False,
-                    ),
+            try:
+                arguments = json.dumps(
+                    act.get("parameters") or act.get("arguments", {}),
+                    ensure_ascii=False,
+                    allow_nan=False,
                 )
+            except ValueError as e:
+                logger.warning(f"Refuse non-finite function.arguments for {name}: {e}")
+                continue
+            results.append(
+                ToolCallItem(tool_index=tool_indices.get(name, -1), name=name, parameters=arguments)
             )
 
         return results
@@ -380,7 +399,7 @@ class BaseFormatDetector(ABC):
                 return value
         elif param_type in ("number", "float", "double"):
             try:
-                fv = float(value)
+                fv = _parse_finite_float(value)
                 return int(fv) if fv == int(fv) else fv
             except (ValueError, TypeError):
                 return value
@@ -388,10 +407,12 @@ class BaseFormatDetector(ABC):
             return value.lower() == "true"
         elif param_type in ("object", "array"):
             try:
-                return json.loads(value)
+                return _loads_finite_json(value)
             except (json.JSONDecodeError, TypeError, ValueError):
                 try:
-                    return ast.literal_eval(value)
+                    parsed = ast.literal_eval(value)
+                    json.dumps(parsed, allow_nan=False)
+                    return parsed
                 except (ValueError, SyntaxError, TypeError):
                     return value
         return value
@@ -592,7 +613,20 @@ class BaseFormatDetector(ABC):
                 if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
-                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
+                    try:
+                        cur_args_json = json.dumps(cur_arguments, ensure_ascii=False, allow_nan=False)
+                    except ValueError as e:
+                        # Locate the rejected call's end even when orjson rejects
+                        # its non-finite tokens; never serialize this decoded value.
+                        payload = current_text[start_idx:]
+                        try:
+                            _, end_idx = JSONDecoder().raw_decode(payload, WHITESPACE.match(payload, 0).end())
+                        except JSONDecodeError:
+                            return StreamingParseResult()
+                        logger.warning(f"Refuse non-finite function.arguments: {e}")
+                        is_current_complete = True
+                        cur_args_json = None
+                        current_tool_call = {}
                     prev_arguments = None
                     if self.current_tool_id < len(self.prev_tool_call_arr):
                         prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
@@ -601,7 +635,7 @@ class BaseFormatDetector(ABC):
 
                     # If the current tool's JSON is complete, send all remaining arguments
                     if is_current_complete:
-                        argument_diff = cur_args_json[sent:]
+                        argument_diff = cur_args_json[sent:] if cur_args_json is not None else None
                         completing_tool_id = self.current_tool_id  # Save the ID of the tool that's completing
 
                         # Only remove the processed portion, keep unprocessed content;
@@ -621,7 +655,7 @@ class BaseFormatDetector(ABC):
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
+                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False, allow_nan=False)
                         if cur_args_json != prev_args_json:
                             prefix = _find_common_prefix(prev_args_json, cur_args_json)
                             argument_diff = prefix[sent:]
@@ -890,7 +924,7 @@ class InvokeParamStreamMixin:
                         self._ps_lead
                         + json.dumps(self._ps_key, ensure_ascii=False)
                         + ":"
-                        + json.dumps(converted, ensure_ascii=False)
+                        + json.dumps(converted, ensure_ascii=False, allow_nan=False)
                     )
                     _update_prev()
                 self._buffer = buf[end + len(self._ps_param_close):]
@@ -1296,7 +1330,7 @@ class Glm47Detector(BaseFormatDetector):
                 continue
             # Undeclared parameter: legacy loose typing.
             try:
-                parsed_value = json.loads(value)
+                parsed_value = _loads_finite_json(value)
                 args[key] = parsed_value
             except (json.JSONDecodeError, ValueError):
                 args[key] = value
@@ -1347,7 +1381,7 @@ class Glm47Detector(BaseFormatDetector):
                     ToolCallItem(
                         tool_index=tool_indices.get(func_name, len(calls)),
                         name=func_name,
-                        parameters=json.dumps(func_args, ensure_ascii=False),
+                        parameters=json.dumps(func_args, ensure_ascii=False, allow_nan=False),
                     )
                 )
             except Exception as e:
@@ -1548,14 +1582,14 @@ class Glm47Detector(BaseFormatDetector):
                         converted = self._convert_param_value(raw, self._g_key, self._g_config, "")
                     else:
                         try:
-                            converted = json.loads(raw)
+                            converted = _loads_finite_json(raw)
                         except (json.JSONDecodeError, ValueError):
                             converted = raw
                     _emit(
                         self._g_lead
                         + json.dumps(self._g_key, ensure_ascii=False)
                         + ":"
-                        + json.dumps(converted, ensure_ascii=False)
+                        + json.dumps(converted, ensure_ascii=False, allow_nan=False)
                     )
                     _update_prev()
                 self._buffer = buf[end + len(self._G_VAL_CLOSE):]
@@ -1669,7 +1703,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             parsed: Any = value
         else:
             try:
-                parsed = json.loads(value)
+                parsed = _loads_finite_json(value)
             except (json.JSONDecodeError, ValueError):
                 parsed = value
         lead = "{" if index == 0 else ", "
@@ -1677,7 +1711,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             lead
             + json.dumps(name, ensure_ascii=False)
             + ": "
-            + json.dumps(parsed, ensure_ascii=False)
+            + json.dumps(parsed, ensure_ascii=False, allow_nan=False)
         )
 
     def _dsml_params_to_json(self, params: List[tuple]) -> str:
@@ -1688,10 +1722,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 args[name] = value
             else:
                 try:
-                    args[name] = json.loads(value)
+                    args[name] = _loads_finite_json(value)
                 except (json.JSONDecodeError, ValueError):
                     args[name] = value
-        return json.dumps(args, ensure_ascii=False)
+        return json.dumps(args, ensure_ascii=False, allow_nan=False)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-time parsing for DSML format tool calls."""
@@ -1710,7 +1744,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 continue
 
             param_matches = self.param_regex.findall(invoke_body)
-            args_json = self._dsml_params_to_json(param_matches)
+            try:
+                args_json = self._dsml_params_to_json(param_matches)
+            except ValueError as e:
+                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                continue
 
             calls.append(
                 ToolCallItem(
@@ -1901,14 +1939,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if self._ds_mode == "pbuf":
                     value = buf[:end]
                     try:
-                        parsed: Any = json.loads(value)
+                        parsed: Any = _loads_finite_json(value)
                     except (json.JSONDecodeError, ValueError):
                         parsed = value
                     _emit_args(
                         self._param_lead
                         + json.dumps(self._param_name, ensure_ascii=False)
                         + ":"
-                        + json.dumps(parsed, ensure_ascii=False)
+                        + json.dumps(parsed, ensure_ascii=False, allow_nan=False)
                     )
                     _update_prev_args()
                 self._buffer = buf[end + len(self.param_end_token):]
@@ -2023,10 +2061,15 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
             param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
 
+        try:
+            arguments = json.dumps(param_dict, ensure_ascii=False, allow_nan=False)
+        except ValueError as e:
+            logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+            return None
         return ToolCallItem(
             tool_index=tool_indices.get(func_name, 0),
             name=func_name,
-            parameters=json.dumps(param_dict, ensure_ascii=False),
+            parameters=arguments,
         )
 
     def _build_partial_arguments_json(self, func_name: str, partial_body: str, tools: List[Tool]) -> Optional[str]:
@@ -2069,7 +2112,11 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
         if not param_dict and not has_visible_value:
             return None
 
-        return json.dumps(param_dict, ensure_ascii=False)
+        try:
+            return json.dumps(param_dict, ensure_ascii=False, allow_nan=False)
+        except ValueError as e:
+            logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+            return None
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
@@ -2123,11 +2170,16 @@ class Gemma4Detector(BaseFormatDetector):
             if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
                 logger.warning(f"Model attempted to call undefined function: {func_name}")
                 continue
+            try:
+                arguments = json.dumps(_parse_gemma_call_args(arg_text), ensure_ascii=False, allow_nan=False)
+            except ValueError as e:
+                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                continue
             calls.append(
                 ToolCallItem(
                     tool_index=len(calls),
                     name=func_name,
-                    parameters=json.dumps(_parse_gemma_call_args(arg_text), ensure_ascii=False),
+                    parameters=arguments,
                 )
             )
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -2333,7 +2385,7 @@ class Gemma4Detector(BaseFormatDetector):
                     self._g4_lead
                     + json.dumps(self._g4_key, ensure_ascii=False)
                     + ":"
-                    + json.dumps(converted, ensure_ascii=False)
+                    + json.dumps(converted, ensure_ascii=False, allow_nan=False)
                 )
                 _update_prev()
                 self._g4_scanned = 0
@@ -2440,11 +2492,16 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
                     args[key] = self._convert_param_value(raw, key, config, func_name)
                 else:
                     args[key] = _parse_loose_json_value(raw)
+            try:
+                arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+            except ValueError as e:
+                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                continue
             calls.append(
                 ToolCallItem(
                     tool_index=len(calls),
                     name=func_name,
-                    parameters=json.dumps(args, ensure_ascii=False),
+                    parameters=arguments,
                 )
             )
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -2594,7 +2651,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     return int(s)
                 except ValueError:
                     try:
-                        return float(s)
+                        return _parse_finite_float(s)
                     except ValueError:
                         return raw
             if ptype in ("object", "array") and raw.strip() == "":
@@ -2623,7 +2680,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     return int(s)
                 except ValueError:
                     try:
-                        return float(s)
+                        return _parse_finite_float(s)
                     except ValueError:
                         continue
             if t in ("boolean", "bool") and s.lower() in ("true", "false"):
@@ -2632,7 +2689,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 return None
             if t in ("object", "array"):
                 try:
-                    v = json.loads(s)
+                    v = _loads_finite_json(s)
                 except (json.JSONDecodeError, ValueError):
                     continue
                 if isinstance(v, dict if t == "object" else list):
@@ -2788,7 +2845,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                     ToolCallItem(
                         tool_index=len(calls),
                         name=func_name,
-                        parameters=json.dumps(args, ensure_ascii=False),
+                        parameters=json.dumps(args, ensure_ascii=False, allow_nan=False),
                     )
                 )
             else:
@@ -2892,7 +2949,7 @@ class MiniMaxM3Detector(BaseFormatDetector):
                 )
                 continue
             args = self._args_from_items(func_name, items, tools)
-            args_json = json.dumps(args, ensure_ascii=False)
+            args_json = json.dumps(args, ensure_ascii=False, allow_nan=False)
             self.current_tool_id += 1
             while len(self.prev_tool_call_arr) <= self.current_tool_id:
                 self.prev_tool_call_arr.append({})
@@ -2991,11 +3048,16 @@ class GptOssDetector(BaseFormatDetector):
             args = _parse_first_json_value(payload)
             if args is None:
                 continue
+            try:
+                arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+            except ValueError as e:
+                logger.warning(f"Refuse non-finite function.arguments for {func_name}: {e}")
+                continue
             calls.append(
                 ToolCallItem(
                     tool_index=len(calls),
                     name=func_name,
-                    parameters=json.dumps(args, ensure_ascii=False),
+                    parameters=arguments,
                 )
             )
         return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -3696,12 +3758,14 @@ class FunctionCallParser:
         # behind). Re-feed "" until the detector stops making progress.
         text = chunk_text
         for _ in range(16):
+            buffer_before = self.detector._buffer
             sp_result = self.detector.parse_streaming_increment(text, self.tools)
             if sp_result.normal_text:
                 segments.append(("text", sp_result.normal_text))
             if sp_result.calls:
                 segments.append(("calls", sp_result.calls))
-            if text == "" and not sp_result.calls and not sp_result.normal_text:
+            if (text == "" and not sp_result.calls and not sp_result.normal_text
+                    and self.detector._buffer == buffer_before):
                 break
             text = ""
         return segments
@@ -3750,7 +3814,10 @@ class FunctionCallParser:
             # `is not None`, not truthiness: {} is a legitimate ledger entry (an
             # empty-argument call) and must serialize instead of falling through.
             if args is not None:
-                return json.dumps(args, ensure_ascii=False)
+                try:
+                    return json.dumps(args, ensure_ascii=False, allow_nan=False)
+                except ValueError as e:
+                    logger.warning(f"Refuse non-finite function.arguments for tool {tool_ordinal}: {e}")
         return None
 
     def finalize_stream(self) -> List[ToolCallItem]:
