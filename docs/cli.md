@@ -41,6 +41,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--host` | 127.0.0.1 | Bind address |
 | `--port` | 1919 | Bind port |
+| `--http-keep-alive-s` | 360 | HTTP idle keep-alive timeout in seconds. Set above the longest client pool idle timeout (e.g. Bun/opencode: 300 s) so the client closes first; uvicorn does not advertise a `Keep-Alive` timeout or buffer the close |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
