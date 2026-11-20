@@ -135,6 +135,15 @@ struct CpuMoeExecutor {
   // Hybrid hands the CPU a few routes of a step: only these get work items, since a claim that finds nothing still costs a contended atomic.
   std::vector<int64_t> active_routes;  // intermediate rows tok * top_k + k whose route names an expert
   std::vector<int> active_tokens;      // tokens with at least one such route
+  // Pass 1 splits the work by expert: one item computes a block for every token on that expert, so the block is read from DRAM once.
+  // Only a step where some expert has two or more routes is grouped; otherwise pass 1 item u is active route u.
+  bool grouped = false;
+  std::vector<int64_t> expert_routes;  // active_routes grouped by expert, larger groups first, each group in token order
+  std::vector<int64_t> expert_start;   // expert_routes[expert_start[u], expert_start[u + 1]) is group u
+  int p2_tokens = 1;                   // active tokens per pass 2 item
+  // Grouping scratch over the experts a step uses; expert_slot is -1 for every expert between steps.
+  std::vector<int> expert_slot, slot_expert, slot_count, slot_order, size_at;
+  std::vector<int64_t> slot_fill;
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -179,6 +188,15 @@ struct CpuMoeExecutor {
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
     active_routes.reserve(static_cast<size_t>(params.max_tokens) * params.top_k);
     active_tokens.reserve(params.max_tokens);
+    const size_t max_routes = static_cast<size_t>(params.max_tokens) * params.top_k;
+    expert_routes.reserve(max_routes);
+    expert_start.reserve(max_routes + 1);
+    expert_slot.assign(num_experts, -1);
+    slot_expert.assign(max_routes, 0);
+    slot_count.assign(max_routes, 0);
+    slot_order.assign(max_routes, 0);
+    size_at.assign(max_routes + 1, 0);
+    slot_fill.assign(max_routes, 0);
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -235,26 +253,37 @@ struct CpuMoeExecutor {
     }
   }
 
-  // Pass 1 item p = one kRowBlock block of one active route's intermediate row.
+  // Pass 1 item p = one kRowBlock block of one expert's intermediate rows, for each active route on that expert (one if
+  // ungrouped). The routes run back to back on one worker, so every token after the first reads the block from cache.
   void do_pass1(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t ib = p % n_iblk;
-    const int64_t tk = active_routes[p / n_iblk];
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = io_ids[static_cast<size_t>(tok) * top_k + k];
-    const float w_in = apply_on_input ? io_w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
+    const int64_t u = p / n_iblk;
     const int i0 = static_cast<int>(ib) * kRowBlock;
     const int i1 = std::min(I, i0 + kRowBlock);
-    format_of(t).gate_up(static_cast<int>(t.layer), e, tok, i0, i1, io_x + (size_t)tok * H, w_in,
-                         g_scratch.data() + ((size_t)tok * top_k + k) * I);
+    const MoeFormat& f = format_of(t);
+    const int64_t* routes = grouped ? expert_routes.data() + expert_start[u] : active_routes.data() + u;
+    const int64_t n = grouped ? expert_start[u + 1] - expert_start[u] : 1;
+    for (int64_t j = 0; j < n; ++j) {
+      const int64_t r = routes[j];
+      const int tok = static_cast<int>(r / top_k);
+      const float w_in = apply_on_input ? io_w[r] : 1.0f;
+      f.gate_up(static_cast<int>(t.layer), io_ids[r], tok, i0, i1, io_x + (size_t)tok * H, w_in, g_scratch.data() + (size_t)r * I);
+    }
   }
 
-  // Pass 2 item p = one kRowBlock block of one active token's output row, summed over its routes.
+  // Pass 2 item p = one kRowBlock block of the output rows of p2_tokens active tokens, one token after another.
+  // Tokens that share an expert read its rows of the block from cache after the first.
   void do_pass2(const MoeTask& t, int64_t p) {
-    const int top_k = params.top_k, H = params.H, I = params.I;
     const int64_t hb = p % n_hblk;
-    const int tok = active_tokens[p / n_hblk];
+    const int64_t first = p / n_hblk * p2_tokens;
+    const int64_t last = std::min<int64_t>(static_cast<int64_t>(active_tokens.size()), first + p2_tokens);
+    for (int64_t i = first; i < last; ++i) down_block(t, active_tokens[i], hb);
+  }
+
+  // One kRowBlock block of token tok's output row, summed over its routes.
+  void down_block(const MoeTask& t, int tok, int64_t hb) {
+    const int top_k = params.top_k, H = params.H, I = params.I;
     const int h0 = static_cast<int>(hb) * kRowBlock;
     const int h1 = std::min(H, h0 + kRowBlock);
     DownRoute routes[kMaxTopK];
@@ -347,6 +376,45 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Groups active_routes by expert, larger groups first so heavy pass 1 items do not run last; counts only the experts the
+  // step uses, so submit pays no pass over all experts. A step where no expert has two routes is left ungrouped.
+  void group_routes_by_expert() {
+    int u = 0, most = 0;
+    for (const int64_t r : active_routes) {
+      int& s = expert_slot[io_ids[r]];
+      if (s < 0) {
+        s = u;
+        slot_expert[u] = io_ids[r];
+        slot_count[u++] = 0;
+      }
+      most = std::max(most, ++slot_count[s]);
+    }
+    grouped = most > 1;
+    if (!grouped) {
+      for (int s = 0; s < u; ++s) expert_slot[slot_expert[s]] = -1;
+      return;
+    }
+    std::fill(size_at.begin(), size_at.begin() + most + 1, 0);
+    for (int s = 0; s < u; ++s) ++size_at[slot_count[s]];
+    for (int c = most, first = 0; c >= 1; --c) {
+      const int m = size_at[c];
+      size_at[c] = first;
+      first += m;
+    }
+    for (int s = 0; s < u; ++s) slot_order[size_at[slot_count[s]]++] = s;
+    expert_start.clear();
+    int64_t at = 0;
+    for (int i = 0; i < u; ++i) {
+      expert_start.push_back(at);
+      slot_fill[slot_order[i]] = at;
+      at += slot_count[slot_order[i]];
+    }
+    expert_start.push_back(at);
+    expert_routes.resize(active_routes.size());
+    for (const int64_t r : active_routes) expert_routes[slot_fill[expert_slot[io_ids[r]]]++] = r;
+    for (int s = 0; s < u; ++s) expert_slot[slot_expert[s]] = -1;
+  }
+
   void submit(MoeTask t) {
     const int num_tokens = static_cast<int>(t.num_tokens);
     MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
@@ -363,8 +431,15 @@ struct CpuMoeExecutor {
       else
         std::memset(io_y + static_cast<size_t>(tok) * params.H, 0, sizeof(bf16_t) * params.H);
     }
-    p1_total = static_cast<int64_t>(active_routes.size()) * n_iblk;
-    p2_total = static_cast<int64_t>(active_tokens.size()) * n_hblk;
+    group_routes_by_expert();
+    // When some expert serves several tokens, pass 2 puts as many tokens in an item as still leaves each worker about
+    // four items; otherwise there is nothing to reuse and an item stays one token, as finer items balance better.
+    const int64_t n_tok = static_cast<int64_t>(active_tokens.size());
+    const int64_t groups = std::min<int64_t>(n_tok, (4 * static_cast<int64_t>(num_threads) + n_hblk - 1) / n_hblk);
+    p2_tokens = grouped && groups > 0 ? static_cast<int>((n_tok + groups - 1) / groups) : 1;
+    const int64_t p1_items = grouped ? static_cast<int64_t>(expert_start.size()) - 1 : static_cast<int64_t>(active_routes.size());
+    p1_total = p1_items * n_iblk;
+    p2_total = (n_tok + p2_tokens - 1) / p2_tokens * n_hblk;
     prt_total = fmt.preps_inter() ? static_cast<int64_t>(active_routes.size()) : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
