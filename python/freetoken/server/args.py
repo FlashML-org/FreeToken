@@ -114,7 +114,7 @@ class ServerArgs(SchedulerConfig):
 # the prompt length a preset's KV reserve allows for on top of the default max output tokens
 PRESET_PROMPT_TOKENS = 4096
 
-# --preset: what each one sets where the command line says nothing. 'none' (the default) sets nothing.
+# --preset: what each one sets where the command line says nothing. 'none' sets nothing.
 _PRESETS: dict[str, dict] = {
     "single": {
         "max_running_req": 1,
@@ -394,7 +394,10 @@ def parse_args(
         type=int,
         dest="max_running_req",
         default=ServerArgs.max_running_req,
-        help="The maximum number of running requests.",
+        help=(
+            "The maximum number of running requests: 1 with no --preset (serves as 'single'), "
+            "4 with --preset none."
+        ),
     )
 
     parser.add_argument(
@@ -1072,8 +1075,9 @@ def parse_args(
         default=ServerArgs.preset,
         choices=["none", *sorted(_PRESETS)],
         help=(
-            "Settings for a kind of use, applied only where the command line says nothing; 'none' (the default) sets "
-            "nothing. 'single' serves one "
+            "Settings for a kind of use, applied only where the command line says nothing. With no --preset and no "
+            "--max-running-requests above 1, the server serves as 'single'; 'none' serves without a preset. "
+            "'single' serves one "
             "request at a time on a GPU smaller than the model: --max-running-requests 1, --embed-weights host, "
             "--memory-ratio 0.95, --moe-prefill-hit-d2d, mtp speculative decoding with 3 draft tokens where the "
             "checkpoint has the MTP layers, and a --kv-reserve-tokens that holds the default max output tokens and "
@@ -1115,10 +1119,20 @@ def parse_args(
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
+    # with no named preset, a server whose command line gives no --max-running-requests, or gives 1, serves as
+    # --preset single; --preset none keeps it without one; --max-running-requests above 1 is a server of several
+    default_single = kwargs["preset"] is None and ("max_running_req" in left_alone or kwargs["max_running_req"] == 1)
     if kwargs["preset"] == "none":
         kwargs["preset"] = None
+    elif default_single:
+        kwargs["preset"] = "single"
     if kwargs["preset"] is not None:
         kwargs["preset_fields"] = _apply_preset(kwargs, left_alone)
+    if default_single:
+        logger.info(
+            "no --preset and one running request (no --max-running-requests, or 1): serving as --preset single, which filled "
+            + (", ".join(kwargs["preset_fields"]) or "nothing") + " (--preset none serves without it)"
+        )
     if kwargs["speculative_algorithm"] == "off":
         kwargs["speculative_algorithm"] = None
 

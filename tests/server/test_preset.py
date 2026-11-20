@@ -1,4 +1,4 @@
-"""--preset: fills only the fields the command line left alone, and nothing without the flag."""
+"""--preset: fills only the fields the command line left alone; with no preset named, a one-request server is single."""
 
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ _PRESET_SINGLE = {
 
 
 def test_preset_single_changes_its_fields_and_nothing_without_the_flag():
-    plain, preset = _parse(), _parse("--preset", "single")
+    # --preset none is the server without a preset (no flag at all now serves as single)
+    plain, preset = _parse("--preset", "none"), _parse("--preset", "single")
     changed = {f.name: getattr(preset, f.name) for f in dataclasses.fields(plain) if getattr(plain, f.name) != getattr(preset, f.name)}
     assert changed == {**_PRESET_SINGLE, "preset": "single", "preset_fields": tuple(_PRESET_SINGLE)}
     # without the flag: the class defaults, and a startup dump of the arguments that does not name it
@@ -57,9 +58,51 @@ def test_explicit_flag_wins_over_the_preset(flag, field, value):
         assert args.speculative_num_steps == 0
 
 
-def test_preset_none_is_the_default_and_sets_nothing():
-    assert _parse("--preset", "none") == _parse()
-    assert _parse("--preset", "none").preset is None and _parse().preset_fields == ()
+def test_a_one_request_server_without_a_preset_serves_as_single():
+    """No --preset and no --max-running-requests above 1: 'single''s fields, filled as --preset single fills them."""
+    with patch("freetoken.server.args.logger") as log:
+        alone = _parse("--max-running-requests", "1")
+    single = _parse("--preset", "single", "--max-running-requests", "1")
+    assert dataclasses.asdict(alone) == dataclasses.asdict(single)
+    assert alone.preset == "single" and alone.preset_fields == tuple(f for f in _PRESET_SINGLE if f != "max_running_req")
+    assert all(getattr(alone, name) == value for name, value in _PRESET_SINGLE.items())
+    # one line says it serves as single and names the fields it filled
+    said = [c.args[0] for c in log.info.call_args_list if "serving as --preset single" in c.args[0]]
+    assert len(said) == 1 and all(name in said[0] for name in alone.preset_fields)
+    # --preset single itself differs only in the field the command line typed here
+    named = _parse("--preset", "single")
+    differ = {f.name for f in dataclasses.fields(named) if getattr(named, f.name) != getattr(alone, f.name)}
+    assert differ == {"preset_fields"} and named.preset_fields == tuple(_PRESET_SINGLE)
+    # no flag at all resolves to the same config as --preset single
+    assert dataclasses.asdict(_parse()) == dataclasses.asdict(named)
+    # several running requests: no preset, as before
+    assert _parse("--max-running-requests", "2").preset is None
+
+
+def test_preset_none_keeps_a_one_request_server_without_a_preset():
+    bare = _parse("--preset", "none", "--max-running-requests", "1")
+    assert bare.preset is None and bare.preset_fields == ()
+    # the config without a preset: the class defaults, the one running request it typed apart
+    plain = _parse("--preset", "none")
+    differ = {f.name: getattr(bare, f.name) for f in dataclasses.fields(bare) if getattr(bare, f.name) != getattr(plain, f.name)}
+    assert differ == {"max_running_req": 1}
+    assert all(getattr(plain, name) == getattr(ServerArgs, name) for name in _PRESET_SINGLE)
+    assert plain.preset is None and plain.preset_fields == ()
+
+
+@pytest.mark.parametrize(
+    "flag, field, value",
+    [
+        (("--memory-ratio", "0.9"), "memory_ratio", 0.9),
+        (("--embed-weights", "gpu"), "embed_weights", "gpu"),
+        (("--speculative-algorithm", "off"), "speculative_algorithm", None),
+        (("--kv-reserve-tokens", "8192"), "kv_reserve_tokens", 8192),
+    ],
+)
+def test_explicit_flag_wins_over_the_one_request_default(flag, field, value):
+    args = _parse("--max-running-requests", "1", *flag)
+    assert args.preset == "single" and getattr(args, field) == value and field not in args.preset_fields
+    assert dataclasses.asdict(args) == dataclasses.asdict(_parse("--preset", "single", "--max-running-requests", "1", *flag))
 
 
 def test_preset_kv_reserve_follows_the_output_limit_and_leaves_a_sized_kv_pool_alone():
