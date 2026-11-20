@@ -329,6 +329,126 @@ def test_triton_overlap_prefill_matches_dequant_reference():
 
 
 @cuda
+@pytest.mark.parametrize(("cache_size", "query_width"), [(1100, None), (E, 3)])
+def test_triton_demand_prefill_matches_the_streamed_layer_bit_for_bit(monkeypatch, cache_size, query_width):
+    """A short prefill chunk loads only its routed experts, through the slot cache, and runs the
+    same grouped GEMM over the slots: its output must equal the whole-layer stream's exactly, and
+    its admissions must not count as decode misses. The chunk routes more often than one
+    admission query compiles for, and the wider cache aligns past 1024 experts; the cache of one
+    layer's experts, filled three at a time, must keep every query's experts until the GEMM."""
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+
+    if query_width is not None:
+        monkeypatch.setattr(offload_kernels, "ENSURE_QUERY_WIDTH", query_width)
+    device = torch.device("cuda")
+    torch.manual_seed(15)
+    M = 600
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.rand(M, E, device=device).argsort(dim=1)[:, :TOPK].to(torch.int32).contiguous()
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+
+    streamed_cache, _ = _triton_cache(device)
+    streamed_cache.materialize_layer(1)
+    streamed_cache.copy_missing()
+    streamed = fused_experts_nvfp4(
+        hidden, *streamed_cache.stage_views(1, 0), topk_weights, topk_ids.clone(), E, "silu", False
+    )
+
+    demand_cache, _ = _triton_cache(device, cache_size=cache_size)
+    demand_cache.collect_stats = True
+    # decode left the other layer's experts and one of this layer's resident, so slots are not expert ids
+    for layer_id, resident in ((0, [7, 6]), (1, [2])):
+        demand_cache.ensure_experts(layer_id, torch.tensor([resident], dtype=torch.int32, device=device))
+        demand_cache.copy_missing()
+    decode_stats = demand_cache.lru_stats.clone()
+    slots = demand_cache.load_prefill_experts(1, topk_ids)
+    demanded = fused_experts_nvfp4(
+        hidden, *demand_cache.pool_bank_views(1), topk_weights, slots, demand_cache.pool_slots(1), "silu", False,
+        routed_experts=E,
+    )
+
+    assert not torch.equal(slots, topk_ids), "the admission must have mapped expert ids to slots"
+    assert torch.equal(demanded, streamed)
+    assert torch.equal(demand_cache.lru_stats, decode_stats)
+
+
+def test_triton_prefill_over_cache_slots_sizes_its_tiles_by_the_routed_layer(monkeypatch):
+    """The Triton prefill over a demand chunk's slots aligns over the slots and hands the GEMM the layer's experts to
+    size its tiles by, as the stream's banks would."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization import ExpertView, RoutedExperts
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+    from freetoken.moe import fused_nvfp4
+
+    seen = {}
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4", lambda *args, **kwargs: seen.update(args=args, kwargs=kwargs))
+    slots = 1100
+    banks = {role: torch.zeros(slots, 1) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
+    view = ExpertView(banks, n=slots, routed=RoutedExperts(E))
+    TritonNvfp4MoEKernel().apply(
+        SimpleNamespace(activation="silu", alpha=1.702, limit=7.0, apply_router_weight_on_input=False),
+        torch.zeros(4, H), torch.ones(4, TOPK), torch.zeros(4, TOPK, dtype=torch.int32), view, is_prefill=True,
+    )
+
+    assert seen["args"][9] == slots
+    assert seen["kwargs"]["routed_experts"] == E
+
+
+def test_w4a4_prefill_over_cache_slots_takes_the_routed_layers_scales_and_tiles(monkeypatch):
+    """A demand prefill chunk's W4A4 GEMMs read cache slots, but the stream quantizes its activations under the max of
+    the layer's own input scales and sizes its tiles by the layer's experts: other layers' slots carry scales this
+    layer never routes to."""
+    from types import SimpleNamespace
+
+    from freetoken.layers.quantization import ExpertView, RoutedExperts
+    from freetoken.layers.quantization.moe.nvfp4 import W4a4Nvfp4MoEKernel
+    from freetoken.moe import fused_nvfp4
+
+    seen = {}
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4_w4a4", lambda *args, **kwargs: seen.update(args=args, kwargs=kwargs))
+    slots = 1100
+    layer_scales = (torch.full((E,), 2.0), torch.full((E,), 3.0))
+    slot_scales = (torch.full((slots,), 9.0), torch.full((slots,), 9.0))
+    banks = {role: torch.zeros(slots, 1) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
+    view = ExpertView(banks, n=slots, alphas=slot_scales, routed=RoutedExperts(E, layer_scales))
+    W4a4Nvfp4MoEKernel().apply(
+        SimpleNamespace(activation="silu", alpha=1.702, limit=7.0),
+        torch.zeros(4, H), torch.ones(4, TOPK), torch.zeros(4, TOPK, dtype=torch.int32), view, is_prefill=True,
+    )
+
+    assert seen["args"][7] is layer_scales[0] and seen["args"][8] is layer_scales[1]
+    assert seen["args"][11] == slots
+    assert seen["kwargs"]["routed_experts"] == E
+
+
+def test_w4a4_prefill_sizes_its_tiles_by_the_routed_experts_and_hands_them_to_its_fallback(monkeypatch):
+    """Where W4A4 does not pay, the Triton W4A16 prefill takes over: it aligns over the slots and sizes its tiles
+    by the layer's experts, as W4A4 itself would have."""
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.moe import fused_nvfp4
+
+    seen = {}
+
+    def without_w4a4(M, top_k, num_experts, *rest):
+        seen["tile_experts"] = num_experts
+        return None
+
+    monkeypatch.setattr(nvfp4_moe, "w4a4_prefill_config", without_w4a4)
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4", lambda *args: seen.update(fallback=args))
+    slots = 1100
+    banks = [torch.zeros(slots, 2 * I)] * 6
+    fused_nvfp4.fused_experts_nvfp4_w4a4(
+        torch.zeros(4, H), *banks, torch.ones(E), torch.ones(E), torch.ones(4, TOPK), torch.zeros(4, TOPK, dtype=torch.int32),
+        slots, routed_experts=E,
+    )
+
+    assert seen["tile_experts"] == E
+    assert seen["fallback"][9] == slots and seen["fallback"][-1] == E
+
+
+@cuda
 def test_triton_swigluoai_matches_dequant_reference():
     """MiniMax-M3's swigluoai routed experts through the Triton prefill grouped GEMM
     and the marlin-style decode GEMV: same banks, the clamped (up+1) swiglu instead
