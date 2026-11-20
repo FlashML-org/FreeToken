@@ -107,7 +107,7 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
-    include_vision: bool = True,
+    include_vision: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     import safetensors
 
