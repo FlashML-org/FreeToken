@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable
 import torch
 import torch.nn.functional as F
 
-# the draft's own tensors; ``mtp.safetensors`` holds exactly these (``*`` = layer index)
+# the draft's own tensors; ``mtp.safetensors`` holds exactly these, the first group under ``layers.{i}.``
 _LAYER_TENSORS = (
     "dflare_norm.weight", "input_layernorm.weight", "post_attention_layernorm.weight",
     "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight",
