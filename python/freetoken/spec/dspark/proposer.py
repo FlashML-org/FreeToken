@@ -196,10 +196,9 @@ class DSparkProposer(Proposer):
 
     # ------------------------------------------------------------------ draft step
 
-    def _context(self, rows: torch.Tensor, starts: torch.Tensor):
+    def _context(self, rows: torch.Tensor, starts: torch.Tensor, longest: int):
         """``context(layer)`` for the draft's block forward, read from the slots each request's page-table row maps: a local layer's window right-aligned below each start, a full layer's positions in chunks."""
         c, bs = self.draft_config, rows.shape[0]
-        longest = int(starts.max())
         table = self.ctx.page_table
 
         def gather(layer: int, pos: torch.Tensor, valid: torch.Tensor):
@@ -223,7 +222,7 @@ class DSparkProposer(Proposer):
         greedy = [r.sampling_params.is_greedy for r in reqs]
         starts = torch.tensor([r.cached_len for r in reqs], dtype=torch.int64, device=self.device)
         anchor = pending.to(torch.int64)
-        hidden = self.draft.forward_block(anchor, starts, self._context(rows.to(self.device), starts))
+        hidden = self.draft.forward_block(anchor, starts, self._context(rows.to(self.device), starts, max(r.cached_len for r in reqs)))
         f_rnn = self.f_rnn[rows]
         if all(greedy):
             return SpecProposal(self.draft.walk(hidden[:, 1 : self.width], anchor, f_rnn, lambda j, logits: logits.argmax(-1)))
