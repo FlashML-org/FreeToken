@@ -9,6 +9,9 @@ PROPOSERS.register("dflash")("freetoken.spec.dflash.proposer:DFlashProposer")
 
 # draft method name -> "module:Class" of the proposer it selects behind the CLI algorithm. A family
 # opts in through its spec_drafts, so these are not --spec-algo names and carry no user-facing validation
-DRAFT_PROPOSERS = {"shared_kv_mtp": "freetoken.spec.mtp.shared_proposer:SharedKVMTPProposer"}
+DRAFT_PROPOSERS = {
+    "shared_kv_mtp": "freetoken.spec.mtp.shared_proposer:SharedKVMTPProposer",
+    "dspark_mtp": "freetoken.spec.dspark.proposer:DSparkProposer",
+}
 
 __all__ = ["DRAFT_PROPOSERS", "PROPOSERS"]
