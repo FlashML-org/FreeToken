@@ -250,6 +250,25 @@ def test_mixed_layers_decode_and_prefill_through_their_pools():
 
 
 @cuda
+def test_prefill_staging_is_cleared_after_the_last_call_of_a_looped_order():
+    torch.manual_seed(1)
+    device = torch.device("cuda")
+    pieces = _pieces()
+    cache, layers, _ = _mixed_cache(device, pieces)
+    # a looped model runs layers 2-3 twice and ends its forward on layer 3, not on the last layer
+    cache.layer_order = (0, 1, 2, 3, 4, 2, 3)
+    M = 16
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    ids = torch.stack([torch.randperm(E)[:TOPK] for _ in range(M)]).to(torch.int32)
+    weights = torch.rand(M, TOPK, device=device)
+    for _ in range(2):  # the order's cursor wraps for the next forward
+        for layer_id in cache.layer_order:
+            out = layers[layer_id]._prefill_routed(hidden.clone(), weights, ids.to(device))
+            _assert_close(out, _reference(pieces, layer_id, hidden, weights, ids))
+        assert not any(cache._stage_dirty), "staged rows left after the forward's last MoE call"
+
+
+@cuda
 def test_resident_layers_each_read_their_own_format(monkeypatch):
     from freetoken.layers.moe import MoELayer
     from freetoken.layers.quantization import NoQuantConfig, QuantBackend, QuantConfig, set_quant_backend

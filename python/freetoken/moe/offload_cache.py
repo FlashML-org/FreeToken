@@ -865,13 +865,22 @@ class OffloadMoeCache:
             tail.zero_()
 
     def next_prefill_layer(self, layer_id: int) -> int:
-        """The MoE layer the forward runs after this call of ``layer_id`` (``num_layers`` after the last); advances the cursor of ``layer_order``."""
+        """The MoE layer the forward runs after this call of ``layer_id`` (``num_layers`` after the last)."""
         if self.layer_order is None:
             return layer_id + 1
         cursor = self._prefill_cursor
         assert self.layer_order[cursor] == layer_id, f"MoE layer {layer_id} ran out of the declared order at step {cursor}"
-        self._prefill_cursor = cursor + 1
         return self.layer_order[cursor + 1] if cursor + 1 < len(self.layer_order) else self.num_layers
+
+    def _ends_prefill_forward(self, layer_id: int) -> bool:
+        """Whether this released call of ``layer_id`` is the forward's last MoE call; steps the ``layer_order`` cursor, which wraps for the next forward."""
+        if self.layer_order is None:
+            return layer_id == self.num_layers - 1
+        cursor = self._prefill_cursor
+        assert self.layer_order[cursor] == layer_id, f"MoE layer {layer_id} ran out of the declared order at step {cursor}"
+        last = cursor + 1 == len(self.layer_order)
+        self._prefill_cursor = 0 if last else cursor + 1
+        return last
 
     def begin_prefill(self) -> None:
         self._prefill_cursor = 0
@@ -1067,7 +1076,7 @@ class OffloadMoeCache:
         return self.stage_views(layer_id, buffer_id)
 
     def release_prefill_layer(self, layer_id: int) -> None:
-        if layer_id == self.num_layers - 1:
+        if self._ends_prefill_forward(layer_id):
             # the staged slots were invalidated and nothing registers them within the forward, so their bytes are free to clear
             for b in range(2):
                 if self._stage_dirty[b]:
