@@ -39,6 +39,10 @@ from .compressor import Compressor
 from .indexer import Indexer
 from .rope import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
 
+# Up to this many tokens a GGUF wo_a runs as one batched ggml mul_mat, above it dequantize + bf16 einsum: on an RTX PRO 6000
+# MMQ is ahead for every attn_output_a type of the published GGUFs at 192 tokens, and Q2_K falls behind from 256
+WO_A_GGML_MAX_TOKENS = 192
+
 
 class DSV41Attention(BaseOP):
     def __init__(self, args: DeepseekV41Args, role: LayerRole, *, quant_config=None, prefix: str = ""):
@@ -64,9 +68,8 @@ class DSV41Attention(BaseOP):
         # bf16 copy in VRAM. An unquantized checkpoint ships it bf16.
         wo_a_scheme = quant_config.scheme_for(f"{prefix}.wo_a") if quant_config is not None else None
         self._wo_a_block = fp8_block_size(wo_a_scheme) if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.FP8_BLOCK else None
-        # A quantized GGUF wo_a keeps its packed ggml rows the same way: decode multiplies the groups as experts in ggml's MMVQ
+        # A quantized GGUF wo_a keeps its packed ggml rows the same way: decode runs the groups as one batched ggml mul_mat
         self._wo_a_ggml = gguf_types(wo_a_scheme)[0] if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.GGUF else None
-        self._wo_a_ids: torch.Tensor | None = None
         rows, cols = args.o_groups * args.o_lora_rank, args.n_heads * args.head_dim // args.o_groups
         if self._wo_a_block is not None:
             self.wo_a = torch.empty(rows, cols, dtype=torch.float8_e4m3fn)
@@ -97,8 +100,6 @@ class DSV41Attention(BaseOP):
     def bind(self, device: torch.device, tables: dict | None = None) -> None:
         """Attach the RoPE table; ``tables`` (key -> table) lets the model share one table per key
         instead of every layer holding its own ``[max_seq_len, rd // 2]`` copy."""
-        if self._wo_a_ggml is not None:
-            self._wo_a_ids = torch.arange(self.n_groups, dtype=torch.int32, device=device).unsqueeze(0)
         if tables is not None and self.freqs_key in tables:
             self._freqs = tables[self.freqs_key]
             return
@@ -122,9 +123,9 @@ class DSV41Attention(BaseOP):
         return self.kv_norm.forward(self.wkv.forward(x))
 
     def _wo(self, o: torch.Tensor) -> torch.Tensor:
-        """``wo_b(wo_a(o))``: while the vector kernels take the rows, a quantized ``wo_a`` is read in place (the grouped W8A16
-        GEMV over the fp8 payload, or ggml's ``mul_mat_id`` MMVQ over a GGUF's blocks with group ``g`` as expert ``g``);
-        above that, the reference's grouped einsum over the bf16 (or dequantized) ``wo_a``."""
+        """``wo_b(wo_a(o))``: for decode-sized ``T`` a quantized ``wo_a`` is read in place (the grouped W8A16 GEMV over the fp8
+        payload, or one ggml ``mul_mat`` over a GGUF's blocks batched over the groups); above that, the reference's grouped
+        einsum over the bf16 (or dequantized) ``wo_a``."""
         t = o.shape[0]
         o = o.reshape(t, self.n_groups, -1)
         if self._wo_a_block is not None and t <= GEMV_MAX_M:
@@ -133,12 +134,12 @@ class DSV41Attention(BaseOP):
         if self._wo_a_ggml is not None:
             from freetoken.kernel import ggml
 
-            if t <= ggml.mmvq_max_tokens(self._wo_a_ggml):
-                assert self._wo_a_ids is not None, "attention layer is not bound (call bind first)"
-                ids = self._wo_a_ids.expand(t, -1).contiguous()
+            if t <= WO_A_GGML_MAX_TOKENS:
+                # [T, G, D] read and [T, G, R] written as [G, T, *] views: MMVQ / MMQ go over each group's blocks once for all T rows
+                out = torch.empty(t, self.n_groups, self.o_lora_rank, dtype=o.dtype, device=o.device)
                 w = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
-                return self.wo_b.forward(ggml.mul_mat_id(w, self._wo_a_ggml, o, ids).flatten(1))
-            # above that, dequantize for the reference einsum: MMQ over 8 groups wins only on short chunks, not prefill-sized ones
+                ggml.mul_mat(w, self._wo_a_ggml, o.transpose(0, 1), out=out.transpose(0, 1))
+                return self.wo_b.forward(out.flatten(1))
             wo_a = ggml.dequantize(self.wo_a, self._wo_a_ggml, o.shape[-1])
         elif self._wo_a_block is not None:
             wo_a = dequant_block_fp8(self.wo_a, self.wo_a_scale, block=self._wo_a_block)

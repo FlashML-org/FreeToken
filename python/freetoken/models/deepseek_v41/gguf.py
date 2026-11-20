@@ -260,7 +260,7 @@ def iter_gguf_weights(
         yield from linear(f"{m}.wq_b", f"{blk}.attn_q_b", args.q_lora_rank)
         yield from linear(f"{m}.wkv", f"{blk}.attn_kv", args.dim)
         yield f"{m}.kv_norm.weight", bf16(f"{blk}.attn_kv_a_norm")
-        # wo_a is not a Linear: a quantized one stays packed for the layer's grouped GEMV, a float one feeds the bf16 einsum
+        # wo_a is not a Linear: a quantized one stays packed for the layer's ggml mul_mat, a float one feeds the bf16 einsum
         wo_a = t(f"{blk}.attn_output_a")
         yield f"{m}.wo_a", packed_rows(wo_a) if is_quantized(wo_a.ggml_type) else bf16(f"{blk}.attn_output_a")
         yield from linear(f"{m}.wo_b", f"{blk}.attn_output_b", args.o_groups * args.o_lora_rank)

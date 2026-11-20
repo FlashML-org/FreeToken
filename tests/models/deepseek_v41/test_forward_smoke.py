@@ -43,7 +43,7 @@ def test_prefill_and_decode(checkpoint):
 def test_gguf_forward_matches_the_checkpoint(tmp_path, wo_a_type):
     """The same bf16 weights through the GGUF reader and the HF reader give the same logits, with non-zero Engram rows and random q / k gate weights so the file's stored product and ``wkv`` count.
 
-    A Q8_0 ``wo_a`` stays packed: decode runs its groups as ggml experts (MMVQ), the 300-token prefill dequantizes it for the einsum. The HF
+    A Q8_0 ``wo_a`` stays packed: decode runs its groups as one batched ggml mul_mat, the 300-token prefill dequantizes it for the einsum. The HF
     side reads the values its blocks decode to, so prefill matches exactly and decode differs only by the q8_1 rounding of the activation."""
     from safetensors.torch import load_file, save_file
 
