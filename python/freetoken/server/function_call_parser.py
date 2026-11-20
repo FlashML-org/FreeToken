@@ -105,6 +105,22 @@ def _first_existing_pos(text: str, tokens: List[str]) -> int:
     return min(positions) if positions else -1
 
 
+def _text_after_blocks(text: str, openers: tuple, closers: tuple) -> List[str]:
+    """The text after each complete tool block, up to the next opener; an unclosed block ends the scan."""
+    gaps = []
+    pos = _first_existing_pos(text, list(openers))
+    while pos != -1:
+        ends = [(i, tok) for tok in closers if tok and (i := text.find(tok, pos)) != -1]
+        if not ends:
+            break
+        i, tok = min(ends)
+        start = i + len(tok)
+        nxt = _first_existing_pos(text[start:], list(openers))
+        gaps.append(text[start:] if nxt == -1 else text[start : start + nxt])
+        pos = -1 if nxt == -1 else start + nxt
+    return gaps
+
+
 def _find_common_prefix(s1: str, s2: str) -> str:
     prefix = ""
     min_length = min(len(s1), len(s2))
@@ -415,6 +431,11 @@ class BaseFormatDetector(ABC):
         """Tokens that end a tool block — used to locate text AFTER the last call
         in one-shot parsing (detect_and_parse only keeps text before the first)."""
         return (self.eot_token,) if self.eot_token else ()
+
+    def block_open_tokens(self) -> tuple:
+        """Tokens that open a tool block, for formats whose blocks are a plain open/close
+        pair; one-shot parsing then keeps the text between blocks, not just the tail."""
+        return ()
 
     def finish_streaming(self) -> str:
         """End-of-stream drain: return residual buffered text that should be surfaced
@@ -941,6 +962,9 @@ class Qwen25Detector(BaseFormatDetector):
         """Check if the text contains a Qwen 2.5 format tool call."""
         return self.bot_token in text
 
+    def block_open_tokens(self) -> tuple:
+        return (self.bot_token,)
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -1271,6 +1295,9 @@ class Glm47Detector(BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a GLM-4.7 format tool call."""
         return self.bot_token in text
+
+    def block_open_tokens(self) -> tuple:
+        return (self.bot_token,)
 
     def _parse_xml_arguments(self, arg_text: str, param_config: Dict | None = None, func_name: str = "") -> dict:
         """
@@ -1657,6 +1684,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def block_close_tokens(self) -> tuple:
         return (self.eot_token, self.alt_eot_token)
 
+    def block_open_tokens(self) -> tuple:
+        return (self.bot_token, self.alt_bot_token)
+
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text or self.alt_bot_token in text
 
@@ -1990,6 +2020,8 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
     def has_tool_call(self, text: str) -> bool:
         return "<function=" in text or self.bot_token in text
 
+    def block_open_tokens(self) -> tuple:
+        return (self.bot_token,)
 
     def _parse_function_call(self, function_str: str, tools: List[Tool]) -> Optional[ToolCallItem]:
         """Parse a single <function=name>...</function> block into a ToolCallItem."""
@@ -2110,6 +2142,9 @@ class Gemma4Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
+
+    def block_open_tokens(self) -> tuple:
+        return (self.bot_token,)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
@@ -2418,6 +2453,9 @@ class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
+
+    def block_open_tokens(self) -> tuple:
+        return (self.bot_token,)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         idx = text.find(self.bot_token)
@@ -3642,6 +3680,13 @@ class FunctionCallParser:
             return StreamingParseResult(normal_text=full_text, calls=[])
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
+        openers = self.detector.block_open_tokens()
+        if tool_call_list and openers:
+            # detect_and_parse keeps only the text before the first block; the streaming
+            # path also emits the text after each block, so one-shot parsing must too.
+            gaps = _text_after_blocks(full_text, openers, self.detector.block_close_tokens())
+            parsed_result.normal_text = (parsed_result.normal_text or "") + "".join(g for g in gaps if g.strip())
+            return parsed_result
         if tool_call_list:
             # Keep text after the LAST tool block: the streaming path emits it, so
             # one-shot parsing must agree instead of silently dropping it.
