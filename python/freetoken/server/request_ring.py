@@ -24,6 +24,9 @@ class RequestRecord:
     completion_tokens: int | None
     stream: bool | None
     error: str | None
+    # prompt_tokens served from the prefix cache (whatever the scheduler reported on the
+    # terminal ack). None where the path cannot know it (the HTTP middleware, pre-totals).
+    cached_tokens: int | None = None
 
 
 class RequestRing:
