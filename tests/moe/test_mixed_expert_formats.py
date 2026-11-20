@@ -128,16 +128,17 @@ def _mixed_banks(pieces, device, layer_sink=None, act="silu"):
     return merge_expert_banks(parts, methods, E), methods
 
 
-def _mixed_cache(device, pieces, *, decode_target="gpu", prefill_overlap=False, act="silu"):
+def _mixed_cache(device, pieces, *, decode_target="gpu", prefill_overlap=False, act="silu", staging_only=False):
     from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
-    from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, split_slots
+    from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, pool_row_bytes, split_slots, staging_slots
     from freetoken.engine.cache_budget import layer_slot_bytes
 
     banks, methods = _mixed_banks(pieces, device, act=act)
     slot_bytes = layer_slot_bytes(banks.sources)
     groups = group_layers("unified", bank_layouts(banks.sources, banks.layer_tags), slot_bytes)
     pools = make_pools(groups, E, TOPK, None)
-    sizes = split_slots(4 * E, pools)
+    # staging_only: the engine's --moe-strategy cpu sizing, where the slots only back the prefill double buffer
+    sizes = staging_slots(*pool_row_bytes(banks.sources, banks.row_tail_bytes, pools), E) if staging_only else split_slots(4 * E, pools)
     cache = OffloadMoeCache(
         num_layers=L, num_experts=E, cache_size=sum(sizes), device=device, quant_format=banks.quant_format,
         decode_target=decode_target, hybrid_max_fetch=1, prefill_overlap=prefill_overlap,
@@ -287,6 +288,33 @@ def test_cpu_executor_computes_each_layer_in_its_format(act, monkeypatch):
             ids = torch.stack([torch.randperm(E)[:TOPK] for _ in range(bs)]).to(torch.int32)
             out = layer._decode_routed(hidden, weights, ids.clone().to(device))
             _assert_close(out, _reference(pieces, layer.layer_id, hidden, weights, ids, act))
+
+
+@cuda
+def test_cpu_strategy_stages_every_format_twice():
+    """--moe-strategy cpu: the slots only back the prefill double buffer, two layers of each format's widest bank rows.
+
+    Goes red if the staging sizing undercounts a bank: overlap is then turned off or a layer stages into another's bytes."""
+    pytest.importorskip("freetoken.kernel._cpu_moe")
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    pieces = _pieces(seed=3)
+    cache, layers, _ = _mixed_cache(device, pieces, decode_target="cpu", prefill_overlap=True, staging_only=True)
+    assert cache.prefill_overlap and len(cache.pool_sizes) == 2
+    cache.cpu_layer_ids = frozenset(range(L))
+    _executor(cache, "silu", device)
+    M = 16
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    ids = torch.stack([torch.randperm(E)[:TOPK] for _ in range(M)]).to(torch.int32)
+    weights = torch.rand(M, TOPK, device=device)
+    cache.begin_prefill()
+    for layer in layers:
+        out = layer._prefill_routed(hidden.clone(), weights, ids.to(device))
+        _assert_close(out, _reference(pieces, layer.layer_id, hidden, weights, ids))
+    for layer in layers:
+        ids = torch.randperm(E)[:TOPK].to(torch.int32).view(1, TOPK)
+        out = layer._decode_routed(hidden[:1], weights[:1], ids.clone().to(device))
+        _assert_close(out, _reference(pieces, layer.layer_id, hidden[:1], weights[:1], ids))
 
 
 @cuda
