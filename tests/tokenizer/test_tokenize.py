@@ -833,3 +833,125 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     )
     assert manager.render_prompt(msg) == f"Reasoning Effort: {budget}"
     assert msg.chat_template_kwargs["reasoning_effort"] == budget
+
+
+def _chat_tokenizer():
+    """A small byte-level BPE tokenizer with ChatML tokens and a bos, on the real tokenizers pipeline."""
+    from tokenizers import AddedToken, Tokenizer, models, normalizers, pre_tokenizers, processors, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    tok = Tokenizer(models.BPE())
+    tok.normalizer = normalizers.NFC()
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    corpus = ["the tokenizer keeps the token ids", "prefill prompt café cafè au lait", "hello world, hello tokens"] * 4
+    trainer = trainers.BpeTrainer(vocab_size=320, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False)
+    tok.train_from_iterator(corpus, trainer)
+    tok.add_special_tokens(["<s>", "<|im_start|>", "<|im_end|>"])
+    tok.add_tokens([AddedToken(text, normalized=False) for text in ("<think>", "</think>")])
+    tok.post_processor = processors.TemplateProcessing(single="<s> $A", special_tokens=[("<s>", tok.token_to_id("<s>"))])
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=tok)
+    tokenizer.chat_template = (
+        "{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n{% endfor %}"
+        "<|im_start|>assistant\n<think>\n"
+    )
+    return tokenizer
+
+
+def _split_tokenizer():
+    """A small byte-level BPE tokenizer with the Qwen2 split pattern and ChatML tokens, as the Qwen tokenizers build it."""
+    from tokenizers import Regex, Tokenizer, models, normalizers, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    from freetoken.tokenizer.pieces import _PIECE_PATTERNS
+
+    pattern = min(_PIECE_PATTERNS, key=len)
+    tok = Tokenizer(models.BPE())
+    tok.normalizer = normalizers.NFC()
+    tok.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(pattern), behavior="isolated"),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+    ])
+    trainer = trainers.BpeTrainer(vocab_size=600, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False)
+    tok.train_from_iterator(_PIECE_TEXTS * 4 + ["the quick brown fox jumps over the lazy dog"] * 4, trainer)
+    tok.add_special_tokens(["<|im_start|>", "<|im_end|>"])
+    tok.add_tokens(["<think>", "</think>"])
+    return PreTrainedTokenizerFast(tokenizer_object=tok)
+
+
+def _hub_tokenizer(repo: str):
+    if repo == "built":
+        return _split_tokenizer()
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(repo, local_files_only=True)
+    except Exception:  # noqa: BLE001 -- not in the local HF cache
+        pytest.skip(f"{repo} is not in the local HF cache")
+
+
+_CHAT = "<|im_start|>system\nyou are helpful<|im_end|>\n<|im_start|>user\n"
+_PIECE_TEXTS = [
+    "one line\nTwo lines\n\nthree 'quoted' lines\n  indented\n\tand tabs\n<|im_end|>\n<think>x</think>\n",
+    "a word, another word's end; we'd go\nThe end.\n\n\"Quoted\" start\n(paren) start\n_under_ start\n123 numbers",
+    "café au lait été ßä 中文 ́mark \U0001f600 emoji nbsp　wide\r\nCRLF line\rCR",
+    "  spaces   between   words \n \n\n  \n trailing  \nx y z 'll 're 've\n'twas\n'S\n",
+]
+
+
+@pytest.mark.parametrize("repo", ["built", "Qwen/Qwen3-0.6B", "nvidia/Qwen3.6-35B-A3B-NVFP4"])
+def test_pieces_encode_to_the_ids_of_the_whole_text(repo, monkeypatch):
+    """A long prompt is cut after a newline or at a space between letters and its pieces encoded apart: the ids
+    equal those of the whole-text encode."""
+    import random
+
+    from freetoken.tokenizer import pieces
+
+    tokenizer = _hub_tokenizer(repo)
+    backend = pieces.piece_encoder(tokenizer)
+    assert backend is not None
+    monkeypatch.setattr(pieces, "_PIECE_CHARS", 1)
+    rng = random.Random(0)
+    texts = _PIECE_TEXTS + ["".join(rng.choice(_PIECE_TEXTS)[rng.randrange(40):][:rng.randrange(1, 60)] for _ in range(8))
+                            for _ in range(200)]
+    for most in (2, 7, 64):
+        monkeypatch.setattr(pieces, "_MAX_PIECES", most)
+        for text in texts:
+            prompt = _CHAT + text + "<|im_end|>\n<|im_start|>assistant\n"
+            ids = pieces.encode_pieces(backend, prompt)
+            assert ids is not None and ids.dtype == torch.int32
+            assert ids.tolist() == tokenizer.encode(prompt, add_special_tokens=False)
+
+
+def test_tokenize_encodes_a_long_templated_prompt_in_pieces(monkeypatch):
+    """A templated prompt long enough to cut goes through the pieces encode and keeps the whole-text ids; a
+    raw-string prompt keeps the whole-text encode with its special tokens."""
+    tokenizer = _hub_tokenizer("Qwen/Qwen3-0.6B")
+    manager = TokenizeManager(tokenizer)
+    assert manager._pieces is not None
+    batches = []
+    encode_batch = manager._pieces.encode_batch
+    monkeypatch.setattr(manager, "_pieces", type("Spy", (), {
+        "encode_batch": lambda self, texts, **kw: batches.append(len(texts)) or encode_batch(texts, **kw)})())
+    content = "\n".join(f"Line {i}: the quick brown fox jumps over the lazy dog's back." for i in range(400))
+    msg = TokenizeMsg(uid=1, text=[{"role": "user", "content": content}], sampling_params=SamplingParams())
+    (out,) = manager.tokenize([msg])
+    assert batches and batches[0] > 1
+    assert out.input_ids.tolist() == tokenizer.encode(manager.render_prompt(msg), add_special_tokens=False)
+
+    batches.clear()
+    (raw,) = manager.tokenize([TokenizeMsg(uid=2, text=content, sampling_params=SamplingParams())])
+    assert not batches
+    assert raw.input_ids.tolist() == tokenizer.encode(content)
+
+
+def test_pieces_keep_the_whole_text_encode_where_a_cut_could_change_ids():
+    from freetoken.tokenizer.pieces import piece_encoder
+
+    # byte-level with its own split pattern, which this check does not know
+    tokenizer = _chat_tokenizer()
+    assert piece_encoder(tokenizer) is None
+    manager = TokenizeManager(tokenizer)
+    content = "hello world\n" * 1000
+    msg = TokenizeMsg(uid=1, text=[{"role": "user", "content": content}], sampling_params=SamplingParams())
+    (out,) = manager.tokenize([msg])
+    assert out.input_ids.tolist() == tokenizer.encode(manager.render_prompt(msg), add_special_tokens=False)

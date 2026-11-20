@@ -154,6 +154,7 @@ def tokenize_worker(
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
+    tokenize_manager.warm()
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
