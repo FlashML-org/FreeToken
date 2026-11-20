@@ -20,6 +20,8 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 E, H, I, TOPK = 8, 256, 128, 2
 FORMATS = ["bf16", "nvfp4", "nvfp4", "nvfp4", "bf16"]
 L = len(FORMATS)
+# (activation, alpha, limit); swiglu_softcap is Inkling 2's form, with caps the test inputs reach
+ACTS = {"silu": ("silu", 1.0, None), "swiglu_softcap": ("swiglu_softcap", 1.5, 6.0)}
 
 _E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
@@ -29,7 +31,7 @@ def _init_tp():
         set_tp_info(rank=0, size=1)
 
 
-def _layer(layer_id: int, fmt: str):
+def _layer(layer_id: int, fmt: str, act: str = "silu"):
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.layers.quantization import NoQuantConfig, QuantBackend, QuantConfig, set_quant_backend
 
@@ -39,7 +41,9 @@ def _layer(layer_id: int, fmt: str):
     else:
         set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
         quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
-    return OffloadMoELayer(layer_id, E, TOPK, H, I, quant_config=quant, prefix=f"model.layers.{layer_id}.mlp.experts")
+    activation, alpha, limit = ACTS[act]
+    return OffloadMoELayer(layer_id, E, TOPK, H, I, activation=activation, alpha=alpha, limit=limit, quant_config=quant,
+                           prefix=f"model.layers.{layer_id}.mlp.experts")
 
 
 def _dequant(packed, scale, row_global):
@@ -90,15 +94,22 @@ def _weights(pieces, layer):
     return gu, dn
 
 
-def _reference(pieces, layer, hidden, weights, ids):
+def _gated(h, act):
+    gate, up = h[:I], h[I:]
+    if act == "silu":
+        return torch.nn.functional.silu(gate) * up
+    _, alpha, limit = ACTS[act]
+    return alpha * torch.tanh(gate / alpha) * torch.sigmoid(gate) * limit * torch.tanh(up / limit)
+
+
+def _reference(pieces, layer, hidden, weights, ids, act="silu"):
     gu, dn = _weights(pieces, layer)
     out = torch.zeros(hidden.shape, dtype=torch.float32)
     x = hidden.float().cpu()
     for t in range(hidden.shape[0]):
         for k in range(ids.shape[1]):
             e = int(ids[t, k])
-            h = gu[e] @ x[t]
-            out[t] += float(weights[t, k]) * (dn[e] @ (torch.nn.functional.silu(h[:I]) * h[I:]))
+            out[t] += float(weights[t, k]) * (dn[e] @ _gated(gu[e] @ x[t], act).bfloat16().float())
     return out
 
 
@@ -106,10 +117,10 @@ def _assert_close(out, ref):
     torch.testing.assert_close(out.float().cpu(), ref, rtol=3e-2, atol=0.03 * float(ref.abs().max()))
 
 
-def _mixed_banks(pieces, device, layer_sink=None):
+def _mixed_banks(pieces, device, layer_sink=None, act="silu"):
     from freetoken.moe.expert_banks import build_expert_banks, merge_expert_banks, method_groups
 
-    methods = [_layer(layer, fmt).quant_method for layer, fmt in enumerate(FORMATS)]
+    methods = [_layer(layer, fmt, act).quant_method for layer, fmt in enumerate(FORMATS)]
     parts = [
         build_expert_banks(method, L, _reader(pieces, method.kind), device=device, layer_sink=layer_sink, layers=layers)
         for method, layers in method_groups(methods)
@@ -117,12 +128,12 @@ def _mixed_banks(pieces, device, layer_sink=None):
     return merge_expert_banks(parts, methods, E), methods
 
 
-def _mixed_cache(device, pieces, *, decode_target="gpu", prefill_overlap=False):
+def _mixed_cache(device, pieces, *, decode_target="gpu", prefill_overlap=False, act="silu"):
     from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
     from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, split_slots
     from freetoken.engine.cache_budget import layer_slot_bytes
 
-    banks, methods = _mixed_banks(pieces, device)
+    banks, methods = _mixed_banks(pieces, device, act=act)
     slot_bytes = layer_slot_bytes(banks.sources)
     groups = group_layers("unified", bank_layouts(banks.sources, banks.layer_tags), slot_bytes)
     pools = make_pools(groups, E, TOPK, None)
@@ -134,7 +145,7 @@ def _mixed_cache(device, pieces, *, decode_target="gpu", prefill_overlap=False):
     )
     cache.set_bank_sources(banks.sources, layer_tags=banks.layer_tags)
     cache.reset()
-    layers = [_layer(layer, fmt) for layer, fmt in enumerate(FORMATS)]
+    layers = [_layer(layer, fmt, act) for layer, fmt in enumerate(FORMATS)]
     for layer in layers:
         layer.offload_cache = cache
     return cache, layers, banks
@@ -237,32 +248,45 @@ def test_mixed_layers_decode_and_prefill_through_their_pools():
         _assert_close(out, _reference(pieces, layer.layer_id, hidden[:1], weights[:1], ids))
 
 
-@cuda
-def test_cpu_executor_computes_each_layer_in_its_format():
-    pytest.importorskip("freetoken.kernel._cpu_moe")
+def _executor(cache, act, device):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
+    activation, alpha, limit = ACTS[act]
+    ex = CpuMoeExecutor(
+        cache, top_k=TOPK, activation=activation, apply_router_weight_on_input=False, num_threads=2,
+        max_tokens=4, device=device, swiglu_alpha=alpha, swiglu_limit=limit, layer_formats=[(f, {}) for f in FORMATS],
+    )
+    cache.set_cpu_executor(ex)
+    return ex
+
+
+@cuda
+@pytest.mark.parametrize("act", list(ACTS))
+def test_cpu_executor_computes_each_layer_in_its_format(act, monkeypatch):
+    pytest.importorskip("freetoken.kernel._cpu_moe")
+    # the fp32 NVFP4 dots: the W4A8 int8 activations would hide an epilogue error behind their rounding
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_NO_VNNI", "1")
     torch.manual_seed(1)
     device = torch.device("cuda")
     pieces = _pieces(seed=1)
-    cache, layers, _ = _mixed_cache(device, pieces, decode_target="hybrid")
-    ex = CpuMoeExecutor(
-        cache, top_k=TOPK, activation="silu", apply_router_weight_on_input=False, num_threads=2,
-        max_tokens=4, device=device, layer_formats=[(f, {}) for f in FORMATS],
-    )
-    cache.set_cpu_executor(ex)
+    cache, layers, _ = _mixed_cache(device, pieces, decode_target="hybrid", act=act)
+    ex = _executor(cache, act, device)
     bs = 3
-    hidden = torch.randn(bs, H, dtype=torch.bfloat16, device=device) / 4
+    # gate and up spread past the softcaps
+    hidden = torch.randn(bs, H, dtype=torch.bfloat16, device=device) * 4
     weights = torch.rand(bs, TOPK, device=device)
     for layer in range(L):
         ids = torch.stack([torch.randperm(E)[:TOPK] for _ in range(bs)]).to(torch.int32)
-        _assert_close(ex.decode(layer, hidden, weights, ids.to(device)), _reference(pieces, layer, hidden, weights, ids))
+        out = ex.decode(layer, hidden, weights, ids.to(device)).float().cpu()
+        ref = _reference(pieces, layer, hidden, weights, ids, act)
+        # bf16 output rounding is ~4e-3 of the largest value; a misplaced cap or sigmoid argument is several times that
+        assert (out - ref).abs().max() <= 1e-2 * ref.abs().max(), (FORMATS[layer], act)
     # hybrid: capped PCIe fetch on the GPU, the overflow misses on the CPU, per layer format
     for _ in range(3):
         for layer in layers:
             ids = torch.stack([torch.randperm(E)[:TOPK] for _ in range(bs)]).to(torch.int32)
             out = layer._decode_routed(hidden, weights, ids.clone().to(device))
-            _assert_close(out, _reference(pieces, layer.layer_id, hidden, weights, ids))
+            _assert_close(out, _reference(pieces, layer.layer_id, hidden, weights, ids, act))
 
 
 @cuda

@@ -1759,7 +1759,7 @@ def _decode_target(config: EngineConfig) -> str:
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    "swiglu_clamp",
+    "swiglu_clamp", "swiglu_softcap",
 )
 
 
