@@ -354,7 +354,8 @@ def test_proposer_tracks_committed_tokens(tmp_path, monkeypatch, k, chunk_rows):
     page_table = torch.full((mr + 1, cols.numel()), num_pages * page_size, dtype=torch.int32)
     page_table[:mr] = (pages[:, cols // page_size] * page_size + cols % page_size).int()
     page_table = page_table.to(DEV)
-    proposer = _proposer(path, target_parts, k, page_table, num_pages, page_size, mr)
+    # fp32: the from-scratch draft runs other batch shapes, whose GEMMs round differently; bf16 would flip near ties
+    proposer = _proposer(path, target_parts, k, page_table, num_pages, page_size, mr, torch.float32)
     toy = _ToyLoopTarget(TOY, H)
     greedy = SamplingParams()
     width = k + 1
@@ -394,7 +395,12 @@ def test_proposer_tracks_committed_tokens(tmp_path, monkeypatch, k, chunk_rows):
         pending = torch.tensor([seq[-1] for seq in seqs], device=DEV)
         drafts = proposer.propose(reqs, rows, pending).draft_token_ids
         for row, seq in enumerate(seqs):
-            assert drafts[row].tolist() == _from_scratch(proposer.draft, toy, seq, k).tolist(), f"step {step}, request {row}"
+            steps = []
+            want = _from_scratch(proposer.draft, toy, seq, k, pick=lambda j, logits: (steps.append(logits[0]), logits.argmax(-1))[1]).tolist()
+            got = drafts[row].tolist()
+            # the two may part only where the from-scratch step has a near tie, and nothing after it is comparable
+            j = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None)
+            assert j is None or steps[j][want[j]] - steps[j][got[j]] < 1e-4, f"step {step}, request {row}: drafts {got}, from scratch {want}"
         # the target takes n drafts, then a token of its own
         emitted = torch.tensor([(step + 3 * row) % width for row in range(2)])
         seen.update(emitted.tolist())
