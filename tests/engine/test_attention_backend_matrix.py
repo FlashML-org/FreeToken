@@ -411,7 +411,7 @@ def test_linear_attention_defaults_to_hybrid_radix():
 
 
 # Speculative decoding x windowed KV: engine.py refuses a windowed target unless the proposer
-# passes target_may_be_windowed (shared-KV admits hybrid SWA; mtp/dflash never reach it).
+# passes target_may_be_windowed (shared-KV and DSpark admit hybrid SWA; mtp/dflash never reach it).
 
 
 class _Draft:
@@ -420,12 +420,26 @@ class _Draft:
         pass
 
 
+def _dspark_config():
+    from freetoken.models.inkling2_loop.dspark import DSparkConfig
+
+    return DSparkConfig(
+        hidden_size=64, num_layers=3, num_heads=2, num_kv_heads=1, head_dim=32, intermediate_size=128, rms_norm_eps=1e-6,
+        rope_theta=1e6, local_layer_ids=(0, 2), window=128, block_size=4, markov_rank=8, target_layer_ids=(1, 2, 4),
+        num_layer_visits=4, pass_start_visits=(), loop_core_start=0, vocab_size=64, target_rms_norm_eps=1e-6, softcap=30.0,
+        max_position=1 << 20,
+    )
+
+
 def _spec_config(kind, backend, method, monkeypatch):
+    from freetoken.spec.dspark.proposer import DSparkProposer
     from freetoken.spec.mtp.proposer import MTPProposer
     from freetoken.spec.mtp.shared_proposer import SharedKVMTPProposer
 
     monkeypatch.setattr(MTPProposer, "_draft_class", classmethod(lambda cls, config: _Draft))
     monkeypatch.setattr(SharedKVMTPProposer, "_draft_class", classmethod(lambda cls, config: _Draft))
+    monkeypatch.setattr(DSparkProposer, "_draft_config", classmethod(lambda cls, config: _dspark_config()))
+    monkeypatch.setattr("freetoken.models.inkling2_loop.dspark.mtp_file", lambda path: path)
     config = _config(kind, attention_backend=backend, speculative_algorithm="mtp")
     object.__setattr__(config, "hf_config", SimpleNamespace(architectures=["Gemma4ForCausalLM"]))
     object.__setattr__(config, "model_spec", SimpleNamespace(spec_drafts={method: "freetoken.test:draft"}))
@@ -441,9 +455,12 @@ def _spec_config(kind, backend, method, monkeypatch):
         ("swa", "triton", "mtp", False),
         # the DSV4 window tiers keep the refusal even for the shared assistant
         ("dsv4", "dsv4_sparse", "shared_kv_mtp", False),
+        # DSpark keeps its own KV, but on the full-attention slot ids, which the window frees never release
+        ("swa", "triton", "dspark_mtp", True),
+        ("dsv4", "dsv4_sparse", "dspark_mtp", False),
     ],
 )
-def test_windowed_target_admits_only_read_only_drafts(monkeypatch, kind, backend, method, allowed):
+def test_windowed_target_admits_only_window_safe_drafts(monkeypatch, kind, backend, method, allowed):
     from freetoken.engine.engine import _adjust_config
 
     _patch_env(monkeypatch)

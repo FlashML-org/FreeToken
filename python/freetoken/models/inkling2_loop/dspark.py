@@ -64,6 +64,7 @@ class DSparkConfig:
     pass_start_visits: tuple[int, ...]
     loop_core_start: int
     vocab_size: int  # unpadded: logits past it are never drafted
+    target_rms_norm_eps: float
     softcap: float
     max_position: int
 
@@ -132,7 +133,7 @@ def parse_dspark_config(hf_config: Any) -> DSparkConfig:
         intermediate_size=int(draft["intermediate_size"]), rms_norm_eps=float(draft["rms_norm_eps"]),
         rope_theta=float(draft["rope_theta"]), local_layer_ids=local, window=int(draft["sliding_window_size"]),
         block_size=block, markov_rank=rank, target_layer_ids=taps, num_layer_visits=visits, pass_start_visits=restarts,
-        loop_core_start=start, vocab_size=vocab, softcap=float(softcap) if softcap else 0.0,
+        loop_core_start=start, vocab_size=vocab, target_rms_norm_eps=float(text.get("rms_norm_eps", 1e-6)), softcap=float(softcap) if softcap else 0.0,
         max_position=int(draft.get("max_position_embeddings") or text.get("model_max_length") or 1 << 20),
     )
 
@@ -259,7 +260,7 @@ class Inkling2DSparkDraft:
         if missing := sorted(expected - set(weights)):
             raise ValueError(f"{path}: DSpark tensors missing: {missing}")
         cls._check_shapes(config, weights, path)
-        embed, head = target_parts(target_model)
+        embed, head = target_parts(target_model, config.target_rms_norm_eps)
         return cls(config, weights, embed, head, dtype)
 
     @staticmethod
@@ -390,15 +391,20 @@ class Inkling2DSparkDraft:
         return torch.stack(tokens, dim=1)
 
 
-def target_parts(target_model) -> tuple[Callable[[torch.Tensor], torch.Tensor], torch.Tensor]:
-    """The target's normalized token embedding (what its first layer reads) and its LM head weight, as the draft shares them.
-
-    The target exposes ``dspark_embed(ids) -> [n, H]`` (``embed_norm(embed(ids))``) and ``lm_head.weight`` (bf16, ``[padded vocab, H]``, as stored).
-    """
-    embed = getattr(target_model, "dspark_embed", None)
+def target_parts(target_model, eps: float) -> tuple[Callable[[torch.Tensor], torch.Tensor], torch.Tensor]:
+    """What the draft shares with the target: its first layer's input of a token (``embed_norm(embed(ids))``) and its bf16 LM head weight ``[padded vocab, H]``, as stored."""
+    model = getattr(target_model, "model", None)
+    embed_tokens, embed_norm = getattr(model, "embed_tokens", None), getattr(model, "embed_norm", None)
     head = getattr(getattr(target_model, "lm_head", None), "weight", None)
-    if embed is None or head is None:
-        raise ValueError(f"{type(target_model).__name__} does not expose dspark_embed and lm_head.weight, which the DSpark draft shares")
+    if embed_tokens is None or embed_norm is None or head is None:
+        raise ValueError(f"{type(target_model).__name__} lacks model.embed_tokens, model.embed_norm or lm_head.weight, which the DSpark draft shares")
+
+    def embed(ids: torch.Tensor) -> torch.Tensor:
+        # the target's own order: fp32 weight times the normalized row, rounded once
+        x = embed_tokens.forward(ids)
+        xf = x.float()
+        return (embed_norm.float() * (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps))).to(x.dtype)
+
     return embed, head
 
 

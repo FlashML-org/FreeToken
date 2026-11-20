@@ -74,14 +74,10 @@ def _toy_weights(t: dict, seed: int = 0) -> tuple[dict[str, torch.Tensor], dict[
 
 
 def _target(parts: dict[str, torch.Tensor]):
-    """The two things the draft takes from the target: the normalized embedding of its first layer and the bf16 head."""
+    """The modules the draft shares with the target, as FreeToken's Inkling target names them: the token embedding, its fp32 norm and the bf16 head."""
     embed, norm, head = (parts[n].to(DEV) for n in ("embed", "embed_norm", "head"))
-
-    def dspark_embed(ids):
-        x = embed[ids.long()].float()
-        return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * norm.float()).to(torch.bfloat16)
-
-    return SimpleNamespace(dspark_embed=dspark_embed, lm_head=SimpleNamespace(weight=head))
+    embed_tokens = SimpleNamespace(forward=lambda ids: embed[ids.long()])
+    return SimpleNamespace(model=SimpleNamespace(embed_tokens=embed_tokens, embed_norm=norm.float()), lm_head=SimpleNamespace(weight=head))
 
 
 def _toy_checkpoint(tmp_path, t: dict = TOY, seed: int = 0):
@@ -206,12 +202,21 @@ def _check_draft(draft, ref, features_by_req, anchors, kv_tol, hidden_tol, logit
     anchor = torch.tensor(anchors, device=DEV)
     hidden = draft.forward_block(anchor, starts, context)
     f_rnn = draft.f_rnn(torch.stack([f[-1] for f in features_by_req]))
-    tokens = draft.walk(hidden[:, 1:], anchor, f_rnn, lambda j, logits: logits.argmax(-1))
+    steps = []
+
+    def pick(j, logits):
+        steps.append(logits.float())
+        return logits.argmax(-1)
+
+    tokens = draft.walk(hidden[:, 1:], anchor, f_rnn, pick)
     for b, f in enumerate(features_by_req):
         want = ref.block(f, anchors[b])
         err = (hidden[b].float() - want).norm(dim=-1) / want.norm(dim=-1)
         assert err.max() < hidden_tol, f"request {b}: block hidden off by {err.max():.3g} (relative)"
+        # the Markov head alone: the reference walks the draft's own hidden and tokens
         logits = ref.path_logits(hidden[b, 1:].float(), f[-1], anchors[b], tokens[b])
+        got = torch.stack([s[b] for s in steps])
+        assert (got - logits).abs().max() < logit_tol, f"request {b}: step logits off by {(got - logits).abs().max():.3g}"
         picked = logits.gather(1, tokens[b, :, None].long())[:, 0]
         # a draft may differ from the fp32 argmax only at a near tie
         assert (picked >= logits.max(-1).values - logit_tol).all(), f"request {b}: drafts {tokens[b].tolist()} miss the reference argmax {logits.argmax(-1).tolist()}"
@@ -295,7 +300,7 @@ class _ToyLoopTarget:
         return torch.cat(cols, dim=-1).to(DEV, torch.bfloat16)
 
 
-def _proposer(path: str, target_parts, k: int, page_table, num_pages: int, page_size: int, max_running_req: int):
+def _proposer(path: str, target_parts, k: int, page_table, num_pages: int, page_size: int, max_running_req: int, dtype=torch.bfloat16):
     from freetoken.core import Req, SamplingParams
     from freetoken.spec.dspark.proposer import DSparkProposer
     from freetoken.spec.proposer import DraftContext
@@ -304,7 +309,7 @@ def _proposer(path: str, target_parts, k: int, page_table, num_pages: int, page_
     config = SimpleNamespace(
         speculative_num_steps=k, speculative_draft_model_path=None, model_path=path, hf_config=cached_load_hf_config(path),
         model_spec=SimpleNamespace(spec_drafts=(("dspark_mtp", "freetoken.models.inkling2_loop.dspark:Inkling2DSparkDraft"),)),
-        dtype=torch.bfloat16, max_running_req=max_running_req, page_size=page_size,
+        dtype=dtype, max_running_req=max_running_req, page_size=page_size,
     )
     proposer = DSparkProposer(config, _target(target_parts))
     dummy = Req(input_ids=torch.zeros(1, dtype=torch.int32), table_idx=max_running_req, cached_len=0, output_len=1, uid=-1,
@@ -403,22 +408,23 @@ def test_proposer_tracks_committed_tokens(tmp_path, k):
 
 
 def test_sampled_drafts_report_their_distribution(tmp_path):
-    """A greedy and a sampled request in one batch: the greedy one drafts what it drafts alone, the sampled one's q is the softmax of its step's top logits at its temperature."""
+    """A greedy and a sampled request in one batch: the greedy one drafts what it drafts alone, the sampled one reports the reference's tempered softmax over its step's top logits along the path it drew. fp32, so q compares tightly."""
     from freetoken.core import Req, SamplingParams
 
-    path, _, target_parts = _toy_checkpoint(tmp_path)
-    mr, page_size, num_pages = 2, 4, 32
+    path, w, target_parts = _toy_checkpoint(tmp_path)
+    mr, page_size, num_pages, temperature = 2, 4, 32, 0.8
     page_table = torch.arange((mr + 1) * 40, dtype=torch.int32).view(mr + 1, 40).to(DEV)
-    proposer = _proposer(path, target_parts, 7, page_table, num_pages, page_size, mr)
+    proposer = _proposer(path, target_parts, 7, page_table, num_pages, page_size, mr, torch.float32)
+    ref = _Reference(w, target_parts, proposer.draft_config)
     toy = _ToyLoopTarget(TOY, TOY["hidden"])
     g = torch.Generator().manual_seed(9)
     seqs = [torch.randint(0, TOY["vocab"], (12,), generator=g).tolist() for _ in range(2)]
     # the pool as a prefill leaves it
-    for row, seq in enumerate(seqs):
-        feats = toy.run(torch.tensor(seq[:-1]), torch.arange(len(seq) - 1))
-        proposer._store_context(feats, torch.arange(len(seq) - 1, device=DEV), page_table[row, : len(seq) - 1].long())
-        proposer.f_rnn[row] = proposer.draft.f_rnn(feats[-1:])[0]
-    params = [SamplingParams(), SamplingParams(temperature=0.8)]
+    feats = [toy.run(torch.tensor(seq[:-1]), torch.arange(len(seq) - 1)) for seq in seqs]
+    for row, (seq, f) in enumerate(zip(seqs, feats)):
+        proposer._store_context(f, torch.arange(len(seq) - 1, device=DEV), page_table[row, : len(seq) - 1].long())
+        proposer.f_rnn[row] = proposer.draft.f_rnn(f[-1:])[0]
+    params = [SamplingParams(), SamplingParams(temperature=temperature)]
     reqs = [Req(input_ids=torch.tensor(seq, dtype=torch.int32), table_idx=row, cached_len=len(seq) - 1, output_len=8, uid=row,
                 sampling_params=params[row], cache_handle=None) for row, seq in enumerate(seqs)]
     torch.manual_seed(0)
@@ -426,12 +432,13 @@ def test_sampled_drafts_report_their_distribution(tmp_path):
     assert proposal.draft_token_ids[0].tolist() == _from_scratch(proposer.draft, toy, seqs[0], 7).tolist()
     tokens, support, q = proposal.draft_token_ids[1], proposal.draft_support_ids[1], proposal.draft_support_probs[1]
     torch.testing.assert_close(q.sum(-1), torch.ones(7, device=DEV))
-    # each sampled draft is in its support with q > 0, and q is the step's tempered top-K softmax along the sampled path
     hits = (support == tokens[:, None]).float()
     assert (hits.sum(-1) == 1).all() and ((q * hits).sum(-1) > 0).all()
-    steps = []
-    _from_scratch(proposer.draft, toy, seqs[1], 7, pick=lambda j, logits: (steps.append(logits[0].float()), tokens[j : j + 1])[1])
-    for j, logits in enumerate(steps):
-        vals = logits.gather(0, support[j])
-        torch.testing.assert_close(q[j], torch.softmax(vals / 0.8, -1), atol=1e-5, rtol=1e-4)
-        assert torch.equal(vals.sort(descending=True).values, logits.topk(proposer.SAMPLE_TOP_K).values)
+    anchor = seqs[1][-1]
+    logits = ref.path_logits(ref.block(feats[1].float(), anchor)[1:], feats[1][-1], anchor, tokens)
+    top = logits.topk(proposer.SAMPLE_TOP_K, dim=-1).values
+    for j in range(7):
+        vals = logits[j].gather(0, support[j])
+        # the support is the step's top K (up to a tie at its edge), and q their softmax at the request's temperature
+        assert vals.min() >= top[j, -1] - 1e-3
+        torch.testing.assert_close(q[j], torch.softmax(vals / temperature, -1), atol=1e-4, rtol=1e-3)
