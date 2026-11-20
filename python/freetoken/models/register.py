@@ -581,6 +581,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         quant_config="freetoken.models.inkling2_loop.config:quant_config",
         mm_processor="freetoken.mm.processors.inkling2:Inkling2MMProcessor",
         encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
+        spec_drafts=(("dspark_mtp", "freetoken.models.inkling2_loop.dspark:Inkling2DSparkDraft"),),
     ),
 }
 

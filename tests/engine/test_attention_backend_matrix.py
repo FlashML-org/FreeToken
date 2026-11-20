@@ -485,8 +485,11 @@ def test_mtp_cli_dispatches_by_the_declared_draft_method():
             hf_config=SimpleNamespace(architectures=[arch]), tp_info=SimpleNamespace(size=1),
         )
 
+    from freetoken.spec.dspark.proposer import DSparkProposer
+
     assert proposer_class(spec_cfg("Gemma4ForCausalLM")) is SharedKVMTPProposer
     assert proposer_class(spec_cfg("Qwen3_5ForCausalLM")) is MTPProposer
+    assert proposer_class(spec_cfg("Inkling2LoopForConditionalGeneration")) is DSparkProposer
     # gpt-oss resolves the hybrid pool but declares no draft: dispatch, not the gate, keeps it off the
     # shared proposer and its MTP refusal verbatim
     draft_less = spec_cfg("GptOssForCausalLM")
