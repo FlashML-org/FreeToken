@@ -570,6 +570,7 @@ def _record_generation(
     completion_tokens: int,
     error: str | None,
     first_token_at: float | None = None,
+    cached_tokens: int = 0,
 ) -> None:
     """Log one generation request into the request ring. Every protocol adapter converges here,
     so token totals are captured whatever endpoint served the request — unlike the HTTP
@@ -590,6 +591,7 @@ def _record_generation(
             ttft_ms=int((first_token_at - start) * 1000) if first_token_at is not None else None,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
             stream=stream,
             error=error,
         )
@@ -605,6 +607,7 @@ async def generate_events(
     start = time.monotonic()
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens = 0
     first_token_at: float | None = None
     error: str | None = None
     try:
@@ -614,6 +617,7 @@ async def generate_events(
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
+                cached_tokens = ev.cached_tokens
             elif first_token_at is None:
                 first_token_at = time.monotonic()
             yield ev
@@ -624,7 +628,7 @@ async def generate_events(
         _record_generation(
             source=source, stream=True, start=start,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
-            first_token_at=first_token_at,
+            first_token_at=first_token_at, cached_tokens=cached_tokens,
         )
 
 
@@ -647,6 +651,7 @@ async def generate_full(
             source=source, stream=False, start=start,
             prompt_tokens=result.prompt_tokens if result else 0,
             completion_tokens=result.completion_tokens if result else 0,
+            cached_tokens=result.cached_tokens if result else 0,
             error=error,
         )
 
