@@ -150,3 +150,80 @@ def test_prefill_decode_and_verify_match_reference(monkeypatch, ratio, output_ga
     for i, h in enumerate(seqs):
         want = _ref_out(ref, torch.cat([h, last[i:i + 1]]))[-1]
         torch.testing.assert_close(dec[i].float(), want, rtol=RTOL, atol=ATOL)
+
+
+def _split_ba(op, seed: int) -> None:
+    """The op's input GEMM split the way a checkpoint with qkv|z quantized and b|a not loads it: a qkv|z linear and a
+    bf16 b|a linear (torch bf16 both, here). The b|a weight is k * 2^-6 for integers |k| <= 8, so with hidden states
+    of k * 2^-4 every partial sum of a b|a dot is exact in fp32 and any summation order gives the same bits."""
+    from freetoken.layers import LinearColParallelMerged
+
+    w, hv, cut = op.in_proj.weight, op.num_v_heads, op.conv_dim + op.value_dim
+    with torch.device(DEV), torch_dtype(torch.bfloat16):
+        op.in_proj_qkvz = LinearColParallelMerged(HIDDEN, [op.conv_dim, op.value_dim], has_bias=False)
+        op.in_proj_ba = LinearColParallelMerged(HIDDEN, [hv, hv], has_bias=False)
+    op.in_proj_qkvz.weight = w[:cut].contiguous()
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    op.in_proj_ba.weight = (torch.randint(-8, 9, (2 * hv, HIDDEN), device=DEV, generator=gen) * 2.0**-6).to(torch.bfloat16)
+    del op.in_proj
+    op._split_in_proj = True
+    op._ba_weight = False
+
+
+def _exact_rows(rows: int, gen: torch.Generator) -> torch.Tensor:
+    return (torch.randint(-8, 9, (rows, HIDDEN), device=DEV, generator=gen) * 2.0**-4).to(torch.bfloat16)
+
+
+@pytest.fixture
+def cublas_bf16_fp32_partials():
+    """cuBLAS keeps bf16 GEMM partials in fp32 for the test; afterwards the setting comes back whole (its split-K part
+    too). monkeypatch cannot undo this flag: cuBLASModule serves it through __getattr__ and __setattr__, so there is no
+    instance attribute to restore and undo() deletes one that is not there."""
+    matmul = torch.backends.cuda.matmul
+    was = torch._C._get_cublas_allow_bf16_reduced_precision_reduction()
+    matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = tuple(was)
+
+
+@pytest.mark.usefixtures("cublas_bf16_fp32_partials")
+def test_split_ba_in_the_recurrence_kernel_is_the_launched_projection_bit_for_bit_on_exact_dots(monkeypatch):
+    """With b|a its own bf16 linear, a decode or verify step takes b and a inside the recurrence kernel and does not
+    launch the linear; a prefill still launches it. On b|a dots every summation order gets exactly (cuBLAS kept to fp32
+    partials), a prefill, a decode step, a verify committed at a different accept count per request and another
+    decode step give the outputs and states of the launched linear, bit for bit."""
+    import freetoken.layers.linear_attn.gdn as gdn
+
+    assert not torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    lengths, accepted = [128, 37, 5], [1, 2, K + 1]
+    runs = []
+    for fold in (True, False):
+        monkeypatch.setattr(gdn, "_BA_IN_KERNEL", fold)
+        op, _ = _make_layer(2, "silu", seed=4)
+        _split_ba(op, seed=5)
+        calls, launch = [], op.in_proj_ba.forward
+        monkeypatch.setattr(op.in_proj_ba, "forward", lambda x: calls.append(x.shape[0]) or launch(x))
+        ctx = _ctx(monkeypatch, 2)
+        _, reqs, pre = _prefill(op, ctx, lengths, seed=13)
+        gen = torch.Generator(device=DEV).manual_seed(14)
+        x = _exact_rows(len(lengths), gen)
+        if fold:
+            exact = (x.double() @ op.in_proj_ba.weight.double().t()).float().to(torch.bfloat16)
+            assert torch.equal(launch(x), exact), "F.linear does not give the exact dot here: the arms cannot be bit-equal"
+        outs = [pre, _step(op, ctx, reqs, x)]
+        outs.append(_step(op, ctx, reqs, _exact_rows(len(lengths) * (K + 1), gen), "verify", K + 1))
+        ctx.linear_state_pool.commit_verify([r.table_idx for r in reqs], accepted)
+        outs.append(_step(op, ctx, reqs, _exact_rows(len(lengths), gen)))
+        pool = ctx.linear_state_pool
+        runs.append((outs, pool.recurrent_states.clone(), pool.conv_states.clone(), calls, op._ba_weight, op._ba_off))
+    (folded, state1, conv1, calls1, w1, off1), (launched, state0, conv0, calls0, w0, off0) = runs
+    assert isinstance(w1, torch.Tensor) and off1 is None, off1
+    assert w0 is None and off0 == "FREETOKEN_GDN_BA_IN_KERNEL=0", off0
+    assert calls1 == [sum(lengths)], calls1
+    assert calls0 == [sum(lengths), len(lengths), len(lengths) * (K + 1), len(lengths)], calls0
+    for what, a, b in zip(("prefill", "decode", "verify", "decode after the commit"), folded, launched):
+        assert torch.equal(a, b), what
+    assert float(state1.float().norm()) > 0
+    assert torch.equal(state1, state0) and torch.equal(conv1, conv0)

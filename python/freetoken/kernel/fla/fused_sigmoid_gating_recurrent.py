@@ -6,12 +6,36 @@ per-request state read/write-by-index in ONE kernel — no external gating or
 gather/scatter/clone glue.
 
 FreeToken additions: the verify mode can stash each token's recurrence inputs (STASH_INPUTS), and
-``gdn_state_replay`` re-runs the accepted prefix from that stash to commit the live state."""
+``gdn_state_replay`` re-runs the accepted prefix from that stash to commit the live state. FOLD_BA takes b and a
+from the hidden states and the b|a projection's bf16 weight in the kernel, in place of that projection's launch: each
+program sums its value head's two dots in its own order, so b and a are F.linear's only up to that order (see
+``fused_sigmoid_gating_delta_rule_update``)."""
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+# the strip FOLD_BA sums the b and a dots over; part of their summation order, so fixed
+_BA_BLOCK = 512
+
+
+@triton.jit
+def _ba_dots(x_row, wb_row, wa_row, HIDDEN: tl.constexpr, BLOCK: tl.constexpr):
+    """``x . w_b`` and ``x . w_a`` over HIDDEN bf16 values in fp32: each lane sums its own column of BLOCK-wide strips
+    in order, then one tree sums the lanes. The products are exact, so this order sets the bits. Each is rounded to
+    bf16, the dtype the projection stores, and read back as fp32, as the kernel reads the projection's output."""
+    acc_b = tl.zeros((BLOCK,), dtype=tl.float32)
+    acc_a = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k0 in range(0, HIDDEN, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        mask = offs < HIDDEN
+        x = tl.load(x_row + offs, mask=mask, other=0.0).to(tl.float32)
+        acc_b += x * tl.load(wb_row + offs, mask=mask, other=0.0).to(tl.float32)
+        acc_a += x * tl.load(wa_row + offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.sum(acc_b, axis=0).to(tl.bfloat16).to(tl.float32)
+    a = tl.sum(acc_a, axis=0).to(tl.bfloat16).to(tl.float32)
+    return b, a
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -40,6 +64,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stash_v,
     stash_g,
     stash_beta,
+    # the b|a projection (FOLD_BA): its input [tokens, HIDDEN] bf16 with unit inner stride, its weight [2 * HV, HIDDEN]
+    # bf16 (the b rows, then the a rows), and where the b|a it computed is written, [tokens, 2 * HV] bf16 (STORE_BA)
+    ba_x,
+    ba_w,
+    ba_out,
+    stride_x,
     # ================================================
     scale,
     T,
@@ -65,6 +95,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
     STASH_INPUTS: tl.constexpr = False,
+    FOLD_BA: tl.constexpr = False,
+    STORE_BA: tl.constexpr = False,
+    HIDDEN: tl.constexpr = 1,
+    BA_BLOCK: tl.constexpr = 1,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -90,17 +124,25 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_q = q + bos * stride_q + i_h * K + o_k
     p_k = k + bos * stride_k + i_h * K + o_k
     p_v = v + bos * stride_v + i_hv * V + o_v
-    p_b = b + bos * stride_b + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     # Gating computation pointers
     p_A_log = A_log + i_hv
-    if IS_KDA:
-        p_a = a + bos * stride_a + i_hv * K + o_k
-        p_dt_bias = dt_bias + i_hv * K + o_k
-    else:
-        p_a = a + bos * stride_a + i_hv
+    if FOLD_BA:
+        p_x = ba_x + bos * stride_x
+        p_wb = ba_w + i_hv * HIDDEN
+        p_wa = ba_w + (HV + i_hv) * HIDDEN
+        if STORE_BA:
+            p_ba = ba_out + bos * (2 * HV) + i_hv
         p_dt_bias = dt_bias + i_hv
+    else:
+        p_b = b + bos * stride_b + i_hv
+        if IS_KDA:
+            p_a = a + bos * stride_a + i_hv * K + o_k
+            p_dt_bias = dt_bias + i_hv * K + o_k
+        else:
+            p_a = a + bos * stride_a + i_hv
+            p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -172,7 +214,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_b = tl.load(p_b).to(tl.float32)
+        if FOLD_BA:
+            # the b|a projection's two outputs of this token and value head, at the bf16 it stores them in
+            b_b, b_a = _ba_dots(p_x, p_wb, p_wa, HIDDEN, BA_BLOCK)
+            if STORE_BA:
+                if i_v == 0:
+                    tl.store(p_ba, b_b.to(tl.bfloat16))
+                    tl.store(p_ba + HV, b_a.to(tl.bfloat16))
+        else:
+            b_b = tl.load(p_b).to(tl.float32)
 
         # Compute sigmoid gating
         # Load gating parameters
@@ -181,7 +231,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
             b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
         else:
-            b_a = tl.load(p_a).to(tl.float32)
+            if not FOLD_BA:
+                b_a = tl.load(p_a).to(tl.float32)
             b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
@@ -257,9 +308,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_q += stride_q
         p_k += stride_k
         p_v += stride_v
-        p_b += stride_b
         p_o += HV * V
-        p_a += stride_a
+        if FOLD_BA:
+            p_x += stride_x
+            if STORE_BA:
+                p_ba += 2 * HV
+        else:
+            p_b += stride_b
+            p_a += stride_a
 
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
@@ -278,14 +334,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
-    a: torch.Tensor,
+    a: Optional[torch.Tensor],
     dt_bias: torch.Tensor,
     softplus_beta: float,
     softplus_threshold: float,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    b: torch.Tensor,
+    b: Optional[torch.Tensor],
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
     scale: Optional[float] = None,
@@ -301,6 +357,7 @@ def fused_sigmoid_gating_delta_rule_update(
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
     input_stash: Optional[tuple] = None,
+    ba_fold: Optional[tuple] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -315,17 +372,38 @@ def fused_sigmoid_gating_delta_rule_update(
     ``input_stash`` = (k, v, g, beta) fp32 buffers of shape [rows, steps, H, K] / [rows, steps, HV, V] /
     [rows, steps, HV] / [rows, steps, HV], indexed by batch row: each token's l2-normed k,
     raw v and gates, for ``gdn_state_replay``.
+
+    ``ba_fold`` = (x, weight) or (x, weight, out), with ``a`` and ``b`` None: the kernel takes b|a = ``x @ weight.T``
+    itself, x [tokens, hidden] bf16 with unit inner stride and weight [2 * HV, hidden] bf16 contiguous (the b rows,
+    then the a rows), rounded to bf16 as F.linear stores them. That is F.linear's but for the summation order of each
+    dot: the products are exact in fp32, so the two differ by up to one bf16 step of the larger plus
+    2 * hidden * 2^-24 * sum |x * w| (any fp32 order's error), if cuBLAS keeps fp32 partials. ``out``
+    [tokens, 2 * HV] bf16, if given, gets the b|a the kernel used.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
     stride_v = v.stride()[1]
-    stride_b = b.stride()[-2]
-    # Both paths (KDA/GDN) advance p_a once per token, so use the token-axis stride.
-    # For 2D a ([T, ...]) this is stride(0); for 3D a ([B, T, ...]) this is stride(1).
-    # Using stride()[-2] covers GDN [T, HV] and KDA layouts ([T, HV*K] / [B, T, HV*K]).
-    stride_a = a.stride()[-2]
     HV = v.shape[2]
+    ba_x = ba_w = ba_out = None
+    stride_x, hidden, ba_block = 0, 1, 1
+    if ba_fold is not None:
+        assert not is_kda and a is None and b is None
+        ba_x, ba_w, *rest = ba_fold
+        ba_out = rest[0] if rest else None
+        hidden = ba_x.shape[1]
+        assert ba_x.shape == (B * T, hidden) and ba_x.dtype == torch.bfloat16 and ba_x.stride(1) == 1
+        assert ba_w.shape == (2 * HV, hidden) and ba_w.dtype == torch.bfloat16 and ba_w.is_contiguous()
+        assert ba_out is None or (ba_out.shape == (B * T, 2 * HV) and ba_out.dtype == torch.bfloat16 and ba_out.is_contiguous())
+        stride_x = ba_x.stride(0)
+        ba_block = min(_BA_BLOCK, triton.next_power_of_2(hidden))
+        stride_a = stride_b = 0
+    else:
+        stride_b = b.stride()[-2]
+        # Both paths (KDA/GDN) advance p_a once per token, so use the token-axis stride.
+        # For 2D a ([T, ...]) this is stride(0); for 3D a ([B, T, ...]) this is stride(1).
+        # Using stride()[-2] covers GDN [T, HV] and KDA layouts ([T, HV*K] / [B, T, HV*K]).
+        stride_a = a.stride()[-2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
@@ -391,6 +469,10 @@ def fused_sigmoid_gating_delta_rule_update(
         stash_v=stash_v,
         stash_g=stash_g,
         stash_beta=stash_beta,
+        ba_x=ba_x,
+        ba_w=ba_w,
+        ba_out=ba_out,
+        stride_x=stride_x,
         scale=scale,
         T=T,
         stride_a=stride_a,
@@ -414,6 +496,10 @@ def fused_sigmoid_gating_delta_rule_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         STASH_INPUTS=input_stash is not None,
+        FOLD_BA=ba_fold is not None,
+        STORE_BA=ba_out is not None,
+        HIDDEN=hidden,
+        BA_BLOCK=ba_block,
         num_warps=num_warps,
         num_stages=num_stages,
     )
