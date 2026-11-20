@@ -240,16 +240,18 @@ class Inkling2LoopForConditionalGeneration(Inkling2LoopForCausalLM):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         if config.is_multimodal:
-            from .vision import Inkling2VisionModel  # the vision tower module
+            from .vision import Inkling2VisionModel
 
+            # state-dict names visual.*, the checkpoint's model.visual.* (weight.iter_weights renames)
             self.visual = Inkling2VisionModel(config.vision_config)
 
     def place_encoder_weights(self, mode: str) -> None:
         self.visual.place_weights(mode)
 
     def encode(self, item: MMItem) -> torch.Tensor:
-        """``[item.num_tokens, hidden]`` image features, one per image token."""
-        return self.visual.encode(item)
+        """``[rows * cols, hidden]`` image features, one per image token (``item.grid_thw`` is ``[1, rows, cols]``)."""
+        feature = item.feature.to(self.visual.proj_in.weight.device, non_blocking=True)
+        return self.visual.forward(feature, item.grid_thw)
 
 
 __all__ = [

@@ -185,6 +185,8 @@ def conv_slot_states(args: Inkling2LoopArgs) -> Tuple[SlotStateSpec, ...]:
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
+    from .vision import parse_vision_config  # vision imports the layers
+
     text = _get(hf_config, "text_config", default=hf_config)
     args = parse_args(text)
     # no rope: positions only size the page table; the attention reads them as relative distances
@@ -219,7 +221,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         has_router_bias=True,
         routed_scaling_factor=args.route_scale,
         final_logit_softcapping=float(_get(text, "final_logit_softcapping")),
-        vision_config=_get(hf_config, "vision_config"),
+        vision_config=parse_vision_config(hf_config),
         image_token_id=int(_get(hf_config, "image_token_id", default=200054)),
         attention_groups=(
             FullAttentionGroupConfig(

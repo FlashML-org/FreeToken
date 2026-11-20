@@ -572,12 +572,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     # Inkling 2 Mini (model_type inkling2_loop): 24 decoder layers, layers 6-17 run three times with their own
     # KV and convolution state per pass; relative-bias attention with sinks, short convolutions, block attention
-    # residuals, sigmoid-routed experts (NVFP4 on layers 0-19, MXFP8 on 20-23, served dequantized to bf16).
+    # residuals, sigmoid-routed experts (NVFP4 on layers 0-19, MXFP8 on 20-23, served dequantized to bf16); the ViT
+    # tower under model.visual serves image input.
     "Inkling2LoopForConditionalGeneration": ModelSpec(
         "freetoken.models.inkling2_loop",
         "Inkling2LoopForConditionalGeneration",
         checkpoint_roots=_INKLING2_LOOP_ROOTS,
         quant_config="freetoken.models.inkling2_loop.config:quant_config",
+        mm_processor="freetoken.mm.processors.inkling2:Inkling2MMProcessor",
+        encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
     ),
 }
 
