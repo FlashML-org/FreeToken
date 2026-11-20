@@ -8,6 +8,7 @@ from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+    from freetoken.grammar.matcher import GrammarPlan
 
 
 @dataclass
@@ -17,6 +18,8 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
     penalties: list[tuple[int, torch.Tensor, float, float]] = field(default_factory=list)
+    # set by the scheduler between steps; None on every batch without a json_schema request
+    grammar: GrammarPlan | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -112,6 +115,8 @@ class Sampler:
                 logits = logits.float().clone()
                 for row, counts, presence, frequency in args.penalties:
                     logits[row] -= frequency * counts + presence * (counts > 0)
+            if args.grammar is not None:
+                logits = args.grammar.apply(logits)
             if args.temperatures is None:  # greedy sampling
                 tokens = torch.argmax(logits, dim=-1)
             else:
@@ -138,6 +143,9 @@ class Sampler:
         width = k + 1
         if args.penalties:
             logits = self._penalize_rows(logits, args, drafts)
+        if args.grammar is not None:
+            # a draft the mask rejects never equals its row's target: it is rejected as a mismatch is
+            logits = args.grammar.apply(logits, drafts)
         if args.temperatures is None:
             return torch.argmax(logits, dim=-1)
 
@@ -158,6 +166,8 @@ class Sampler:
         width = drafts.shape[1] + 1
         if args.penalties:
             logits = self._penalize_rows(logits, args, drafts)
+        if args.grammar is not None:
+            logits = args.grammar.apply(logits, drafts)
         top = None if args.greedy_mask is None else torch.argmax(logits, dim=-1, keepdim=True)
         probs = sampling.softmax(logits.float(), args.temperatures.repeat_interleave(width), enable_pdl=is_sm90_supported())
         # frees the penalized copy before the renorms allocate theirs
