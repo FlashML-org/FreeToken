@@ -58,6 +58,8 @@ class PrefillAdder:
     reserved_swa: int = 0
     # slots a decode step may hold past a request's own length; reserved with it
     token_headroom: int = 0
+    # a rest of at most this many tokens past the budget goes into a request's last chunk instead of a chunk of its own
+    tail_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.pass_budget:
@@ -149,6 +151,10 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        if 0 < remain_len - chunk_size <= self.tail_tokens:
+            # a forward of its own for the rest costs about a whole eager pass; the budget left is <= 0 after this, so
+            # the pass holds at most tail_tokens past it (SchedulerConfig.max_forward_len counts them)
+            chunk_size = remain_len
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -284,6 +290,8 @@ class PrefillManager:
     encoder_cache: EncoderCache | None = None
     keep_images_whole: bool = False
     token_headroom: int = 0
+    # PrefillAdder.tail_tokens, set by the scheduler
+    tail_tokens: int = 0
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -313,6 +321,7 @@ class PrefillManager:
             encoder_cache=self.encoder_cache,
             keep_images_whole=self.keep_images_whole,
             token_headroom=self.token_headroom,
+            tail_tokens=self.tail_tokens,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
