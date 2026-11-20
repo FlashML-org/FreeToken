@@ -28,7 +28,7 @@ from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks,
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
-from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
+from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, pool_row_bytes, resolve_profile, split_slots, staging_slots
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -849,10 +849,10 @@ class Engine:
         layer_methods = offload_layer_methods(self.model)
         if not is_mixed(layer_methods):
             layer_methods = None
-        elif config.moe_strategy == "cpu" or config.moe_cpu_layers:
+        elif config.moe_cpu_layers:
             raise ValueError(
                 "this model's experts come in several formats, which are served from per-format GPU slot pools; "
-                "they do not combine with --moe-strategy cpu or --moe-cpu-layers (use offload or hybrid)"
+                "they do not combine with --moe-cpu-layers (use offload, hybrid or cpu)"
             )
         # Fast path: an FTW checkpoint loads its repacked banks directly.
         # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -916,7 +916,8 @@ class Engine:
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
-        if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch:
+        # --moe-strategy cpu decodes no layer from the slots, which only back the prefill staging (sized below)
+        if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch and config.moe_strategy != "cpu":
             raise ValueError(
                 "several MoE slot pools (--moe-cache-scope per-layer, or experts in several quant formats) need every MoE "
                 "layer to decode from the GPU slot cache; they combine with --moe-cpu-layers only for locked layers under "
@@ -962,8 +963,17 @@ class Engine:
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
                 f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
-        _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
-        pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
+        if config.moe_strategy == "cpu" and len(pools) > 1:
+            # the fixed two-layer buffer is sized for one format; give each bank two layers of its widest one instead
+            pool_sizes = staging_slots(*pool_row_bytes(banks.sources, banks.row_tail_bytes, pools), config.model_config.num_experts)
+            object.__setattr__(config, "moe_cache_size", sum(pool_sizes))
+            logger.info_rank0(
+                f"MoE backend 'cpu': {len(pools)} expert formats; prefill staging pools of {pool_sizes} slots "
+                f"(moe_cache_size={config.moe_cache_size})"
+            )
+        else:
+            _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
         if len(pools) > 1:
             logger.info_rank0(
                 f"MoE slot pools: {config.moe_cache_scope}, {len(pools)} pools of {min(pool_sizes)}-{max(pool_sizes)} "
@@ -1761,7 +1771,7 @@ def _decode_target(config: EngineConfig) -> str:
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    "swiglu_clamp",
+    "swiglu_clamp", "swiglu_softcap",
 )
 
 
