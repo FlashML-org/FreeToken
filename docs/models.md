@@ -203,6 +203,8 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   off: a cached prefix would need the convolution windows at the cut, which nothing snapshots yet, so
   `--cache-type radix` serves as `naive`. The NVFP4 experts (layers 0-19) run W4A16, since the checkpoint
   declares only per-token activation scales; the MXFP8 experts (layers 20-23) are dequantized to bf16 at
-  load. Speculative decoding uses the checkpoint's DSpark draft (`mtp.safetensors`).
+  load. Speculative decoding uses the checkpoint's DSpark draft (`mtp.safetensors`). On a 16 GB card start
+  with `--memory-ratio 0.85`: the prefill activations are not in the memory budget, and at the default 0.9 a
+  4K-token prompt runs out of memory in the expert GEMM.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).
