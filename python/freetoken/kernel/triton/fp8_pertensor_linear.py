@@ -312,23 +312,144 @@ def _scaled_mm(
     )
 
 
+# ======================================================================================
+# Decode steps (M <= SMALL_M_MAX) W8A8 in one split-K launch that reads each weight tile once.
+# ``_scaled_mm``'s fp8 x fp8 products, summed in another fp32 order fixed by the weight shape.
+# ======================================================================================
+# a server takes this kernel for all of its decode steps or for none, so this is its widest step
+SMALL_M_MAX = 8
+_SMALL_M_BLOCK = 16  # tl.dot's smallest row block; rows past M are masked to zero
+
+
+@triton.jit
+def _w8a8_small_m_kernel(
+    a_ptr, w_ptr, part_ptr, in_scale_ptr, scale_ptr, M, N, K, n_kb, kb_per,
+    stride_am, stride_wn, stride_wk, stride_pk, stride_pm,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, FINAL: tl.constexpr,
+    OUT: tl.constexpr,
+):
+    """(pid_n, pid_k, pid_m): partial sums of BLOCK_N outputs over ``kb_per`` K chunks for one
+    block of BLOCK_M rows. FINAL (one split): the scales are applied here and ``part_ptr`` is
+    the output."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = tl.program_id(2) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    s_in = tl.load(in_scale_ptr).to(tl.float32)
+    inv = 1.0 / s_in
+    kb_start = pid_k * kb_per
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for i in range(kb_per):
+        kb = kb_start + i
+        if kb < n_kb:
+            offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+            v = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + offs_k[None, :],
+                mask=m_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.float32) * inv
+            v = tl.minimum(tl.maximum(v, -448.0), 448.0)
+            q = f32_to_e4m3(v).to(tl.bfloat16)
+            w = tl.load(
+                w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+            ).to(tl.bfloat16)
+            acc += tl.dot(q, tl.trans(w), out_dtype=tl.float32)
+    ptrs = part_ptr + pid_k * stride_pk + offs_m[:, None] * stride_pm + offs_n[None, :]
+    mask = m_mask[:, None] & n_mask[None, :]
+    if FINAL:
+        scale = tl.load(scale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        tl.store(ptrs, (acc * scale[None, :] * s_in).to(OUT), mask=mask)
+    else:
+        tl.store(ptrs, acc, mask=mask)
+
+
+@triton.jit
+def _w8a8_small_m_reduce_kernel(
+    part_ptr, scale_ptr, in_scale_ptr, out_ptr, N, stride_pk, stride_pm, stride_om,
+    SPLIT_K: tl.constexpr, BLOCK: tl.constexpr, OUT: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = tl.program_id(1)
+    mask = offs < N
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in tl.static_range(SPLIT_K):
+        acc += tl.load(part_ptr + k * stride_pk + m * stride_pm + offs, mask=mask, other=0.0)
+    scale = tl.load(scale_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    s_in = tl.load(in_scale_ptr).to(tl.float32)
+    tl.store(out_ptr + m * stride_om + offs, (acc * scale * s_in).to(OUT), mask=mask)
+
+
+_SMALL_M_TILES = (64, 128, 4)  # BLOCK_N, BLOCK_K, warps
+_SMALL_M_PROGRAMS, _SMALL_M_TUNED_SMS = 512, 170  # programs a launch aims for, on the SM count it was tuned on
+
+
+def _small_m_split(N: int, K: int, sm_count: int) -> int:
+    """K splits for one weight shape: the tuned programs per SM on this device, a power of two
+    so the reduction order is fixed."""
+    block_n, block_k, _ = _SMALL_M_TILES
+    programs = sm_count * _SMALL_M_PROGRAMS // _SMALL_M_TUNED_SMS
+    split = max(1, min(programs // triton.cdiv(N, block_n), triton.cdiv(K, block_k)))
+    return 1 << (split.bit_length() - 1)
+
+
+def _w8a8_small_m(
+    a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    input_scale: torch.Tensor, out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """``a`` [M, K] bf16 with M <= SMALL_M_MAX; ``weight`` [N, K] fp8; ``weight_scale`` [N]
+    fp32; ``input_scale`` the static activation scale."""
+    M, K = a.shape
+    N = weight.shape[0]
+    a = a.contiguous()
+    compute = out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16
+    block_n, block_k, warps = _SMALL_M_TILES
+    split = _small_m_split(N, K, torch.cuda.get_device_properties(a.device).multi_processor_count)
+    n_kb = triton.cdiv(K, block_k)
+    out = torch.empty((M, N), dtype=compute, device=a.device)
+    final = split == 1
+    part = out if final else torch.empty((split, M, N), dtype=torch.float32, device=a.device)
+    _w8a8_small_m_kernel[(triton.cdiv(N, block_n), split, triton.cdiv(M, _SMALL_M_BLOCK))](
+        a, weight, part, input_scale, weight_scale, M, N, K, n_kb, triton.cdiv(n_kb, split),
+        a.stride(0), weight.stride(0), weight.stride(1),
+        0 if final else part.stride(0), out.stride(0) if final else part.stride(1),
+        BLOCK_M=_SMALL_M_BLOCK, BLOCK_N=block_n, BLOCK_K=block_k, FINAL=final, OUT=_TL_DTYPE[compute],
+        num_warps=warps,
+    )
+    if not final:
+        _w8a8_small_m_reduce_kernel[(triton.cdiv(N, 256), M)](
+            part, weight_scale, input_scale, out, N, part.stride(0), part.stride(1), out.stride(0),
+            SPLIT_K=split, BLOCK=256, OUT=_TL_DTYPE[compute], num_warps=2,
+        )
+    return out
+
+
 def fp8_pertensor_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
     input_scale: torch.Tensor | None = None,
     uniform_scale: bool = False,
     scale_segments: list[tuple[int, int]] | None = None,
+    small_m: bool = False,
 ) -> torch.Tensor:
     """``y = x @ (weight_fp8 * weight_scale)^T``. ``weight`` [N, K] fp8-e4m3, ``weight_scale``
     [N] fp32 (per output row). ``scale_segments``: the fused parts' row ranges, precomputed at
-    load by the layer; derived here (with a sync) when omitted and needed.
+    load by the layer; derived here (with a sync) when omitted and needed. ``small_m``: W8A8
+    calls of up to SMALL_M_MAX rows take the split-K kernel and wider ones ``_scaled_mm``; for
+    a caller whose decode steps never have more, so that they all sum in one order. The choice
+    is made per call, so a prefill chunk of SMALL_M_MAX tokens or fewer (the uncached tail
+    after a prefix-cache hit, or a few short prompts batched together) takes the split-K kernel
+    too, and its outputs can round differently from the same tokens in a wider prefill.
 
     Whether the activation is quantized is a property of the *deployment*, never of the batch:
     with ``input_scale`` on sm_89+ every M runs W8A8, otherwise every M runs W8A16 (split-K
     GEMV at M=1, GEMM above it). Picking per-M would make a request's numerics depend on how
     many unrelated requests happened to be in flight, so a reply would not reproduce at bs=1 --
     and W8A16 at M=1 is worth only ~0.5% (5.53 ms vs 5.56 ms of per-step GEMM) anyway. vLLM and
-    SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores."""
+    SGLang likewise run one scheme across all M on any GPU with FP8 tensor cores. ``small_m``
+    keeps that for decode steps only: a prefill's sums depend on its chunk length, as above."""
     *lead, K = x.shape
     N = weight.shape[0]
     w8a8 = input_scale is not None and e4m3_native()
@@ -337,7 +458,9 @@ def fp8_pertensor_linear(
         segments = scale_segments if scale_segments is not None else weight_scale_segments(weight_scale)
         if not _segments_w8a8_ok(segments):
             w8a8 = False  # W8A16 below is exact for any per-row scale and never calls _scaled_mm
-    if w8a8:
+    if w8a8 and small_m and x.numel() // K <= SMALL_M_MAX:
+        out = _w8a8_small_m(x.reshape(-1, K), weight, weight_scale, input_scale, x.dtype).reshape(*lead, N)
+    elif w8a8:
         out = _scaled_mm(
             x.reshape(-1, K), weight, weight_scale, input_scale, uniform_scale, x.dtype,
             scale_segments=segments,

@@ -587,3 +587,42 @@ def test_moe_pool_flags_and_decode_batch_clamp():
     )
     _clamp_decode_batch_to_pools(config, [12, 16, 9])
     assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (1, 1, [1])
+
+
+@pytest.mark.parametrize("kw,rows,kernel", [
+    (dict(max_running_req=1), 1, "triton-w8a8"),
+    # one request verifying 5 MTP drafts a step
+    (dict(max_running_req=1, speculative_algorithm="mtp", speculative_num_steps=5), 6, "triton-w8a8"),
+    (dict(max_running_req=8), 8, "triton-w8a8"),
+    (dict(max_running_req=2, speculative_algorithm="mtp", speculative_num_steps=5), 12, "torch"),
+    # a batch is padded to the graph it replays, so a captured size above the running requests counts
+    (dict(max_running_req=1, cuda_graph_bs=[1, 2], speculative_algorithm="mtp", speculative_num_steps=5), 12, "torch"),
+    (dict(max_running_req=1, cuda_graph_max_bs=16), 16, "torch"),
+])
+def test_fp8_split_k_decode_kernel_only_where_every_decode_step_fits(monkeypatch, kw: dict, rows: int, kernel: str):
+    """The split-K W8A8 kernel and torch._scaled_mm add the same products in different orders, so a server takes one
+    of them for every decode step it can form (running requests or captured graph size, times rows per request)."""
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.kernel import backend
+    from freetoken.kernel.triton import e4m3_compat
+    from freetoken.layers.quantization import KernelSelectionError, LinearConfig
+    from freetoken.layers.quantization.linear import Fp8TensorLinearMethod
+    from freetoken.layers.quantization.linear.fp8_tensor import set_max_decode_rows
+    from freetoken.layers.quantization.scheme import fp8_tensor_scheme
+
+    monkeypatch.setattr(backend, "device_capability", lambda: (12, 0))
+    monkeypatch.setattr(e4m3_compat, "e4m3_native", lambda: True)
+    config = EngineConfig(model_path="", tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, **kw)
+    assert config.max_decode_rows == rows
+    linear = LinearConfig(2048, 4096, scheme=fp8_tensor_scheme("fp32", per_row=True, input_scale=True))
+    # a model built outside an engine has no decode batch to check against
+    assert Fp8TensorLinearMethod(linear).kernel.name == "torch"
+    set_max_decode_rows(config.max_decode_rows)
+    try:
+        assert Fp8TensorLinearMethod(linear).kernel.name == kernel
+        if kernel == "torch":
+            with pytest.raises(KernelSelectionError, match="decode steps reach"):
+                Fp8TensorLinearMethod(linear, "triton-w8a8")
+    finally:
+        set_max_decode_rows(None)
