@@ -244,13 +244,17 @@ def test_resident_layers_each_read_their_own_format(monkeypatch):
     from freetoken.moe import expert_pieces
     from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
 
+    from freetoken.utils.torch_utils import torch_dtype
+
     _init_tp()
     set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
     nvfp4 = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
-    layers = [
-        MoELayer(E, TOPK, H, I, layer_id=layer, quant_config=NoQuantConfig() if fmt == "bf16" else nvfp4, prefix=f"model.layers.{layer}.mlp.experts")
-        for layer, fmt in enumerate(FORMATS)
-    ]
+    # resident experts compute in the model dtype the engine builds them under
+    with torch_dtype(torch.bfloat16):
+        layers = [
+            MoELayer(E, TOPK, H, I, layer_id=layer, quant_config=NoQuantConfig() if fmt == "bf16" else nvfp4, prefix=f"model.layers.{layer}.mlp.experts")
+            for layer, fmt in enumerate(FORMATS)
+        ]
     pieces = _pieces(seed=3)
     monkeypatch.setattr(expert_pieces, "iter_expert_pieces", lambda path, config, kind, *, layers=None, **kw: (
         p for p in _reader(pieces, kind) if p[0] in layers))

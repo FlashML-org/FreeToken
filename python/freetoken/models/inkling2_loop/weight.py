@@ -143,6 +143,19 @@ def iter_weights(
     )
 
 
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    import safetensors
+
+    from freetoken.models.loader import iter_weight_files
+
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw in f.keys():
+                if raw.startswith(_VISUAL):
+                    yield "visual." + raw[len(_VISUAL):], f.get_tensor(raw)
+
+
 def deinterleave_rows(t: torch.Tensor) -> torch.Tensor:
     """[E, 2I, ...] with gate and up rows alternating -> [gate rows; up rows]."""
     raw = t.view(torch.uint8) if t.element_size() == 1 else t
@@ -224,4 +237,4 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers: Collectio
     return pieces()
 
 
-__all__ = ["dequant_mxfp8", "dequant_nvfp4", "deinterleave_rows", "iter_expert_pieces", "iter_weights", "merge_message_queries", "rename"]
+__all__ = ["dequant_mxfp8", "dequant_nvfp4", "deinterleave_rows", "iter_expert_pieces", "iter_vision_weights", "iter_weights", "merge_message_queries", "rename"]
