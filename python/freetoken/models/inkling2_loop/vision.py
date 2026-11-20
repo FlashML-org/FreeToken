@@ -199,8 +199,9 @@ class Inkling2VisionModel(BaseOP):
         self.proj_in = LinearReplicated(vc.merge_size**2 * vc.hidden_size, vc.projection_hidden_dim, has_bias=vc.projector_bias)
         self.proj_out = LinearReplicated(vc.projection_hidden_dim, vc.text_hidden_size, has_bias=vc.projector_bias)
         head_dim = vc.hidden_size // vc.num_heads
-        # one rope band per axis over head_dim / 2 channels; the pairs take the width band first
-        self._inv_freq = 1.0 / (vc.rope_theta ** (torch.arange(0, head_dim // 2, 2, dtype=torch.float32) / (head_dim // 2)))
+        # one rope band per axis over head_dim / 2 channels, built on the CPU as the reference builds it
+        band = torch.arange(0, head_dim // 2, 2, dtype=torch.float32, device="cpu") / (head_dim // 2)
+        self._inv_freq = 1.0 / (vc.rope_theta ** band)
         self._vc = vc
         self._streamer: BlockWeightStreamer | None = None
 
