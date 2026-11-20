@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -16,7 +17,7 @@ from ..moe import MoEConfig
 from ..names import Matcher, NameMap, name_set
 from ..quant_backend import get_quant_backend
 from ..registry import LayerKind, dialects, method_class, methods_for, online_kinds, register_dialect
-from ..scheme import QuantKind, QuantScheme
+from ..scheme import QuantKind, QuantScheme, nvfp4_scheme
 
 logger = init_logger(__name__)
 
@@ -64,6 +65,8 @@ class QuantConfig(ABC):
     # --online-quant: the kind served for the layers this checkpoint stores bf16; --online-quant-modules narrows them (glob patterns on checkpoint names)
     online: QuantKind | None = None
     online_modules: Matcher | None = None
+    # --moe-expert-activation-scales: NVFP4 experts are served under the input_scale tensors the checkpoint stores for them, whatever activation precision its config declares
+    expert_activation_scales: bool = False
 
     def __init__(self, name_map: NameMap | None = None, unquantized: tuple[str, ...] = ()):
         self.name_map = name_map or NameMap()
@@ -103,10 +106,16 @@ class QuantConfig(ABC):
         scheme = self.scheme_for(prefix)
         layer_kind = layer.quant_layer_kind
         kind = scheme.kind if scheme else QuantKind.NONE
+        flagged = self.expert_activation_scales and layer_kind is LayerKind.MOE and kind is QuantKind.NVFP4 and not scheme.has("input_scale")
+        if flagged:
+            # only the kernel selection reads this scheme: the expert reader takes the stored input_scale tensors under any scheme
+            scheme = nvfp4_scheme(input_scale=True)
         if layer_kind is LayerKind.EMBEDDING and kind not in methods_for(layer_kind):
             # a checkpoint that quantizes its linears stores the vocab table dense
             scheme, kind = None, QuantKind.NONE
         cfg = self.layer_config(layer, layer_kind, scheme)
+        if flagged:
+            cfg = dataclasses.replace(cfg, expert_activation_scales=True)
         if kind is QuantKind.NONE and (method := self._online_method(layer, layer_kind, prefix, cfg)) is not None:
             return method
         cls = method_class(kind, layer_kind)
@@ -119,6 +128,12 @@ class QuantConfig(ABC):
         quant = copy.copy(self)
         quant.online = kind
         quant.online_modules = name_set(tuple(modules)) if kind is not None and modules else None
+        return quant
+
+    def with_expert_activation_scales(self) -> "QuantConfig":
+        """A copy whose NVFP4 experts declare the static activation scale their checkpoint stores, so a W4A4 expert kernel can take them."""
+        quant = copy.copy(self)
+        quant.expert_activation_scales = True
         return quant
 
     def _online_method(self, layer: Any, layer_kind: LayerKind, prefix: str, cfg: Any):

@@ -118,7 +118,7 @@ def _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="silu
     return out
 
 
-def _bound_layer(kernel: str):
+def _bound_layer(kernel: str, *, algo: str = "NVFP4", expert_activation_scales: bool = False):
     """An NVFP4 offload layer with ``kernel`` bound, as the engine binds it."""
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
@@ -126,8 +126,10 @@ def _bound_layer(kernel: str):
 
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
-    set_quant_backend(QuantBackend.parse(f"moe.nvfp4={kernel}"))
-    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    set_quant_backend(QuantBackend.parse("" if kernel == "auto" else f"moe.nvfp4={kernel}"))
+    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": algo, "ignore": ["lm_head"]}})
+    if expert_activation_scales:
+        quant = quant.with_expert_activation_scales()
     return OffloadMoELayer(0, E, TOPK, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
 
 
@@ -415,6 +417,80 @@ def test_triton_prefill_routes_to_gluon_on_sm120(monkeypatch, hidden_size, inter
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))
 
 
+@pytest.mark.parametrize("flag", [False, True])
+def test_expert_activation_scales_flag_binds_w4a4_and_keeps_the_stored_input_scales(monkeypatch, flag):
+    """A W4A16 export can still store an input_scale per expert projection, and the expert reader hands them over either way.
+    The Triton kernel its config binds drops them; under --moe-expert-activation-scales the W4A4 kernel is bound on a GPU
+    that has it and keeps them as the layer's resident scales (gate_up: the larger of gate's and up's)."""
+    from freetoken.layers.quantization.moe.nvfp4 import W4a4Nvfp4MoEKernel
+    from freetoken.moe.expert_banks import build_expert_banks
+    from freetoken.moe.expert_pieces import per_expert_pieces
+
+    monkeypatch.setattr(W4a4Nvfp4MoEKernel, "worth_it", lambda self, cfg: True)  # sm_120 with Gluon
+    layer = _bound_layer("auto", algo="W4A16_NVFP4", expert_activation_scales=flag)
+    assert layer.quant_method.kernel.name == ("w4a4" if flag else "triton")
+
+    stored = {proj: torch.rand(L, E, generator=torch.Generator().manual_seed(i)) + 0.01 for i, proj in enumerate(("gate", "up", "down"))}
+
+    def tensors():
+        for layer_id in range(L):
+            for expert in range(E):
+                for proj, (rows, cols) in (("gate", (I, H)), ("up", (I, H)), ("down", (H, I))):
+                    yield (layer_id, expert, proj), torch.zeros(rows, cols // 2, dtype=torch.uint8)
+                    yield (layer_id, expert, proj + "_scale"), torch.zeros(rows, cols // 16).to(torch.float8_e4m3fn)
+                    yield (layer_id, expert, proj + "_global"), torch.ones(())
+                    yield (layer_id, expert, proj + "_input"), stored[proj][layer_id, expert]
+
+    pieces = per_expert_pieces(tensors(), lambda name: name, tensors_per_expert=12)
+    banks = build_expert_banks(layer.quant_method, L, pieces, device=torch.device("cpu"), resident=True)
+
+    if not flag:
+        assert banks.gate_up_alpha is None and banks.down_alpha is None
+        return
+    assert torch.equal(banks.gate_up_alpha, torch.maximum(stored["gate"], stored["up"]).reshape(-1))
+    assert torch.equal(banks.down_alpha, stored["down"].reshape(-1))
+
+
+@pytest.mark.parametrize(
+    "algo, flag, engage, tokens, a4",
+    [
+        ("W4A16_NVFP4", True, None, 2047, False),
+        ("W4A16_NVFP4", True, None, 2048, True),
+        ("W4A16_NVFP4", True, 1024, 1023, False),  # FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS=1024
+        ("W4A16_NVFP4", True, 1024, 1024, True),
+        ("W4A16_NVFP4", True, 0, 4, True),  # 0 leaves the W4A4 kernel's own floor
+        ("NVFP4", False, None, 4, True),  # a checkpoint that declares the scales has no engage length, with the flag or not
+        ("NVFP4", True, None, 4, True),
+    ],
+)
+def test_expert_activation_scales_take_w4a4_only_for_prefill_forwards_of_the_engage_length(monkeypatch, algo, flag, engage, tokens, a4):
+    """Under --moe-expert-activation-scales a prefill forward shorter than ACT_SCALES_MIN_TOKENS keeps the W4A16 GEMMs its
+    checkpoint declares (W4A4 measured slower there), and decode always does. The startup line names the same length."""
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.layers.quantization import ExpertView
+    from freetoken.layers.quantization.moe import nvfp4
+    from freetoken.moe import fused_nvfp4
+
+    monkeypatch.setattr(nvfp4.W4a4Nvfp4MoEKernel, "worth_it", lambda self, cfg: True)  # sm_120 with Gluon
+    if engage is not None:
+        monkeypatch.setattr(nvfp4, "ACT_SCALES_MIN_TOKENS", engage)
+    layer = _bound_layer("auto", algo=algo, expert_activation_scales=flag)
+    method = layer.quant_method
+    assert method.kernel.name == "w4a4"
+    floor = nvfp4_moe.w4a4_min_tokens(E, TOPK)
+    assert method.kernel.a4_min_tokens(method.cfg) == (max(floor, nvfp4.ACT_SCALES_MIN_TOKENS) if algo == "W4A16_NVFP4" else floor)
+
+    calls = []
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4_w4a4", lambda *args, **kwargs: calls.append("a4"))
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_nvfp4", lambda *args, **kwargs: calls.append("a16"))
+    monkeypatch.setattr(fused_nvfp4, "fused_experts_decode_nvfp4_marlin", lambda *args, **kwargs: calls.append("decode"))
+    banks = {role: torch.zeros(E, 1) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
+    view = ExpertView(banks, n=E, alphas=(torch.ones(E), torch.ones(E)))
+    for is_prefill in (True, False):
+        method.apply(torch.zeros(tokens, H), torch.ones(tokens, TOPK), torch.zeros(tokens, TOPK, dtype=torch.int32), view, layer=layer, is_prefill=is_prefill)
+    assert calls == ["a4" if a4 else "a16", "decode"]
+
+
 def _round_e2m1(v: torch.Tensor) -> torch.Tensor:
     """Round to the nearest e2m1 value, ties to the even code, saturating at 6 (cvt.rn.satfinite)."""
     grid = _E2M1[:8].to(v.device)
@@ -503,7 +579,8 @@ def test_w4a4_prefill_matches_nvfp4_activation_reference(hidden_size, inter, act
     banks = {role: torch.empty((E, *spec.shape), dtype=spec.dtype, device=device) for role, spec in layout.items() if not spec.resident}
     alphas = kernel.pack(pieces, cfg, banks)
     view = ExpertView(banks, n=E, alphas=(alphas["gate_up_alpha"], alphas["down_alpha"]))
-    layer = SimpleNamespace(activation=activation, alpha=alpha, limit=limit, apply_router_weight_on_input=False)
+    layer = SimpleNamespace(activation=activation, alpha=alpha, limit=limit, apply_router_weight_on_input=False,
+                            quant_method=SimpleNamespace(cfg=cfg))
     out = kernel.apply(layer, hidden, topk_weights, topk_ids, view, is_prefill=True)
     assert torch.equal(alphas["gate_up_alpha"], torch.maximum(pieces["gate_input"], pieces["up_input"]).squeeze(1))
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2 * float(ref.abs().max()))

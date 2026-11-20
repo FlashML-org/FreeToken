@@ -70,6 +70,9 @@ class EngineConfig:
     # no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # --moe-expert-activation-scales: serve NVFP4 experts under the input_scale tensors the checkpoint stores for them even where its
+    # config declares W4A16, so prefill takes the W4A4 expert kernel where the GPU has one. Changes the output.
+    moe_expert_activation_scales: bool = False
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
@@ -192,7 +195,8 @@ class EngineConfig:
                 setattr(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(
-            self.model_path, hf_config, spec, online=self.online_quant, online_modules=self.online_quant_modules
+            self.model_path, hf_config, spec, online=self.online_quant, online_modules=self.online_quant_modules,
+            expert_activation_scales=self.moe_expert_activation_scales,
         )
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)

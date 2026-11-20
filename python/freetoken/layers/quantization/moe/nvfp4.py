@@ -20,6 +20,7 @@ import math
 
 import torch
 
+from freetoken.env import ENV
 from freetoken.kernel import backend
 from freetoken.utils import init_logger
 
@@ -32,6 +33,9 @@ logger = init_logger(__name__)
 FP8 = torch.float8_e4m3fn
 MARLIN_MAX_SLOTS = 992
 B12X_MIN_INTERMEDIATE = 1024
+# --moe-expert-activation-scales: tokens of the shortest prefill forward that runs the experts on NVFP4 activations
+# (FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS); a checkpoint that declares them has only the W4A4 kernel's own floor
+ACT_SCALES_MIN_TOKENS = ENV.NVFP4_ACT_SCALES_MIN_TOKENS.value
 
 
 class TritonNvfp4MoEKernel(MoEKernel):
@@ -115,9 +119,17 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
         gate, up, down = (pieces[f"{p}_input"].reshape(len(pieces[f"{p}_input"]), -1)[:, 0].float() for p in ("gate", "up", "down"))
         return {"gate_up_alpha": torch.maximum(gate, up), "down_alpha": down}
 
+    def a4_min_tokens(self, cfg: MoEConfig) -> int:
+        """Tokens of the shortest prefill forward whose GEMMs run on NVFP4 activations."""
+        from freetoken.kernel import nvfp4_moe
+
+        floor = nvfp4_moe.w4a4_min_tokens(cfg.num_experts, cfg.top_k)
+        return max(floor, ACT_SCALES_MIN_TOKENS) if cfg.expert_activation_scales else floor
+
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
-        if not is_prefill:
-            return super().apply(layer, x, topk_weights, topk_ids, view, is_prefill=False)
+        # under the flag a short forward keeps the activations its checkpoint declares
+        if not is_prefill or (layer.quant_method.cfg.expert_activation_scales and x.shape[0] < ACT_SCALES_MIN_TOKENS):
+            return super().apply(layer, x, topk_weights, topk_ids, view, is_prefill=is_prefill)
         from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4_w4a4
 
         t = view.tensors

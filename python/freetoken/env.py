@@ -75,6 +75,8 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # --moe-expert-activation-scales: a prefill forward of fewer tokens than this keeps the experts on 16-bit activations.
+    NVFP4_ACT_SCALES_MIN_TOKENS = EnvInt(2048)
 
     def __new__(cls):
         # single instance
