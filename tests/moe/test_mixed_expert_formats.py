@@ -2,8 +2,8 @@
 
 A checkpoint may leave some MoE layers unquantized (Muse Spark keeps its first and last layer's
 experts bf16). Each format fills its own layers' banks, the banks merge over the union of roles with
-zero-byte placeholders, the slot cache keeps one pool per format, the FTW stores each layer's own
-banks, and the CPU executor computes each layer in its format.
+zero-byte placeholders, the slot cache keeps one pool per format, resident layers each take their own
+roles, the FTW stores each layer's own banks, and the CPU executor computes each layer in its format.
 """
 
 from __future__ import annotations
@@ -235,6 +235,39 @@ def test_mixed_layers_decode_and_prefill_through_their_pools():
         ids = torch.randperm(E)[:TOPK].to(torch.int32).view(1, TOPK)
         out = layer._decode_routed(hidden[:1], weights[:1], ids.clone().to(device))
         _assert_close(out, _reference(pieces, layer.layer_id, hidden[:1], weights[:1], ids))
+
+
+@cuda
+def test_resident_layers_each_read_their_own_format(monkeypatch):
+    from freetoken.layers.moe import MoELayer
+    from freetoken.layers.quantization import NoQuantConfig, QuantBackend, QuantConfig, set_quant_backend
+    from freetoken.moe import expert_pieces
+    from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
+
+    _init_tp()
+    set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
+    nvfp4 = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    layers = [
+        MoELayer(E, TOPK, H, I, layer_id=layer, quant_config=NoQuantConfig() if fmt == "bf16" else nvfp4, prefix=f"model.layers.{layer}.mlp.experts")
+        for layer, fmt in enumerate(FORMATS)
+    ]
+    pieces = _pieces(seed=3)
+    monkeypatch.setattr(expert_pieces, "iter_expert_pieces", lambda path, config, kind, *, layers=None, **kw: (
+        p for p in _reader(pieces, kind) if p[0] in layers))
+    config = SimpleNamespace(num_moe_layers=L, num_experts=E)
+    device = torch.device("cuda")
+    banks = load_expert_banks("", config, method=layers[1].quant_method, device=device, parallel=False, resident=True,
+                              layer_methods=[layer.quant_method for layer in layers])
+    attach_resident_banks(layers, banks)
+    M = 16
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    ids = torch.stack([torch.randperm(E)[:TOPK] for _ in range(M)]).to(torch.int32)
+    weights = torch.rand(M, TOPK, device=device)
+    for layer in layers:
+        assert all(t.device.type == "cuda" for t in layer._expert_banks.values())
+        method = layer.quant_method
+        out = method.apply(hidden.clone(), weights, ids.to(device), method.resident_view(layer), layer=layer, is_prefill=True)
+        _assert_close(out, _reference(pieces, layer.layer_id, hidden, weights, ids))
 
 
 @cuda
