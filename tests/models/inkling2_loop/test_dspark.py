@@ -445,3 +445,9 @@ def test_sampled_drafts_report_their_distribution(tmp_path):
         # the support is the step's top K (up to a tie at its edge), and q their softmax at the request's temperature
         assert vals.min() >= top[j, -1] - 1e-3
         torch.testing.assert_close(q[j], torch.softmax(vals / temperature, -1), atol=1e-4, rtol=1e-3)
+    # the drafts are drawn from that q: many copies of the sampled request, the first draft's frequencies against q at 4 sigma
+    n = 4096
+    many = proposer.propose([reqs[1]] * n, torch.ones(n, dtype=torch.int64, device=DEV), torch.full((n,), anchor, device=DEV))
+    q0, ids0 = many.draft_support_probs[0, 0], many.draft_support_ids[0, 0]
+    freq = (many.draft_token_ids[:, :1] == ids0[None]).float().mean(0)
+    assert ((freq - q0).abs() <= 4 * (q0 * (1 - q0) / n).sqrt() + 1e-3).all(), (freq - q0).abs().max()
