@@ -171,8 +171,12 @@ class OffloadMoeCache:
     # Each layer belongs to one pool: a contiguous slot range with its own LRU scope; pool p owns slots [sum(pool_sizes[:p]), +pool_sizes[p]). Slot ids in slot_for_id are local to the pool. None = one pool for all layers.
     pool_of_layer: list[int] | None = None
     pool_sizes: list[int] | None = None
+    # MoE layers in the order one forward runs them, when that is not 0..num_layers-1 once each (looped models run
+    # some layers several times); the overlap prefill prefetches the next entry. None = ascending, each once.
+    layer_order: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
+        self._prefill_cursor = 0
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
@@ -860,7 +864,17 @@ class OffloadMoeCache:
         for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
             tail.zero_()
 
+    def next_prefill_layer(self, layer_id: int) -> int:
+        """The MoE layer the forward runs after this call of ``layer_id`` (``num_layers`` after the last); advances the cursor of ``layer_order``."""
+        if self.layer_order is None:
+            return layer_id + 1
+        cursor = self._prefill_cursor
+        assert self.layer_order[cursor] == layer_id, f"MoE layer {layer_id} ran out of the declared order at step {cursor}"
+        self._prefill_cursor = cursor + 1
+        return self.layer_order[cursor + 1] if cursor + 1 < len(self.layer_order) else self.num_layers
+
     def begin_prefill(self) -> None:
+        self._prefill_cursor = 0
         if not self.prefill_overlap:
             return
         self._prefill_buffer_layer = [None, None]

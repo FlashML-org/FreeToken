@@ -389,10 +389,10 @@ class OffloadMoELayer(MoELayer):
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0:
+        if self.layer_id == 0 and (cache.layer_order is None or cache.layer_order[0] == 0):
             cache.begin_prefill()
         cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
+        cache.prefetch_prefill_layer(cache.next_prefill_layer(self.layer_id))
         return cache.wait_prefill_layer(self.layer_id)
 
     # ------------------------------------------------------------------

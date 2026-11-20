@@ -221,6 +221,8 @@ class Inkling2LoopForCausalLM(BaseLLMModel):
         )
         self._softcap = config.final_logit_softcapping
         self._unpadded = args.unpadded_vocab_size
+        # the offload prefill streams experts in this order: each MoE layer is keyed by its weight layer
+        self.moe_layer_order = tuple(layer for layer, _ in args.schedule())
         super().__init__()
 
     @nvtx_annotate("Inkling2Loop")
