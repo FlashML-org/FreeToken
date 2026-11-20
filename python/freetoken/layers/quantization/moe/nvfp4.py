@@ -39,6 +39,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    takes_shared_route = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
@@ -74,8 +75,12 @@ class TritonNvfp4MoEKernel(MoEKernel):
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
         if is_prefill:
+            assert view.shared is None, "a prefill reads every route from the bank"
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
-        return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+        return fused_experts_decode_nvfp4_marlin(
+            x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit,
+            shared=view.shared,
+        )
 
 
 class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):

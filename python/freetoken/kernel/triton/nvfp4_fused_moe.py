@@ -185,6 +185,10 @@ def _decode_nvfp4_marlin_kernel(
     A_WIDE: tl.constexpr,         # activation rows are contiguous bf16/fp16, 16-byte aligned
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
+    shared_packed_ptr,  # [N, K // 8] int32: the weights of a row's last route with SHARED_ROUTE, else unread
+    shared_scale_ptr,   # [N, K // 16] fp8-e4m3, with one slot's strides of scale_ptr
+    shared_global_ptr,  # [N] fp32
+    SHARED_ROUTE: tl.constexpr,
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -205,7 +209,11 @@ def _decode_nvfp4_marlin_kernel(
     :func:`_nvfp4_pair_f32` (2^14 folded into the scale), and with ``A_WIDE`` the 8
     activations of a word are read as two int64 and unpacked by shifts. Mirrors the fast
     kernel's route/tile mapping and epilogue so it is a drop-in decode GEMV (CUDA-graph
-    safe: fixed shapes, no host sync)."""
+    safe: fixed shapes, no host sync).
+
+    With ``SHARED_ROUTE`` the last of a row's TOP_K routes is an expert outside the bank (a shared expert): the
+    program takes its weights from the ``shared_*`` tensors instead of a slot, once, before the K-loop, which is
+    the same for every route."""
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
     token_id = route_id // TOP_K
@@ -223,8 +231,16 @@ def _decode_nvfp4_marlin_kernel(
     K_WORDS = K // 8
     partial = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
 
-    p_base = packed_ptr + slot * stride_pe + offs_n[:, None] * stride_pn
-    s_base = scale_ptr + slot * stride_se + offs_n[:, None] * stride_sn
+    p_expert = packed_ptr + slot * stride_pe
+    s_expert = scale_ptr + slot * stride_se
+    g_expert = global_ptr + slot * stride_ge
+    if SHARED_ROUTE:
+        if route_k == TOP_K - 1:
+            p_expert = shared_packed_ptr
+            s_expert = shared_scale_ptr
+            g_expert = shared_global_ptr
+    p_base = p_expert + offs_n[:, None] * stride_pn
+    s_base = s_expert + offs_n[:, None] * stride_sn
     for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW), UNROLL):
         for u in tl.static_range(UNROLL):
             widx = (kw_start + u) * BLOCK_SIZE_KW + offs_kw
@@ -283,7 +299,7 @@ def _decode_nvfp4_marlin_kernel(
             partial += acc_w * scale
 
     accumulator = tl.sum(partial, axis=1)
-    g = tl.load(global_ptr + slot * stride_ge + offs_n * stride_gn, mask=n_mask, other=0.0).to(tl.float32)
+    g = tl.load(g_expert + offs_n * stride_gn, mask=n_mask, other=0.0).to(tl.float32)
     accumulator = accumulator * g
 
     if MUL_ROUTED_WEIGHT:

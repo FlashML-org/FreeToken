@@ -85,6 +85,9 @@ class ExpertView:
     slots: torch.Tensor | None = None
     n: int | None = None
     alphas: tuple[torch.Tensor, torch.Tensor] | None = None
+    # an expert outside the bank by the layout's roles, one slot's shape each: a decode apply() of a kernel with
+    # ``takes_shared_route`` reads it for the last column of the routes, whose id it ignores
+    shared: dict[str, torch.Tensor] | None = None
 
 
 def fused_piece(pieces: dict[str, torch.Tensor], role: str) -> torch.Tensor:
@@ -144,6 +147,8 @@ class MoEKernel(ABC):
     # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
     # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
     supports_inactive_slots: ClassVar[bool] = False
+    # Whether a decode ``apply`` takes ``ExpertView.shared``: one more expert, outside the bank, as every row's last route.
+    takes_shared_route: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

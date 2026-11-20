@@ -974,3 +974,46 @@ def test_quantized_nextn_expert_banks_keep_their_packed_rows(tmp_path):
         assert torch.equal(gate_up[e, :MI].reshape(-1, rb), raw["ffn_gate_exps"][e * MI : (e + 1) * MI])
         assert torch.equal(gate_up[e, MI:].reshape(-1, rb), raw["ffn_up_exps"][e * MI : (e + 1) * MI])
         assert torch.equal(down[e].reshape(-1, rb_down), raw["ffn_down_exps"][e * H : (e + 1) * H])
+
+
+# --------------------------------------------------------------------------- the shared expert as one more routed expert
+
+
+@pytest.mark.parametrize("name", ["modelopt_mixed", "ct_nvfp4_moe"])
+def test_shared_expert_bank_slot_is_the_routed_expert_of_the_same_tensors(name, tmp_path):
+    """A decode step may run the shared expert as one more route of the routed experts' kernels, reading it as one slot
+    of their banks. Through the readers of either dialect: a routed expert stored with the shared expert's tensors packs
+    to the bank rows that the shared expert's loaded projections, put on the triton linear kernel's K-major layout and
+    back, give: the same codes, block scales and per-row globals (gate rows, then up rows)."""
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+    from freetoken.models.qwen3_5_moe.moe import shared_expert_bank_slot
+
+    torch.manual_seed(31)
+    moe, quant, raw = _layout(name)
+    shared, expert = f"{LM}.layers.1.mlp.shared_expert", f"{LM}.layers.1.mlp.experts.2"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for key in [k for k in raw if k.startswith(f"{shared}.{proj}.")]:
+            raw[f"{expert}.{proj}.{key.rsplit('.', 1)[1]}"] = raw[key].clone()
+    folder = _write(tmp_path, moe, quant, raw)
+    loaded = _load(folder)
+    config = parse_config(cached_load_hf_config(folder))
+    pieces = iter_nvfp4_expert_pieces(folder, config, nvfp4_expert_spec(folder, config), layers=[1], drop_page_cache=lambda *_: None)
+    piece = next(p for p in pieces if p[1] == 2)[3]
+
+    kernel, cfg = TritonNvfp4MoEKernel(), MoEConfig(num_experts=E, hidden=H, intermediate=MI, top_k=2)
+    bank = {role: torch.empty((1, *spec.shape), dtype=spec.dtype) for role, spec in kernel.layout(cfg).items()}
+    kernel.pack(piece, cfg, bank)
+
+    def proj(p):
+        key = next(k for k in loaded if k.endswith(f"layers.1.mlp.shared_expert.{p}.weight"))[: -len(".weight")]
+        # TritonNvfp4LinearKernel.finalize: nvfp4_transpose_resident
+        return SimpleNamespace(weight=loaded[f"{key}.weight"].view(torch.int32).t().contiguous(),
+                               weight_scale=loaded[f"{key}.weight_scale"].t().contiguous(),
+                               weight_global=loaded[f"{key}.weight_global"])
+
+    slot = shared_expert_bank_slot(proj("gate_up_proj"), proj("down_proj"))
+    assert set(slot) == set(bank)
+    for role, rows in bank.items():
+        assert slot[role].shape == rows.shape[1:] and slot[role].stride() == rows.stride()[1:], role
+        assert _same(slot[role], rows[0]), role
