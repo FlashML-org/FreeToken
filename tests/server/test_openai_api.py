@@ -1008,3 +1008,171 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+# ------------------------------------------------- response_format json_schema
+def _resolved_sampling(endpoint: str, model_sampling: dict, **fields):
+    """The SamplingParams the endpoint hands the engine for a request carrying ``fields``, or its error response."""
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    if endpoint == "chat":
+        req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], **fields)
+        response = run(handle_chat_completion(req, request=None, state=state, model_sampling=model_sampling))
+    elif endpoint == "completions":
+        req = CompletionRequest(model="m", prompt="hi", **fields)
+        response = run(handle_completion(req, request=None, state=state, model_sampling=model_sampling))
+    else:
+        req = ResponsesRequest.model_validate({"model": "m", "input": "hi", **fields})
+        response = run(handle_responses(req, request=None, state=state, model_sampling=model_sampling))
+    return response if state.sent is None else state.sent.sampling_params
+
+
+PERSON = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "maxLength": 8},
+        "age": {"type": "integer", "minimum": 0, "maximum": 130},
+        "tags": {"type": "array", "items": {"enum": ["a", "b"]}, "maxItems": 2},
+        "email": {"type": ["string", "null"]},
+    },
+    "required": ["name", "age"],
+}
+
+
+def _json_schema_format(schema):
+    return {"type": "json_schema", "json_schema": {"name": "person", "schema": schema, "strict": True}}
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions"])
+def test_a_json_schema_reaches_the_engine_in_its_key_order(endpoint):
+    sent = _resolved_sampling(endpoint, {}, response_format=_json_schema_format(PERSON))
+    # properties are emitted in the schema's order, so the text the engine gets must keep it
+    assert list(json.loads(sent.json_schema)["properties"]) == ["name", "age", "tags", "email"]
+    assert json.loads(sent.json_schema) == PERSON
+    for plain in (None, {"type": "text"}):
+        assert _resolved_sampling(endpoint, {}, response_format=plain).json_schema is None
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions"])
+@pytest.mark.parametrize("response_format, fields, words", [
+    ({"type": "json_object"}, {}, "json_object"),
+    ({"type": "json_schema"}, {}, "schema object"),
+    (_json_schema_format({"type": "string", "pattern": "^a+$"}), {}, "pattern"),
+    (_json_schema_format({"type": "object", "properties": {"a": {"type": "integer"}}, "minProperties": 1}), {}, "minProperties"),
+    (_json_schema_format({"oneOf": [{"type": "integer"}, {"type": "number"}]}), {}, "oneOf"),
+    (_json_schema_format({"type": "object", "properties": {}, "required": ["a"]}), {}, "required"),
+    (_json_schema_format({"$ref": "#/$defs/n", "$defs": {"n": {"type": "array", "items": {"$ref": "#/$defs/n"}}}}), {}, "recursive"),
+    (_json_schema_format({"type": "object", "properties": {"a": {}}}), {}, "type"),
+    (_json_schema_format(PERSON), {"ignore_eos": True}, "ignore_eos"),
+])
+def test_a_response_format_the_decoder_cannot_enforce_is_a_400(endpoint, response_format, fields, words):
+    """A keyword the automaton does not enforce is refused, never dropped: the reply could break it."""
+    response = _resolved_sampling(endpoint, {}, response_format=response_format, **fields)
+
+    assert response.status_code == 400
+    error = json.loads(response.body)["error"]
+    assert error["param"] == "response_format" and words in error["message"]
+
+
+def test_a_json_schema_with_tools_is_a_400_unless_tool_choice_is_none():
+    state = FakeState([UserReply(uid=42, incremental_output="{}", finished=True)])
+    response = run(handle_chat_completion(chat_request(response_format=_json_schema_format(PERSON)), None, state, {}))
+    assert response.status_code == 400 and state.sent is None
+    sent = _resolved_sampling("chat", {}, response_format=_json_schema_format(PERSON), tools=tool_schema(), tool_choice="none")
+    assert sent.json_schema is not None
+
+
+@pytest.mark.parametrize("schema, accepted, refused", [
+    (PERSON,
+     ['{"name": "Ann", "age": 7}', '{\n  "name": "é😀\\"\\u00e9",\n  "age": 130,\n  "tags": ["a", "b"],\n  "email": null\n}',
+      '{"name":"","age":0,"email":"x@y"}'],
+     ['{"age": 7, "name": "Ann"}', '{"name": "Ann"}', '{"name": "Ann", "age": 131}', '{"name": "Ann", "age": -1}',
+      '{"name": "123456789", "age": 1}', '{"name": "Ann", "age": 7, "x": 1}', '{"name": "Ann", "age": 7,}',
+      '{"name": "Ann", "age": 7, "tags": ["a", "b", "a"]}', '{"name": "Ann", "age": 07}', '{"name": "\\ud800", "age": 1}',
+      '{"name": "a\nb", "age": 1}', '{"name": "Ann", "age": 7}\n']),
+    ({"type": "integer", "exclusiveMinimum": -3, "maximum": 1000}, ["-2", "0", "999", "1000"], ["-3", "1001", "-0", "1.0", "01"]),
+    ({"type": "number", "minimum": 1, "maximum": 3}, ["1", "2.75", "3", "3.000"], ["0.5", "3.01", "-1", "4", "2."]),
+    ({"type": "array", "items": {"type": "boolean"}, "minItems": 2}, ["[true, false]", "[false,false,true]"], ["[]", "[true]"]),
+    ({"anyOf": [{"const": {"k": [1, 2]}}, {"type": "null"}]}, ['{"k": [1, 2]}', "null"], ['{"k":[1,2]}', "1"]),
+])
+def test_the_schema_automaton_accepts_exactly_the_texts_it_should(schema, accepted, refused):
+    """Hand-checked JSON Schema validity: what it accepts validates, and the subset it promises is all there."""
+    from freetoken.grammar.json_schema import compile_schema
+
+    dfa = compile_schema(schema)
+    for text in accepted:
+        assert dfa.accepts(text.encode()), text
+    for text in refused:
+        assert not dfa.accepts(text.encode()), text
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_schema_over_the_automaton_cap_is_a_400_before_the_engine_or_a_stream(endpoint, stream, monkeypatch):
+    """The full automaton is compiled at the endpoint, so a schema over the state cap is refused with a 400 on a
+    stream too, never reaches the scheduler, and a resend is answered from the kept verdict without compiling."""
+    import freetoken.grammar.json_schema as json_schema
+    import freetoken.server.openai_api as api
+    from collections import OrderedDict
+
+    monkeypatch.setattr(api, "_SCHEMA_VERDICTS", OrderedDict())
+    monkeypatch.setattr(json_schema, "MAX_DFA_STATES", 8)
+    response = _resolved_sampling(endpoint, {}, response_format=_json_schema_format(PERSON), stream=stream)
+    assert response.status_code == 400
+    error = json.loads(response.body)["error"]
+    assert error["param"] == "response_format" and "8 automaton states" in error["message"]
+
+    calls = []
+    monkeypatch.setattr(api, "compile_schema", lambda schema: calls.append(schema))
+    again = _resolved_sampling(endpoint, {}, response_format=_json_schema_format(PERSON), stream=stream)
+    assert again.status_code == 400 and calls == []
+    # a schema that compiles goes on to the engine
+    sent = _resolved_sampling(endpoint, {}, response_format=_json_schema_format({"type": "integer"}))
+    assert sent.json_schema == '{"type":"integer"}' and len(calls) == 1
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions"])
+@pytest.mark.parametrize("fields, param", [({"n": 2}, "n"), ({"max_tokens": -1}, "max_tokens")])
+def test_a_cheaper_400_comes_before_the_schema_compile(endpoint, fields, param, monkeypatch):
+    import freetoken.server.openai_api as api
+    from collections import OrderedDict
+
+    monkeypatch.setattr(api, "_SCHEMA_VERDICTS", OrderedDict())
+    calls = []
+    monkeypatch.setattr(api, "compile_schema", lambda schema: calls.append(schema))
+    response = _resolved_sampling(endpoint, {}, response_format=_json_schema_format(PERSON), **fields)
+    error = json.loads(response.body)["error"]
+    assert response.status_code == 400 and param in (error["param"] or error["message"])
+    assert calls == []
+
+
+def test_concurrent_first_sends_of_a_schema_share_one_compile_a_cancelled_one_too(monkeypatch):
+    import threading
+
+    import freetoken.server.openai_api as api
+    from collections import OrderedDict
+
+    monkeypatch.setattr(api, "_SCHEMA_VERDICTS", OrderedDict())
+    monkeypatch.setattr(api, "_SCHEMA_COMPILING", {})
+    calls, started, release = [], threading.Event(), threading.Event()
+
+    def compile_schema(schema):
+        calls.append(schema)
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(api, "compile_schema", compile_schema)
+    text = json.dumps(PERSON)
+
+    async def sends():
+        first = asyncio.ensure_future(api._schema_refusal(text))
+        await asyncio.to_thread(started.wait, 5)
+        others = [asyncio.ensure_future(api._schema_refusal(text)) for _ in range(2)]
+        await asyncio.sleep(0)
+        first.cancel()  # the client of the send that started the compile goes away
+        await asyncio.sleep(0)
+        release.set()
+        return await asyncio.gather(*others), first.cancelled()
+
+    verdicts, cancelled = run(sends())
+    assert verdicts == [None, None] and cancelled and len(calls) == 1
+    assert api._SCHEMA_COMPILING == {} and api._SCHEMA_VERDICTS[text] is None

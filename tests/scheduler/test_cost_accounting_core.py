@@ -156,6 +156,7 @@ def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():
     scheduler.prefill_manager = SimpleNamespace(abort_req=lambda uid: None)
     scheduler.decode_manager = SimpleNamespace(abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
+    scheduler._grammars = {}
     sent = []
     scheduler.send_result = sent.extend
 
@@ -177,6 +178,7 @@ def test_abort_before_cross_worker_user_message_cannot_resurrect_request():
     )
     scheduler.decode_manager = SimpleNamespace(abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
+    scheduler._grammars = {}
     scheduler._abort_tombstones = {}
     sent = []
     scheduler.send_result = sent.extend
@@ -203,10 +205,11 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler.prefill_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
+    scheduler._grammars = {}
     scheduler._pending_rebuild = None
     scheduler._pending_flush = None
     scheduler.receive_msg = lambda blocking: [AbortBackendMsg(uid=5)]
-    scheduler._schedule_next_batch = lambda: None
+    scheduler._schedule_next_batch = lambda hold=(): None
     sent = []
     scheduler.send_result = lambda messages: sent.append(messages)
     late_sample = DetokenizeMsg(uid=5, next_tokens=[99], finished=False)

@@ -32,10 +32,10 @@ class DecodeManager:
         tokens_reserved = (self.page_size - 1 + self.token_headroom) * len(self.running_reqs)
         return sum(req.remain_len for req in self.running_reqs) + tokens_reserved
 
-    def schedule_next_batch(self) -> Batch | None:
-        if not self.runnable:
-            return None
-        return Batch(reqs=sorted(self.running_reqs, key=lambda req: req.uid), phase="decode")
+    def schedule_next_batch(self, hold: Iterable[Req] = ()) -> Batch | None:
+        """The next decode step over every running request but those in ``hold``, which sit this one out."""
+        reqs = sorted(self.running_reqs.difference(hold), key=lambda req: req.uid)
+        return Batch(reqs=reqs, phase="decode") if reqs else None
 
     @property
     def runnable(self) -> bool:

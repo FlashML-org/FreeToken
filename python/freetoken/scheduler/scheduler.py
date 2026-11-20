@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
 from freetoken.core import Batch, Req
@@ -42,6 +42,7 @@ from .table import TableManager
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
     from freetoken.engine.spec_protocol import SpecRuntime
+    from freetoken.grammar.matcher import GrammarPlan, Matcher, Vocab
 
 
 logger = init_logger(__name__)
@@ -128,6 +129,12 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
         self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
+        # uid -> matcher of each live request with a response_format json_schema; empty otherwise
+        self._grammars: dict[int, Matcher] = {}
+        # the model's token bytes, built by the first such request, or why this tokenizer cannot be masked
+        self._grammar_vocab: Vocab | str | None = None
+        # the thinking (open, close) tag token ids, resolved with the vocabulary; None without a tag pair
+        self._grammar_think: Tuple[Tuple[int, ...], Tuple[int, ...]] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -256,7 +263,9 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
-        forward_input = self._schedule_next_batch()
+        # a constrained request's mask is made from every token before it: while one of its tokens is in flight, it
+        # sits this launch out
+        forward_input = self._schedule_next_batch(hold=self._awaiting_inflight(last_data))
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -496,7 +505,51 @@ class Scheduler(SchedulerIOMixin):
             matched_stop=matched_stop,
             stop_strs=params.stop_strs or None,
         )
+        if self._grammars and (matcher := self._grammars.get(req.uid)) is not None:
+            matcher.advance(committed)
         return msg, len(committed)
+
+    def _track_grammar(self, msg: UserMsg) -> str | None:
+        """Start matching the request's json_schema; returns the reason when this server cannot. A prompt that leaves
+        thinking open is free until the close tag."""
+        from freetoken.grammar.matcher import OPEN_TAIL, Matcher, Vocab, starts_open, think_ids, token_bytes
+
+        if self._grammar_vocab is None:
+            try:
+                self._grammar_vocab = Vocab(token_bytes(self.tokenizer), self.engine.sampler.vocab_size, self.eos_token_ids)
+            except ValueError as exc:
+                # kept, so later requests are refused without reading the vocabulary again
+                self._grammar_vocab = f"response_format json_schema: {exc}"
+                return self._grammar_vocab
+            from freetoken.server.reasoning_parser import think_tags
+
+            self._grammar_think = think_ids(self.tokenizer, think_tags(getattr(self.config, "reasoning_parser", None)))
+        if isinstance(self._grammar_vocab, str):
+            return self._grammar_vocab
+        try:
+            grammar = self._grammar_vocab.grammar(msg.sampling_params.json_schema)
+        except ValueError as exc:
+            return f"response_format json_schema: {exc}"
+        think = self._grammar_think
+        thinking = think is not None and starts_open(msg.input_ids[-OPEN_TAIL:].tolist(), *think)
+        self._grammars[msg.uid] = Matcher(grammar, think[1] if thinking else (), thinking)
+        return None
+
+    def _plan_grammar(self, batch: Batch) -> GrammarPlan | None:
+        """The matchers of the batch's constrained requests, None when it has none."""
+        from freetoken.grammar.matcher import GrammarPlan
+
+        matchers = [self._grammars.get(req.uid) if req.can_decode else None for req in batch.reqs]
+        if not any(matchers):
+            return None
+        return GrammarPlan(matchers, batch.rows_per_req if batch.phase == "verify" else 1)
+
+    def _awaiting_inflight(self, last_data: ForwardData | None) -> List[Req]:
+        """The requests of the undrained batch whose next token is masked: their next step waits for the drain, which
+        commits the token in flight to the host."""
+        if not self._grammars or last_data is None:
+            return []
+        return [req for req in last_data[0].batch.reqs if req.uid in self._grammars]
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -612,6 +665,9 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.sampling_params.json_schema is not None and (error := self._track_grammar(msg)) is not None:
+                self.send_result([ErrorReplyMsg(uid=msg.uid, error=error)])
+                return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -624,6 +680,7 @@ class Scheduler(SchedulerIOMixin):
             # in-flight concurrency.
             while len(tombstones) > 65_536:
                 tombstones.pop(next(iter(tombstones)))
+            self._grammars.pop(msg.uid, None)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if (
@@ -704,6 +761,7 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        self._grammars.pop(req.uid, None)
         if self.spec is not None:
             self.spec.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
@@ -912,6 +970,8 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # before the widening below, so the penalty check reads each request's real remain_len
         sample_args = self.engine.sampler.prepare(batch)
+        if self._grammars:
+            sample_args.grammar = self._plan_grammar(batch)
         # widened after the window free above, whose threshold reads device_len
         if batch.phase == "verify":
             for req in batch.reqs:
@@ -960,11 +1020,12 @@ class Scheduler(SchedulerIOMixin):
                 f"an image of {hi - lo} tokens does not fit one prefill chunk (--max-extend-tokens {self.prefill_budget}, or the sliding-window pool's share of it): its earlier rows attend within the first part only"
             )
 
-    def _schedule_next_batch(self) -> ForwardInput | None:
+    def _schedule_next_batch(self, hold: Iterable[Req] = ()) -> ForwardInput | None:
+        """``hold``: decoding requests this launch leaves out."""
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
+            or self.decode_manager.schedule_next_batch(hold)
         )
         if batch is None:
             return None
