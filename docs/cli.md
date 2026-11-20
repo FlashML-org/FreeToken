@@ -43,6 +43,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--port` | 1919 | Bind port |
 | `--api-key` | `$FREETOKEN_API_KEY`, else off | Require the key on every route except `/health`, as `Authorization: Bearer <key>` or `x-api-key: <key>`; other requests get a 401 |
 | `--gpu` | GPU 0 | GPU to run on: a UUID from `nvidia-smi -L` or an `nvidia-smi` index; see [below](#choosing-a-gpu) |
+| `--preset` | `none` | `single`: the settings for one request at a time on a GPU smaller than the model, filled in only where the command line says nothing; see [Presets](#presets) |
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
@@ -105,7 +106,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF; Gemma-4 (dense, E2B / E4B and MoE) keeps no draft in the target file and drafts from an `mtp-*.gguf` assistant sidecar (architecture `gemma4-assistant`) given with `--speculative-draft-model-path` / `--spec-draft-model`. `dflash` drafts a block of tokens per step with a DFlash 2 draft checkpoint over the target's layer outputs, for the Qwen3.5 / Qwen3.6 / Qwen3.8 family and Qwen3.8-Flash-Next: `incoai/Qwen3.8-27B-DFlash2` for Qwen3.8-27B, `incoai/Qwen3.6-35B-A3B-DFlash2` for Qwen3.6-35B-A3B, `incoai/Qwen3.8-Flash-Next-DFlash2` for Qwen3.8-Flash-Next (or its GGUF release, `incoai/Qwen3.8-Flash-Next-DFlash2-GGUF`, as BF16, Q4_K_M, Q5_K_M, Q6_K or Q8_0) |
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method; `off` keeps it off under a [preset](#presets). `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF; Gemma-4 (dense, E2B / E4B and MoE) keeps no draft in the target file and drafts from an `mtp-*.gguf` assistant sidecar (architecture `gemma4-assistant`) given with `--speculative-draft-model-path` / `--spec-draft-model`. `dflash` drafts a block of tokens per step with a DFlash 2 draft checkpoint over the target's layer outputs, for the Qwen3.5 / Qwen3.6 / Qwen3.8 family and Qwen3.8-Flash-Next: `incoai/Qwen3.8-27B-DFlash2` for Qwen3.8-27B, `incoai/Qwen3.6-35B-A3B-DFlash2` for Qwen3.6-35B-A3B, `incoai/Qwen3.8-Flash-Next-DFlash2` for Qwen3.8-Flash-Next (or its GGUF release, `incoai/Qwen3.8-Flash-Next-DFlash2-GGUF`, as BF16, Q4_K_M, Q5_K_M, Q6_K or Q8_0) |
 | `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`, the draft's `block_size` - 1 for `dflash`) | Draft tokens per decode step, 1 to 8 for `mtp`; 1 to the draft's `block_size` - 1 for `dflash` |
 | `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; for `mtp`, a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft. `dflash` requires it: the DFlash 2 draft checkpoint (bf16 safetensors with its `config.json`, or a local `.gguf` from `incoai/Qwen3.8-Flash-Next-DFlash2-GGUF`, served natively at its BF16, Q4_K_M, Q5_K_M, Q6_K or Q8_0 types), whose `target_layer_ids`, hidden size and vocabulary must match the target (`num_target_layers` too, when the checkpoint records it; only the HF checkpoint does) |
 | `--speculative-token-map`, `--spec-token-map` | off | `mtp` only. A file of distinct little-endian int32 token ids (`python scripts/make_token_map.py MODEL` writes one): the draft computes its logits over those LM head rows alone, from a copy made at startup whose size is logged. That VRAM comes out of the expert cache when `--moe-cache-auto` sizes it (the default for hybrid and offload without a cache size), and out of the KV cache otherwise. The target still verifies over the whole vocabulary, so the output distribution does not depend on the file, only the acceptance rate does. A tied or block-FP8 LM head is refused |
@@ -113,6 +114,23 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 Speculative decoding needs `--tp 1` and runs without overlap scheduling; a target with sliding-window KV is served only by the Gemma-4 assistant, which reads the target's cache through a read-only view; every other target with sliding-window KV is refused at startup, and so is every target with DSV4 window-tier KV. The Gemma-4 assistant keeps no KV of its own: it reads the target's cache, so it adds nothing to the KV budget and its weights cost about 149 MiB for the E4B draft, about 425-428 MiB for the 12b and 26B-A4B Q8_0 ones. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
 `dflash` keeps the draft's context in a per-request ring of the draft's sliding window (2048 positions for the released drafts) and, on a hybrid GDN target, in a window on the GDN state slots, so a prefix-cache hit restores it with the GDN snapshot; the window adds `(window + 64) x hidden` activation-dtype bytes to every GDN slot (`/v1/cache/status` counts them). A target without GDN layers needs `--cache-type naive`. DFlash v1 drafts are refused, and so is a quantized safetensors draft: the GGUF release is the quantized path. A quantized GGUF draft loads its linear weights at the file's own ggml types (Q4_K_M, Q5_K_M, Q6_K or Q8_0) and dequantizes only the selector codebooks and the K/V context copy; a BF16/F16/F32 GGUF loads floats throughout. With sampling, the drafts are drawn from the draft's own distribution over its top-16 candidates and verified by rejection sampling against the target's distribution, so the output distribution is the target's.
+
+### Presets
+
+`--preset single` is for one user at a time on a GPU that cannot hold every expert. It sets
+`--max-running-requests 1`, `--embed-weights host`, `--memory-ratio 0.95` and `--moe-prefill-hit-d2d`,
+turns on `--speculative-algorithm mtp` with 3 draft tokens, and raises `--kv-reserve-tokens` to the
+default max output tokens plus a 4096-token prompt (36864), so that an answer of the default length is
+not cut off with `finish_reason: length`. What each of these costs or buys in expert slots is in
+[performance/decode.md](performance/decode.md#getting-more-slots).
+
+A flag on the command line always wins, also when it repeats the default (`--memory-ratio 0.9`);
+`--speculative-algorithm off` keeps speculative decoding off. Three settings are dropped where they
+cannot apply, each with one log line: speculative decoding where the checkpoint has no MTP layers (or
+an explicit `--speculative-algorithm mtp` would be refused), host embeddings where the table is tied
+to the LM head, and the KV reserve where the expert cache's minimum does not fit beside it (the
+default `--kv-reserve-tokens` comes back, with a warning). The startup log lists what the preset set
+and the resulting expert slots and KV tokens. `--preset none`, the default, sets nothing.
 
 ### API behaviour
 

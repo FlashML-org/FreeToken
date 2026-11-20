@@ -120,6 +120,10 @@ class EngineConfig:
     speculative_token_map: str | None = None
     # the proposer's states on the target's linear-state slots, resolved by _adjust_config
     spec_slot_states: tuple[SlotStateSpec, ...] = ()
+    # --preset, and the fields whose value is the preset's because the command line left them alone. The engine drops
+    # from them what the checkpoint or the memory budget cannot take (speculative decoding, host embeddings, the KV reserve).
+    preset: str | None = field(default=None, repr=False)
+    preset_fields: tuple[str, ...] = field(default=(), repr=False)
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
