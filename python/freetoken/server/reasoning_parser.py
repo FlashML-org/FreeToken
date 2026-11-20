@@ -639,6 +639,125 @@ class MiniMaxM3ReasoningParser(BaseReasoningParser):
         return super().flush()
 
 
+TML_MESSAGE_MODEL = "<|message_model|>"
+TML_END_MESSAGE = "<|end_message|>"
+TML_END_SAMPLING = "<|content_model_end_sampling|>"
+TML_THINKING = "<|content_thinking|>"
+TML_TOOL_JSON = "<|content_invoke_tool_json|>"
+# content kinds the checkpoint's tokenizer_config.json response_template reads as visible text
+TML_TEXT_KINDS = ("<|content_text|>", "<|content_tool_error|>", "<|content_invoke_tool_text|>")
+TML_KINDS = (TML_THINKING, TML_TOOL_JSON) + TML_TEXT_KINDS
+# a header is <|message_model|> plus an optional name (a tool's, for calls) up to the content marker
+TML_HEADER_SPAN = 256
+
+
+def tml_hold_len(text: str, tokens: Tuple[str, ...]) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of one of ``tokens``."""
+    return max((_partial_suffix(text, tok) for tok in tokens), default=0)
+
+
+class Inkling2ReasoningParser(BaseReasoningParser):
+    """Inkling 2's TMLv0 output, as the checkpoint's ``tokenizer_config.json`` response_template reads it.
+
+    A turn is a run of messages, each ``<|message_model|>[name]<|content_KIND|>body<|end_message|>``, closed by
+    ``<|content_model_end_sampling|>`` (the stop token). Thinking bodies go to reasoning; text, tool-error and
+    text-tool bodies go to content, unwrapped; a ``content_invoke_tool_json`` message is passed through to content
+    verbatim, header and end marker included, for the ``inkling2`` tool parser. The model opens its own turn and
+    its own thinking message, so there is nothing to force. ``chat_template.jinja`` renders an assistant turn back
+    in exactly this layout.
+    """
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(think_start_token="", think_end_token="", stream_reasoning=stream_reasoning)
+        self._mode = "seek"  # seek (between messages) | header | body
+        self._kind = ""
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        clone = type(self)()
+        first = clone.parse_streaming_increment(text)
+        rest = clone.flush()
+        return ReasoningParseResult(
+            reasoning_text=first.reasoning_text + rest.reasoning_text,
+            normal_text=first.normal_text + rest.normal_text,
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        self._buffer += new_text
+        return self._drain(final=False)
+
+    def flush(self) -> ReasoningParseResult:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> ReasoningParseResult:
+        reasoning: List[str] = []
+        content: List[str] = []
+
+        def emit(kind: str, piece: str) -> None:
+            if piece:
+                (reasoning if kind == TML_THINKING else content).append(piece)
+
+        while self._buffer:
+            buf = self._buffer
+            if self._mode == "seek":
+                markers = (TML_MESSAGE_MODEL, TML_END_SAMPLING, TML_END_MESSAGE) + TML_KINDS
+                hits = [(buf.find(tok), tok) for tok in markers if tok in buf]
+                if not hits:
+                    hold = 0 if final else tml_hold_len(buf, markers)
+                    content.append(buf[: len(buf) - hold])
+                    self._buffer = buf[len(buf) - hold:]
+                    break
+                pos, tok = min(hits)
+                content.append(buf[:pos])
+                if tok == TML_MESSAGE_MODEL:
+                    self._buffer, self._mode = buf[pos:], "header"
+                elif tok in TML_KINDS:  # a message without its header
+                    self._buffer = buf[pos + len(tok):]
+                    self._open(tok, "", content)
+                else:  # the stop token or a stray end marker carries nothing
+                    self._buffer = buf[pos + len(tok):]
+                continue
+
+            if self._mode == "header":
+                rest = buf[len(TML_MESSAGE_MODEL):]
+                lt = rest.find("<")
+                if lt == -1 and not final and len(rest) <= TML_HEADER_SPAN:
+                    break  # the name is still arriving
+                tail = rest[lt:] if lt != -1 else ""
+                kind = next((k for k in TML_KINDS if tail.startswith(k)), None)
+                if kind is not None:
+                    self._buffer = tail[len(kind):]
+                    self._open(kind, TML_MESSAGE_MODEL + rest[:lt], content)
+                    continue
+                if not final and lt != -1 and any(k.startswith(tail) for k in TML_KINDS):
+                    break  # the content marker is still arriving
+                # no content marker follows: the bare header is protocol debris, its text stays content
+                self._buffer, self._mode = rest, "seek"
+                continue
+
+            # body: ends at its end marker, or where the next message or the stop token starts without one
+            ends = (TML_END_MESSAGE, TML_MESSAGE_MODEL, TML_END_SAMPLING)
+            hits = [(buf.find(tok), tok) for tok in ends if tok in buf]
+            if not hits:
+                if self._kind == TML_THINKING and not self.stream_reasoning and not final:
+                    break
+                hold = 0 if final else tml_hold_len(buf, ends)
+                emit(self._kind, buf[: len(buf) - hold])
+                self._buffer = buf[len(buf) - hold:]
+                break
+            pos, tok = min(hits)
+            emit(self._kind, buf[:pos])
+            if self._kind == TML_TOOL_JSON:
+                content.append(TML_END_MESSAGE)
+            self._buffer = buf[pos + len(tok):] if tok == TML_END_MESSAGE else buf[pos:]
+            self._mode = "seek"
+        return ReasoningParseResult(reasoning_text="".join(reasoning), normal_text="".join(content))
+
+    def _open(self, kind: str, header: str, content: List[str]) -> None:
+        self._mode, self._kind = "body", kind
+        if kind == TML_TOOL_JSON:
+            content.append(header + kind)
+
+
 class GemmaThoughtReasoningParser(BaseReasoningParser):
     """Reasoning parser for Gemma-4's thought channel: the model emits its thought,
     then a closing ``<channel|>`` marker, then the visible answer. The opening
@@ -991,6 +1110,7 @@ class ReasoningParser:
         "minimax_m3": MiniMaxM3ReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
+        "inkling2": Inkling2ReasoningParser,
     }
 
     def __init__(
