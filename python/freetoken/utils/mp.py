@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Callable, Dict, Generic, TypeVar
 
 import msgpack
@@ -110,9 +111,29 @@ class ZmqPubQueue(Generic[T]):
         encoder: Callable[[T], Dict],
     ):
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PUB)
+        # XPUB sends like a PUB and surfaces inbound subscription events, so
+        # wait_for_subscribers can close the slow-joiner gap
+        self.socket = self.context.socket(zmq.XPUB)
         self.socket.bind(addr) if create else self.socket.connect(addr)
         self.encoder = encoder
+
+    def wait_for_subscribers(self, count: int, timeout_s: float = 30.0) -> None:
+        """Block until ``count`` subscribers have registered.
+
+        A SUB's subscribe only reaches the publisher asynchronously; anything
+        broadcast before it lands is silently dropped.
+        """
+        if count <= 0:
+            return
+        deadline = time.monotonic() + timeout_s
+        seen = 0
+        while seen < count:
+            remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
+            if not self.socket.poll(remaining_ms):
+                raise TimeoutError(f"only {seen}/{count} subscribers registered within {timeout_s}s")
+            event = self.socket.recv(copy=False)
+            if event.bytes and event.bytes[0] == 1:
+                seen += 1
 
     def put_raw(self, raw: bytes):
         self.socket.send(raw, copy=False)
