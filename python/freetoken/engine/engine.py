@@ -624,7 +624,7 @@ class Engine:
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
-        if linear_group is not None:
+        if linear_group is not None or config.model_config.slot_states:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
             self.linear_state_pool = LinearStatePool(
@@ -1428,7 +1428,7 @@ class Engine:
 
     def commit_verify(self, reqs, counts, out: torch.Tensor) -> None:
         """Commit each verified request's first ``counts`` tokens (row i of ``out`` is reqs[i]) to the target's per-request state."""
-        if self.linear_state_pool is not None and self.linear_state_pool.verify_scratch is not None:
+        if self.linear_state_pool is not None and self.linear_state_pool.verifies:
             self.linear_state_pool.commit_verify([gdn_slot(r) for r in reqs], counts)
         for req, n, tokens in zip(reqs, counts, out):
             if req.output_token_counts is not None:
@@ -2055,6 +2055,10 @@ def _adjust_config(config: EngineConfig):
             "cache_type",
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
         )
+
+    if (reason := getattr(model_config, "no_prefix_reuse", None)) is not None and getattr(config, "cache_type", "radix") != "naive":
+        logger.warning_rank0(f"prefix cache off for {getattr(model_config, 'model_type', 'this model')}: {reason}")
+        override("cache_type", "naive")
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every
