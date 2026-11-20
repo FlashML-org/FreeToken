@@ -10,9 +10,10 @@ target head's logits, which are softcapped like the target's.
 
 from __future__ import annotations
 
+import itertools
 import os
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import torch
 import torch.nn.functional as F
@@ -307,10 +308,10 @@ class Inkling2DSparkDraft:
 
     # ---------------------------------------------------------------- block forward
 
-    def forward_block(self, anchor: torch.Tensor, starts: torch.Tensor, context: Callable[[int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> torch.Tensor:
+    def forward_block(self, anchor: torch.Tensor, starts: torch.Tensor, context: Callable[[int], Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]) -> torch.Tensor:
         """Final hidden ``[bs, block, H]`` of the blocks ``[anchor, mask x (block-1)]`` at positions ``starts + j``.
 
-        ``context(layer)`` returns that layer's context ``k, v [bs, C, kv_heads, d]`` and ``valid [bs, C]``: the columns a query of the block may read.
+        ``context(layer)`` yields that layer's context in chunks ``k, v [bs, C, kv_heads, d]`` and ``valid [bs, C]``, the columns a query of the block may read; chunks bound the memory of a long context.
         """
         c = self.config
         bs, block = anchor.shape[0], c.block_size
@@ -318,7 +319,6 @@ class Inkling2DSparkDraft:
         x[:, 0] = self.embed(anchor).to(x.dtype)
         x = x.view(bs * block, -1)
         positions = (starts.view(-1, 1) + torch.arange(block, device=anchor.device)).view(-1)
-        group = c.num_heads // c.num_kv_heads
         residual = None
         for i, layer in enumerate(self.layers):
             if residual is None:
@@ -330,20 +330,39 @@ class Inkling2DSparkDraft:
             k = rms_norm(qkv[:, self.q_size : self.q_size + self.kv_size].reshape(-1, c.num_kv_heads, c.head_dim), layer["k_norm"], c.rms_norm_eps)
             q, k = apply_rope(q, positions, self.inv_freq), apply_rope(k, positions, self.inv_freq)
             v = qkv[:, self.q_size + self.kv_size :].reshape(-1, c.num_kv_heads, c.head_dim)
-            ctx_k, ctx_v, valid = context(i)
-            # bidirectional over the block, which every query reads in full after the context
-            keys = torch.cat([ctx_k, k.view(bs, block, c.num_kv_heads, c.head_dim)], dim=1).transpose(1, 2)
-            values = torch.cat([ctx_v, v.view(bs, block, c.num_kv_heads, c.head_dim)], dim=1).transpose(1, 2)
-            mask = torch.cat([valid, valid.new_ones(bs, block)], dim=1)[:, None, None, :]
-            queries = q.view(bs, block, c.num_heads, c.head_dim).transpose(1, 2)
-            keys, values = keys.repeat_interleave(group, dim=1), values.repeat_interleave(group, dim=1)
-            o = F.scaled_dot_product_attention(queries, keys, values, attn_mask=mask, scale=c.head_dim**-0.5)
-            o = F.linear(o.transpose(1, 2).reshape(bs * block, self.q_size), layer["o"])
+            # bidirectional over the block, which every query reads in full; it goes first so every row has a finite max
+            own = (k.view(bs, block, c.num_kv_heads, c.head_dim), v.view(bs, block, c.num_kv_heads, c.head_dim),
+                   torch.ones(bs, block, dtype=torch.bool, device=k.device))
+            o = self._attend(q.view(bs, block, c.num_heads, c.head_dim), itertools.chain([own], context(i)))
+            o = F.linear(o.to(h.dtype).reshape(bs * block, self.q_size), layer["o"])
             h, residual = add_rms_norm(o, residual, layer["post_ln"], c.rms_norm_eps)
             gate, up = F.linear(h, layer["gate_up"]).float().chunk(2, dim=-1)
             x = F.linear((F.silu(gate) * up).to(h.dtype), layer["down"])
         out, _ = add_rms_norm(x, residual, self.norm, c.rms_norm_eps)
         return out.view(bs, block, -1)
+
+    def _attend(self, q: torch.Tensor, chunks: Iterable[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> torch.Tensor:
+        """fp32 softmax attention of ``q [bs, block, heads, d]`` over the key chunks, merged by their running max and sum; ``[bs, block, heads, d]``."""
+        c = self.config
+        bs, block, heads, d = q.shape
+        group = heads // c.num_kv_heads
+        # GQA as [bs, kv_heads, group*block, d] against [bs, kv_heads, C, d]: no repeated keys
+        qf = q.float().view(bs, block, c.num_kv_heads, group, d).permute(0, 2, 3, 1, 4).reshape(bs, c.num_kv_heads, group * block, d) * d**-0.5
+        m = acc = total = None
+        for k, v, valid in chunks:
+            s = qf @ k.float().permute(0, 2, 3, 1)
+            s = s.masked_fill(~valid[:, None, None, :], float("-inf"))
+            m_new = s.amax(-1, keepdim=True) if m is None else torch.maximum(m, s.amax(-1, keepdim=True))
+            p = torch.exp(s - m_new)
+            pv = p @ v.float().transpose(1, 2)
+            if m is None:
+                acc, total = pv, p.sum(-1, keepdim=True)
+            else:
+                scale = torch.exp(m - m_new)
+                acc, total = acc * scale + pv, total * scale + p.sum(-1, keepdim=True)
+            m = m_new
+        out = (acc / total).view(bs, c.num_kv_heads, group, block, d)
+        return out.permute(0, 3, 1, 2, 4).reshape(bs, block, heads, d)
 
     # ---------------------------------------------------------------- Markov head
 

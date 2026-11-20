@@ -61,6 +61,8 @@ class DSparkProposer(Proposer):
     radix_lookahead = False
     # support of a sampled draft: the step's top logits, renormalized at the request's temperature
     SAMPLE_TOP_K: ClassVar[int] = 64
+    # request-positions of a full layer's context gathered at once: about 12 KiB each with the fp32 copies
+    CONTEXT_CHUNK_ROWS: ClassVar[int] = 16384
 
     @classmethod
     def _draft_config(cls, config) -> DSparkConfig:
@@ -195,22 +197,25 @@ class DSparkProposer(Proposer):
     # ------------------------------------------------------------------ draft step
 
     def _context(self, rows: torch.Tensor, starts: torch.Tensor):
-        """``context(layer)`` for the draft's block forward: each request's context K/V right-aligned below its start, from the slots its page-table row maps."""
-        c = self.draft_config
-        full = any(i not in c.local_layer_ids for i in range(c.num_layers))
+        """``context(layer)`` for the draft's block forward, read from the slots each request's page-table row maps: a local layer's window right-aligned below each start, a full layer's positions in chunks."""
+        c, bs = self.draft_config, rows.shape[0]
         longest = int(starts.max())
-        width = longest if full else min(longest, c.window)
-        pos = starts[:, None] - width + torch.arange(width, device=starts.device)
-        slots = self.ctx.page_table[rows[:, None], pos.clamp(min=0)].long()
-        valid_full = pos >= 0
-        valid_local = pos >= (starts[:, None] - c.window).clamp(min=0)
-        local_width = min(width, c.window)
+        table = self.ctx.page_table
+
+        def gather(layer: int, pos: torch.Tensor, valid: torch.Tensor):
+            slots = table[rows[:, None], pos.clamp(min=0)].long()
+            return self.k_cache[layer][slots], self.v_cache[layer][slots], valid
 
         def context(layer: int):
-            local = layer in c.local_layer_ids
-            cols = slots[:, width - local_width :] if local else slots
-            valid = valid_local[:, width - local_width :] if local else valid_full
-            return self.k_cache[layer][cols], self.v_cache[layer][cols], valid
+            if layer in c.local_layer_ids:
+                width = min(longest, c.window)
+                pos = starts[:, None] - width + torch.arange(width, device=starts.device)
+                yield gather(layer, pos, pos >= (starts[:, None] - c.window).clamp(min=0))
+                return
+            chunk = max(1, self.CONTEXT_CHUNK_ROWS // bs)
+            for lo in range(0, longest, chunk):
+                pos = (lo + torch.arange(min(chunk, longest - lo), device=starts.device)).expand(bs, -1)
+                yield gather(layer, pos, pos < starts[:, None])
 
         return context
 

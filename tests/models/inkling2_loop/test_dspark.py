@@ -197,7 +197,7 @@ def _check_draft(draft, ref, features_by_req, anchors, kv_tol, hidden_tol, logit
             lo = max(0, n - c.window) if layer in c.local_layer_ids else 0
             k[b, width - n + lo :], v[b, width - n + lo :] = kk[layer, lo:], vv[layer, lo:]
             valid[b, width - n + lo :] = True
-        return k, v, valid
+        return [(k, v, valid)]
 
     anchor = torch.tensor(anchors, device=DEV)
     hidden = draft.forward_block(anchor, starts, context)
@@ -330,18 +330,21 @@ def _from_scratch(draft, target: _ToyLoopTarget, seq: list[int], k: int, pick=No
         lo = max(0, p - c.window) if layer in c.local_layer_ids else 0
         valid = torch.zeros(1, p, dtype=torch.bool, device=DEV)
         valid[:, lo:] = True
-        return ck[layer][None], cv[layer][None], valid
+        return [(ck[layer][None], cv[layer][None], valid)]
 
     anchor = torch.tensor([seq[-1]], device=DEV)
     hidden = draft.forward_block(anchor, torch.tensor([p], device=DEV), context)
     return draft.walk(hidden[:, 1 : k + 1], anchor, draft.f_rnn(feats[-1:]), pick or (lambda j, logits: logits.argmax(-1)))[0]
 
 
-@pytest.mark.parametrize("k", [7, 3])
-def test_proposer_tracks_committed_tokens(tmp_path, k):
+# the second case reads the full layer's context 7 positions at a time, so the softmax merges many chunks, some masked out for one request
+@pytest.mark.parametrize("k, chunk_rows", [(7, 16384), (3, 14)])
+def test_proposer_tracks_committed_tokens(tmp_path, monkeypatch, k, chunk_rows):
     """Chunked prefill, then verify steps with every accept count: the pool rows past the accepted ones and the Markov context's row must never show in the next drafts."""
+    from freetoken.spec.dspark.proposer import DSparkProposer
     from freetoken.core import Batch, Req, SamplingParams
 
+    monkeypatch.setattr(DSparkProposer, "CONTEXT_CHUNK_ROWS", chunk_rows)
     path, _, target_parts = _toy_checkpoint(tmp_path)
     H, page_size, num_pages, mr = TOY["hidden"], 4, 64, 2
     g = torch.Generator().manual_seed(5)
