@@ -393,6 +393,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         arch_aliases=("MuseGlimmerGGUFForCausalLM",),
     ),
     AotModel(
+        name="thinkingmachines/Inkling-2-Mini",
+        architecture="Inkling2LoopForConditionalGeneration",
+        hidden_size=2304,
+        kv_groups=((8, 128),),  # sliding and full (NoPE) layers share the same geometry
+        top_k=8,
+        moe_intermediate_size=1152,
+        # NVFP4 layers 0-19; the MXFP8 layers 20-23 load as bf16 banks
+        expert_formats=(*_NVFP4_FORMATS, "bf16"),
+    ),
+    AotModel(
         name="ricursiveAI/Ripple-65B-Preview",
         architecture="RicursiveForCausalLM",
         hidden_size=5120,
