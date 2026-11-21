@@ -45,6 +45,30 @@ def net_cache_budget_bytes(
     return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
+def prefill_working_bytes(
+    tokens: int, *, hidden: int, key_dim: int, value_dim: int, value_heads: int, head_dim: int, chunk: int, itemsize: int
+) -> int:
+    """GPU bytes the temporaries of a prefill of ``tokens`` tokens hold at their peak, on a model with GatedDeltaNet layers.
+
+    The peak is in one of those layers, where the chunk kernel allocates its output (layers/linear_attn/gdn.py,
+    kernel/fla/chunk.py): every term below is a tensor alive there, in elements per token. The count is from tensor
+    shapes. Other architectures are not counted here; the caller plans without a reserve for them.
+    """
+    conv = 2 * key_dim + value_dim
+    per_token = (
+        4 * hidden  # the layer's input and residual, and the normed input and summed residual made from them
+        + conv + value_dim  # in_proj: q, k, v before the conv, and the output gate z
+        + conv  # the conv's output
+        + conv  # q, k, v copied out of it head by head
+        + 2 * key_dim  # q and k l2-normalised
+        + value_heads * chunk  # A, the solved chunk-local matrix
+        + value_heads * head_dim + value_dim  # w and u
+        + 2 * value_dim  # v_new and the output o
+    )
+    states = div_ceil(tokens, chunk) * value_heads * head_dim * head_dim  # h: the recurrent state entering each kernel chunk
+    return (tokens * per_token + states) * itemsize
+
+
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:
@@ -61,6 +85,8 @@ def plan_cache_budget(
     prefill_overlap: bool,
     kv_reserve_pages: int,
     max_slots: int,
+    reserve_bytes: int = 0,
+    kv_soft_pages: int = 0,
 ) -> tuple[int, int, bool]:
     """Split ``budget_bytes`` MoE-first into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -69,6 +95,15 @@ def plan_cache_budget(
     Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
     to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
     overlap is feasible else ``num_experts``); KV pages take whatever remains.
+
+    ``reserve_bytes`` are left out of both caches (the working memory of a prefill chunk).
+    KV pages above ``kv_reserve_pages`` pay for them first and expert slots pay the rest;
+    neither goes under its floor, so a budget that cannot afford the whole reserve keeps
+    less of it rather than failing.
+
+    ``kv_soft_pages`` is a KV floor that cannot fail a plan: KV gets that many pages ahead
+    of the expert slots above their floor when the budget has them after the reserve, and
+    what it has otherwise, never under ``kv_reserve_pages``.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
@@ -81,8 +116,14 @@ def plan_cache_budget(
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
     kv_reserve_bytes = kv_reserve_pages * cache_per_page
-    # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
-    raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
+    # Off the budget before the split: experts fill first and KV takes what is left, so the
+    # bytes come out of KV's pages above the floor, then out of expert slots. The floors are
+    # the slot floor and the KV reserve, or the two pages the plan needs at least.
+    floors = lo * per_expert_bytes + max(kv_reserve_pages, 2) * cache_per_page
+    budget_bytes -= max(0, min(reserve_bytes, budget_bytes - floors))
+    # MoE-priority: reserve KV first, then experts greedily take the remaining budget. A soft
+    # floor the budget cannot pay puts the slots at their floor (the clamp below), no lower.
+    raw = (budget_bytes - max(kv_reserve_bytes, kv_soft_pages * cache_per_page)) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
     # A tiny budget may have forced moe_cache_size below 2*num_experts even with overlap on.
     overlap = overlap and moe_cache_size >= 2 * num_experts
@@ -116,10 +157,14 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    reserve_bytes: int = 0,
+    kv_soft_tokens: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
     ``max_slots`` is the expert kernel's addressable slot limit; the plan never exceeds it.
+    ``reserve_bytes`` is plan_cache_budget's: bytes neither cache may take. ``kv_soft_tokens``
+    is its soft KV floor, in tokens.
 
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
@@ -137,4 +182,6 @@ def resolve_moe_cache_auto(
         prefill_overlap=prefill_overlap,
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
+        reserve_bytes=reserve_bytes,
+        kv_soft_pages=div_ceil(kv_soft_tokens, page_size),
     )

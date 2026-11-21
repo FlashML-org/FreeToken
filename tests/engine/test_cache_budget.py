@@ -80,6 +80,60 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
         )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
 
 
+@pytest.mark.parametrize(
+    "reserve, soft, slots, pages",
+    [
+        (0, 0, 10, 100),  # every expert cached, KV holds 90 pages above its floor of 10
+        (300, 0, 10, 70),  # the pages above the floor cover the reserve: the slots are untouched
+        (900, 0, 10, 10),  # exactly the pages above the floor
+        (1200, 0, 7, 10),  # 300 B more than those pages: three slots pay the rest
+        (5000, 0, 4, 10),  # more than the plan can give: both caches at their floors, and the plan still stands
+        # a soft KV floor of 30 pages
+        (300, 30, 10, 70),  # KV is above it after the reserve: the plan without it
+        (900, 30, 8, 30),  # the reserve would leave KV at 10: two slots pay for the 20 pages
+        (1400, 30, 4, 20),  # the slot floor leaves 20 pages: KV gets those and the plan still stands
+        (5000, 30, 4, 10),  # the reserve comes first: nothing is left for the soft floor
+    ],
+)
+def test_reserve_comes_out_of_kv_above_its_floor_before_expert_slots(reserve, soft, slots, pages):
+    plan = dict(
+        budget_bytes=2000, per_expert_bytes=100, cache_per_page=10, num_experts=2, total_experts=10,
+        prefill_overlap=True, kv_reserve_pages=10, max_slots=10,
+    )
+    assert plan_cache_budget(**plan, reserve_bytes=reserve, kv_soft_pages=soft)[:2] == (slots, pages)
+    # what is left out of the caches is the reserve, or all the floors (4 slots, 10 pages) leave of it
+    assert 2000 - slots * 100 - pages * 10 >= min(reserve, 2000 - 4 * 100 - 10 * 10)
+    # a budget the floors do not fit fails as it does without a reserve
+    with pytest.raises(AssertionError, match="budget too small"):
+        plan_cache_budget(**{**plan, "budget_bytes": 480}, reserve_bytes=reserve, kv_soft_pages=soft)
+
+
+def test_kv_soft_floor_costs_slots_only_where_kv_is_short_of_it():
+    # a slot is about 79 KV tokens, a page 16 tokens; the soft floor of 9219 tokens is 577 pages over a hard floor of 512
+    pe, pp, lo, soft_pages, reserve = 1264, 256, 512, 577, 800_000
+    plan = dict(
+        weights_bytes=0, memory_ratio=1.0, fixed_cache_size=0, per_expert_bytes=pe, cache_per_page=pp, num_experts=256,
+        total_experts=10240, prefill_overlap=True, kv_reserve_tokens=8192, page_size=16, reserve_bytes=reserve,
+    )
+    floors = lo * pe + 512 * pp
+    equal = 0
+    # from both caches at their floors to every expert cached with KV to spare
+    for budget in range(floors, 10240 * pe + 700 * pp + reserve, 997):
+        old = resolve_moe_cache_auto(baseline_free=budget, **plan)
+        new = resolve_moe_cache_auto(baseline_free=budget, **plan, kv_soft_tokens=9219)
+        # the soft floor never comes out of the reserve
+        assert budget - new[0] * pe - new[1] * pp >= min(reserve, budget - floors)
+        if old[1] >= soft_pages:
+            assert new == old
+            equal += 1
+            continue
+        # KV reaches the soft floor, or gets every page the slots above their floor can pay for
+        assert new[1] >= min(soft_pages, old[1] + (old[0] - lo) * pe // pp)
+        # and no more slots go than the missing pages cost
+        assert 0 <= (old[0] - new[0]) * pe < (soft_pages - old[1]) * pp + pe
+    assert equal
+
+
 def test_prefill_overlap_false_is_honored():
     # Even when the cache could fit 2*num_experts, an explicit False stays False.
     size, pages, overlap = plan_cache_budget(
@@ -343,6 +397,67 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
 
     size, _, _ = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), StubMethod())
     assert size == 5
+
+    # a reserve reaches the planner as bytes neither cache takes: here KV pays all of it and every expert stays
+    reserved = engine._resolve_auto_moe_cache_size(StubConfig(), StubBanks(), reserve_bytes=64 * cache_per_page)
+    assert reserved == (8, expected[1] - 64, True)
+
+
+def test_prefill_working_bytes_counts_gdn_models_only():
+    from freetoken.engine.cache_budget import prefill_working_bytes
+    from freetoken.engine.engine import _prefill_working_bytes
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    # Qwen3.6-35B-A3B in bf16: hidden 2048, 16 key and 32 value heads of 128, the chunk kernel's 64-token chunks
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 1, 2), num_key_heads=16, num_value_heads=32, key_head_dim=128, value_head_dim=128,
+        conv_kernel_dim=4, output_gate="silu",
+    )
+    shapes = dict(hidden=2048, key_dim=2048, value_dim=4096, value_heads=32, head_dim=128, chunk=64, itemsize=2)
+
+    def config(group, chunk=8192, context=262144):
+        model = SimpleNamespace(hidden_size=2048, linear_attention_group=lambda: group)
+        return SimpleNamespace(
+            model_config=model, max_forward_len=chunk, max_seq_len=context, dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1)
+        )
+
+    assert _prefill_working_bytes(config(group)) == (8192, prefill_working_bytes(8192, **shapes))
+    # a server with 0.43 GiB free after its CUDA graphs ran out of memory in this layer on a 3785-token prompt
+    assert prefill_working_bytes(3785, **shapes) > 0.43 * 2**30
+    # no chunk is longer than the context
+    assert _prefill_working_bytes(config(group, context=4096)) == (4096, prefill_working_bytes(4096, **shapes))
+    # two ranks hold half the heads each
+    halved = {**shapes, "key_dim": 1024, "value_dim": 2048, "value_heads": 16}
+    two_ranks = config(group)
+    two_ranks.tp_info.size = 2
+    assert _prefill_working_bytes(two_ranks)[1] == prefill_working_bytes(8192, **halved)
+    # not counted: no linear attention layers, or the KDA kernels. No reserve, no warning
+    from dataclasses import replace
+
+    assert _prefill_working_bytes(config(None))[1] == 0
+    assert _prefill_working_bytes(config(replace(group, variant="kda")))[1] == 0
+
+
+@pytest.mark.parametrize("rows", [1, 4])  # no drafts, and MTP with 3 draft tokens
+def test_prefill_kv_hold_leaves_a_prompt_of_one_chunk_its_reply(rows):
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _prefill_kv_tokens, _seq_limits
+
+    def config(**over):
+        fields = dict(
+            kv_reserve_tokens=EngineConfig.kv_reserve_tokens, num_page_override=None, decode_rows_per_req=rows,
+            max_seq_len=262144, page_size=1,
+        )
+        return SimpleNamespace(**{**fields, **over})
+
+    # the scheduler refuses a prompt that is not under the longest request, and caps the reply at the difference:
+    # a pool of the default floor refuses a prompt of the default chunk, the held pool gives it 1024 tokens
+    assert _seq_limits(config(), EngineConfig.kv_reserve_tokens)[0] - 8192 <= 0
+    assert _seq_limits(config(), _prefill_kv_tokens(config(), 8192))[0] - 8192 == 1024
+    # a floor or a KV size the user typed is left as typed
+    assert _prefill_kv_tokens(config(kv_reserve_tokens=2048), 8192) == 0
+    assert _prefill_kv_tokens(config(kv_reserve_tokens=131072), 8192) == 0
+    assert _prefill_kv_tokens(config(num_page_override=8192), 8192) == 0
 
 
 # ---------------------------------------------------------------------------
