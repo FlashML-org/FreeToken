@@ -232,6 +232,8 @@ def parse_args(
             return "minimax"
         if "muse_glimmer" in marker or "muse-glimmer" in marker or "museglimmer" in marker:
             return "muse_glimmer"
+        if "inkling2" in marker:
+            return "inkling2"
         if "gemma4" in marker:
             return "gemma4"
         if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
@@ -297,6 +299,8 @@ def parse_args(
             return "minimax"
         if "muse_glimmer" in marker or "muse-glimmer" in marker or "museglimmer" in marker:
             return "muse_glimmer"
+        if "inkling2" in marker:
+            return "inkling2"
         if "gemma4" in marker:
             return "gemma4"
         return None
@@ -672,6 +676,7 @@ def parse_args(
             "minimax",
             "minimax_m3",
             "muse_glimmer",
+            "inkling2",
             "gpt_oss",
             "gpt-oss",
         ],
@@ -684,13 +689,13 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive", "inkling2",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
             "for OpenAI responses. 'auto' selects per model family (gpt-oss Harmony, "
             "<think> for qwen3/glm/minimax, <mm:think> for minimax-m3, ATEM to=self "
-            "channels for muse-glimmer, gemma thought, dsv4); 'off' disables it."
+            "channels for muse-glimmer, gemma thought, dsv4, inkling2 message segments); 'off' disables it."
         ),
     )
 
