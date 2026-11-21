@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -149,6 +150,29 @@ def test_scheduler_rejection_emits_error_but_no_admission():
     assert added == []
     assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
     assert not any(isinstance(msg, PromptAdmittedMsg) for msg in sent)
+
+
+def test_scheduler_stamps_the_receipt_on_an_admitted_user_msg():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(max_seq_len=64)
+    added = []
+    scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append)
+    scheduler.send_result = lambda msgs: pytest.fail(f"unexpected reply {msgs}")
+    # arrived, handler entry, pre-check rendered, tokenize start and end
+    stamps = [time.perf_counter()] * 5
+
+    Scheduler._process_one_msg(
+        scheduler,
+        UserMsg(
+            uid=9,
+            input_ids=torch.arange(4, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=4),
+            stamps=stamps,
+        ),
+    )
+    assert len(added) == 1 and added[0].stamps is stamps
+    # the sixth stamp is the scheduler's receipt; without it ReqStats reports no span before the queue
+    assert len(stamps) == 6 and stamps[5] >= stamps[4]
 
 
 def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():

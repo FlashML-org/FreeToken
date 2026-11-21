@@ -163,13 +163,16 @@ def test_chunked_reqs_share_one_stats_stamped_at_the_first_chunk():
 
     cm, _tm, _dm, pm = _build_managers(num_pages=64)
     prompt_len = 3 * CHUNK
+    stamps = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     pm.add_one_req(SimpleNamespace(
         uid=UID, input_ids=torch.arange(prompt_len, dtype=torch.int32),
         sampling_params=SamplingParams(max_tokens=4), mm_items=None,
-        mrope_positions=None, mrope_delta=0,
+        mrope_positions=None, mrope_delta=0, stamps=stamps,
     ))
     pending = pm.pending_list[0]
     assert pending.stats.enqueued_at is not None
+    # the timings split reads the message's stamps off the shared ReqStats
+    assert pending.stats.stamps is stamps
 
     seen_first_chunks = []
     while pm.runnable:

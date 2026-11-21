@@ -487,6 +487,26 @@ def test_completion_and_chat_omit_timings_without_the_flag():
     assert "timings" not in chat
 
 
+def test_chat_completion_stamps_the_message_only_under_the_flag():
+    def reply():
+        return [UserReply(uid=42, incremental_output="hi", finished=True,
+                          prompt_tokens_delta=5, completion_tokens_delta=1)]
+
+    on = FakeState(reply())
+    on.config.enable_timings_report = True
+    run(handle_chat_completion(chat_request(tools=None), request=None, state=on, model_sampling={}))
+    assert on.sent is not None
+    stamps = on.sent.stamps
+    # arrival, handler entry and submit; with no request the arrival falls back to entry
+    assert stamps is not None and len(stamps) == 3
+    assert stamps[0] == stamps[1] <= stamps[2]
+
+    off = FakeState(reply())
+    run(handle_chat_completion(chat_request(tools=None), request=None, state=off, model_sampling={}))
+    assert off.sent is not None
+    assert off.sent.stamps is None
+
+
 def test_omitted_max_tokens_honors_server_default():
     from freetoken.server.generation import DEFAULT_MAX_OUTPUT_TOKENS
 
