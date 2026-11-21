@@ -1,0 +1,1 @@
+# Vast's pinned PyWorker bootstrap installs the Vast SDK separately.

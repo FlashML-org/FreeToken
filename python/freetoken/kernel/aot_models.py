@@ -368,7 +368,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="Qwen3_5ForConditionalGeneration",
         hidden_size=5120,
         kv_groups=((4, 256),),
-        aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
+        aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8", "RadixArk/Qwen3.8-27B-NVFP4"),
         arch_aliases=("Qwen3_5ForCausalLM", "Qwen3_5GGUFForCausalLM"),  # text-only release of the same tower
     ),
     AotModel(
