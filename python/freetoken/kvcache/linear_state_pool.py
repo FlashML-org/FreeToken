@@ -393,13 +393,14 @@ def verify_scratch_bytes(config, rows_per_req: int) -> int:
 
 def _slots_per_running_req(config) -> int:
     """Non-evictable state slots of one running request. Hybrid radix: 1 live + 2 ping-pong + 1
-    committed snapshot locked through decode. swa_snapshot_radix: 1 live + 1 track slot; its
-    committed prompt snapshot ends a token before the node the request locks, so it stays
-    evictable. Naive: the live slot."""
+    committed snapshot locked through decode. swa_snapshot_radix: 1 live + 1 track slot + the
+    snapshot a prefix hit restores from, locked from admission to the prompt's commit (its own
+    committed snapshot ends a token before the node it locks, so it stays evictable). Naive: the
+    live slot."""
     if config.cache_type == "hybrid_radix":
         return 4
     if config.cache_type == "swa_snapshot_radix":
-        return 2
+        return 3
     return 1
 
 

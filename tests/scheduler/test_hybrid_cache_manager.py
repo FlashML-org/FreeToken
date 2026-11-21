@@ -163,6 +163,61 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def test_snapshot_radix_admits_a_hit_with_no_snapshot_cache():
+    """swa_snapshot_radix at one running request and no snapshot cache (what a small GPU leaves):
+    the hit's restore snapshot stays locked through admission, so the working set must count it,
+    or the next turn of a conversation waits for slots no one will free."""
+    from freetoken.core import Context, set_global_ctx
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.kvcache.linear_state_pool import _linear_pool_num_slots
+    from freetoken.models.config import KVCacheGroupSpec, SlotStateSpec
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    set_global_ctx(Context(page_size=1))
+    window = 4
+    groups = (KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None),
+              KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8, sliding_window=window))
+    kv = HybridSWAKVCache(groups=groups, num_layers=2, num_full_pages=256, page_size=1, dtype=torch.bfloat16,
+                          device=torch.device("cpu"), num_swa_tokens=64)
+    cfg = SimpleNamespace(max_running_req=1, cache_type="swa_snapshot_radix", linear_state_cache_ratio=2.0, snapshot_cache_slots=0)
+    state = LinearStatePool(group=None, num_slots=_linear_pool_num_slots(cfg), dtype=torch.bfloat16, device=torch.device("cpu"),
+                            tp_size=1, slot_states=(SlotStateSpec(name="conv", shape=(3, 8), layer_ids=(0,), history=3),))
+    pt = torch.zeros(2, 128, dtype=torch.int32)
+    cm = CacheManager(256, 1, pt, "swa_snapshot_radix", linear_state_pool=state, swa_pool=kv, sliding_window_size=window)
+    tm = TableManager(max_running_reqs=1, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=1))
+
+    def prefill(uid, ids):
+        pm.pending_list = [PendingReq(uid=uid, input_ids=torch.tensor(ids, dtype=torch.int32),
+                                      sampling_params=SamplingParams(max_tokens=4))]
+        batch = pm.schedule_next_batch(64)
+        assert batch is not None, "admission waits for state slots"
+        (req,) = batch.reqs
+        hit = req.cached_len
+        cm.allocate_paged(batch.reqs)
+        cm.plan_snapshots(batch.reqs)
+        req.complete_one()
+        cm.cache_req(req, finished=False)
+        return req, hit
+
+    a, _ = prefill(0, list(range(1, 21)))
+    for _ in range(3):
+        a.append_host(torch.tensor([99], dtype=torch.int32))
+        cm.allocate_paged([a])
+        a.complete_one()
+    cm.cache_req(a, finished=True)  # the finish donates the live state: a snapshot at a's end
+    tm.free(a.table_idx)
+
+    _, hit = prefill(1, a.input_ids.tolist() + [7, 8, 9])
+    assert hit == a.cached_len
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
