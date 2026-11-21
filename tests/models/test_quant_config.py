@@ -31,6 +31,7 @@ from freetoken.layers.quantization import (
     NoQuantConfig,
     QuantConfig,
     QuantKind,
+    online_kinds,
 )
 from freetoken.layers.quantization.embedding import Df11EmbeddingMethod, UnquantizedEmbeddingMethod
 from freetoken.layers.quantization.linear import (
@@ -439,6 +440,34 @@ def test_the_modelopt_sidecar_is_folded_into_the_hf_config(tmp_path):
     assert type(quant) is ModelOptConfig
     assert quant.scheme_for("model.layers.0.self_attn.q_proj").kind is QuantKind.FP8_TENSOR
     assert quant.scheme_for("lm_head") is None
+
+
+def test_moe_expert_activation_scales_reaches_the_checkpoint_quant_config(tmp_path, monkeypatch):
+    """--moe-expert-activation-scales sets the field on the checkpoint's QuantConfig, a --online-quant copy keeps it, and EngineConfig passes the flag through."""
+    from freetoken.utils import cached_load_hf_config
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_moe", "architectures": ["Qwen3MoeForCausalLM"]}))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"producer": {"name": "modelopt", "version": "0.29.0"}, "quantization": {"quant_algo": "NVFP4", "exclude_modules": ["lm_head"]}}))
+    hf = cached_load_hf_config(str(tmp_path))
+    spec = get_model_spec("Qwen3MoeForCausalLM")
+    assert checkpoint_quant_config(str(tmp_path), hf, spec).expert_activation_scales is False
+    assert checkpoint_quant_config(str(tmp_path), hf, spec, expert_activation_scales=True).expert_activation_scales is True
+    online = min(online_kinds(), key=lambda kind: kind.value)
+    quant = checkpoint_quant_config(str(tmp_path), hf, spec, online=online.value, expert_activation_scales=True)
+    assert (quant.online, quant.expert_activation_scales) == (online, True)
+
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("recorded")
+
+    monkeypatch.setattr("freetoken.engine.config.checkpoint_quant_config", record)
+    for flag in (False, True):
+        config = EngineConfig(model_path=str(tmp_path), tp_info=None, dtype=torch.bfloat16, moe_expert_activation_scales=flag)
+        with pytest.raises(RuntimeError, match="recorded"):
+            config.model_config
+        assert seen["expert_activation_scales"] is flag
 
 
 def test_compressed_tensors_ignore_names_the_module_alone():

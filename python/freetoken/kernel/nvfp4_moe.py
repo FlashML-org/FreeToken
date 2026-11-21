@@ -413,6 +413,11 @@ _W4A4_MIN_TOKENS_PER_EXPERT = 4
 _W4A4_BLOCK_M_STEPS = ((3.0, 128), (0.0, 64))
 
 
+def w4a4_min_tokens(num_experts: int, top_k: int) -> int:
+    """Tokens of the shortest prefill forward with _W4A4_MIN_TOKENS_PER_EXPERT routes per expert."""
+    return -(-_W4A4_MIN_TOKENS_PER_EXPERT * num_experts // top_k)
+
+
 @functools.lru_cache(maxsize=None)
 def _w4a4_device(device_index: int) -> Tuple[float, int]:
     props = torch.cuda.get_device_properties(device_index)
