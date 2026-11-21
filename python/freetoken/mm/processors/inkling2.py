@@ -28,6 +28,8 @@ _MEAN_STD = 0.5
 _PAD_FILL = -1.0
 _CHECKER = 8
 _CHECKER_LIGHT, _CHECKER_DARK = 204, 153
+# one image's token cap without --image-max-tokens (a 5120x5120 image); the tower attends over all its patches at once
+DEFAULT_MAX_IMAGE_TOKENS = 16384
 
 
 def _section(config: Any, *names: str) -> Any:
@@ -77,6 +79,7 @@ class Inkling2MMProcessor(MMProcessor):
         self.tile = int(_section(vc, "patch_size", "native_patch_size")) * int(_section(vc, "spatial_merge_size", "adapter_merge_size"))
         self.image_token_id = getattr(hf_config, "image_token_id", None) or IMAGE_TOKEN_ID
         self.placeholder = [self.image_token_id]
+        self.max_tokens = mm.image_max_tokens if mm.image_max_tokens is not None else DEFAULT_MAX_IMAGE_TOKENS
 
     def decode_image(self, raw: bytes) -> Any:
         from PIL import Image
@@ -86,6 +89,15 @@ class Inkling2MMProcessor(MMProcessor):
     def process(self, images: list[Any]) -> list[MMItem]:
         items: list[MMItem] = []
         for image in images:
+            width, height = image.size
+            rows, cols = math.ceil(height / self.tile), math.ceil(width / self.tile)
+            if rows * cols > self.max_tokens:
+                # the reference never resizes, so an image past the cap is refused rather than scaled down
+                raise ValueError(
+                    f"a {width}x{height} image takes {rows * cols} image tokens ({rows}x{cols} tiles of {self.tile} pixels), "
+                    f"above the limit of {self.max_tokens}; Inkling 2 does not resize images, so send a smaller image "
+                    "or raise --image-max-tokens"
+                )
             tiles, rows, cols = preprocess(image, self.tile)
             # the tower casts the pixels to its bf16 weights first, so bf16 on the wire loses nothing
             feature = tiles.to(torch.bfloat16)
