@@ -34,6 +34,9 @@ GELU_TANH = 2
 SWIGLUOAI = 3
 # GLM-5.3 "swiglu_limit": swigluoai's clamped form WITHOUT the (up + 1) bias.
 SWIGLU_CLAMP = 4
+# Inkling 2: the sigmoid sees the raw gate, softcaps bound the linear gate factor and up:
+#   y = alpha * tanh(gate / alpha) * sigmoid(gate) * limit * tanh(up / limit)
+SOFTCAP_SWIGLU = 5
 
 _SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2/pi)
 _GELU_C = 0.044715
@@ -117,6 +120,9 @@ def _act_and_mul_kernel(
         up = tl.minimum(tl.maximum(up, -limit), limit)
         act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
         y = act * up
+    elif ACT == 5:  # SOFTCAP_SWIGLU (Inkling 2): alpha / limit are the gate / up softcaps
+        act = alpha * libdevice.tanh(gate / alpha) / (1.0 + libdevice.exp(-gate))
+        y = act * (limit * libdevice.tanh(up / limit))
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
         y = act * up
@@ -190,10 +196,23 @@ def swiglu_clamp_and_mul(
     return _act_and_mul(SWIGLU_CLAMP, x, out, alpha=alpha, limit=limit)
 
 
+def softcap_swiglu_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    gate_cap: float = 4.0,
+    up_cap: float = 25.0,
+) -> torch.Tensor:
+    """Inkling 2 softcapped SwiGLU over UNINTERLEAVED halves:
+    ``gate_cap * tanh(gate / gate_cap) * sigmoid(gate) * up_cap * tanh(up / up_cap)``."""
+    return _act_and_mul(SOFTCAP_SWIGLU, x, out, alpha=gate_cap, limit=up_cap)
+
+
 __all__ = [
     "silu_and_mul",
     "gelu_and_mul",
     "gelu_tanh_and_mul",
     "swigluoai_and_mul",
     "swiglu_clamp_and_mul",
+    "softcap_swiglu_and_mul",
 ]
