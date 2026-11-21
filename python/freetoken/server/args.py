@@ -111,6 +111,47 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
+# the prompt length a preset's KV reserve allows for on top of the default max output tokens
+PRESET_PROMPT_TOKENS = 4096
+
+# --preset: what each one sets where the command line says nothing. 'none' sets nothing.
+_PRESETS: dict[str, dict] = {
+    "single": {
+        "max_running_req": 1,
+        "embed_weights": "host",
+        "memory_ratio": 0.95,
+        "moe_prefill_hit_d2d": True,
+        "speculative_algorithm": "mtp",
+        "speculative_num_steps": 3,
+        "kv_reserve_tokens": None,  # the default max output tokens + PRESET_PROMPT_TOKENS (_apply_preset)
+    },
+}
+_UNSET = object()
+
+
+def _apply_preset(kwargs: dict, left: set[str]) -> tuple[str, ...]:
+    """Fill the fields --preset names that the command line left alone (``left``); returns the names it filled."""
+    from freetoken.server.generation import DEFAULT_MAX_OUTPUT_TOKENS
+
+    values = dict(_PRESETS[kwargs["preset"]])
+    values["kv_reserve_tokens"] = (kwargs["max_output_tokens"] or DEFAULT_MAX_OUTPUT_TOKENS) + PRESET_PROMPT_TOKENS
+    theirs = set(values) - left
+    if "speculative_algorithm" in theirs:
+        theirs.add("speculative_num_steps")  # 0 there is the default k of the method they chose
+    if kwargs["num_page_override"] is not None or kwargs["num_token_override"] is not None:
+        theirs.add("kv_reserve_tokens")  # they sized the KV pool themselves
+    filled = tuple(name for name in values if name not in theirs)
+    changed = [name for name in filled if kwargs[name] != values[name]]
+    for name in filled:
+        kwargs[name] = values[name]
+    kept = ", ".join(f"{name}={kwargs[name]!r}" for name in values if name in theirs)
+    logger.info(
+        f"--preset {kwargs['preset']} sets " + (", ".join(f"{name}={values[name]!r}" for name in changed) or "nothing")
+        + (f"; the command line keeps {kept}" if kept else "")
+    )
+    return filled
+
+
 def _json_object(text: str) -> dict:
     try:
         value = json.loads(text)
@@ -353,7 +394,10 @@ def parse_args(
         type=int,
         dest="max_running_req",
         default=ServerArgs.max_running_req,
-        help="The maximum number of running requests.",
+        help=(
+            "The maximum number of running requests: 1 with no --preset (serves as 'single'), "
+            "4 with --preset none."
+        ),
     )
 
     parser.add_argument(
@@ -992,7 +1036,7 @@ def parse_args(
         default=ServerArgs.speculative_algorithm,
         help=(
             "Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers; dflash: a DFlash 2 draft "
-            "checkpoint from --speculative-draft-model-path). Off by default."
+            "checkpoint from --speculative-draft-model-path). Off by default; 'off' keeps it off under a --preset that turns it on."
         ),
     )
 
@@ -1027,6 +1071,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--preset",
+        default=ServerArgs.preset,
+        choices=["none", *sorted(_PRESETS)],
+        help=(
+            "Settings for a kind of use, applied only where the command line says nothing. With no --preset and no "
+            "--max-running-requests above 1, the server serves as 'single'; 'none' serves without a preset. "
+            "'single' serves one "
+            "request at a time on a GPU smaller than the model: --max-running-requests 1, --embed-weights host, "
+            "--memory-ratio 0.95, --moe-prefill-hit-d2d, mtp speculative decoding with 3 draft tokens where the "
+            "checkpoint has the MTP layers, and a --kv-reserve-tokens that holds the default max output tokens and "
+            f"a {PRESET_PROMPT_TOKENS}-token prompt where the expert cache's minimum still fits. The log says what it set."
+        ),
+    )
+
+    parser.add_argument(
         "--cors-origins",
         type=str,
         default=ServerArgs.cors_origins,
@@ -1036,8 +1095,12 @@ def parse_args(
         ),
     )
 
-    # Parse arguments
-    kwargs = parser.parse_args(args).__dict__.copy()
+    # Parse arguments. A field a preset may fill starts as _UNSET, so one the command line set to its default still counts as set.
+    preset_names = sorted({name for values in _PRESETS.values() for name in values})
+    kwargs = parser.parse_args(args, argparse.Namespace(**dict.fromkeys(preset_names, _UNSET))).__dict__.copy()
+    left_alone = {name for name in preset_names if kwargs[name] is _UNSET}
+    for name in left_alone:
+        kwargs[name] = parser.get_default(name)
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
@@ -1055,6 +1118,23 @@ def parse_args(
         kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
+
+    # with no named preset, a server whose command line gives no --max-running-requests, or gives 1, serves as
+    # --preset single; --preset none keeps it without one; --max-running-requests above 1 is a server of several
+    default_single = kwargs["preset"] is None and ("max_running_req" in left_alone or kwargs["max_running_req"] == 1)
+    if kwargs["preset"] == "none":
+        kwargs["preset"] = None
+    elif default_single:
+        kwargs["preset"] = "single"
+    if kwargs["preset"] is not None:
+        kwargs["preset_fields"] = _apply_preset(kwargs, left_alone)
+    if default_single:
+        logger.info(
+            "no --preset and one running request (no --max-running-requests, or 1): serving as --preset single, which filled "
+            + (", ".join(kwargs["preset_fields"]) or "nothing") + " (--preset none serves without it)"
+        )
+    if kwargs["speculative_algorithm"] == "off":
+        kwargs["speculative_algorithm"] = None
 
     # the old flag stands in for one --quant-backend entry; next to the real flag it is a usage error
     entry = kwargs.pop("nvfp4_backend", None)
