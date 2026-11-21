@@ -249,23 +249,61 @@ def test_mixed_layers_decode_and_prefill_through_their_pools():
         _assert_close(out, _reference(pieces, layer.layer_id, hidden[:1], weights[:1], ids))
 
 
+def _prefill_batch(device, seed):
+    g = torch.Generator().manual_seed(seed)
+    M = 16
+    hidden = (torch.randn(M, H, generator=g) / 4).to(device, torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, generator=g)[:TOPK] for _ in range(M)]).to(torch.int32)
+    weights = torch.rand(M, TOPK, generator=g).to(device)
+    return hidden, ids, weights
+
+
+# a looped model runs layers 2-3 twice, steps 4 -> 2 at the same layer parity and ends on layer 3, not the last layer
+LOOPED_ORDER = (0, 1, 2, 3, 4, 2, 3)
+
+
 @cuda
-def test_prefill_staging_is_cleared_after_the_last_call_of_a_looped_order():
-    torch.manual_seed(1)
+@pytest.mark.parametrize("prefill_overlap", [False, True])
+def test_looped_order_prefills_and_clears_the_staging(prefill_overlap):
     device = torch.device("cuda")
     pieces = _pieces()
-    cache, layers, _ = _mixed_cache(device, pieces)
-    # a looped model runs layers 2-3 twice and ends its forward on layer 3, not on the last layer
-    cache.layer_order = (0, 1, 2, 3, 4, 2, 3)
-    M = 16
-    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
-    ids = torch.stack([torch.randperm(E)[:TOPK] for _ in range(M)]).to(torch.int32)
-    weights = torch.rand(M, TOPK, device=device)
+    cache, layers, _ = _mixed_cache(device, pieces, prefill_overlap=prefill_overlap)
+    cache.set_layer_order(LOOPED_ORDER)
+    assert cache.prefill_overlap == prefill_overlap
+    hidden, ids, weights = _prefill_batch(device, 1)
     for _ in range(2):  # the order's cursor wraps for the next forward
-        for layer_id in cache.layer_order:
+        for layer_id in LOOPED_ORDER:
             out = layers[layer_id]._prefill_routed(hidden.clone(), weights, ids.to(device))
             _assert_close(out, _reference(pieces, layer_id, hidden, weights, ids))
         assert not any(cache._stage_dirty), "staged rows left after the forward's last MoE call"
+
+
+@cuda
+@pytest.mark.parametrize("prefill_overlap", [False, True])
+def test_prefill_after_a_forward_that_stopped_midway(prefill_overlap):
+    device = torch.device("cuda")
+    pieces = _pieces()
+    cache, layers, _ = _mixed_cache(device, pieces, prefill_overlap=prefill_overlap)
+    cache.set_layer_order(LOOPED_ORDER)
+    hidden, ids, weights = _prefill_batch(device, 2)
+    # a forward that dies after its fourth MoE call (an OOM in the next layer) never reaches the end of the order
+    for layer_id in LOOPED_ORDER[:4]:
+        layers[layer_id]._prefill_routed(hidden.clone(), weights, ids.to(device))
+    for layer_id in LOOPED_ORDER:
+        out = layers[layer_id]._prefill_routed(hidden.clone(), weights, ids.to(device))
+        _assert_close(out, _reference(pieces, layer_id, hidden, weights, ids))
+    assert not any(cache._stage_dirty)
+
+
+def test_layer_order_refuses_a_repeated_first_layer():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.num_layers = L
+    with pytest.raises(ValueError, match="runs it again"):
+        cache.set_layer_order((0, 1, 0))
+    with pytest.raises(ValueError, match="leaves"):
+        cache.set_layer_order((0, L))
 
 
 @cuda

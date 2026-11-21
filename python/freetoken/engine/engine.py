@@ -1020,7 +1020,7 @@ class Engine:
             pool_sizes=pool_sizes,
         )
         # a looped model runs some MoE layers more than once per forward; the overlap prefill follows its order
-        cache.layer_order = getattr(self.model, "moe_layer_order", None)
+        cache.set_layer_order(getattr(self.model, "moe_layer_order", None))
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         if locked_fetch:
