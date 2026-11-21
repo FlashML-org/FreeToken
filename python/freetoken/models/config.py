@@ -406,11 +406,6 @@ class ModelConfig:
         return "moe" in self.model_type or self.moe_enabled
 
     @property
-    def kv_layer_count(self) -> int:
-        """Layers the KV pool maps: ``num_kv_layers`` when the model sets it, else every model layer."""
-        return self.num_kv_layers if self.num_kv_layers is not None else self.num_layers
-
-    @property
     def num_moe_layers(self) -> int:
         """Number of layers that own a sparse MoE block (and offload-cache expert slots).
 
