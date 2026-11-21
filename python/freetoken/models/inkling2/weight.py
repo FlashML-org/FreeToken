@@ -25,7 +25,13 @@ _LLM = "model.llm."
 _LAYER = re.compile(r"model\.llm\.layers\.(\d+)\.(.+)")
 _EXPERT_SUFFIXES = ("w13_weight", "w13_weight_scale", "w13_weight_amax", "w13_weight_outer_scale_denominator",
                     "w2_weight", "w2_weight_scale", "w2_weight_amax", "w2_weight_outer_scale_denominator")
-_CONTROLLERS = {"attn": "q_gate", "k": "k_gate", "v": "v_gate", "mlp": "mlp_gate"}
+# checkpoint controller -> (model gate group, the group's controllers in order)
+_GATES = {
+    "attn": ("attn_gates", ("attn", "k", "v")),
+    "k": ("attn_gates", ("attn", "k", "v")),
+    "v": ("attn_gates", ("attn", "k", "v")),
+    "mlp": ("mlp_gate", ("mlp",)),
+}
 
 
 def quantization_config(model_path: str) -> dict:
@@ -90,16 +96,16 @@ def iter_weights(
             elif leaf == "embed_norm.weight":
                 yield "model.embed_norm.weight", get(name)
             elif leaf == "norm.weight":
-                yield "model.norm.weight", get(name)
+                yield "model.norm", get(name).view(1, -1)
             elif leaf == "unembed.weight":
                 yield "lm_head.weight", get(name)[: args.unpadded_vocab_size].contiguous()
             elif leaf == "attn_res.output_query":
-                yield "model.final_query", get(name)
+                yield "model.final_query", get(name).view(1, -1)
             elif leaf.startswith("attn_res.attn_queries."):
                 # attention residual queries start at layer 1: layer 0 reads its input directly
-                yield f"model.layers.{int(leaf.rsplit('.', 1)[1]) + 1}.attention_input", get(name)
+                yield f"model.layers.{int(leaf.rsplit('.', 1)[1]) + 1}.attention_input", get(name).view(-1, args.hidden_size)
             elif leaf.startswith("attn_res.mlp_queries."):
-                yield f"model.layers.{int(leaf.rsplit('.', 1)[1])}.mlp_input", get(name)
+                yield f"model.layers.{int(leaf.rsplit('.', 1)[1])}.mlp_input", get(name).view(1, -1)
             elif leaf == "middle_cycle_cross_pass_queries":
                 # rows (2j, 2j + 1) are loop layer j's query and MLP messages, the kv tensor its key and value ones
                 qm = get(name).unflatten(0, (-1, 2))
@@ -144,10 +150,12 @@ def _layer_tensor(layer: int, leaf: str, name: str, get, args: Inkling2Args) -> 
         return  # fused above
     elif leaf == "attn_norm.weight":
         yield p + "input_norm.weight", get(name)
-    elif leaf in ("q_input_norm.weight", "k_input_norm.weight", "v_input_norm.weight"):
-        yield p + f"{leaf[0]}_input_norm.weight", get(name)
+    elif leaf == "q_input_norm.weight":
+        yield p + "qkv_input_norm", torch.stack([get(base + f"{kind}_input_norm.weight") for kind in "qkv"])
+    elif leaf in ("k_input_norm.weight", "v_input_norm.weight"):
+        return  # stacked with q's
     elif leaf == "mlp_norm.weight":
-        yield p + "mlp_norm.weight", get(name)
+        yield p + "mlp_norm", get(name).view(1, -1)
     elif leaf == "attn_sconv.weight":
         yield p + "attn_conv", _lag_taps(get(name))
     elif leaf == "mlp_sconv.weight":
@@ -157,14 +165,19 @@ def _layer_tensor(layer: int, leaf: str, name: str, get, args: Inkling2Args) -> 
     elif leaf == "mlp.gate.bias":
         yield p + "mlp.router_bias", get(name).float()
     elif leaf.startswith("controllers."):
+        # the query, key and value gates run side by side; the MLP gate on its own
         _, which, w = leaf.split(".")
-        gate = p + _CONTROLLERS[which]
-        if w == "down_weight":
-            yield gate + ".down.weight", get(name)
-        elif w == "forget_weight":
-            yield gate + ".up", torch.cat([get(name), get(base + f"controllers.{which}.gain_weight")], dim=0).float()
-        elif w != "gain_weight":
+        if which not in _GATES or w not in ("down_weight", "forget_weight", "gain_weight"):
             raise ValueError(f"unexpected inkling2 tensor {name}")
+        group, members = _GATES[which]
+        if which != members[0] or w == "gain_weight":
+            return
+        ctl = base + "controllers."
+        if w == "down_weight":
+            yield p + f"{group}.down", torch.stack([get(ctl + f"{m}.down_weight") for m in members])
+        else:
+            up = [torch.cat([get(ctl + f"{m}.forget_weight"), get(ctl + f"{m}.gain_weight")]) for m in members]
+            yield p + f"{group}.up", torch.stack(up).float()
     else:
         raise ValueError(f"unexpected inkling2 tensor {name}")
 
