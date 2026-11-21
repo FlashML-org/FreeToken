@@ -112,7 +112,19 @@ def _extend_attention_kernel(
     if SLIDING_WINDOW > 0:
         lo = tl.maximum(prefix_len + first - SLIDING_WINDOW + 1, 0) // BLOCK_N * BLOCK_N
     else:
-        lo = 0
+        # key blocks at least REL_EXTENT behind every row of the block: no bias, no mask
+        lo = tl.maximum(prefix_len + first - REL_EXTENT + 1, 0) // BLOCK_N * BLOCK_N
+        for start_n in tl.range(0, lo, BLOCK_N):
+            slots = tl.load(kv_indices_ptr + kv_start + start_n + offs_n).to(tl.int64)
+            k = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None])
+            s = tl.dot(q, k) * qk_scale
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            alpha = tl.math.exp2(m_i - m_new)
+            p = tl.math.exp2(s - m_new[:, None])
+            v = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_d[None, :])
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
     for start_n in tl.range(lo, hi, BLOCK_N):
         k_pos = start_n + offs_n
         mask_n = k_pos < kv_len
@@ -170,7 +182,8 @@ def extend_attention(
     assert bias.shape == (row_hi - row_lo, Hq, rel_extent) and bias.stride(-1) == 1, bias.shape
     assert sinks.shape == (T, Hq) and sinks.stride(-1) == 1
     assert gate.shape == out.shape == (T, Hq * D) and gate.stride(-1) == 1 and out.stride(-1) == 1
-    block_m, block_n = 64, 64
+    # full layers stream the whole prefix, SWA ones a 1K window (measured on sm_120)
+    block_m, block_n, num_warps, num_stages = (64, 128, 8, 2) if sliding_window else (128, 64, 8, 3)
     grid = (qo_indptr.numel() - 1, Hq, triton.cdiv(max_q_len, block_m))
     _extend_attention_kernel[grid](
         q, k_cache, v_cache, out, gate, bias, sinks,
@@ -180,7 +193,7 @@ def extend_attention(
         out.stride(0), gate.stride(0), bias.stride(0), bias.stride(1), sinks.stride(0),
         GROUP=Hq // Hkv, D=D, BLOCK_M=block_m, BLOCK_N=block_n,
         SLIDING_WINDOW=sliding_window or 0, REL_EXTENT=rel_extent,
-        num_warps=4, num_stages=2,
+        num_warps=num_warps, num_stages=num_stages,
     )
     return out
 
