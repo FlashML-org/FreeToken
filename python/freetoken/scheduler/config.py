@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from freetoken.engine import EngineConfig
+from freetoken.engine.config import prefill_tail
 
 
 def _get_pid_suffix() -> str:
@@ -35,8 +36,14 @@ class SchedulerConfig(EngineConfig):
         return "ipc:///tmp/freetoken_2" + self._unique_suffix
 
     @property
+    def prefill_tail_tokens(self) -> int:
+        """Tokens past --max-prefill-length that a prompt's last chunk takes with it where the scheduler allows it."""
+        return prefill_tail(self.max_extend_tokens)
+
+    @property
     def max_forward_len(self) -> int:
-        return self.max_extend_tokens
+        # the longest prefill forward: a chunk and the rest a last chunk may take (scheduler/prefill.py)
+        return self.max_extend_tokens + self.prefill_tail_tokens
 
     @property
     def backend_create_detokenizer_link(self) -> bool:

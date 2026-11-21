@@ -53,6 +53,14 @@ def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
 
 
+def _prefill_tail_tokens(config, cache_manager) -> int:
+    """The rest past the prefill budget a prompt's last chunk takes with it (SchedulerConfig.prefill_tail_tokens), or 0
+    where the budget is a pool's cap (DSV4's window pool) or the sliding-window pool charges every chunk."""
+    if cache_manager.prefill_chunk_budget or cache_manager.swa_paged:
+        return 0
+    return getattr(config, "prefill_tail_tokens", 0)
+
+
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
@@ -148,6 +156,7 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_budget = (
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
+        self.prefill_manager.tail_tokens = _prefill_tail_tokens(config, self.cache_manager)
         self.config = config
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
@@ -216,6 +225,7 @@ class Scheduler(SchedulerIOMixin):
             min(self.config.max_extend_tokens, _chunk_cap)
             if _chunk_cap else self.config.max_extend_tokens
         )
+        self.prefill_manager.tail_tokens = _prefill_tail_tokens(self.config, self.cache_manager)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 
