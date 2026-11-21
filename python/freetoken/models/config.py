@@ -282,6 +282,8 @@ class SlotStateSpec:
     fill_value: float = 0.0
     # None on a model's own state: speculative decoding cannot serve the model; a proposer's state may leave it None and keep itself right in post_verify
     verify: type[SlotVerify] | None = None
+    # input rows before a track boundary the state is rebuilt from, in a pool without GDN layers
+    history: int = 0
 
 
 @dataclass(frozen=True)

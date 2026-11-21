@@ -44,8 +44,11 @@ class CacheManager:
         self.linear_state_pool = linear_state_pool
         self.swa_pool = swa_pool
         self.sliding_window_size = sliding_window_size
-        self.is_hybrid = type == "hybrid_radix"
-        self.is_swa = type == "swa_radix"
+        # swa_snapshot_radix (Inkling 2) rides both: the window currency of swa_radix and the
+        # state-slot currency of hybrid_radix, joined in SWASnapshotRadixCache.
+        self.is_swa_snapshot = type == "swa_snapshot_radix"
+        self.is_hybrid = type == "hybrid_radix" or self.is_swa_snapshot
+        self.is_swa = type == "swa_radix" or self.is_swa_snapshot
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
         # lifecycle (alloc_swa / out-of-window free / free-on-finish). is_swa gates only the extra
@@ -91,6 +94,9 @@ class CacheManager:
         return total - len(self.free_slots) - evictable // self.page_size, total
 
     def _make_prefix_cache(self, device, page_size, type):
+        if type == "swa_snapshot_radix":
+            from freetoken.kvcache.swa_snapshot_radix_cache import SWASnapshotRadixCache
+            return SWASnapshotRadixCache(device, page_size, self.sliding_window_size)
         if type == "hybrid_radix":
             from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
             return HybridRadixCache(device, page_size)
@@ -104,6 +110,12 @@ class CacheManager:
         assert input_len > 0, "Input length must be greater than 0."
         limit = input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))
         ids = self._keys(req.input_ids, limit)
+        if self.is_swa_snapshot:
+            from freetoken.kvcache.swa_snapshot_radix_cache import SWASnapshotCacheHandle
+            m = self.prefix_cache.match_prefix(ids)
+            return MatchResult(
+                SWASnapshotCacheHandle(m.cached_len, m.node, m.kv_indices),
+                mamba_value=m.mamba_value, raw_len=m.raw_len)
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -144,6 +156,8 @@ class CacheManager:
             self.swa_pool.free_swa(ev.swa_indices)
             if ev.kv_indices.numel():
                 self._free(ev.kv_indices)
+            if self.is_swa_snapshot and ev.mamba_slots:
+                self.linear_state_pool.free(ev.mamba_slots)
 
     def ensure_mamba_slots(self, n: int) -> None:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
@@ -153,6 +167,8 @@ class CacheManager:
             if not er.mamba_slots:
                 break
             self.linear_state_pool.free(er.mamba_slots)
+            if self.is_swa_snapshot:
+                self._free_swa(er.swa_indices)
             self._free(er.kv_indices)
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
@@ -246,7 +262,10 @@ class CacheManager:
                 req.swa_evicted_seqlen = new_evicted
 
     def lock(self, handle: BaseCacheHandle) -> None:
-        if self.is_swa:
+        if self.is_swa_snapshot:
+            object.__setattr__(handle, "swa_uuid", self.prefix_cache.inc_lock(handle.node))
+            object.__setattr__(handle, "mamba_locked", self.prefix_cache.inc_mamba(handle.node))
+        elif self.is_swa:
             # records the window boundary on the (frozen) handle for unlock/dec_lock.
             object.__setattr__(handle, "swa_uuid", self.prefix_cache.inc_lock(handle.node))
         elif self.is_hybrid:
@@ -255,7 +274,11 @@ class CacheManager:
             self.prefix_cache.lock_handle(handle, unlock=False)
 
     def unlock(self, handle: BaseCacheHandle) -> None:
-        if self.is_swa:
+        if self.is_swa_snapshot:
+            self.prefix_cache.dec_lock(handle.node, handle.swa_uuid)
+            if handle.mamba_locked:
+                self.prefix_cache.dec_mamba(handle.node)
+        elif self.is_swa:
             self.prefix_cache.dec_lock(handle.node, handle.swa_uuid)
         elif self.is_hybrid:
             self.prefix_cache.dec_lock(handle.node)
@@ -290,6 +313,8 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if self.is_swa_snapshot:
+            return self._cache_req_swa_snapshot(req, finished=finished)
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
@@ -503,6 +528,89 @@ class CacheManager:
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
 
+    def plan_snapshots(self, reqs: List[Req]) -> None:
+        """swa_snapshot_radix: choose the state snapshots this prefill forward writes. Only a
+        prompt's last chunk snapshots: one token before its end (the next turn's prompt starts
+        with this one, and a resent prompt must keep a token to prefill) and at the branch point
+        its admission matched (a prefix another request shares), each at least ``track_rows``
+        tokens into the chunk and each into its own ping-pong slot."""
+        if not self.is_swa_snapshot:
+            return
+        rows = self.linear_state_pool.track_rows
+        for req in reqs:
+            req.snapshot_tracks = []
+            if req.mamba_ping_pong is None or req.device_len != req.prompt_len:
+                continue
+            start, end = req.cached_len, req.device_len
+            for boundary in dict.fromkeys(b for b in (req.snapshot_branch_len, end - 1) if start + rows <= b < end):
+                req.snapshot_tracks.append((boundary, req.mamba_ping_pong[req.mamba_next_track_idx]))
+                req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
+            req.pending_snapshots = list(req.snapshot_tracks)
+
+    def _donate_snapshots(self, req: Req, insert_len: int) -> set:
+        """Hand the request's written snapshots (planned prefill tracks, the tool-call anchor) to the
+        tree; the ones it does not take go back to the pool. Returns the slots consumed either way."""
+        pool = self.linear_state_pool
+        items = list(req.pending_snapshots)
+        if req.mamba_last_track_seqlen is not None and req.mamba_ping_pong is not None:
+            items.append((req.mamba_last_track_seqlen, req.mamba_ping_pong[1 - req.mamba_next_track_idx]))
+        consumed = set()
+        for boundary, slot in items:
+            if boundary > insert_len or self.prefix_cache.attach_snapshot(req.input_ids[:boundary], slot):
+                pool.free([slot])
+            consumed.add(slot)
+        req.pending_snapshots = []
+        req.mamba_last_track_seqlen = None
+        return consumed
+
+    def _cache_req_swa_snapshot(self, req: Req, *, finished: bool) -> None:
+        """swa_snapshot_radix cache_req: commit the full and window KV as swa_radix does, donate the
+        state snapshots the request's forwards wrote and, at finish, its live state (zero-copy),
+        then tombstone the window KV on the path that no snapshot reads."""
+        from freetoken.kvcache.swa_snapshot_radix_cache import SWASnapshotCacheHandle
+
+        pc = self.prefix_cache
+        old_handle = req.cache_handle
+        page_indices = self.page_table[req.table_idx, : req.cached_len]
+        insert_len = align_down(req.cached_len, self.page_size)
+        if not finished and pc.has_locked_tombstone(req.input_ids[:insert_len], old_handle.cached_len):
+            return  # as swa_radix (#204); the pending snapshots wait for the finish commit
+        freed = page_indices[:0]
+        if insert_len > 0:
+            _, freed = pc.insert(
+                req.input_ids[:insert_len], page_indices[:insert_len],
+                swa_evicted_seqlen=req.swa_evicted_seqlen, update_kv_after_len=old_handle.cached_len)
+        consumed = self._donate_snapshots(req, insert_len)
+        keep_live = False
+        if finished and req.linear_slot_idx is not None and 0 < insert_len == req.cached_len:
+            keep_live = not pc.attach_snapshot(req.input_ids[:insert_len], req.linear_slot_idx)
+        self.unlock(old_handle)
+        self._free_swa(freed)
+        self._free(freed)
+        if finished:
+            self._free_swa(pc.trim_swa(req.input_ids[:insert_len]))
+            tail = self._padded_tail(req, insert_len)
+            self._free_swa(tail)
+            self._free(tail)
+            if req.mamba_ping_pong is not None:
+                req.mamba_ping_pong = tuple(s for s in req.mamba_ping_pong if s not in consumed)
+            self._free_req_slots(req, keep_live=keep_live)
+            return
+        # Lock the trailing window alone (as swa_radix) before trimming the rest of the path.
+        keep_from = align_down(max(insert_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0), self.page_size)
+        if keep_from > 0:
+            pc.walk_path(req.input_ids[:keep_from])
+        node, kv = pc.walk_path(req.input_ids[:insert_len])
+        if kv.numel() > 0:
+            self.page_table[req.table_idx, : kv.numel()].copy_(kv)
+        req.cache_handle = SWASnapshotCacheHandle(int(kv.numel()), node, kv)
+        self.lock(req.cache_handle)
+        self._free_swa(pc.trim_swa(req.input_ids[:insert_len]))
+        if consumed:
+            self.ensure_mamba_slots(len(consumed))
+            req.mamba_ping_pong = tuple(
+                self.linear_state_pool.alloc(1)[0] if s in consumed else s for s in req.mamba_ping_pong)
+
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish
         frees through the page-CEIL bound, not cached_len: allocate_paged allocates (and, when
@@ -537,6 +645,16 @@ class CacheManager:
                 f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
                 f"capacity({pool.num_slots - 1})"
             )
+        if self.is_swa_snapshot:
+            # idle-only, like the full-pool check below: no request holds a window slot
+            tree_swa = pc.swa_evictable + pc.swa_protected
+            cap = self.swa_pool.swa_num_tokens - 1
+            assert self.swa_pool.swa_available_size() + tree_swa == cap, (
+                f"SWA-slot leak/double-free: free({self.swa_pool.swa_available_size()}) + "
+                f"tree({tree_swa}) != capacity({cap})"
+            )
+        elif self.is_hybrid:
+            pass
         elif self.is_swa:
             pc = self.prefix_cache
             pc.check_integrity()  # full>=swa refs, tombstone => no swa lock
@@ -612,6 +730,8 @@ class CacheManager:
             # Evicting KV leaf nodes drops their swa slots too -> return both pools.
             ev = self.prefix_cache.evict_full(need)
             self._free_swa(ev.swa_indices)
+            if self.is_swa_snapshot and ev.mamba_slots:
+                self.linear_state_pool.free(ev.mamba_slots)
             return ev.kv_indices
         if self.is_hybrid:
             # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.

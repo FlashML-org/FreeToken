@@ -86,7 +86,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
     from .dsv4.v4_cost_model import _dsv4_pool_sizes
-    from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
+    from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens, _swa_snapshot_num_tokens
     from .dsv4.v4_pool import DSV4PagedKVCache
 
     model_config = config.model_config
@@ -124,11 +124,12 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     # Both the naive and radix SWA paths share the global-paged swa pool; radix sizes it by
     # ratio (cross-request reuse), naive by concurrency x window.
     if model_config.has_swa_attention:
-        num_swa_tokens = (
-            _swa_paged_num_tokens(config, num_pages + 1)
-            if config.cache_type == "swa_radix"
-            else _naive_swa_num_tokens(config)
-        )
+        if config.cache_type == "swa_radix":
+            num_swa_tokens = _swa_paged_num_tokens(config, num_pages + 1)
+        elif config.cache_type == "swa_snapshot_radix":
+            num_swa_tokens = _swa_snapshot_num_tokens(config)
+        else:
+            num_swa_tokens = _naive_swa_num_tokens(config)
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page

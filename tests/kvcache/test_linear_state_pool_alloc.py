@@ -177,10 +177,10 @@ def test_slot_state_in_the_byte_account():
     config.slot_states = ()
     assert state_pool_bytes(config, num_slots=4) == gdn_only * 4
 
+    # a model without GDN layers keeps only its slot states in the pool
     config.slot_states = _SPECS
     mc.linear_attention_group = lambda: None
-    with pytest.raises(ValueError, match="slot_states"):
-        state_pool_bytes(config, num_slots=4)
+    assert state_pool_bytes(config, num_slots=4) == (with_state - gdn_only) * 4
 
 
 def test_slot_state_bytes_for_the_real_geometry():

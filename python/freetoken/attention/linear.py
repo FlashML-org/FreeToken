@@ -87,7 +87,10 @@ def build_fla_metadata(batch: "Batch", device: torch.device, pool: LinearStatePo
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
-    track = _build_track_metadata(reqs, cu_host, device, pin, pool.conv_states.shape[-1])
+    if pool.has_gdn:
+        track = _build_track_metadata(reqs, cu_host, device, pin, pool.track_rows)
+    else:
+        track = _build_planned_track_metadata(reqs, cu_host, device, pin, pool.track_rows)
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),
@@ -144,6 +147,24 @@ def _build_track_metadata(reqs, cu_host, device, pin, km1: int):
         track_conv_src=to(conv_src, dtype=torch.int64),
         track_boundary_row=to(boundary_rows, dtype=torch.int64),
     )
+
+
+def _build_planned_track_metadata(reqs, cu_host, device, pin, rows: int):
+    """A pool without GDN layers snapshots at the boundaries its cache manager planned for this
+    forward (``Req.snapshot_tracks``: ``(boundary, dst slot)``, at least ``rows`` tokens into the
+    extend), from the ``rows`` input rows before each boundary."""
+    dst, src, conv_src, boundary_rows = [], [], [], []
+    for i, r in enumerate(reqs):
+        for boundary, slot in r.snapshot_tracks:
+            row = int(cu_host[i]) + boundary - r.cached_len
+            dst.append(slot)
+            src.append(gdn_slot(r))
+            conv_src.append([row - rows + j for j in range(rows)])
+            boundary_rows.append(row)
+    if not dst:
+        return dict(track_dst=None, track_src=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
+    to = lambda xs: torch.tensor(xs, dtype=torch.int64, **pin).to(device, non_blocking=True)
+    return dict(track_dst=to(dst), track_src=to(src), track_h_row=None, track_conv_src=to(conv_src), track_boundary_row=to(boundary_rows))
 
 
 @dataclass

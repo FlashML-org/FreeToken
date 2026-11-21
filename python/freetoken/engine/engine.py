@@ -40,7 +40,7 @@ from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    SNAPSHOT_CACHE_TYPES, _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -624,7 +624,7 @@ class Engine:
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
-        if linear_group is not None:
+        if linear_group is not None or config.slot_states:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
             self.linear_state_pool = LinearStatePool(
@@ -673,7 +673,7 @@ class Engine:
         )
         # padded/dummy rows index the GDN padding slot (0) so gather/scatter hits scratch.
         # Naive GDN keys state by table_idx, where slot 0 is a live request and the dummy's own row is the scratch.
-        if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
+        if self.linear_state_pool is not None and config.cache_type in SNAPSHOT_CACHE_TYPES:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
 
@@ -1512,6 +1512,7 @@ class Engine:
                     sampling_params=None,  # type: ignore[arg-type]
                     cache_handle=None,  # type: ignore[arg-type]
                 )
+                warm_req.linear_slot_idx = self.dummy_req.linear_slot_idx
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
@@ -1521,6 +1522,8 @@ class Engine:
                         batch.positions.unsqueeze(0).expand(3, -1).contiguous()
                     )
                 batch.out_loc = dummy_row[:length]
+                if self.linear_backend is not None:
+                    self.linear_backend.prepare_metadata(batch)
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
                     self.model.forward()

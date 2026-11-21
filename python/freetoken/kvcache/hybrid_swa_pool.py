@@ -371,7 +371,9 @@ class HybridSWAKVCache(BaseKVCachePool):
                 cache_per_page += per_token * config.page_size
                 continue
             cache_per_page += 8 * config.page_size  # full_to_swa_index_mapping bytes/page
-            if config.cache_type != "swa_radix":
+            if config.cache_type == "swa_snapshot_radix":
+                fixed_cache_size += per_token * _swa_snapshot_num_tokens(config)
+            elif config.cache_type != "swa_radix":
                 # naive swa pool (see _naive_swa_num_tokens): fixed concurrency x window.
                 fixed_cache_size += per_token * _naive_swa_num_tokens(config)
             elif swa_pin is not None:
@@ -388,11 +390,12 @@ class HybridSWAKVCache(BaseKVCachePool):
         self, config, num_pages: int, *, num_swa_pages: int | None = None
     ) -> None:
         # radix sizes the window by ratio (cross-request reuse), naive by concurrency x window.
-        num_swa_tokens = (
-            _swa_paged_num_tokens(config, num_pages + 1, num_swa_pages=num_swa_pages)
-            if config.cache_type == "swa_radix"
-            else _naive_swa_num_tokens(config)
-        )
+        if config.cache_type == "swa_radix":
+            num_swa_tokens = _swa_paged_num_tokens(config, num_pages + 1, num_swa_pages=num_swa_pages)
+        elif config.cache_type == "swa_snapshot_radix":
+            num_swa_tokens = _swa_snapshot_num_tokens(config)
+        else:
+            num_swa_tokens = _naive_swa_num_tokens(config)
         # +1 for the dummy page (matches create_kvcache_pool)
         self.rebuild(num_full_pages=num_pages + 1, num_swa_tokens=num_swa_tokens)
 
@@ -449,6 +452,22 @@ def _swa_pool_floor(config) -> int:
     reserves the decode growth of the requests already running, so a full batch can drive the
     pool to zero -- and the alloc_swa that then raises has no handler above it."""
     return config.max_running_req * _swa_per_req_swa_floor(config)
+
+
+def _swa_snapshot_num_tokens(config) -> int:
+    """swa_snapshot_radix window pool: window KV is reusable only in front of a state snapshot,
+    so beyond the running requests' floor it holds one window per cacheable snapshot plus one
+    prefill chunk, independent of the full pool (+1 slot-0 sentinel). An explicit
+    swa_num_pages_override pins it instead, as for swa_radix."""
+    from freetoken.scheduler.cache import _SWA_RETAIN_GAP
+
+    from .linear_state_pool import snapshot_cache_slots
+
+    floor = _swa_pool_floor(config)
+    if config.swa_num_pages_override is not None:
+        return max(floor, int(config.swa_num_pages_override)) + 1
+    window = config.model_config.swa_attention_group().sliding_window
+    return floor + snapshot_cache_slots(config) * (window + _SWA_RETAIN_GAP) + config.max_forward_len + 1
 
 
 def _swa_paged_num_tokens(config, num_full_pages: int, num_swa_pages: int | None = None) -> int:

@@ -100,6 +100,10 @@ class Req:
     mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
+    # --- swa_snapshot_radix (Inkling 2): planned prefill snapshots instead of the GDN x64 track ---
+    snapshot_branch_len: int = 0                    # the tree's raw token match at admission: a branch point worth a snapshot
+    snapshot_tracks: list = field(default_factory=list)    # (boundary, slot) this forward writes
+    pending_snapshots: list = field(default_factory=list)  # (boundary, slot) written, not yet donated to the tree
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
