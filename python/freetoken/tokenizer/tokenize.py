@@ -24,6 +24,7 @@ from .effort import (
     quantize_effort,
 )
 from .inline_system import has_inline_system, normalize_inline_system, probe_inline_system
+from .pieces import encode_pieces, piece_encoder, warm
 
 logger = init_logger(__name__)
 
@@ -62,6 +63,13 @@ class TokenizeManager:
         self._logged_effort_maps: set[tuple[Any, str | int | None]] = set()
         self._inline_system_lock = threading.Lock()
         self._inline_system_modes: dict[str, str] = {}
+        # a long templated prompt is encoded in pieces in parallel where that gives the ids of the whole text
+        self._pieces = piece_encoder(tokenizer)
+
+    def warm(self) -> None:
+        """Start the pieces encode's thread pool, so that the first long prompt does not."""
+        if self._pieces is not None:
+            warm(self._pieces)
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
         results: List[UserMsg] = []
@@ -74,11 +82,11 @@ class TokenizeManager:
             # the template already rendered one. Raw-string prompts and the dsv4
             # encoder path keep the default.
             templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
+            input_ids = encode_pieces(self._pieces, prompt) if templated and self._pieces is not None else None
+            if input_ids is None:
+                input_ids = self.tokenizer.encode(  # type: ignore
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
-            )
             input_ids = input_ids.view(-1).to(torch.int32)
             if msg.images:
                 if self.mm_processor is None:
