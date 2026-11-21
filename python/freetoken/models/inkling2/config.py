@@ -269,6 +269,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         ),
         inkling2_args=args,
         recurrent_conv_state=True,
+        revisits_layers=args.num_passes > 1,
     )
 
 

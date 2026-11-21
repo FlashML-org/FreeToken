@@ -2275,6 +2275,19 @@ def _adjust_config(config: EngineConfig):
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
 
+    if (
+        is_moe
+        and getattr(model_config, "revisits_layers", False)
+        and is_offload_moe_strategy(config.moe_strategy)
+        and config.moe_prefill_overlap
+    ):
+        # the overlap double buffer streams each MoE layer once, in layer order
+        logger.info_rank0(
+            f"{model_config.model_type} runs some MoE layers more than once per forward; offload prefill "
+            "loads each visit's experts synchronously (no prefill overlap)"
+        )
+        override("moe_prefill_overlap", False)
+
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
         object.__setattr__(model_config, "decode_target", _decode_target(config))

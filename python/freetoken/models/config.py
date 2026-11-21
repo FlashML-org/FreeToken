@@ -389,6 +389,8 @@ class ModelConfig:
     # KV layers the attention groups index, when looped decoder layers attend once per visit
     # with their own KV (Inkling 2 Mini: 48 over 24 decoder layers); 0 means num_layers.
     num_kv_layers: int = 0
+    # Some decoder layers (and their experts) run more than once per forward (looped models).
+    revisits_layers: bool = False
     # The model keeps per-request short-convolution state in its own buffers, keyed by
     # Req.table_idx: the prefix caches cannot restore it and a verify step cannot roll it back.
     recurrent_conv_state: bool = False
