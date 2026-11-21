@@ -11,6 +11,7 @@ Pure functions. The engine supplies the constraints and hands the result to ``Of
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,6 +79,43 @@ def split_slots(total: int, pools: list[PoolSpec], counts: torch.Tensor | None =
         return [total]
     _check_budget(total, pools)
     return _split_equal(total, pools) if counts is None else _split_hot(total, pools, counts)
+
+
+def pool_row_bytes(sources: dict, row_tail_bytes: dict | None, pools: list[PoolSpec]) -> tuple[list[list[int]], list[list[int]]]:
+    """Bytes of one slot of each pool in each bank of ``sources``, and the zeroed pad after its rows, as ``OffloadMoeCache`` lays them out."""
+    from freetoken.moe.legacy_format import canonical_role
+
+    tails = {canonical_role(name): per_layer for name, per_layer in (row_tail_bytes or {}).items()}
+    rows, pads = [], []
+    for pool in pools:
+        first = pool.layers[0]
+        rows.append([math.prod(per_layer[first].shape[1:]) * per_layer[first].element_size() for per_layer in sources.values()])
+        pads.append([
+            max(-(-tails[role][layer] // 16) * 16 for layer in pool.layers) if (role := canonical_role(name)) in tails else 0
+            for name in sources
+        ])
+    return rows, pads
+
+
+def staging_slots(row_bytes: list[list[int]], pad_bytes: list[list[int]], num_experts: int, buffers: int = 2) -> list[int]:
+    """Slots per pool for a cache that only backs the prefill staging (``--moe-strategy cpu``).
+
+    ``row_bytes[p][k]`` / ``pad_bytes[p][k]`` are one slot of pool p and its pad in bank k. A staging buffer of bank k is
+    ``num_experts`` rows of the widest layout plus the largest pad and sits at the start of the bank's bytes, whichever
+    pools they belong to, so each bank must hold ``buffers`` of them; the pool with the widest rows of a short bank grows.
+    """
+    sizes = [1] * len(row_bytes)
+    # banks that fewer pools fill go first: the slots they force count toward the shared banks
+    for k in sorted(range(len(row_bytes[0])), key=lambda k: sum(1 for rows in row_bytes if rows[k])):
+        widest = max(range(len(row_bytes)), key=lambda p: row_bytes[p][k])
+        if row_bytes[widest][k] == 0:
+            continue
+        max_pad = max(pads[k] for pads in pad_bytes)
+        need = buffers * (num_experts * row_bytes[widest][k] + max_pad)
+        have = sum(s * rows[k] + pads[k] for s, rows, pads in zip(sizes, row_bytes, pad_bytes)) + max_pad
+        if have < need:
+            sizes[widest] += -(-(need - have) // row_bytes[widest][k])
+    return sizes
 
 
 def _check_budget(total: int, pools: list[PoolSpec]) -> None:

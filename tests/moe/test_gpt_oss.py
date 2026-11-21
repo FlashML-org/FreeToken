@@ -260,7 +260,7 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
     E, H, tk = c.num_experts, c.hidden_size, c.num_experts_per_tok
 
     cache = _make_offload_cache(c, dev, prefill_overlap=True)
-    # layer_id=0 is mandatory: _wait_prefill_overlap gates begin_prefill() on layer_id==0,
+    # layer_id=0 is mandatory: the prefill's first MoE call (layer 0) runs begin_prefill(),
     # so only layer 0 exercises the previously-crashing code path.
     layer = _offload_layer(c, 0, cache)
 

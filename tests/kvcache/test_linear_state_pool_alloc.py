@@ -177,10 +177,15 @@ def test_slot_state_in_the_byte_account():
     config.slot_states = ()
     assert state_pool_bytes(config, num_slots=4) == gdn_only * 4
 
+    # a model without GDN layers (Inkling 2's convolution windows) gets a pool of its slot states alone
     config.slot_states = _SPECS
     mc.linear_attention_group = lambda: None
-    with pytest.raises(ValueError, match="slot_states"):
-        state_pool_bytes(config, num_slots=4)
+    assert state_pool_bytes(config, num_slots=4) == (with_state - gdn_only) * 4
+    pool = LinearStatePool(None, 4, torch.bfloat16, torch.device("cpu"), tp_size=1, slot_states=_SPECS)
+    assert pool.bytes_per_slot() == with_state - gdn_only
+    pool.slot_states["ple_conv"].fill_(1.0)
+    pool.clear_slots([2])
+    assert pool.slot_state("ple_conv", 1)[2].abs().sum().item() == 0.0
 
 
 def test_slot_state_bytes_for_the_real_geometry():

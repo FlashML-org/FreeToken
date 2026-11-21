@@ -464,7 +464,7 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
             or bool(ctk.get("enable_thinking"))
             or bool(ctk.get("thinking"))
         )
-    elif parser_name in ("flint", "ricursive"):
+    elif parser_name in ("flint", "ricursive", "inkling2"):
         # These families open their own optional think block, including when tools are present.
         force_reasoning = False
     elif parser_name == "minimax_m3":

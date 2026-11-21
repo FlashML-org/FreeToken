@@ -109,10 +109,14 @@ class MMProcessor(ABC):
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         """The smallest encodable item of each modality the family serves, for warming the encoders."""
 
-    def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
-        """Swap each image placeholder for its replacement sequence and precompute rope positions."""
+    def decode_image(self, raw: bytes) -> Any:
+        """One request image as the PIL image process() takes; families that composite alpha themselves keep the mode."""
         from PIL import Image
 
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+
+    def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
+        """Swap each image placeholder for its replacement sequence and precompute rope positions."""
         ids = input_ids.tolist()
         target = self.placeholder
         slots = _find_all(ids, target)
@@ -122,7 +126,7 @@ class MMProcessor(ABC):
                 f"carries {len(images)} images"
             )
 
-        pils = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
+        pils = [self.decode_image(raw) for raw in images]
         items = self.process(pils)
         out: list[int] = []
         cursor = 0
