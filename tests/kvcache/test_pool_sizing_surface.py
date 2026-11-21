@@ -219,7 +219,7 @@ def test_create_kv_pool_builds_the_right_family():
 
     mc = SimpleNamespace(
         has_swa_attention=False, has_linear_attention=False, dsv4_args=None,
-        num_layers=2, num_kv_heads=1, head_dim=8,
+        num_layers=2, kv_layer_count=2, num_kv_heads=1, head_dim=8,
     )
     mc.kv_cache_group_specs = lambda: (_spec("full", AttnType.FULL),)
     config = SimpleNamespace(
@@ -236,7 +236,7 @@ def test_create_kv_pool_builds_the_right_family():
         dataclasses.replace(_spec("swa", AttnType.SWA, sliding_window=4), layer_ids=(1,)),
     )
     mc2 = SimpleNamespace(
-        has_swa_attention=True, has_linear_attention=False, dsv4_args=None, num_layers=2,
+        has_swa_attention=True, has_linear_attention=False, dsv4_args=None, num_layers=2, kv_layer_count=2,
     )
     mc2.kv_cache_group_specs = lambda: swa_specs
     config2 = SimpleNamespace(

@@ -153,7 +153,7 @@ def _factory_config(specs, *, swa: bool = False):
     from types import SimpleNamespace
 
     return SimpleNamespace(
-        kv_cache_group_specs=lambda: specs, num_layers=3, num_kv_heads=2, head_dim=64,
+        kv_cache_group_specs=lambda: specs, num_layers=3, kv_layer_count=3, num_kv_heads=2, head_dim=64,
         has_swa_attention=swa, has_linear_attention=False, model_is_mrope=False,
     )
 
