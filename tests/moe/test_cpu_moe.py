@@ -452,6 +452,62 @@ def test_cpu_decode_dsfp4_matches_gpu(bs):
     assert rel < 4e-2, f"ds_fp4 bs={bs} rel err {rel.item()}"
 
 
+# mxfp4 and ds_fp4 apply the router weight on the output only
+@pytest.mark.parametrize("make_cache, opts, apply_in", [
+    (_make_cache, {}, False), (_make_cache, {}, True), (_make_nvfp4_cache, {}, False), (_make_nvfp4_cache, {}, True),
+    (_make_mxfp4_cache, {}, False), (_make_dsfp4_cache, {"activation": "silu", "act_block": 128}, False),
+], ids=["bf16-w-out", "bf16-w-in", "nvfp4-w-out", "nvfp4-w-in", "mxfp4-w-out", "ds_fp4-w-out"])
+# 7 tokens on 3 threads split pass 2 into token groups of 4 and 3; 70 tokens on one thread share expert 0, so each of
+# its pass 1 items runs 70 routes and one pass 2 item holds every token
+@pytest.mark.parametrize("bs, threads", [(7, 3), (70, 1)], ids=["groups", "one-wide-group"])
+def test_cpu_moe_tokens_sharing_experts_match_each_token_alone(make_cache, opts, apply_in, bs, threads):
+    """Tokens of a batch that pick the same experts, as an MTP verify step's do, get bit for bit what each gets alone.
+
+    Goes red if a work item grouped by expert reads another route's scratch, input or router weight,
+    or a token block of pass 2 writes another token's row.
+    """
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(11)
+    L, E, H, I, top_k = 2, 8, 256, 256, 4
+    opts = dict(opts)
+    act = opts.pop("activation", "gpt_oss_swiglu" if make_cache is _make_mxfp4_cache else "silu")
+    cache = make_cache(L, E, H, I)
+    layer_formats = [(cache.quant_format, opts)] * L if opts else None
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation=act, apply_router_weight_on_input=apply_in, num_threads=threads,
+                        max_tokens=bs, device=torch.device("cuda"), layer_formats=layer_formats)
+    io = ex._io
+    x = torch.randn(bs, H, dtype=torch.bfloat16) * 0.1
+    w = torch.rand(bs, top_k, dtype=torch.float32)
+    if bs == 7:
+        # five experts over seven tokens: each expert serves several tokens, in different route slots; one GPU route (-1)
+        ids = torch.tensor([[0, 1, 2, 3], [1, 0, 3, 2], [4, 2, 0, 1], [3, 4, 1, 0], [2, 3, 4, -1], [0, 4, 3, 1],
+                            [1, 2, 4, 0]], dtype=torch.int32)
+    else:
+        # expert 0 in a different route slot per token, the other slots on distinct experts; some GPU routes (-1)
+        ids = torch.stack([torch.cat([torch.zeros(1, dtype=torch.long), torch.randperm(E - 1)[: top_k - 1] + 1])
+                           .roll(t % top_k) for t in range(bs)]).int()
+        gpu = torch.arange(0, bs, 5)
+        ids[gpu, (gpu + 1) % top_k] = -1
+
+    def run(rows):
+        n = len(rows)
+        io["x"][:n].copy_(x[rows])
+        io["ids"][:n].copy_(ids[rows])
+        io["w"][:n].copy_(w[rows])
+        io["y"].fill_(float("nan"))
+        ex._ext.run(1, n)
+        return io["y"][:n].clone()
+
+    batch = run(list(range(bs)))
+    alone = torch.cat([run([t]) for t in range(bs)])
+    assert torch.equal(batch.view(torch.int16), alone.view(torch.int16))
+    # a token alone has no shared expert, so its step is not grouped; the grouped step after it builds its groups anew
+    assert torch.equal(run(list(range(bs))).view(torch.int16), batch.view(torch.int16))
+    # y starts as NaN, so a row no item wrote is not finite
+    assert batch.isfinite().all() and batch.ne(0).any(dim=1).all()
+
+
 # --------------------------------------------------------------------------------
 # Part 2: CUDA-graph capture/replay (cudaLaunchHostFunc submit/sync host nodes).
 # --------------------------------------------------------------------------------
