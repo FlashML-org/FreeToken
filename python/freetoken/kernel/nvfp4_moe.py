@@ -7,6 +7,7 @@ The kernels are templates (:mod:`freetoken.kernel.triton.nvfp4_fused_moe`, :mod:
 from __future__ import annotations
 
 import functools
+import os
 import re
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Tuple
@@ -45,6 +46,36 @@ _DECODE_MARLIN_DEEPK_BLOCK_N = 8
 _DECODE_MARLIN_DEEPK_BLOCK_KW = 32
 _DECODE_MARLIN_DEEPK_UNROLL = 2
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
+
+
+# A wide verify step (many requests, each with its drafts) pays the GEMV's per-route ALU work on every row, while the
+# prefill tensor-core GEMM decodes each expert tile once per M block. From this row count a decode call on full-layer
+# banks takes the prefill GEMM: FREETOKEN_NVFP4_DECODE_GEMM is that count, 0 (or false/no/off) for never, true/yes/on
+# for the default count. The two paths differ in bits.
+DECODE_GEMM_ENV = "FREETOKEN_NVFP4_DECODE_GEMM"
+_DECODE_GEMM_DEFAULT_ROWS = 32
+
+
+def decode_gemm_rows(value: str | None) -> int:
+    """The rows of a decode step from which it takes the prefill GEMM, as FREETOKEN_NVFP4_DECODE_GEMM gives them; 0 = never."""
+    text = (value or "").strip().lower()
+    if not text:
+        return _DECODE_GEMM_DEFAULT_ROWS
+    if text in ("false", "no", "off"):
+        return 0
+    if text in ("true", "yes", "on"):
+        return _DECODE_GEMM_DEFAULT_ROWS
+    if not text.isdigit():
+        raise ValueError(f"{DECODE_GEMM_ENV}={value!r} is not a row count (0 = never, on = {_DECODE_GEMM_DEFAULT_ROWS})")
+    return int(text)
+
+
+_DECODE_GEMM_ROWS = decode_gemm_rows(os.environ.get(DECODE_GEMM_ENV))
+
+
+def decode_takes_gemm(rows: int) -> bool:
+    """Whether a decode step of ``rows`` rows on full-layer banks runs the prefill GEMM instead of the decode GEMV."""
+    return 0 < _DECODE_GEMM_ROWS <= rows
 
 
 def _tl_dtype(dt: torch.dtype):

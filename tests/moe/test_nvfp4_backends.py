@@ -582,6 +582,137 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
 
 
+def test_decode_gemm_runs_from_a_row_count_on(monkeypatch):
+    """A decode step takes the prefill GEMM from 32 rows (8 requests with 3 drafts) by default; FREETOKEN_NVFP4_DECODE_GEMM
+    names another count, 0 for never, on for the default."""
+    from freetoken.kernel import nvfp4_moe
+
+    takes = nvfp4_moe.decode_takes_gemm
+    assert nvfp4_moe.decode_gemm_rows(None) == nvfp4_moe.decode_gemm_rows(" ") == 32
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 32)
+    assert [rows for rows in (1, 4, 6, 16, 24, 31, 32, 36, 64, 96) if takes(rows)] == [32, 36, 64, 96]
+    for value, rows, gemm in (("0", 0, []), ("off", 0, []), ("on", 32, [64]), ("Yes", 32, [64]), ("1", 1, [1, 4, 31, 64]), ("48", 48, [64])):
+        assert nvfp4_moe.decode_gemm_rows(value) == rows
+        monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", rows)
+        assert [n for n in (1, 4, 31, 64) if takes(n)] == gemm
+    with pytest.raises(ValueError, match="FREETOKEN_NVFP4_DECODE_GEMM"):
+        nvfp4_moe.decode_gemm_rows("wide")
+
+
+def _align_on_cpu(topk_ids: torch.Tensor, block_m: int, num_experts: int):
+    """moe_align_block_size's buffers, sized as it sizes them; the M blocks past the padded routes hold garbage."""
+    flat = topk_ids.reshape(-1).long()
+    numel = flat.numel()
+    padded = numel * block_m if numel < num_experts + 1 else numel + (num_experts + 1) * (block_m - 1)
+    sorted_ids = torch.full((padded,), numel, dtype=torch.int32)
+    expert_ids = torch.tensor([-(2**31), 2**31 - 1], dtype=torch.int32).repeat(padded)[: math.ceil(padded / block_m)].clone()
+    start = 0
+    for expert in flat.unique().tolist():
+        routes = (flat == expert).nonzero().flatten()
+        blocks = math.ceil(routes.numel() / block_m)
+        sorted_ids[start : start + routes.numel()] = routes
+        expert_ids[start // block_m : start // block_m + blocks] = expert
+        start += blocks * block_m
+    return sorted_ids, expert_ids, torch.tensor([start], dtype=torch.int32)
+
+
+@pytest.mark.parametrize("view_kind", ["resident", "slots"])
+@pytest.mark.parametrize("rows", [1, 31, 32, 64, 96])
+def test_triton_wide_decode_on_resident_banks_takes_the_prefill_gemm(monkeypatch, rows, view_kind):
+    """From the switch's row count a decode call on resident full-layer banks runs the prefill GEMM over the layer's
+    experts. A slot cache view (the offload and hybrid decodes) stays on the GEMV, and so does a narrower step."""
+    from types import SimpleNamespace
+
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.layers.quantization import ExpertView
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+    from freetoken.moe import fused_nvfp4
+
+    ran, aligned_over = [], []
+
+    def align(ids, block, num_experts):
+        aligned_over.append(num_experts)
+        return _align_on_cpu(ids, block, num_experts)
+
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 32)
+    monkeypatch.setattr(nvfp4_moe, "prefill_config", lambda *args: {"BLOCK_SIZE_M": 16})
+    monkeypatch.setattr(nvfp4_moe, "prefill_gemm", lambda *args: ran.append("gemm"))
+    monkeypatch.setattr(nvfp4_moe, "decode_gemm_marlin", lambda *args, **kwargs: ran.append("gemv"))
+    monkeypatch.setattr(fused_nvfp4, "moe_align_block_size", align)
+    monkeypatch.setattr(fused_nvfp4, "gated_act_and_mul", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fused_nvfp4, "moe_sum_reduce_triton", lambda *args: ran.append("sum"))
+    ids = torch.randint(0, E, (rows, TOPK), dtype=torch.int32)
+    banks = {role: torch.zeros(E, 2 * I, H // 2) for role in ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")}
+    view = ExpertView(banks, n=E) if view_kind == "resident" else ExpertView(banks, slots=ids)
+    out = TritonNvfp4MoEKernel().apply(
+        SimpleNamespace(activation="silu", alpha=1.702, limit=7.0, apply_router_weight_on_input=False),
+        torch.zeros(rows, H, dtype=torch.bfloat16), torch.ones(rows, TOPK), ids, view, is_prefill=False,
+    )
+
+    kernel = "gemm" if view_kind == "resident" and rows >= 32 else "gemv"
+    assert ran == [kernel, kernel, "sum"]
+    assert aligned_over == ([E] if kernel == "gemm" else [])
+    assert out.shape == (rows, H)
+
+
+@cuda
+@pytest.mark.parametrize("rows", [32, 96])
+def test_triton_wide_decode_gemm_replays_in_a_cuda_graph_as_it_runs_eager(monkeypatch, rows):
+    """A wide decode step on resident banks runs the prefill GEMM inside the decode CUDA graph: captured at the step's
+    rows (8 requests with 3 drafts, 16 with 5) at the 35B-A3B shapes, a replay over new activations, routes and weights
+    gives the eager call's bits, and its output is the decode GEMV's up to the order of the sums."""
+    from types import SimpleNamespace
+
+    from freetoken.kernel import nvfp4_moe
+    from freetoken.layers.quantization import ExpertView
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+
+    device = torch.device("cuda")
+    experts, top_k, hidden_size, inter = 256, 8, 2048, 512
+    g = torch.Generator().manual_seed(rows)
+
+    def bank(n, k):
+        packed = torch.randint(0, 256, (experts, n, k // 2), dtype=torch.uint8, generator=g)
+        scale = (torch.rand(experts, n, k // 16, generator=g) * 1.5 + 0.25).to(torch.float8_e4m3fn)
+        return packed.to(device), scale.to(device), (torch.rand(experts, n, generator=g) + 0.5).to(device)
+
+    def inputs():
+        x = (torch.randn(rows, hidden_size, generator=g) / 4).to(device, torch.bfloat16)
+        weights = torch.rand(rows, top_k, generator=g).to(device)
+        ids = torch.stack([torch.randperm(experts, generator=g)[:top_k] for _ in range(rows)])
+        return x, weights, ids.to(device, torch.int32).contiguous()
+
+    roles = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+    view = ExpertView(dict(zip(roles, (*bank(2 * inter, hidden_size), *bank(hidden_size, inter)))), n=experts)
+    layer = SimpleNamespace(activation="silu", alpha=1.702, limit=7.0, apply_router_weight_on_input=False)
+    kernel = TritonNvfp4MoEKernel()
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 32)
+    static = inputs()
+
+    def step():
+        return kernel.apply(layer, *static, view, is_prefill=False)
+
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    fresh = inputs()
+    for into, value in zip(static, fresh):
+        into.copy_(value)
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = kernel.apply(layer, *fresh, view, is_prefill=False)
+    assert captured.shape == (rows, hidden_size)
+    assert not torch.isnan(captured).any()
+    assert torch.equal(captured.view(torch.int16), eager.view(torch.int16))
+
+    monkeypatch.setattr(nvfp4_moe, "_DECODE_GEMM_ROWS", 0)
+    gemv = kernel.apply(layer, *fresh, view, is_prefill=False).float()
+    assert ((captured.float() - gemv).norm() / gemv.norm()).item() < 2e-2
+
+
 @cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache
