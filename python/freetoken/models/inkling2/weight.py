@@ -84,7 +84,7 @@ def iter_weights(
         for name in tqdm(names, desc="Loading weights", disable=not get_tp_info().is_primary()):
             if name.startswith("model.visual."):
                 if include_vision:
-                    yield "visual." + name[len("model.visual."):], get(name)
+                    yield from _vision_tensor(name, get)
                 continue
             m = _LAYER.fullmatch(name)
             if m is not None:
@@ -182,13 +182,51 @@ def _layer_tensor(layer: int, leaf: str, name: str, get, args: Inkling2Args) -> 
         raise ValueError(f"unexpected inkling2 tensor {name}")
 
 
+_VISION_LAYER = re.compile(r"model\.visual\.backbone\.layers\.(\d+)\.(.+)")
+_VISION_LAYER_LEAVES = {
+    "ln_1": "layernorm_before", "ln_2": "layernorm_after", "mlp.c_fc": "fc1", "mlp.c_proj": "fc2", "self_attn.out_proj": "out_proj",
+}
+_VISION_TOP = {
+    "model.visual.backbone.embeddings.patch_embedding.weight": "visual.patch_embedding.weight",
+    "model.visual.backbone.embeddings.position_embedding": "visual.position_embedding",
+    "model.visual.backbone.embeddings.class_embedding": "visual.class_embedding",
+    "model.visual.backbone.embeddings.cls_position_embedding": "visual.cls_position_embedding",
+    "model.visual.backbone.ln_pre.weight": "visual.pre_layernorm.weight",
+    "model.visual.backbone.ln_pre.bias": "visual.pre_layernorm.bias",
+    "model.visual.proj_in.weight": "visual.merger_in.weight",
+    "model.visual.proj_out.weight": "visual.merger_out.weight",
+}
+
+
+def _vision_tensor(name: str, get) -> Iterator[tuple[str, torch.Tensor]]:
+    if name in _VISION_TOP:
+        yield _VISION_TOP[name], get(name)
+        return
+    m = _VISION_LAYER.fullmatch(name)
+    if m is None:
+        raise ValueError(f"unexpected inkling2 vision tensor {name}")
+    p, leaf = f"visual.layers.{m.group(1)}.", m.group(2)
+    stem, _, kind = leaf.rpartition(".")
+    if stem == "self_attn.q_proj":
+        base = name[: -len(leaf)]
+        yield p + f"qkv.{kind}", torch.cat([get(base + f"self_attn.{x}_proj.{kind}") for x in "qkv"])
+    elif stem in ("self_attn.k_proj", "self_attn.v_proj"):
+        return  # fused with q
+    elif leaf in ("ls_1.gamma", "ls_2.gamma"):
+        yield p + f"lambda_{leaf[3]}", get(name)
+    elif stem in _VISION_LAYER_LEAVES:
+        yield p + f"{_VISION_LAYER_LEAVES[stem]}.{kind}", get(name)
+    else:
+        raise ValueError(f"unexpected inkling2 vision tensor {name}")
+
+
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     reader = ShardReader(model_path, device)
     try:
         for f in reader.files():
             for name in reader.names_in(f):
                 if name.startswith("model.visual."):
-                    yield "visual." + name[len("model.visual."):], reader.get_tensor(name)
+                    yield from _vision_tensor(name, reader.get_tensor)
     finally:
         reader.close()
 

@@ -15,9 +15,11 @@ from freetoken.utils import nvtx_annotate
 
 from .attention import Inkling2Attention
 from .state import ConvState
+from .vision import Inkling2VisionModel
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+    from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
     from .config import Inkling2Args
@@ -223,7 +225,16 @@ class Inkling2LoopForCausalLM(BaseLLMModel):
 
 
 class Inkling2LoopForConditionalGeneration(Inkling2LoopForCausalLM):
-    pass
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            self.visual = Inkling2VisionModel(config.vision_config)
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.visual.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.visual.forward(item.feature, [item.grid_thw])
 
 
 __all__ = ["Inkling2LoopForCausalLM", "Inkling2LoopForConditionalGeneration"]
