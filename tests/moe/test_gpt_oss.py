@@ -98,6 +98,54 @@ def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=Fals
     return cache
 
 
+@pytest.mark.parametrize("tp_size,rank", [(4, 0), (4, 3), (8, 0), (8, 7)])
+def test_mxfp4_tp_banks_match_padded_shards(tmp_path, monkeypatch, tp_size, rank):
+    from dataclasses import replace
+
+    from safetensors.torch import save_file
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.gpt_oss import weight
+    from freetoken.moe.expert_banks import build_expert_banks
+    from freetoken.moe.expert_pieces import iter_expert_pieces
+
+    # Keep the official intermediate size (90 MXFP4 groups), with fewer experts and hidden channels.
+    config = replace(_tiny_config(), num_layers=1, num_experts=2, moe_intermediate_size=2880)
+    e, h, i = config.num_experts, config.hidden_size, config.moe_intermediate_size
+    gen = torch.Generator().manual_seed(0)
+    raw = {
+        "gate_up_proj_blocks": torch.randint(0, 256, (e, 2 * i, h // 32, 16), dtype=torch.uint8, generator=gen),
+        "gate_up_proj_scales": torch.full((e, 2 * i, h // 32), 127, dtype=torch.uint8),
+        "gate_up_proj_bias": torch.randn(e, 2 * i, dtype=torch.bfloat16, generator=gen),
+        "down_proj_blocks": torch.randint(0, 256, (e, h, i // 32, 16), dtype=torch.uint8, generator=gen),
+        "down_proj_scales": torch.full((e, h, i // 32), 127, dtype=torch.uint8),
+        "down_proj_bias": torch.randn(e, h, dtype=torch.bfloat16, generator=gen),
+    }
+    prefix = "model.layers.0.mlp.experts."
+    save_file({prefix + name: tensor for name, tensor in raw.items()}, tmp_path / "model.safetensors")
+    tp_info = DistributedInfo(rank=rank, size=tp_size)
+    monkeypatch.setattr(weight, "get_tp_info", lambda: tp_info)
+    monkeypatch.setattr("freetoken.layers.moe.get_tp_info", lambda: tp_info)
+    method = _offload_layer(config, 0, None).quant_method
+    pieces = iter_expert_pieces(str(tmp_path), config, QuantKind.MXFP4)
+    banks = build_expert_banks(method, 1, pieces, device=torch.device("cpu"))
+
+    # The existing state-dict loader supplies an independent padding and rank-0 bias reference.
+    for name, tensor in raw.items():
+        projection, kind = name.split("_proj_")
+        role = projection + {"blocks": "", "scales": "_scale", "bias": "_bias"}[kind]
+        expected = weight.shard_gpt_oss_tensor(
+            prefix + name, tensor, rank=rank, world_size=tp_size,
+            num_q_heads=config.num_qo_heads, num_kv_heads=config.num_kv_heads,
+            head_dim=config.head_dim, intermediate_size=i,
+        )
+        actual = banks.sources[role][0]
+        if kind != "bias":
+            actual = actual.transpose(1, 2).reshape(expected.shape)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # ── kernel numerics ────────────────────────────────────────────────────────
 
 
