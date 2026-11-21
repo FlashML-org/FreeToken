@@ -163,9 +163,10 @@ bool mmq_reads_16bit(ggml_type type) {
 }
 
 // x as the kernel reads it: x itself, or an fp32 copy in ``tmp`` for a kernel that reads fp32 only
-// strided: x may have strided rows and channels (its last dim contiguous), which only the copy has to undo
+// strided: x may be a [(G,) M, K] view with strided rows and channels (its last dim contiguous); the fp32 copy is contiguous
 Activation activation(TensorView x, bool f16_ok, ggml_cuda_pool_alloc<float> & tmp, cudaStream_t stream, bool strided = false) {
-    RuntimeCheck(strided ? x.stride(x.ndim() - 1) == 1 : x.IsContiguous(), "ggml activations must be contiguous");
+    RuntimeCheck(strided ? x.stride(x.ndim() - 1) == 1 : x.IsContiguous(),
+                 strided ? "ggml activations must have contiguous rows" : "ggml activations must be contiguous");
     const ggml_type type = float_type(x);
     if (type == GGML_TYPE_F32) {
         return {x.data_ptr(), type, 4};
@@ -173,9 +174,15 @@ Activation activation(TensorView x, bool f16_ok, ggml_cuda_pool_alloc<float> & t
     if (f16_ok) {
         return {x.data_ptr(), type, 2};
     }
-    RuntimeCheck(x.IsContiguous(), "an fp32-only ggml kernel needs a contiguous activation");
     float * f32 = tmp.alloc(x.numel());
-    ggml_get_to_fp32_cuda(type)(x.data_ptr(), f32, x.numel(), stream);
+    if (x.IsContiguous()) {
+        ggml_get_to_fp32_cuda(type)(x.data_ptr(), f32, x.numel(), stream);
+    } else {
+        const int nd = x.ndim();
+        const int64_t k = x.size(nd - 1), m = x.size(nd - 2), g = nd == 3 ? x.size(0) : 1;
+        const int64_t s1 = x.stride(nd - 2), s2 = nd == 3 ? x.stride(0) : s1 * m;
+        ggml_get_to_fp32_nc_cuda(type)(x.data_ptr(), f32, k, m, g, 1, s1, s2, s2 * g, stream);
+    }
     return {f32, GGML_TYPE_F32, 4};
 }
 
@@ -510,6 +517,8 @@ void op_get_rows(TensorView w, int64_t type_id, int64_t k, TensorView ids, Tenso
 
 bool op_uses_mmvq(int64_t type_id, int64_t m) { return ggml_cuda_should_use_mmvq((ggml_type) type_id, device_cc(), m); }
 
+bool op_uses_mmq(int64_t type_id, int64_t m) { return ggml_cuda_should_use_mmq((ggml_type) type_id, device_cc(), m, 0); }
+
 int64_t op_mmvq_max_tokens(int64_t type_id) {
     return std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch((ggml_type) type_id, device_cc()));
 }
@@ -523,5 +532,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(mul_mat_id_glu, op_mul_mat_id_glu);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_weighted_sum, op_moe_weighted_sum);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dequantize, op_dequantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_rows, op_get_rows);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(uses_mmq, op_uses_mmq);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(uses_mmvq, op_uses_mmvq);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mmvq_max_tokens, op_mmvq_max_tokens);

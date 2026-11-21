@@ -31,7 +31,7 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import GEMV_MAX_M, dequant_block_fp8, grouped_w8a16_gemv
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.quantization import QuantKind
-from freetoken.layers.quantization.ggml_types import row_bytes
+from freetoken.layers.quantization.ggml_types import pad_rows, row_bytes
 from freetoken.layers.quantization.scheme import fp8_block_size, gguf_types
 
 from .args import DeepseekV41Args, LayerRole, Mode
@@ -68,7 +68,8 @@ class DSV41Attention(BaseOP):
         # bf16 copy in VRAM. An unquantized checkpoint ships it bf16.
         wo_a_scheme = quant_config.scheme_for(f"{prefix}.wo_a") if quant_config is not None else None
         self._wo_a_block = fp8_block_size(wo_a_scheme) if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.FP8_BLOCK else None
-        # A quantized GGUF wo_a keeps its packed ggml rows the same way: decode runs the groups as one batched ggml mul_mat
+        # A quantized GGUF wo_a keeps its packed ggml rows the same way: up to WO_A_GGML_MAX_TOKENS tokens (decode, short prefills,
+        # chunk tails) the groups run as one batched ggml mul_mat on q8_1 activations, as in llama.cpp
         self._wo_a_ggml = gguf_types(wo_a_scheme)[0] if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.GGUF else None
         rows, cols = args.o_groups * args.o_lora_rank, args.n_heads * args.head_dim // args.o_groups
         if self._wo_a_block is not None:
@@ -123,9 +124,9 @@ class DSV41Attention(BaseOP):
         return self.kv_norm.forward(self.wkv.forward(x))
 
     def _wo(self, o: torch.Tensor) -> torch.Tensor:
-        """``wo_b(wo_a(o))``: for decode-sized ``T`` a quantized ``wo_a`` is read in place (the grouped W8A16 GEMV over the fp8
-        payload, or one ggml ``mul_mat`` over a GGUF's blocks batched over the groups); above that, the reference's grouped
-        einsum over the bf16 (or dequantized) ``wo_a``."""
+        """``wo_b(wo_a(o))``: a quantized ``wo_a`` is read in place for small ``T`` (the grouped W8A16 GEMV over the fp8 payload
+        up to ``GEMV_MAX_M``, or one ggml ``mul_mat`` over a GGUF's blocks batched over the groups up to ``WO_A_GGML_MAX_TOKENS``,
+        q8_1 activations); above that, the reference's grouped einsum over the bf16 (or dequantized) ``wo_a``."""
         t = o.shape[0]
         o = o.reshape(t, self.n_groups, -1)
         if self._wo_a_block is not None and t <= GEMV_MAX_M:
@@ -134,9 +135,10 @@ class DSV41Attention(BaseOP):
         if self._wo_a_ggml is not None:
             from freetoken.kernel import ggml
 
-            if t <= WO_A_GGML_MAX_TOKENS:
+            # where ggml has no kernel for T rows on this GPU (MMQ declines larger T on Volta, CDNA2 and RDNA3), the einsum runs
+            if t <= WO_A_GGML_MAX_TOKENS and (ggml.uses_mmvq(self._wo_a_ggml, t) or ggml.uses_mmq(self._wo_a_ggml, t)):
                 # [T, G, D] read and [T, G, R] written as [G, T, *] views: MMVQ / MMQ go over each group's blocks once for all T rows
-                out = torch.empty(t, self.n_groups, self.o_lora_rank, dtype=o.dtype, device=o.device)
+                out = o.new_empty((t, self.n_groups, self.o_lora_rank))
                 w = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
                 ggml.mul_mat(w, self._wo_a_ggml, o.transpose(0, 1), out=out.transpose(0, 1))
                 return self.wo_b.forward(out.flatten(1))
@@ -161,6 +163,14 @@ class DSV41Attention(BaseOP):
                 "converted by an earlier build stores wo_a dequantized -- reconvert it with `ft checkpoint`"
             )
         super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        pad = pad_rows(self._wo_a_ggml, self.n_heads * self.head_dim // self.n_groups) if self._wo_a_ggml is not None else 0
+        if pad:
+            # MMQ reads up to 512 values past the last packed row, which must read as zeros: keep zero rows after them in the
+            # storage, behind a view of the rows, so the state dict shape and _wo stay as they are
+            rows = self.wo_a.shape[0]
+            padded = self.wo_a.new_zeros(rows + pad, self.wo_a.shape[1])
+            padded[:rows].copy_(self.wo_a)
+            self.wo_a = padded[:rows]
 
     # ----- prefill -----------------------------------------------------------------------------
     def publish_prefill(self, x: torch.Tensor, segments: List[PrefillSegment]) -> None:

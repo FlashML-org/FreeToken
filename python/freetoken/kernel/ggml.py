@@ -95,6 +95,12 @@ def _q8_1_row_bytes(k: int) -> int:
 
 
 @functools.cache
+def uses_mmq(ggml_type: int, m: int) -> bool:
+    """Whether ggml's matrix kernel takes ``m`` rows on this GPU: ``mul_mat`` runs it where ``uses_mmvq`` is false and has no kernel where both are."""
+    return _module().uses_mmq(ggml_type, m)
+
+
+@functools.cache
 def uses_mmvq(ggml_type: int, m: int) -> bool:
     """Whether ``mul_mat`` of ``m`` rows on this GPU runs the vector kernel, the one that reads ``xq``."""
     return _module().uses_mmvq(ggml_type, m)
@@ -172,5 +178,6 @@ __all__ = [
     "mul_mat_id",
     "mul_mat_id_glu",
     "quantize_q8_1",
+    "uses_mmq",
     "uses_mmvq",
 ]

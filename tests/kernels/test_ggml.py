@@ -168,12 +168,18 @@ def test_iq1_m_matrix_and_moe_routes_match_cpu(dtype, batch):
 
 
 @pytest.mark.parametrize("qtype", list(_SCALE_FIELDS))
-def test_batched_matrix_matches_cpu(qtype):
-    """DeepSeek-V4.1's wo_a as one batched mul_mat: 8 groups of [1024, 4096], x and out as the transposed [T, G, *] views the
-    layer passes, over MMVQ and MMQ sizes. A bf16 / fp16 out from MMQ's stream-k fixup goes through the per-channel fp32 copy."""
-    g, n, k = 8, 1024, 4096
+@pytest.mark.parametrize("k", [4096, 768])
+def test_batched_matrix_matches_cpu(qtype, k):
+    """DeepSeek-V4.1's wo_a as one batched mul_mat: 8 groups of [1024, K], x and out as the transposed [T, G, *] views the
+    layer passes, over MMVQ and MMQ sizes (up to the layer's 192, two MMQ column tiles from 129). A bf16 / fp16 out from MMQ's
+    stream-k fixup goes through the per-channel fp32 copy. K=768 leaves MMQ reading past the last row into zero rows."""
+    g, n = 8, 1024
     w, ref = _random_blocks(qtype, (g, n, k))
-    for t in [*range(1, 17), 31, 64, 65, 128]:
+    if pad := pad_rows(int(qtype), k):
+        storage = torch.zeros(g * n + pad, w.shape[-1], dtype=torch.uint8, device="cuda")
+        storage[: g * n].copy_(w.view(g * n, -1))
+        w = storage[: g * n].view(g, n, -1)
+    for t in [*range(1, 17), 31, 64, 65, 128, 160, 192]:
         x = _activation((t, g, k), torch.float32, seed=t, zero_sums=False)
         expected = torch.einsum("tgk, gnk -> tgn", x.cpu(), ref)
         tol = dict(atol=1e-3 * expected.abs().max().item(), rtol=2**-7)
