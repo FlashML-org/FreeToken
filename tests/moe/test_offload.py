@@ -1229,11 +1229,9 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
 
 def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch):
     """The RAM probe must size the shards the reader will actually open, indexed subdirectory layouts included."""
-    import builtins
-    import io
     import json
 
-    from freetoken.moe.expert_banks import _host_ram_fits_parallel
+    import freetoken.moe.expert_banks as expert_banks
 
     sub = tmp_path / "tensors"
     sub.mkdir()
@@ -1249,12 +1247,6 @@ def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch)
             }
         )
     )
-    real_open = builtins.open
-
-    def fake_open(file, *args, **kwargs):
-        if str(file) == "/proc/meminfo":
-            return io.StringIO("MemAvailable:           512 kB\n")
-        return real_open(file, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", fake_open)
-    assert not _host_ram_fits_parallel(str(tmp_path))
+    # 512 kB available against 2 MiB of shards; the probe reads memory through the shared resolver
+    monkeypatch.setattr(expert_banks, "effective_memory_available", lambda: 512 * 1024)
+    assert not expert_banks._host_ram_fits_parallel(str(tmp_path))
