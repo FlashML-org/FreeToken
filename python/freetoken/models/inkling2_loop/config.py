@@ -246,6 +246,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
             "the convolution windows of each cache layer are not snapshotted at prefix boundaries, "
             "so a cached prefix cannot be resumed"
         ),
+        # the relative-bias kernel reads bf16 K and V and no row scales
+        kv_formats=frozenset({"none"}),
         inkling2_args=args,
     )
 

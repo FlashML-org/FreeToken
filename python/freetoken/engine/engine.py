@@ -243,6 +243,12 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
 
 def _validate_kv_format(config, model_config) -> None:
     kv_format = getattr(config, "kv_format", NONE)
+    own = getattr(model_config, "kv_formats", None)
+    if own is not None and kv_format.name not in own:
+        raise ValueError(
+            f"--kv-cache-dtype {kv_format.name}: {getattr(model_config, 'model_type', 'this model')} attends with its own "
+            f"kernel, which reads only {sorted(own)} KV"
+        )
     if not kv_format.quantized:
         return
     pool_cls = resolve_pool_class(model_config)

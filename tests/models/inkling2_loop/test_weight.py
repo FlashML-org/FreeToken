@@ -75,19 +75,40 @@ def test_conv_taps_reverse_conv1d():
     assert torch.allclose(out, by_lag, atol=1e-6)
 
 
-def test_cache_layers_follow_reference_offsets():
-    from freetoken.models.inkling2_loop.config import parse_args
-
-    text = SimpleNamespace(
+def _text_config():
+    """The checkpoint's text_config fields (config.json at 6e7c8248) the parser reads."""
+    return SimpleNamespace(
         num_hidden_layers=24, local_layer_ids=[i for i in range(24) if (i + 1) % 6], hidden_size=2304,
         loop_config={"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64, "is_varloop": False},
         num_attention_heads=24, num_key_value_heads=8, head_dim=128, swa_num_attention_heads=24,
         swa_num_key_value_heads=8, swa_head_dim=128, sliding_window_size=1024, d_rel=16, rel_extent=1024,
         log_scaling_n_floor=8192, log_scaling_alpha=0.1, qk_l2_clip_threshold=22.6, rel_l2_clip_threshold=8.0,
         sconv_kernel_size=4, mlp_gate_softcap=4.0, mlp_up_softcap=25.0, route_scale=8.0, unpadded_vocab_size=200058,
-        n_layers_per_attn_res_block=6,
+        n_layers_per_attn_res_block=6, vocab_size=201024, model_max_length=1048576, rms_norm_eps=1e-6,
+        intermediate_size=1152, n_routed_experts=128, num_experts_per_tok=8, final_logit_softcapping=30.0,
     )
-    args = parse_args(text)
+
+
+def test_quantized_kv_is_refused_at_config_time():
+    import pytest
+
+    from freetoken.engine.engine import _validate_kv_format
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, NONE
+    from freetoken.models.inkling2_loop.config import parse_config
+
+    model_config = parse_config(SimpleNamespace(architectures=["Inkling2LoopForConditionalGeneration"], text_config=_text_config()))
+    engine = SimpleNamespace(dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1))
+    # the pool and the triton backend both store these, but the relative-bias kernel reads no row scales
+    for fmt in (FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD):
+        with pytest.raises(ValueError, match="reads only"):
+            _validate_kv_format(SimpleNamespace(kv_format=fmt, **vars(engine)), model_config)
+    _validate_kv_format(SimpleNamespace(kv_format=NONE, **vars(engine)), model_config)
+
+
+def test_cache_layers_follow_reference_offsets():
+    from freetoken.models.inkling2_loop.config import parse_args
+
+    args = parse_args(_text_config())
     # the reference's call order: prelude, pass 1 at the layer's own cache layer, passes 2.. at layer + cache_offset, coda
     calls = [(i, i) for i in range(6)] + [(i, i) for i in range(6, 18)]
     for loop_idx in (1, 2):
