@@ -59,7 +59,7 @@ def fused_moe_decode_kernel(
             k_mask = offs_k < K - k_start * BLOCK_SIZE_K
             a = tl.load(a_ptrs, mask=k_mask, other=0.0)
             b = tl.load(b_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        accumulator += tl.sum(a[:, None] * b, axis=0)
+        accumulator += tl.sum(a[:, None] * b.to(a.dtype), axis=0)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 

@@ -110,9 +110,13 @@ def test_fused_experts_decode_matches_reference_for_non_contiguous_slots(batch_s
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype,weight_dtype", [
+    (torch.float16, torch.float16),
+    (torch.bfloat16, torch.bfloat16),
+    (torch.float16, torch.bfloat16),
+])
 @pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
-def test_fused_experts_decode_matches_grouped_impl(dtype, apply_router_weight_on_input):
+def test_fused_experts_decode_matches_grouped_impl(dtype, weight_dtype, apply_router_weight_on_input):
     from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
 
     device = torch.device("cuda")
@@ -129,14 +133,14 @@ def test_fused_experts_decode_matches_grouped_impl(dtype, apply_router_weight_on
         intermediate_size * 2,
         hidden_size,
         device=device,
-        dtype=dtype,
+        dtype=weight_dtype,
     ) * 0.25
     down = torch.randn(
         num_experts,
         hidden_size,
         intermediate_size,
         device=device,
-        dtype=dtype,
+        dtype=weight_dtype,
     ) * 0.25
     weights = torch.rand(batch_size, top_k, device=device, dtype=torch.float32)
     topk_weights = weights / weights.sum(dim=-1, keepdim=True)

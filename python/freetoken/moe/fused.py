@@ -227,6 +227,7 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+    assert w1.dtype == w2.dtype and w1.dtype in (hidden_states.dtype, torch.bfloat16)
     # both bias adds assume the router weight scales the expert output
     assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, "per-expert biases need the router weight on the output"
     num_tokens, _ = hidden_states.shape
@@ -345,7 +346,7 @@ def fused_experts_decode_impl(
     assert topk_weights.is_contiguous(), "topk_weights must be contiguous"
     assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
-    assert w1.dtype == hidden_states.dtype and w2.dtype == hidden_states.dtype
+    assert w1.dtype == w2.dtype and w1.dtype in (hidden_states.dtype, torch.bfloat16)
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
     # both bias adds assume the router weight scales the expert output
