@@ -43,9 +43,10 @@ def test_prefill_and_decode(checkpoint):
 def test_gguf_forward_matches_the_checkpoint(tmp_path, wo_a_type):
     """The same bf16 weights through the GGUF reader and the HF reader give the same logits, with non-zero Engram rows and random q / k gate weights so the file's stored product and ``wkv`` count.
 
-    A Q8_0 ``wo_a`` stays packed: decode and a 50-token prefill run its groups as one batched ggml mul_mat (MMVQ, MMQ), the 300-token prefill
-    dequantizes it for the einsum. The HF side reads the values its blocks decode to, so the 300-token prefill matches exactly and the others
-    differ only by the q8_1 rounding of the activation. K=128 here, so MMQ reads past the last packed row: the layer must keep zero rows there."""
+    A Q8_0 ``wo_a`` stays packed: decode runs its groups as one batched ggml mul_mat, every prefill (300 tokens, and 50, under the batched
+    call's 192) dequantizes it for the einsum. The HF side reads the values its blocks decode to, so prefills match exactly and decode differs
+    only by the q8_1 rounding of the activation. K=128 here, so a 16-row decode call runs MMQ past the last packed row into the zero rows the
+    layer keeps there."""
     from safetensors.torch import load_file, save_file
 
     from .common import _pack_q8_0
@@ -75,10 +76,13 @@ def test_gguf_forward_matches_the_checkpoint(tmp_path, wo_a_type):
     for step in range(4):
         hf, ggml = [e.decode([r], [10 + step]).float() for e, r in zip(engines, reqs)]
         assert (hf - ggml).abs().max() <= 2**-7 * hf.abs().max()
-    # every one of the 50 rows carries its own q8_1 rounding into the later layers' KV, so allow 2^-5 there
     short = [e.new_request(1, _tokens(50, 2)) for e in engines]
-    hf, ggml = [e.prefill([r]).float() for e, r in zip(engines, short)]
-    assert torch.isfinite(ggml).all() and (hf - ggml).abs().max() <= 2**-5 * hf.abs().max()
+    assert torch.equal(*[e.prefill([r]) for e, r in zip(engines, short)])
+    if wo_a_type == "Q8_0":
+        o = torch.randn(16, 4 * 64, generator=torch.Generator().manual_seed(3)).to(torch.bfloat16).cuda()
+        for block in engines[1].model.model.layers.op_list:
+            got, want = block.attn._wo(o, decode=True).float(), block.attn._wo(o).float()
+            assert (got - want).abs().max() <= 2**-5 * want.abs().max()
 
 
 def test_chunked_prefill_matches_single_shot(checkpoint):
