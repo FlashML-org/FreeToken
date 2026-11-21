@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from freetoken.attention import AttentionSpec
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, LinearOProj, LinearQKVMerged, RMSNorm
@@ -26,6 +27,8 @@ class MistralAttention(BaseOP):
     ):
         head_dim = config.head_dim
         self.layer_id = layer_id
+        swa = config.swa_attention_group()
+        self.attn_spec = AttentionSpec(sliding_window=swa.sliding_window) if swa is not None else None
         tp_size = get_tp_info().size
         self.num_qo_heads = div_even(config.num_qo_heads, tp_size)
         self.num_kv_heads = div_even(config.num_kv_heads, tp_size, allow_replicate=True)
@@ -78,7 +81,7 @@ class MistralAttention(BaseOP):
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch, attn_spec=self.attn_spec)
         return self.o_proj.forward(o.view(-1, self.qo_attn_dim))
 
 

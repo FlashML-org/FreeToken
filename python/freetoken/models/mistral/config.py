@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
-from freetoken.models.config import ModelConfig, RotaryConfig
+from freetoken.models.config import ModelConfig, RotaryConfig, SWAAttentionGroupConfig
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -18,7 +19,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if rope_theta is None:
         rope_theta = 10_000.0
 
-    return ModelConfig(
+    config = ModelConfig(
         num_layers=hf_config.num_hidden_layers,
         num_qo_heads=hf_config.num_attention_heads,
         num_kv_heads=num_kv_heads,
@@ -43,6 +44,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         model_type=getattr(hf_config, "model_type", "mistral"),
         architectures=getattr(hf_config, "architectures", ["MistralForCausalLM"]),
     )
+    window = getattr(hf_config, "sliding_window", None)
+    if window is not None and window > 0:
+        config = replace(config, attention_groups=(SWAAttentionGroupConfig(
+            name="swa", layer_ids=tuple(range(config.num_layers)),
+            num_kv_heads=num_kv_heads, head_dim=head_dim,
+            rotary_config=config.rotary_config, sliding_window=window,
+        ),))
+    return config
 
 
 __all__ = ["parse_config"]
