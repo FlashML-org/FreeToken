@@ -172,3 +172,68 @@ def test_prepare_stop_route_rejects_non_loopback_without_closing_admission():
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "::ffff:127.0.0.1"])
 def test_loopback_recognizes_ipv4_ipv6_and_mapped_ipv4(host):
     assert _is_loopback(host)
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"x": 1 << 64}}),
+        ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"x": -(1 << 63) - 1}}),
+        ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "top_k": 1 << 64}),
+        ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1 << 64}),
+        ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stop": "\ud800"}),
+        ("/v1/completions", {"model": "m", "prompt": "hi", "max_tokens": 1 << 64}),
+        ("/v1/completions", {"model": "m", "prompt": "hi", "top_k": 1 << 64, "stream": True}),
+        ("/v1/messages", {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}], "top_k": 1 << 64}),
+        ("/v1/messages", {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}], "stop_sequences": ["\ud800"]}),
+        ("/v1/responses", {"model": "m", "input": "hi", "top_k": 1 << 64}),
+    ],
+)
+def test_unpackable_request_fields_return_400_without_leaking_active_uids(path, body):
+    import msgpack
+    from freetoken.message import BaseTokenizerMsg
+    from freetoken.server.anthropic_api import register_anthropic_routes
+    from freetoken.server.openai_api import register_openai_routes
+    from freetoken.server.responses_api import register_responses_routes
+
+    class _PackingPushQueue:
+        async def put(self, obj) -> None:
+            msgpack.packb(BaseTokenizerMsg.encoder(obj), use_bin_type=True)
+
+    class _IdlePullQueue:
+        async def get(self):
+            await asyncio.Future()
+
+    manager = FrontendManager(
+        config=SimpleNamespace(
+            served_model_name="m",
+            max_output_tokens=128,
+            mm=SimpleNamespace(text_model_only=True, disabled_encoders=frozenset()),
+        ),
+        send_tokenizer=_PackingPushQueue(),
+        recv_tokenizer=_IdlePullQueue(),
+        maintenance_state="serving",
+    )
+    app = FastAPI()
+    register_openai_routes(app, lambda: manager, lambda: {})
+    register_anthropic_routes(app, lambda: manager, lambda: {})
+    register_responses_routes(app, lambda: manager, lambda: {})
+
+    import json
+
+    resp = TestClient(app, raise_server_exceptions=False).post(
+        path,
+        content=json.dumps(body).encode("ascii"),
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "invalid_request_error"
+    assert manager.stats.active == 0
+    assert manager.ack_map == {}
+    assert manager.event_map == {}
+
+    sealed = asyncio.run(
+        prepare_stop_accounting(manager, drain_timeout_s=0.0, abort_timeout_s=0.0)
+    )
+    assert sealed["drain_complete"] is True
+

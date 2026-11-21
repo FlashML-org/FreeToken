@@ -250,6 +250,11 @@ class FrontendManager:
         self.stats.on_new_user(uid)
         return uid
 
+    def drop_user(self, uid: int) -> None:
+        self.ack_map.pop(uid, None)
+        self.event_map.pop(uid, None)
+        self.stats.on_drop_user(uid)
+
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
@@ -921,17 +926,19 @@ async def generate(req: GenerateRequest, request: Request):
         return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
+    from .generation import GenerationError, enqueue_tokenize
+
+    try:
+        uid = await enqueue_tokenize(
+            state,
             text=req.prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
             ),
         )
-    )
+    except GenerationError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
     return StreamingResponse(
         state.stream_with_cancellation(state.stream_generate(uid), request, uid),
