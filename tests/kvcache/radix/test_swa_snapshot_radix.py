@@ -45,10 +45,10 @@ def _live(c: SWASnapshotRadixCache, n: int) -> list[bool]:
 def test_a_prefix_resumes_only_at_a_snapshot_boundary(cache):
     cache.insert(_ids(12), _kv(12))
     cold = cache.match_prefix(_ids(12))
-    assert (cold.cached_len, cold.mamba_value, cold.raw_len) == (0, None, 12)
+    assert (cold.cached_len, cold.mamba_value) == (0, None)
     assert cache.attach_snapshot(_ids(8), 7) is False
     hit = cache.match_prefix(_ids(12))
-    assert (hit.cached_len, hit.mamba_value, hit.raw_len) == (8, 7, 12)
+    assert (hit.cached_len, hit.mamba_value) == (8, 7)
     assert hit.kv_indices.tolist() == list(range(100, 108))
     assert cache.match_prefix(_ids(6)).cached_len == 0
 

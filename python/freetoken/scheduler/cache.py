@@ -113,9 +113,7 @@ class CacheManager:
         if self.is_swa_snapshot:
             from freetoken.kvcache.swa_snapshot_radix_cache import SWASnapshotCacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            return MatchResult(
-                SWASnapshotCacheHandle(m.cached_len, m.node, m.kv_indices),
-                mamba_value=m.mamba_value, raw_len=m.raw_len)
+            return MatchResult(SWASnapshotCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -132,6 +130,14 @@ class CacheManager:
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
                      else self.prefix_cache.size_info.evictable_size)
         return evictable + len(self.free_slots) * self.page_size
+
+    @property
+    def snapshot_track_slots(self) -> int:
+        """State slots a running request holds besides its live one, to freeze snapshots into.
+        GDN tracks every prefill chunk, so under overlap the next chunk's track is written before
+        the last one is committed; swa_snapshot_radix freezes once per prompt (its last chunk) and
+        commits that before a tool-call anchor can be frozen."""
+        return 1 if self.is_swa_snapshot else 2
 
     @property
     def mamba_available_size(self) -> int:
@@ -196,7 +202,7 @@ class CacheManager:
             dst = r.mamba_ping_pong[r.mamba_next_track_idx]
             pool.copy_from(r.linear_slot_idx, dst)
             r.mamba_last_track_seqlen = a
-            r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+            r.mamba_next_track_idx = (r.mamba_next_track_idx + 1) % len(r.mamba_ping_pong)
 
     def maybe_free_swa_out_of_window(self, reqs: List[Req]) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
@@ -529,43 +535,39 @@ class CacheManager:
             self.lock(req.cache_handle)
 
     def plan_snapshots(self, reqs: List[Req]) -> None:
-        """swa_snapshot_radix: choose the state snapshots this prefill forward writes. Only a
-        prompt's last chunk snapshots: one token before its end (the next turn's prompt starts
-        with this one, and a resent prompt must keep a token to prefill) and at the branch point
-        its admission matched (a prefix another request shares), each at least ``track_rows``
-        tokens into the chunk and each into its own ping-pong slot."""
+        """swa_snapshot_radix: choose the state snapshot this prefill forward writes. Only a
+        prompt's last chunk snapshots, one token before the prompt's end (the next turn's prompt
+        starts with this one, and a resent prompt must keep a token to prefill), at least
+        ``track_rows`` tokens into the chunk. ``mamba_last_track_seqlen`` marks it pending until
+        the commit donates it, as for the tool-call anchor."""
         if not self.is_swa_snapshot:
             return
         rows = self.linear_state_pool.track_rows
         for req in reqs:
             req.snapshot_tracks = []
-            if req.mamba_ping_pong is None or req.device_len != req.prompt_len:
+            pp = req.mamba_ping_pong
+            boundary = req.device_len - 1
+            if pp is None or req.device_len != req.prompt_len or boundary - req.cached_len < rows:
                 continue
-            start, end = req.cached_len, req.device_len
-            for boundary in dict.fromkeys(b for b in (req.snapshot_branch_len, end - 1) if start + rows <= b < end):
-                req.snapshot_tracks.append((boundary, req.mamba_ping_pong[req.mamba_next_track_idx]))
-                req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
-            req.pending_snapshots = list(req.snapshot_tracks)
+            req.snapshot_tracks = [(boundary, pp[req.mamba_next_track_idx])]
+            req.mamba_last_track_seqlen = boundary
+            req.mamba_next_track_idx = (req.mamba_next_track_idx + 1) % len(pp)
 
-    def _donate_snapshots(self, req: Req, insert_len: int) -> set:
-        """Hand the request's written snapshots (planned prefill tracks, the tool-call anchor) to the
-        tree; the ones it does not take go back to the pool. Returns the slots consumed either way."""
-        pool = self.linear_state_pool
-        items = list(req.pending_snapshots)
-        if req.mamba_last_track_seqlen is not None and req.mamba_ping_pong is not None:
-            items.append((req.mamba_last_track_seqlen, req.mamba_ping_pong[1 - req.mamba_next_track_idx]))
-        consumed = set()
-        for boundary, slot in items:
-            if boundary > insert_len or self.prefix_cache.attach_snapshot(req.input_ids[:boundary], slot):
-                pool.free([slot])
-            consumed.add(slot)
-        req.pending_snapshots = []
+    def _donate_snapshot(self, req: Req, insert_len: int) -> int | None:
+        """Hand the request's pending snapshot (its prompt's, or the tool-call anchor's) to the tree,
+        or back to the pool if the tree does not take it. Returns the slot consumed, if any."""
+        boundary, pp = req.mamba_last_track_seqlen, req.mamba_ping_pong
         req.mamba_last_track_seqlen = None
-        return consumed
+        if boundary is None or pp is None:
+            return None
+        slot = pp[(req.mamba_next_track_idx - 1) % len(pp)]
+        if boundary > insert_len or self.prefix_cache.attach_snapshot(req.input_ids[:boundary], slot):
+            self.linear_state_pool.free([slot])
+        return slot
 
     def _cache_req_swa_snapshot(self, req: Req, *, finished: bool) -> None:
         """swa_snapshot_radix cache_req: commit the full and window KV as swa_radix does, donate the
-        state snapshots the request's forwards wrote and, at finish, its live state (zero-copy),
+        state snapshot the request's forwards froze and, at finish, its live state (zero-copy),
         then tombstone the window KV on the path that no snapshot reads."""
         from freetoken.kvcache.swa_snapshot_radix_cache import SWASnapshotCacheHandle
 
@@ -574,13 +576,16 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         insert_len = align_down(req.cached_len, self.page_size)
         if not finished and pc.has_locked_tombstone(req.input_ids[:insert_len], old_handle.cached_len):
-            return  # as swa_radix (#204); the pending snapshots wait for the finish commit
+            # as swa_radix (#204): keep the pages, commit at finish. The prompt snapshot is dropped
+            # so its slot is free for a tool-call anchor in the meantime.
+            req.mamba_last_track_seqlen = None
+            return
         freed = page_indices[:0]
         if insert_len > 0:
             _, freed = pc.insert(
                 req.input_ids[:insert_len], page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen, update_kv_after_len=old_handle.cached_len)
-        consumed = self._donate_snapshots(req, insert_len)
+        consumed = self._donate_snapshot(req, insert_len)
         keep_live = False
         if finished and req.linear_slot_idx is not None and 0 < insert_len == req.cached_len:
             keep_live = not pc.attach_snapshot(req.input_ids[:insert_len], req.linear_slot_idx)
@@ -593,7 +598,7 @@ class CacheManager:
             self._free_swa(tail)
             self._free(tail)
             if req.mamba_ping_pong is not None:
-                req.mamba_ping_pong = tuple(s for s in req.mamba_ping_pong if s not in consumed)
+                req.mamba_ping_pong = tuple(s for s in req.mamba_ping_pong if s != consumed)
             self._free_req_slots(req, keep_live=keep_live)
             return
         # Lock the trailing window alone (as swa_radix) before trimming the rest of the path.
@@ -606,10 +611,10 @@ class CacheManager:
         req.cache_handle = SWASnapshotCacheHandle(int(kv.numel()), node, kv)
         self.lock(req.cache_handle)
         self._free_swa(pc.trim_swa(req.input_ids[:insert_len]))
-        if consumed:
-            self.ensure_mamba_slots(len(consumed))
-            req.mamba_ping_pong = tuple(
-                self.linear_state_pool.alloc(1)[0] if s in consumed else s for s in req.mamba_ping_pong)
+        if consumed is not None:
+            self.ensure_mamba_slots(1)
+            fresh = self.linear_state_pool.alloc(1)[0]
+            req.mamba_ping_pong = tuple(fresh if s == consumed else s for s in req.mamba_ping_pong)
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish

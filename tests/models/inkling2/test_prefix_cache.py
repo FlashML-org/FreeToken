@@ -110,12 +110,11 @@ warm = run(t1)
 report_case("resent", warm, cold(t1, chunk=warm[2]), expect=len(t1) - 1)
 
 llm.cache_manager.flush()
-a, b, c = price_list("What does item 3 cost?"), price_list("Which item is the cheapest?"), price_list("List three items under 10 coins.")
-branch = next(i for i, (x, y) in enumerate(zip(a, b)) if x != y)
+a = price_list("What does item 3 cost?")
 run(a)
-b_hit = run(b)[2]
-warm = run(c)
-report_case("branch", warm, cold(c, chunk=warm[2]), expect=branch, b_hit=b_hit)
+b = a + user("Also, which item is the cheapest?")  # another request that extends the first one's prompt
+warm = run(b)
+report_case("cross_request", warm, cold(b, chunk=warm[2]), expect=len(a) - 1)
 
 llm.cache_manager.flush()
 t1 = turn(price_list("What does item 5 cost? Answer briefly."))
@@ -167,10 +166,8 @@ def test_a_resent_prompt_prefills_only_its_last_token(results):
     _bitwise_hit(results["resent"])
 
 
-def test_a_shared_prefix_is_reused_from_its_second_branch_on(results):
-    row = results["branch"]
-    assert row["b_hit"] == 0, row  # no snapshot on the first prompt's path ends before the branch
-    _bitwise_hit(row)
+def test_a_request_that_extends_another_requests_prompt_reuses_it(results):
+    _bitwise_hit(results["cross_request"])
 
 
 def test_the_next_turn_resumes_at_the_end_of_the_previous_one(results):

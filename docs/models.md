@@ -203,11 +203,12 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   A prompt resumes from the cache at a point where the cache holds the full-attention KV before it
   (32 KiB per token), the window KV of the 1024 tokens before it (160 KiB per token) and a snapshot
   of the convolution state (1.83 MiB). Those points are one token before each prompt's end, the
-  point where a prompt branches off a cached one (snapshotted only when it falls in the prompt's
-  last prefill chunk), and the end of each finished request; window KV that no snapshot reads is
-  dropped at once. The window pool holds about 2.2K tokens per running request, one window per
-  cacheable snapshot (2 per running request, at least 4) and one prefill chunk: at 8 requests,
-  42K tokens (6.5 GiB) next to 1.86M tokens of full-attention KV on a 96 GiB GPU.
+  end of each finished request and, with `--enable-special-token-ckpt`, the tool-call anchor;
+  window KV that no snapshot reads is dropped at once. Each running request holds 2 state slots
+  (its live state and one snapshot being written) and the cache keeps 2 snapshots per running
+  request (at least 4); the window pool holds about 2.2K tokens per running request, one window per
+  cacheable snapshot and one prefill chunk. At 8 requests that is 33 state slots (60 MiB) and 42K
+  window tokens (6.5 GiB), next to 1.86M tokens of full-attention KV on a 96 GiB GPU.
   `--cache-type naive` turns reuse off and reserves
   `(max-running-requests + 1) x (1024 + --max-extend-length)` window tokens instead (83K at 8 requests).
   Speculative decoding is not served (the `mtp.safetensors` draft is not read), and neither is `--tp` > 1.

@@ -40,7 +40,6 @@ class SWASnapshotMatch(NamedTuple):
     cached_len: int              # the deepest resumable boundary (snapshot + live window)
     node: RadixTreeNode          # the node ending there (lock target)
     mamba_value: Optional[int]   # snapshot slot to restore from (None = cold start)
-    raw_len: int                 # the raw token match, before the cut to a resumable boundary
 
 
 class SWASnapshotEvictResult(NamedTuple):
@@ -84,7 +83,7 @@ class SWASnapshotRadixCache(SWARadixCache):
                 break
         self._stamp_path(best_node)
         kv = torch.cat(value[:best_len]) if best_len else self.empty
-        return SWASnapshotMatch(kv, int(kv.numel()), best_node, best_node.mamba_value, pos)
+        return SWASnapshotMatch(kv, int(kv.numel()), best_node, best_node.mamba_value)
 
     def walk_path(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, torch.Tensor]:
         """The node ending exactly at ``len(input_ids)`` (splitting one if needed) and the KV of

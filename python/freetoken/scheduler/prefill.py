@@ -91,13 +91,14 @@ class PrefillAdder:
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return self.cache_manager.unlock(handle)
 
-        # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
-        # snapshots if the pool is short, fail admission if still short (mirrors the KV gate).
+        # Second currency (hybrid GDN / snapshot radix): reserve 1 live + the track state slots;
+        # evict tree snapshots if the pool is short, fail admission if still short (mirrors the KV gate).
         if self.cache_manager.is_hybrid:
             pool = self.cache_manager.linear_state_pool
-            if pool.num_free_slots < 3:
-                self.cache_manager.ensure_mamba_slots(3)
-            if pool.num_free_slots < 3:
+            need = 1 + self.cache_manager.snapshot_track_slots
+            if pool.num_free_slots < need:
+                self.cache_manager.ensure_mamba_slots(need)
+            if pool.num_free_slots < need:
                 return self.cache_manager.unlock(handle)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
@@ -131,9 +132,9 @@ class PrefillAdder:
         if self.cache_manager.is_hybrid:
             pool = self.cache_manager.linear_state_pool
             linear_slot_idx = pool.alloc(1)[0]
-            ping_pong = tuple(pool.alloc(2))
+            ping_pong = tuple(pool.alloc(self.cache_manager.snapshot_track_slots))
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, mr.raw_len
+        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
 
     def _add_one_req(
         self,
@@ -146,7 +147,6 @@ class PrefillAdder:
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
-        branch_len: int = 0,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -233,7 +233,6 @@ class PrefillAdder:
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
-        req.snapshot_branch_len = branch_len
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
 
@@ -252,11 +251,10 @@ class PrefillAdder:
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
-                branch_len=chunked_req.snapshot_branch_len,
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, raw_len = resource
+            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -266,7 +264,6 @@ class PrefillAdder:
                 ping_pong=ping_pong,
                 next_track_idx=0,
                 restore_src=restore_src,
-                branch_len=raw_len,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its
