@@ -410,8 +410,9 @@ def _linear_pool_num_slots(config) -> int:
     mr = config.max_running_req
     if config.cache_type not in SNAPSHOT_CACHE_TYPES:
         return mr + 1  # live + dummy/padding
-    ratio = config.linear_state_cache_ratio
-    n_cache = max(4, int(ratio * mr))
+    n_cache = getattr(config, "snapshot_cache_slots", None)
+    if n_cache is None or config.cache_type != "swa_snapshot_radix":
+        n_cache = max(4, int(config.linear_state_cache_ratio * mr))
     return _slots_per_running_req(config) * mr + n_cache + 1
 
 

@@ -457,7 +457,8 @@ def _swa_pool_floor(config) -> int:
 def _swa_snapshot_num_tokens(config) -> int:
     """swa_snapshot_radix window pool: window KV is reusable only in front of a state snapshot,
     so beyond the running requests' floor it holds one window per cacheable snapshot plus one
-    prefill chunk, independent of the full pool (+1 slot-0 sentinel). An explicit
+    prefill chunk (``snapshot_chunk_headroom``; without it a chunk is capped by the free window
+    slots), independent of the full pool (+1 slot-0 sentinel). An explicit
     swa_num_pages_override pins it instead, as for swa_radix."""
     from freetoken.scheduler.cache import _SWA_RETAIN_GAP
 
@@ -467,7 +468,8 @@ def _swa_snapshot_num_tokens(config) -> int:
     if config.swa_num_pages_override is not None:
         return max(floor, int(config.swa_num_pages_override)) + 1
     window = config.model_config.swa_attention_group().sliding_window
-    return floor + snapshot_cache_slots(config) * (window + _SWA_RETAIN_GAP) + config.max_forward_len + 1
+    chunk = config.max_forward_len if getattr(config, "snapshot_chunk_headroom", True) else 0
+    return floor + snapshot_cache_slots(config) * (window + _SWA_RETAIN_GAP) + chunk + 1
 
 
 def _swa_paged_num_tokens(config, num_full_pages: int, num_swa_pages: int | None = None) -> int:

@@ -29,7 +29,7 @@ from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import align_ceil, div_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
@@ -40,7 +40,7 @@ from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    SNAPSHOT_CACHE_TYPES, _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    SNAPSHOT_CACHE_TYPES, _linear_pool_min_slots, _linear_pool_num_slots, snapshot_cache_slots, state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -564,6 +564,7 @@ class Engine:
         # unlike a query-time mem_get_info it doesn't drift with allocator caching, CUDA
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
+        self._fit_small_gpu(config)
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
@@ -816,7 +817,7 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes, resolve_moe_cache_auto
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
@@ -825,13 +826,16 @@ class Engine:
         cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        per_expert_bytes = expert_bytes_per_slot(banks.sources)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes,
+            # experts of several formats: the cache must still stage one whole layer of the widest
+            min_slots=div_ceil(num_experts * max(layer_slot_bytes(banks.sources)), per_expert_bytes),
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
@@ -1204,6 +1208,60 @@ class Engine:
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
+
+    def _fit_small_gpu(self, config: EngineConfig) -> None:
+        """On a GPU too small for the configured plan, lower it rather than fail its first allocation:
+        the prefill chunk to what the activation headroom holds, then (swa_snapshot_radix) the cached
+        snapshots with their windows, the window pool's prefill-chunk room and the concurrency, until
+        the window pool, the minimum MoE cache and the KV reserve fit the budget. Each change is logged;
+        a plan that fits is left alone."""
+        from freetoken.engine.cache_budget import shrink_window_plan, small_gpu_chunk_cap
+
+        def override(attr: str, value: Any, why: str) -> None:
+            if getattr(config, attr) != value:
+                logger.warning_rank0(f"small GPU: {attr} {getattr(config, attr)} -> {value} ({why})")
+                object.__setattr__(config, attr, value)
+
+        mc = config.model_config
+        if mc.prefill_bytes_per_token:
+            ratio, cap = small_gpu_chunk_cap(config.memory_ratio, self._baseline_free, mc.prefill_bytes_per_token)
+            override("memory_ratio", ratio, "keep at least 1 GiB for activations")
+            override("max_extend_tokens", min(config.max_extend_tokens, cap),
+                     f"a prefill chunk takes {mc.prefill_bytes_per_token // 1024} KiB per token")
+        if config.cache_type != "swa_snapshot_radix":
+            return
+        budget = int(config.memory_ratio * self._baseline_free) - self._weights_bytes
+        experts = 0
+        if is_offload_moe_strategy(config.moe_strategy) and (methods := offload_layer_methods(self.model)):
+            from freetoken.moe.expert_banks import _method_expert_bytes
+
+            experts = max(_method_expert_bytes(m) for m in methods)  # the cache must stage one whole layer
+
+        names = ("snapshot_cache_slots", "snapshot_chunk_headroom", "max_running_req")
+
+        def need(*plan) -> int:
+            saved = [getattr(config, n) for n in names]
+            for n, v in zip(names, plan):
+                object.__setattr__(config, n, v)
+            try:
+                cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
+                return fixed + state_pool_bytes(config) + experts + div_ceil(config.kv_reserve_tokens, page_tokens) * cache_per_page
+            finally:
+                for n, v in zip(names, saved):
+                    object.__setattr__(config, n, v)
+
+        start = (snapshot_cache_slots(config), True, config.max_running_req)
+        plan = shrink_window_plan(need, budget, *start)
+        if plan == start:
+            return
+        object.__setattr__(config, "snapshot_cache_slots", plan[0])
+        object.__setattr__(config, "snapshot_chunk_headroom", plan[1])
+        override("max_running_req", plan[2], "the window pool keeps ~2.2K tokens per running request")
+        logger.warning_rank0(
+            f"small GPU: window pool, state slots, minimum MoE cache and KV reserve take {mem_GB(need(*plan))} of {mem_GB(budget)} "
+            f"(was {mem_GB(need(*start))}): {plan[0]} cached snapshots, prefill chunk room {'kept' if plan[1] else 'dropped'}"
+            + ("" if need(*plan) <= budget else f"; still {mem_GB(need(*plan) - budget)} short, startup will fail")
+        )
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None, pool_sizes: list[int] | None) -> tuple[int, int]:
         cache = self.moe_offload_cache

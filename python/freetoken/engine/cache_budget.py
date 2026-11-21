@@ -61,6 +61,7 @@ def plan_cache_budget(
     prefill_overlap: bool,
     kv_reserve_pages: int,
     max_slots: int,
+    min_slots: int = 0,
 ) -> tuple[int, int, bool]:
     """Split ``budget_bytes`` MoE-first into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -68,7 +69,7 @@ def plan_cache_budget(
     weights + fixed_cache_size; the (1-memory_ratio) remainder is the graph headroom).
     Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
     to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
-    overlap is feasible else ``num_experts``); KV pages take whatever remains.
+    overlap is feasible else ``num_experts``, and at least ``min_slots``); KV pages take whatever remains.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
@@ -77,7 +78,7 @@ def plan_cache_budget(
     # Prefill overlap borrows two full expert-layer buffers, so it needs >= 2*num_experts
     # slots; disable it (and lower the floor) if the cap cannot fit that.
     overlap = prefill_overlap and hi >= 2 * num_experts
-    lo = 2 * num_experts if overlap else num_experts
+    lo = max(2 * num_experts if overlap else num_experts, min(min_slots, hi))
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
     kv_reserve_bytes = kv_reserve_pages * cache_per_page
@@ -102,6 +103,34 @@ def plan_cache_budget(
     return moe_cache_size, num_pages, overlap
 
 
+MIN_ACTIVATION_HEADROOM = 1 << 30
+
+
+def small_gpu_chunk_cap(memory_ratio: float, baseline_free: int, bytes_per_token: int) -> tuple[float, int]:
+    """(memory_ratio, largest prefill chunk) for a model whose prefill takes ``bytes_per_token`` of
+    transient memory. The ``(1 - memory_ratio)`` headroom is raised to at least
+    ``MIN_ACTIVATION_HEADROOM`` (autotune scratch, cuBLAS workspaces, graph pools and encoder blocks
+    need ~0.5 GiB of it besides the chunk), and a chunk gets 35% of it."""
+    headroom = (1.0 - memory_ratio) * baseline_free
+    if headroom < MIN_ACTIVATION_HEADROOM:
+        headroom = MIN_ACTIVATION_HEADROOM
+        memory_ratio = round(1.0 - headroom / baseline_free, 3)
+    return memory_ratio, max(256, int(0.35 * headroom / bytes_per_token) // 256 * 256)
+
+
+def shrink_window_plan(need, budget: int, cache_slots: int, chunk_room: bool, max_running_req: int) -> tuple[int, bool, int]:
+    """Lower ``(cache_slots, chunk_room, max_running_req)`` -- cached snapshots first (halving), then
+    the window pool's prefill-chunk room, then the concurrency -- until ``need(*plan) <= budget``.
+    Returns the plan as is when it fits, and the smallest plan when nothing does."""
+    while cache_slots > 0 and need(cache_slots, chunk_room, max_running_req) > budget:
+        cache_slots //= 2
+    if need(cache_slots, chunk_room, max_running_req) > budget:
+        chunk_room = False
+    while max_running_req > 1 and need(cache_slots, chunk_room, max_running_req) > budget:
+        max_running_req -= 1
+    return cache_slots, chunk_room, max_running_req
+
+
 def resolve_moe_cache_auto(
     *,
     baseline_free: int,
@@ -116,6 +145,7 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    min_slots: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -137,4 +167,5 @@ def resolve_moe_cache_auto(
         prefill_overlap=prefill_overlap,
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
+        min_slots=min_slots,
     )

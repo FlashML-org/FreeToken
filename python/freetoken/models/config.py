@@ -396,6 +396,9 @@ class ModelConfig:
     # The model keeps per-request short-convolution state in its own buffers, keyed by
     # Req.table_idx: the prefix caches cannot restore it and a verify step cannot roll it back.
     recurrent_conv_state: bool = False
+    # Peak transient GPU bytes a prefill forward takes per token (0: not declared). A small GPU
+    # caps the prefill chunk so that peak fits the memory_ratio headroom.
+    prefill_bytes_per_token: int = 0
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

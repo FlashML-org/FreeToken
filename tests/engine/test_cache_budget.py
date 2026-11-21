@@ -92,6 +92,43 @@ def test_prefill_overlap_false_is_honored():
     assert pages == (2000 - 8 * 100) // 10
 
 
+def test_mixed_formats_floor_the_cache_at_one_layer_of_the_widest():
+    # bf16 layers (4x the nvfp4 slot) stage a whole layer through the shared bank bytes, so 128 slots
+    # of the mean size do not hold one: the plan reaches the floor or refuses, instead of handing the
+    # cache a size it rejects after the banks are loaded
+    plan = dict(per_expert_bytes=10, cache_per_page=1, num_experts=128, total_experts=24 * 128,
+                prefill_overlap=False, kv_reserve_pages=1000, max_slots=24 * 128, min_slots=410)
+    assert plan_cache_budget(budget_bytes=6000, **plan)[0] >= 410
+    with pytest.raises(AssertionError, match="cache budget too small"):
+        plan_cache_budget(budget_bytes=5000, **plan)
+    assert plan_cache_budget(budget_bytes=5000, **{**plan, "min_slots": 0})[0] < 410
+
+
+def test_small_gpu_keeps_a_chunk_within_the_activation_headroom():
+    from freetoken.engine.cache_budget import small_gpu_chunk_cap
+
+    GiB = 1 << 30
+    assert small_gpu_chunk_cap(0.9, 94 * GiB, 192 * 1024) == (0.9, 9.4 * 0.35 * GiB // (192 * 1024) // 256 * 256)
+    ratio, chunk = small_gpu_chunk_cap(0.9, 7 * GiB, 192 * 1024)  # an 8 GB card
+    assert (1 - ratio) * 7 * GiB >= GiB * 0.999 and chunk * 192 * 1024 <= 0.35 * GiB
+
+
+def test_small_gpu_lowers_cached_snapshots_then_chunk_room_then_concurrency():
+    from freetoken.engine.cache_budget import shrink_window_plan
+
+    # an Inkling-like window pool: 2195 tokens per running request, a window per cached snapshot,
+    # one 8K chunk, 160 KiB per token, next to a fixed 2 GiB of experts and KV reserve
+    def need(cached, chunk_room, mr):
+        return (mr * 2195 + cached * 1040 + (8192 if chunk_room else 0)) * 160 * 1024 + (2 << 30)
+
+    start = (8, True, 4)
+    assert shrink_window_plan(need, need(*start), *start) == start
+    assert shrink_window_plan(need, need(*start) - 1, *start) == (4, True, 4)
+    assert shrink_window_plan(need, need(0, True, 4) - 1, *start) == (0, False, 4)
+    assert shrink_window_plan(need, need(0, False, 1), *start) == (0, False, 1)
+    assert shrink_window_plan(need, 0, *start) == (0, False, 1)  # nothing fits: the smallest plan
+
+
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     sources = {
         "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)],  # row = 32*8*2 = 512
