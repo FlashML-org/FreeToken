@@ -31,12 +31,17 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import GEMV_MAX_M, dequant_block_fp8, grouped_w8a16_gemv
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.quantization import QuantKind
-from freetoken.layers.quantization.scheme import fp8_block_size
+from freetoken.layers.quantization.ggml_types import pad_rows, row_bytes
+from freetoken.layers.quantization.scheme import fp8_block_size, gguf_types
 
 from .args import DeepseekV41Args, LayerRole, Mode
 from .compressor import Compressor
 from .indexer import Indexer
 from .rope import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
+
+# A decode / verify step of up to this many tokens runs a GGUF wo_a as one batched ggml mul_mat, above it dequantize + bf16
+# einsum: on an RTX PRO 6000 MMQ is ahead for every attn_output_a type of the published GGUFs at 192 tokens, Q2_K behind from 256
+WO_A_GGML_MAX_TOKENS = 192
 
 
 class DSV41Attention(BaseOP):
@@ -63,10 +68,15 @@ class DSV41Attention(BaseOP):
         # bf16 copy in VRAM. An unquantized checkpoint ships it bf16.
         wo_a_scheme = quant_config.scheme_for(f"{prefix}.wo_a") if quant_config is not None else None
         self._wo_a_block = fp8_block_size(wo_a_scheme) if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.FP8_BLOCK else None
+        # A quantized GGUF wo_a keeps its packed ggml rows the same way: a decode / verify step runs the groups as one batched ggml
+        # mul_mat on q8_1 activations, as in llama.cpp; prefill dequantizes them for the einsum, the same values as main's bf16 copy
+        self._wo_a_ggml = gguf_types(wo_a_scheme)[0] if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.GGUF else None
         rows, cols = args.o_groups * args.o_lora_rank, args.n_heads * args.head_dim // args.o_groups
         if self._wo_a_block is not None:
             self.wo_a = torch.empty(rows, cols, dtype=torch.float8_e4m3fn)
             self.wo_a_scale = torch.empty(rows // self._wo_a_block, cols // self._wo_a_block, dtype=torch.float8_e8m0fnu)
+        elif self._wo_a_ggml is not None:
+            self.wo_a = torch.empty(rows, row_bytes(self._wo_a_ggml, cols), dtype=torch.uint8)
         else:
             self.wo_a = torch.empty(rows, cols, dtype=torch.bfloat16)
         self.wo_b = LinearReplicated(args.o_groups * args.o_lora_rank, args.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
@@ -113,14 +123,29 @@ class DSV41Attention(BaseOP):
     def _kv(self, x: torch.Tensor) -> torch.Tensor:
         return self.kv_norm.forward(self.wkv.forward(x))
 
-    def _wo(self, o: torch.Tensor) -> torch.Tensor:
-        """``wo_b(wo_a(o))``: up to ``GEMV_MAX_M`` rows the grouped W8A16 GEMV over the fp8 payload, else the
-        reference's grouped einsum over the bf16 (or dequantized) ``wo_a``."""
+    def _wo(self, o: torch.Tensor, decode: bool = False) -> torch.Tensor:
+        """``wo_b(wo_a(o))``: a quantized ``wo_a`` is read in place for small ``T`` (the grouped W8A16 GEMV over the fp8 payload
+        up to ``GEMV_MAX_M``, or, on a decode / verify step (``decode``), one ggml ``mul_mat`` over a GGUF's blocks batched over
+        the groups up to ``WO_A_GGML_MAX_TOKENS``, q8_1 activations); otherwise the reference's grouped einsum over the bf16 (or
+        dequantized) ``wo_a``, so a GGUF prefill gives main's values bit for bit."""
         t = o.shape[0]
         o = o.reshape(t, self.n_groups, -1)
         if self._wo_a_block is not None and t <= GEMV_MAX_M:
             return self.wo_b.forward(grouped_w8a16_gemv(o, self.wo_a, self.wo_a_scale, block=self._wo_a_block))
-        wo_a = self.wo_a if self._wo_a_block is None else dequant_block_fp8(self.wo_a, self.wo_a_scale, block=self._wo_a_block)
+        wo_a = self.wo_a
+        if self._wo_a_ggml is not None:
+            from freetoken.kernel import ggml
+
+            # where ggml has no kernel for T rows on this GPU (MMQ declines larger T on Volta, CDNA2 and RDNA3), the einsum runs
+            if decode and t <= WO_A_GGML_MAX_TOKENS and (ggml.uses_mmvq(self._wo_a_ggml, t) or ggml.uses_mmq(self._wo_a_ggml, t)):
+                # [T, G, D] read and [T, G, R] written as [G, T, *] views: MMVQ / MMQ go over each group's blocks once for all T rows
+                out = o.new_empty((t, self.n_groups, self.o_lora_rank))
+                w = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
+                ggml.mul_mat(w, self._wo_a_ggml, o.transpose(0, 1), out=out.transpose(0, 1))
+                return self.wo_b.forward(out.flatten(1))
+            wo_a = ggml.dequantize(self.wo_a, self._wo_a_ggml, o.shape[-1])
+        elif self._wo_a_block is not None:
+            wo_a = dequant_block_fp8(self.wo_a, self.wo_a_scale, block=self._wo_a_block)
         return self.wo_b.forward(torch.einsum("tgd,grd->tgr", o, wo_a.view(self.n_groups, self.o_lora_rank, -1)).flatten(1))
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
@@ -139,6 +164,14 @@ class DSV41Attention(BaseOP):
                 "converted by an earlier build stores wo_a dequantized -- reconvert it with `ft checkpoint`"
             )
         super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        pad = pad_rows(self._wo_a_ggml, self.n_heads * self.head_dim // self.n_groups) if self._wo_a_ggml is not None else 0
+        if pad:
+            # MMQ reads up to 512 values past the last packed row, which must read as zeros: keep zero rows after them in the
+            # storage, behind a view of the rows, so the state dict shape and _wo stay as they are
+            rows = self.wo_a.shape[0]
+            padded = self.wo_a.new_zeros(rows + pad, self.wo_a.shape[1])
+            padded[:rows].copy_(self.wo_a)
+            self.wo_a = padded[:rows]
 
     # ----- prefill -----------------------------------------------------------------------------
     def publish_prefill(self, x: torch.Tensor, segments: List[PrefillSegment]) -> None:
@@ -254,7 +287,7 @@ class DSV41Attention(BaseOP):
 
         o = attn.attend(q.view(B, 1, self.n_heads, self.head_dim), self.layer_id, topk, self.window, self.attn_sink, self.softmax_scale, cmp_counts=cmp_counts)
         apply_rotary_emb_decode(o[..., -self.rope_dim :], freqs_t, inverse=True)
-        return self._wo(o.view(B, self.n_heads, self.head_dim))
+        return self._wo(o.view(B, self.n_heads, self.head_dim), decode=True)
 
 
 @dataclass

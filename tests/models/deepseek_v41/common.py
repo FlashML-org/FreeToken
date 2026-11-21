@@ -236,10 +236,10 @@ def _write_gguf(path: str, kvs: list[tuple[str, int, object, int | None]], tenso
 
 
 def write_tiny_gguf(
-    path: str, seed: int = 0, *, table_type: str = "BF16", random_gate: bool = False, kv_over: dict | None = None,
+    path: str, seed: int = 0, *, table_type: str = "BF16", wo_a_type: str = "BF16", random_gate: bool = False, kv_over: dict | None = None,
     extra_tensors: dict[str, torch.Tensor] | None = None, **over,
 ) -> dict[int, torch.Tensor]:
-    """The tiny checkpoint as llama.cpp's converter lays it out (conversion/deepseek41.py), every tensor float except an optional Q8_0 ``table_type`` table;
+    """The tiny checkpoint as llama.cpp's converter lays it out (conversion/deepseek41.py), every tensor float except an optional Q8_0 ``table_type`` table and ``wo_a_type`` ``attn_output_a``;
     ``kv_over`` replaces KVs (a list writes an array, a scalar one value), ``extra_tensors`` adds tensors. Returns each Engram layer's rows as they decode, keyed by layer."""
     import numpy as np
 
@@ -301,6 +301,9 @@ def write_tiny_gguf(
     out: list[tuple[str, tuple[int, ...], int, bytes]] = []
 
     def add(name: str, t: torch.Tensor) -> None:
+        if wo_a_type == "Q8_0" and name.endswith(".attn_output_a.weight"):
+            out.append((name, tuple(t.shape), int(Q.Q8_0), _pack_q8_0(t)[0].numpy().tobytes()))
+            return
         kind = Q.BF16 if t.dtype is torch.bfloat16 else Q.F32
         raw = t.view(torch.uint16) if t.dtype is torch.bfloat16 else t.float()
         out.append((name, tuple(t.shape), int(kind), raw.numpy().tobytes()))
