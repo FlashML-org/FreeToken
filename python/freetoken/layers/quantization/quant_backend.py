@@ -35,6 +35,7 @@ def _table_text(table: Table) -> str:
 @dataclass(frozen=True)
 class QuantBackend:
     items: tuple[tuple[Table, str], ...] = ()
+    allowed: tuple[tuple[Table, tuple[str, ...]], ...] = ()
 
     @classmethod
     def parse(cls, text: str | None) -> "QuantBackend":
@@ -65,6 +66,13 @@ class QuantBackend:
         if broad and broad in _kernel_names(layer_kind, kind):
             return broad
         return "auto"
+
+    def restrict(self, table: Table, kernels: tuple[str, ...]) -> "QuantBackend":
+        kept = tuple((t, ks) for t, ks in self.allowed if t != table)
+        return QuantBackend(self.items, kept + ((table, tuple(kernels)),))
+
+    def allowed_for(self, layer_kind: LayerKind, kind: QuantKind) -> tuple[str, ...] | None:
+        return dict(self.allowed).get((layer_kind, kind))
 
 
 _QUANT_BACKEND = QuantBackend()

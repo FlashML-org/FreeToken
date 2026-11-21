@@ -56,9 +56,13 @@ class QuantMethod(ABC):
     online: ClassVar[bool] = False
 
     def __init__(self, cfg: Any, requested: str = "auto"):
+        from .quant_backend import get_quant_backend
+
         self.cfg = cfg
         self.requested = requested
-        self.kernel = select_kernel(self.candidates, requested, cfg)
+        allowed = get_quant_backend().allowed_for(self.layer_kind, self.kind) if requested == "auto" else None
+        candidates = tuple(c for c in self.candidates if c.name in allowed) if allowed is not None else self.candidates
+        self.kernel = select_kernel(candidates, requested, cfg)
 
     @classmethod
     def refuses(cls, layer: Any) -> str | None:
