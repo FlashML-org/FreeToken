@@ -103,15 +103,29 @@ def decode_gemm_marlin(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     a_row_is_route: bool,
+    shared: Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
-    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4)."""
+    it is reinterpreted as int32 ``[S, N, K//8]`` (contiguous, K%8==0 for NVFP4).
+
+    ``shared`` is (packed, scale, global) of one expert outside the bank, ``[N, K//2]`` uint8, ``[N, K//16]`` e4m3 and
+    ``[N]`` fp32 with a slot's strides: the last route of every row reads it instead of the slot its id names, and is
+    computed as a route to a slot holding the same weights would be."""
     M, top_k = topk_ids.shape
     N = packed.shape[1]
     K = packed.shape[2] * 2
     packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
     scale = e4m3_kernel_view(scale)
+    shared_args = dict(shared_packed_ptr=packed_i32, shared_scale_ptr=scale, shared_global_ptr=glob, SHARED_ROUTE=False)
+    if shared is not None:
+        sp, ss, sg = shared
+        sp_i32, ss = sp.view(torch.int32), e4m3_kernel_view(ss)
+        assert sp_i32.shape == packed_i32.shape[1:] and ss.shape == scale.shape[1:] and sg.shape == glob.shape[1:], "the shared expert is not one slot of the bank"
+        assert sp_i32.stride() == packed_i32.stride()[1:] and ss.stride() == scale.stride()[1:] and sg.stride() == glob.stride()[1:], \
+            "the shared expert does not have a slot's strides"
+        assert sp_i32.dtype == packed_i32.dtype and ss.dtype == scale.dtype and sg.dtype == glob.dtype
+        shared_args = dict(shared_packed_ptr=sp_i32, shared_scale_ptr=ss, shared_global_ptr=sg, SHARED_ROUTE=True)
     total_routes = M * top_k
     deep_k = K >= _DECODE_MARLIN_DEEPK_THRESHOLD
     block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
@@ -141,6 +155,7 @@ def decode_gemm_marlin(
         A_WIDE=a_wide,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_tl_dtype(c.dtype),
+        **shared_args,
         num_warps=_DECODE_MARLIN_WARPS,
     )
 
