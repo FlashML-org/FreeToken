@@ -1,9 +1,10 @@
 """One QuantConfig per checkpoint dialect; importing the package registers them all."""
 
 from .base import NoQuantConfig, QuantConfig, quantization_config_of
-from . import compressed_tensors, fp8, gguf, modelopt, mxfp4
+from . import compressed_tensors, fp8, gguf, inkling2, modelopt, mxfp4
 from .compressed_tensors import CompressedTensorsConfig
 from .fp8 import Fp8BlockConfig
+from .inkling2 import Inkling2QuantConfig
 from .modelopt import ModelOptConfig
 from .mxfp4 import Mxfp4Config
 from .gguf import GGUFConfig
@@ -42,5 +43,5 @@ def get_quant_config() -> QuantConfig | None:
 __all__ = [
     "QuantConfig", "quantization_config_of", "quant_method_for", "without_online", "set_quant_config", "get_quant_config",
     "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config", "GGUFConfig",
-    "compressed_tensors", "fp8", "gguf", "modelopt", "mxfp4",
+    "Inkling2QuantConfig", "compressed_tensors", "fp8", "gguf", "inkling2", "modelopt", "mxfp4",
 ]

@@ -2034,6 +2034,19 @@ def _adjust_config(config: EngineConfig):
     if is_dsv41:
         _adjust_dsv41_config(config, override)
 
+    if getattr(model_config, "recurrent_conv_state", False):
+        if getattr(config, "speculative_algorithm", None) is not None:
+            raise ValueError(
+                f"speculative decoding does not support {model_config.model_type}: its per-request "
+                "convolution state cannot be rolled back after a rejected draft"
+            )
+        if getattr(config, "cache_type", "radix") != "naive":
+            logger.info_rank0(
+                f"{model_config.model_type} keeps per-request convolution state the prefix caches "
+                "cannot restore; serving without prefix reuse (cache_type naive)"
+            )
+            override("cache_type", "naive")
+
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
         if config.page_size != 1:

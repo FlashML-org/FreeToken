@@ -382,6 +382,16 @@ class ModelConfig:
     # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
     # layers. Opaque to model-agnostic engine code; None for every other model.
     gemma4_e_args: Any | None = None
+    # Inkling 2 Mini (inkling2_loop) payload (Inkling2Args): the loop schedule, the attention
+    # residual blocks and the relative-bias / clip / softcap scalars. Opaque to model-agnostic
+    # engine code; None for every other model.
+    inkling2_args: Any | None = None
+    # KV layers the attention groups index, when looped decoder layers attend once per visit
+    # with their own KV (Inkling 2 Mini: 48 over 24 decoder layers); 0 means num_layers.
+    num_kv_layers: int = 0
+    # The model keeps per-request short-convolution state in its own buffers, keyed by
+    # Req.table_idx: the prefix caches cannot restore it and a verify step cannot roll it back.
+    recurrent_conv_state: bool = False
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
@@ -394,6 +404,10 @@ class ModelConfig:
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type or self.moe_enabled
+
+    @property
+    def kv_layer_count(self) -> int:
+        return self.num_kv_layers or self.num_layers
 
     @property
     def num_moe_layers(self) -> int:

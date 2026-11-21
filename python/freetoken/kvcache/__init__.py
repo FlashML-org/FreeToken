@@ -158,7 +158,7 @@ def create_kvcache_pool(
 
         return HybridSWAKVCache(
             groups=model_config.kv_cache_group_specs(),
-            num_layers=model_config.num_layers,
+            num_layers=model_config.kv_layer_count,
             num_full_pages=num_pages,
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
@@ -283,7 +283,7 @@ def create_kvcache_pool(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=model_config.kv_layer_count,
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,

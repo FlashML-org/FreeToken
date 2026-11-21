@@ -36,6 +36,8 @@ class ModelSpec:
     encoders: tuple[EncoderSpec, ...] = ()
     # speculative method -> "module:Class" of the family's draft for it
     spec_drafts: tuple[tuple[str, str], ...] = ()
+    # "module:function" (model_path -> dict) reading the quantization_config when config.json holds only a stub
+    quantization_config: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -549,6 +551,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    # Inkling 2 Mini (model_type inkling2_loop): 24 MoE decoder layers whose middle 12 run three
+    # times (48 visits, each with its own KV and conv state), NoPE attention with a learned
+    # relative bias and per-token sinks over a 5:1 sliding/global mix, attention residuals
+    # across 6-layer blocks; experts NVFP4 (20 layers) and MXFP8 (4 layers), the rest bf16.
+    "Inkling2LoopForConditionalGeneration": ModelSpec(
+        "freetoken.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+        checkpoint_roots=(("model", "model.llm"),),
+        quantization_config="freetoken.models.inkling2:quantization_config",
+    ),
     # llama.cpp glm5-next GGUF (unsloth GLM-5.3-Flash-GGUF): the same model classes
     # with every tensor in its packed ggml type; a glm5v mmproj adds the vision tower
     "Glm5NextGGUFForCausalLM": ModelSpec(
@@ -595,7 +607,8 @@ def checkpoint_quant_config(
         types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
         quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
     else:
-        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+        q = _load_attr(*spec.quantization_config.split(":"))(model_path) if spec.quantization_config else None
+        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules, quantization_config=q)
     return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 
