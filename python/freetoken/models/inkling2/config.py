@@ -18,10 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     ModelConfig,
     RotaryConfig,
+    SlotStateSpec,
     SWAAttentionGroupConfig,
 )
 
@@ -270,7 +272,32 @@ def parse_config(hf_config: Any) -> ModelConfig:
         inkling2_args=args,
         recurrent_conv_state=True,
         revisits_layers=args.num_passes > 1,
+        slot_states=(conv_state_spec(args),),
     )
 
 
-__all__ = ["IMAGE_TOKEN_ID", "Inkling2Args", "VisionConfig", "parse_args", "parse_config", "parse_vision_config"]
+CONV_STATE = "inkling2_conv"
+
+
+def conv_state_widths(args: Inkling2Args) -> dict[str, int]:
+    """Channels of each visit's four short convolutions, side by side in one state row."""
+    kv = args.num_kv_heads * args.head_dim
+    return {"k": kv, "v": kv, "attn": args.hidden_size, "mlp": args.hidden_size}
+
+
+def conv_state_spec(args: Inkling2Args) -> SlotStateSpec:
+    """Each visit's last ``K - 1`` convolution inputs per request (bf16 projections, so bf16 is
+    exact), one pool layer per visit. A sequence without a prefix starts from zeros."""
+    return SlotStateSpec(
+        name=CONV_STATE,
+        shape=(args.conv_kernel - 1, sum(conv_state_widths(args).values())),
+        layer_ids=tuple(range(args.num_visits)),
+        dtype=torch.bfloat16,
+        history=args.conv_kernel - 1,
+    )
+
+
+__all__ = [
+    "CONV_STATE", "IMAGE_TOKEN_ID", "Inkling2Args", "VisionConfig", "conv_state_spec", "conv_state_widths",
+    "parse_args", "parse_config", "parse_vision_config",
+]

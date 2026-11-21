@@ -200,14 +200,21 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   controls use 128-token pages.
 - Inkling 2 Mini runs its middle 12 decoder layers three times per token, so it attends over 48 KV
   layers (40 with a 1024-token window) and keeps a short-convolution state per visit and request.
-  The prefix caches cannot restore that state: it is served without prefix reuse (`--cache-type naive`)
-  and without speculative decoding (the `mtp.safetensors` draft is not read), on one GPU (`--tp 1`).
+  A prompt resumes from the cache at a point where the cache holds the full-attention KV before it
+  (32 KiB per token), the window KV of the 1024 tokens before it (160 KiB per token) and a snapshot
+  of the convolution state (1.83 MiB). Those points are one token before each prompt's end, the
+  point where a prompt branches off a cached one (snapshotted only when it falls in the prompt's
+  last prefill chunk), and the end of each finished request; window KV that no snapshot reads is
+  dropped at once. The window pool holds about 2.2K tokens per running request, one window per
+  cacheable snapshot (2 per running request, at least 4) and one prefill chunk: at 8 requests,
+  42K tokens (6.5 GiB) next to 1.86M tokens of full-attention KV on a 96 GiB GPU.
+  `--cache-type naive` turns reuse off and reserves
+  `(max-running-requests + 1) x (1024 + --max-extend-length)` window tokens instead (83K at 8 requests).
+  Speculative decoding is not served (the `mtp.safetensors` draft is not read), and neither is `--tp` > 1.
   The NVFP4 experts (layers 0-19) run as W4A16; the MXFP8 experts (layers 20-23) are dequantized
   to bf16 at load, about 8 GiB of the ~22 GiB resident footprint. Pass `--moe-strategy fused` when
   the GPU holds that: under `offload` every prefill streams the experts of all 48 visits over PCIe,
-  which puts a floor of about 0.75 s under the first token. The window pool reserves
-  `(max-running-requests + 1) x (1024 + --max-extend-length)` tokens on each of the 40 window layers,
-  so lower `--max-extend-length` to raise concurrency (64 requests fit with `--max-extend-length 1024`).
+  which puts a floor of about 0.75 s under the first token.
   `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,7 +17,6 @@ from .state import ConvState
 from .vision import Inkling2VisionModel
 
 if TYPE_CHECKING:
-    from freetoken.core import Batch
     from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
@@ -110,10 +108,14 @@ class Inkling2DecoderLayer(BaseOP):
     def _conv(self, x, weight, state: ConvState, visit: int, name: str, **kw) -> torch.Tensor:
         batch = get_global_ctx().batch
         md = batch.attn_metadata
-        return short_conv(
-            x, weight, state.view(visit, name), state.batch_slots(batch.padded_size), self._conv_scale,
+        view = state.view(visit, name)
+        out = short_conv(
+            x, weight, view, state.slots(), self._conv_scale,
             decode=not batch.is_prefill, q_to_req=md.q_to_req, cu_q=md.cu_seqlens_q_gpu, prefix_lens=md.prefix_lens, **kw,
         )
+        if batch.is_prefill:
+            state.track(view, x)
+        return out
 
     def _attn_inputs(self, x: torch.Tensor, blocks: torch.Tensor, nb: int, messages: torch.Tensor | None):
         if self._layer_id == 0:
@@ -160,7 +162,7 @@ class Inkling2Model(BaseOP):
         self.message_queries = torch.empty(args.num_loop_layers, 4, H, dtype=torch.float32)
         self.final_query = torch.empty(1, H, dtype=torch.float32)
         self.norm = torch.empty(1, H)
-        self._state = ConvState(args, torch.bfloat16)
+        self._state = ConvState(args)
 
     def _run(self, layers: range, x: torch.Tensor, blocks: torch.Tensor, nb: int, pass_idx: int, prev: tuple | None):
         args = self.args
@@ -213,11 +215,6 @@ class Inkling2LoopForCausalLM(BaseLLMModel):
         self.lm_head = ParallelLMHead(num_embeddings=args.unpadded_vocab_size, embedding_dim=args.hidden_size, prefix="lm_head")
         self._softcap = args.final_logit_softcap
         super().__init__()
-
-    @contextmanager
-    def forward_host_ctx(self, batch: Batch, use_graph: bool):
-        self.model._state.stage(batch)
-        yield
 
     def forward(self) -> torch.Tensor:
         logits = self.lm_head.forward(self.model.forward(get_global_ctx().batch.input_ids)).float()

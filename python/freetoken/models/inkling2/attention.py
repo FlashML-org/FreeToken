@@ -67,11 +67,15 @@ class Inkling2Attention(BaseOP):
     def _conv(self, x: torch.Tensor, weight: torch.Tensor, dyn: torch.Tensor | None, state: ConvState, visit: int, name: str, epilogue: int, epi_arg: float) -> torch.Tensor:
         batch = get_global_ctx().batch
         md = batch.attn_metadata
-        return short_conv(
-            x, weight, state.view(visit, name), state.batch_slots(batch.padded_size), self._conv_scale,
+        view = state.view(visit, name)
+        out = short_conv(
+            x, weight, view, state.slots(), self._conv_scale,
             decode=not batch.is_prefill, q_to_req=md.q_to_req, cu_q=md.cu_seqlens_q_gpu, prefix_lens=md.prefix_lens,
             dynamic=dyn, head_dim=self.head_dim, epilogue=epilogue, epi_arg=epi_arg,
         )
+        if batch.is_prefill:
+            state.track(view, x)
+        return out
 
     @nvtx_annotate("Attention")
     def forward(self, xq: torch.Tensor, xk: torch.Tensor, xv: torch.Tensor, visit: int, state: ConvState) -> torch.Tensor:
