@@ -214,7 +214,7 @@ def merge_expert_banks(parts: list[ExpertBanks], layer_methods, num_experts: int
     )
 
 
-def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, parallel, workers, chunk, layer_sink=None, resident=False) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
@@ -230,7 +230,7 @@ def _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, 
     parts = []
     for (method, layers), pieces in zip(groups, readers):
         parts.append(build_expert_banks(
-            method, num_layers, pieces, device=device, layer_sink=layer_sink, dummy=dummy, layers=layers,
+            method, num_layers, pieces, device=device, layer_sink=layer_sink, dummy=dummy, layers=layers, resident=resident,
         ))
         logger.info_rank0(f"expert banks: {method.kind} / {method.kernel.name} on {len(layers)} of {num_layers} MoE layers")
     return merge_expert_banks(parts, layer_methods, model_config.num_experts)
@@ -370,8 +370,8 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks, load_ftw_banks_to_device
 
     mixed = is_mixed(layer_methods)
-    if mixed and (resident or layer_residency is not None):
-        raise ValueError("experts of several formats are served from the offload slot cache only (no resident experts, no --moe-cpu-layers)")
+    if mixed and layer_residency is not None:
+        raise ValueError("experts of several formats do not support --moe-cpu-layers")
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
@@ -418,7 +418,7 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if mixed:
-            return _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, par, workers, chunk, layer_sink)
+            return _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, par, workers, chunk, layer_sink, resident)
         if method is not None and method.kind is QuantKind.GGUF:
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
@@ -517,7 +517,9 @@ def attach_resident_banks(layers, banks: ExpertBanks) -> None:
         i, e = layer.layer_id, layer.num_experts
         layout = layer.quant_method.layout()
         rows = {role: (e, *spec.shape) for role, spec in layout.items() if not spec.resident}
-        if set(banks.sources) != set(rows):
+        # experts of several formats: the banks span every format's roles, a layer holds data only in its own
+        foreign = [role for role in set(banks.sources) - set(rows) if banks.sources[role][i].numel()]
+        if not set(rows) <= set(banks.sources) or foreign:
             raise ValueError(f"expert banks hold {sorted(banks.sources)}, the {layer.quant_method.kernel.name} kernel reads {sorted(rows)}")
         for role, shape in rows.items():
             bank = banks.sources[role][i]
@@ -533,5 +535,5 @@ def attach_resident_banks(layers, banks: ExpertBanks) -> None:
             if a is None or a.numel() != num_layers * e or a.dtype != layout[role].dtype:
                 raise ValueError(f"the {layer.quant_method.kernel.name} kernel needs {num_layers * e} {layout[role].dtype} {role} values, the expert banks carry {None if a is None else (a.numel(), a.dtype)}")
             alphas.append(a)
-        layer._expert_banks = {role: per_layer[i] for role, per_layer in banks.sources.items()}
+        layer._expert_banks = {role: banks.sources[role][i] for role in rows}
         layer._expert_alphas = tuple(a[i * e : (i + 1) * e] for a in alphas) or None
