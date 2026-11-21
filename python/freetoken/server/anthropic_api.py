@@ -16,7 +16,6 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -80,6 +79,8 @@ def register_anthropic_routes(
     get_state: Callable[[], Any],
     get_model_sampling: Callable[[], dict[str, Any]],
 ) -> None:
+    validation_handler = app.exception_handlers[RequestValidationError]
+
     @app.post("/v1/messages")
     async def v1_messages(req: AnthropicMessagesRequest, request: Request):
         log_request("/v1/messages", req, request)
@@ -104,7 +105,7 @@ def register_anthropic_routes(
             return _anthropic_error_response(
                 400, "invalid_request_error", _validation_error_message(exc)
             )
-        return await request_validation_exception_handler(request, exc)
+        return await validation_handler(request, exc)
 
 
 async def handle_anthropic_messages(
