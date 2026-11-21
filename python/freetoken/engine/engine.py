@@ -241,6 +241,26 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
         )
 
 
+def _drop_preset_fields(config, *names: str) -> None:
+    object.__setattr__(config, "preset_fields", tuple(name for name in config.preset_fields if name not in names))
+
+
+def _adjust_preset_spec_config(config, override, windowed_kv: bool) -> None:
+    """Speculative decoding a preset turned on: kept where an explicit start's checks pass, dropped with one log line
+    where they raise."""
+    try:
+        _adjust_spec_config(config, override, windowed_kv)
+        return
+    except ValueError as exc:
+        reason = str(exc)
+    logger.info_rank0(f"--preset {config.preset}: no speculative decoding ({reason})")
+    override("speculative_algorithm", None)
+    if "speculative_num_steps" in config.preset_fields:
+        override("speculative_num_steps", 0)
+    override("spec_slot_states", ())
+    _drop_preset_fields(config, "speculative_algorithm", "speculative_num_steps")
+
+
 def _validate_kv_format(config, model_config) -> None:
     kv_format = getattr(config, "kv_format", NONE)
     if not kv_format.quantized:
@@ -621,6 +641,8 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        if config.preset is not None:
+            self._log_preset_plan(config, num_tokens)
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -729,7 +751,15 @@ class Engine:
         resident = [layer for layer in iter_moe_layers(self.model) if not isinstance(layer, OffloadMoELayer)]
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
-        host_keys = _host_embedding_keys(self.model, config)
+        try:
+            host_keys = _host_embedding_keys(self.model, config)
+        except ValueError as exc:
+            if "embed_weights" not in config.preset_fields:
+                raise
+            logger.info_rank0(f"--preset {config.preset}: embeddings stay on the GPU ({exc})")
+            object.__setattr__(config, "embed_weights", "gpu")
+            _drop_preset_fields(config, "embed_weights")
+            host_keys = frozenset()
         staged_keys = _online_quant_keys(self.model, config)
         if config.online_quant:
             logger.info_rank0(f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load")
@@ -840,6 +870,45 @@ class Engine:
             max_slots=max_slots if max_slots is not None or method is None else method.slot_limit(),
         )
 
+    def _resolve_preset_moe_cache_size(self, config: EngineConfig, banks, method, max_slots) -> tuple[int, int, bool]:
+        """_resolve_auto_moe_cache_size with a preset's KV reserve, where the expert cache's minimum fits beside it.
+        Elsewhere the default reserve comes back, with one warning."""
+        try:
+            return self._resolve_auto_moe_cache_size(config, banks, method, max_slots=max_slots)
+        except AssertionError as exc:
+            target = config.kv_reserve_tokens
+            object.__setattr__(config, "kv_reserve_tokens", EngineConfig.kv_reserve_tokens)
+            _drop_preset_fields(config, "kv_reserve_tokens")
+            plan = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=max_slots)
+            logger.warning_rank0(
+                f"--preset {config.preset}: a KV reserve of {target} tokens (the default max output tokens and a prompt) "
+                f"does not fit beside the expert cache's minimum ({exc}); keeping the default reserve of "
+                f"{config.kv_reserve_tokens} tokens, where a longer prompt and answer end with finish_reason length"
+            )
+            return plan
+
+    def _log_preset_plan(self, config: EngineConfig, num_tokens: int) -> None:
+        """One line with what a --preset server ended up with: expert slots, KV tokens, running requests, speculative decoding."""
+        parts = []
+        if self.moe_offload_cache is not None:
+            total = config.model_config.num_moe_layers * config.model_config.num_experts
+            parts.append(f"{config.moe_cache_size} of {total} expert slots ({config.moe_strategy})")
+        parts.append(f"{num_tokens} KV tokens")
+        parts.append(f"{config.max_running_req} running request" + ("s" if config.max_running_req != 1 else ""))
+        if config.speculative_algorithm is not None:
+            parts.append(f"{config.speculative_algorithm} speculative decoding with {config.speculative_num_steps} draft tokens")
+        else:
+            parts.append("no speculative decoding")
+        line = f"--preset {config.preset} plan: " + ", ".join(parts)
+        if "kv_reserve_tokens" in config.preset_fields and num_tokens < config.kv_reserve_tokens:
+            # only where the expert cache was not sized by --moe-cache-auto, which keeps the reserve
+            logger.warning_rank0(
+                f"{line}; fewer KV tokens than the default max output tokens and a prompt ({config.kv_reserve_tokens}): "
+                "a longer prompt and answer end with finish_reason length"
+            )
+        else:
+            logger.info_rank0(line)
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         from freetoken.moe.expert_banks import is_mixed
 
@@ -933,7 +1002,10 @@ class Engine:
         pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
+            if "kv_reserve_tokens" in config.preset_fields:
+                size, pages, overlap = self._resolve_preset_moe_cache_size(config, banks, method, size_cap)
+            else:
+                size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -1992,6 +2064,7 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    preset_fields = getattr(config, "preset_fields", ())  # duck-typed test configs omit it
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -2003,7 +2076,7 @@ def _adjust_config(config: EngineConfig):
         dropped = [
             f"{name}={getattr(config, name)!r}"
             for name, dense_value in _DENSE_MOE_SETTINGS.items()
-            if getattr(config, name, dense_value) != dense_value
+            if getattr(config, name, dense_value) != dense_value and name not in preset_fields
         ]
         if config.moe_strategy not in ("auto", "fused"):
             dropped.insert(0, f"moe_strategy={config.moe_strategy!r}")
@@ -2096,7 +2169,8 @@ def _adjust_config(config: EngineConfig):
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
     if getattr(config, "speculative_algorithm", None) is not None:
-        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
+        adjust_spec = _adjust_preset_spec_config if "speculative_algorithm" in preset_fields else _adjust_spec_config
+        adjust_spec(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
@@ -2154,7 +2228,7 @@ def _adjust_config(config: EngineConfig):
             # the cache sizing flags get their own warning in the 'fused' block below
             inert = [flag for flag, on in (
                 (f"--moe-cpu-layers={config.moe_cpu_layers}", config.moe_cpu_layers),
-                ("--moe-prefill-hit-d2d", config.moe_prefill_hit_d2d),
+                ("--moe-prefill-hit-d2d", config.moe_prefill_hit_d2d and "moe_prefill_hit_d2d" not in preset_fields),
                 ("--disable-moe-prefill-overlap", not config.moe_prefill_overlap),
             ) if on]
             if inert:
