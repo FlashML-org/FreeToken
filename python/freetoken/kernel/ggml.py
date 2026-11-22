@@ -65,14 +65,19 @@ def _check_mmq_tail(w: torch.Tensor, ggml_type: int, k: int) -> None:
 def mul_mat(w: torch.Tensor, ggml_type: int, x: torch.Tensor, *, out: torch.Tensor | None = None, xq: torch.Tensor | None = None) -> torch.Tensor:
     """``x[M, K] @ w[N, K]^T`` in ``x``'s dtype with ``w`` packed as ``[N, row_bytes]`` uint8, or written into the ``[M, N]`` view ``out``.
 
-    ``xq`` is ``quantize_q8_1(x)``: the vector kernel reads it instead of quantizing ``x`` again.
+    Batched over a leading dim, ``x[G, M, K]`` and ``w[G, N, row_bytes]`` give ``[G, M, N]``, channel ``g`` by weight ``g``, in one launch.
+    ``x`` and ``out`` may be views with strided rows and channels (``[M, G, K]`` transposed, say) as long as the last dim is contiguous.
+    ``xq`` is ``quantize_q8_1(x)`` of a 2D ``x``: the vector kernel reads it instead of quantizing ``x`` again.
     """
-    m, k = x.shape
+    *lead, m, k = x.shape
     if out is None:
-        out = torch.empty(m, w.shape[0], dtype=x.dtype, device=x.device)
+        out = torch.empty(*lead, m, w.shape[-2], dtype=x.dtype, device=x.device)
     if not uses_mmvq(ggml_type, m):
         _check_mmq_tail(w, ggml_type, k)
-    _module().mul_mat(w, ggml_type, x.contiguous(), out, xq)
+    # the kernels read strided rows that start 16-byte aligned (MMQ's quantizer loads 4 values at a time)
+    if not x.is_contiguous() and (x.stride(-1) != 1 or x.data_ptr() % 16 or any(s * x.element_size() % 16 for s in x.stride()[:-1])):
+        x = x.contiguous()
+    _module().mul_mat(w, ggml_type, x, out, xq)
     return out
 
 
@@ -87,6 +92,12 @@ def quantize_q8_1(x: torch.Tensor) -> torch.Tensor:
 @functools.cache
 def _q8_1_row_bytes(k: int) -> int:
     return _module().q8_1_row_bytes(k)
+
+
+@functools.cache
+def uses_mmq(ggml_type: int, m: int) -> bool:
+    """Whether ggml's matrix kernel takes ``m`` rows on this GPU: ``mul_mat`` runs it where ``uses_mmvq`` is false and has no kernel where both are."""
+    return _module().uses_mmq(ggml_type, m)
 
 
 @functools.cache
@@ -167,5 +178,6 @@ __all__ = [
     "mul_mat_id",
     "mul_mat_id_glu",
     "quantize_q8_1",
+    "uses_mmq",
     "uses_mmvq",
 ]

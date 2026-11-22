@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from freetoken.kernel import ggml
 from freetoken.layers.quantization.ggml_types import pad_rows
+from freetoken.third_party.gguf import GGML_QUANT_SIZES
 from freetoken.third_party.gguf import GGMLQuantizationType as QType
 from freetoken.third_party.gguf import quants
 
@@ -61,13 +62,32 @@ def _iq1_m_weights(shape, exact_sums, seed=1729):
     return storage[..., :-1, :], reference
 
 
-def _activation(shape, dtype, seed=19):
+def _activation(shape, dtype, seed=19, zero_sums=True):
     rng = np.random.default_rng(seed)
     half = rng.integers(-127, 128, (*shape[:-1], shape[-1] // 32, 16))
     half[..., 0] = 127
-    # Exactly representable q8_1 inputs with zero block sums isolate weight math.
-    values = np.concatenate([half, -half], axis=-1).reshape(shape).astype(np.float32) / 64
+    # Exactly representable q8_1 inputs with zero block sums isolate weight math; nonzero sums also exercise the k-quant mins.
+    other = -half if zero_sums else rng.integers(-127, 128, half.shape)
+    values = np.concatenate([half, other], axis=-1).reshape(shape).astype(np.float32) / 64
     return torch.from_numpy(values).to("cuda", dtype)
+
+
+# block bytes and fp16 scale offsets (d, then dmin) of the types DeepSeek-V4.1 GGUFs store attn_output_a in
+_SCALE_FIELDS = {QType.Q8_0: (34, (0,)), QType.Q2_K: (84, (80, 82)), QType.Q3_K: (110, (108,)), QType.Q4_K: (144, (0, 2)),
+                 QType.Q5_K: (176, (0, 2)), QType.Q6_K: (210, (208,)), QType.IQ3_S: (110, (0,))}
+
+
+def _random_blocks(qtype, shape, seed=2048):
+    """Random blocks of ``qtype`` (every quant and sub-scale bit random) with fp16 scales in [2^-12, 2^-10]."""
+    rng = np.random.default_rng(seed)
+    *lead, rows, k = shape
+    block_bytes, fields = _SCALE_FIELDS[qtype]
+    blocks = rng.integers(0, 256, (*lead, rows, k // GGML_QUANT_SIZES[qtype][0], block_bytes), dtype=np.uint8)
+    for offset in fields:
+        d = rng.uniform(2.0**-12, 2.0**-10, blocks.shape[:-1]).astype(np.float16)
+        blocks[..., offset : offset + 2] = d[..., None].view(np.uint8)
+    packed = blocks.reshape(*lead, rows, -1)
+    return torch.from_numpy(packed).cuda(), torch.from_numpy(quants.dequantize(packed, qtype))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -145,6 +165,31 @@ def test_iq1_m_matrix_and_moe_routes_match_cpu(dtype, batch):
     actual = ggml.mul_mat_id(w, int(QType.IQ1_M), x, ids)
     expected = torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.cpu().long()]).to(dtype)
     torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("qtype", list(_SCALE_FIELDS))
+@pytest.mark.parametrize("k", [4096, 768])
+def test_batched_matrix_matches_cpu(qtype, k):
+    """DeepSeek-V4.1's wo_a as one batched mul_mat: 8 groups of [1024, K], x and out as the transposed [T, G, *] views the
+    layer passes, over MMVQ and MMQ sizes (up to the layer's 192, two MMQ column tiles from 129). A bf16 / fp16 out from MMQ's
+    stream-k fixup goes through the per-channel fp32 copy. K=768 leaves MMQ reading past the last row into zero rows."""
+    g, n = 8, 1024
+    w, ref = _random_blocks(qtype, (g, n, k))
+    if pad := pad_rows(int(qtype), k):
+        storage = torch.zeros(g * n + pad, w.shape[-1], dtype=torch.uint8, device="cuda")
+        storage[: g * n].copy_(w.view(g * n, -1))
+        w = storage[: g * n].view(g, n, -1)
+    for t in [*range(1, 17), 31, 64, 65, 128, 160, 192]:
+        x = _activation((t, g, k), torch.float32, seed=t, zero_sums=False)
+        expected = torch.einsum("tgk, gnk -> tgn", x.cpu(), ref)
+        tol = dict(atol=1e-3 * expected.abs().max().item(), rtol=2**-7)
+        for dtype in DTYPES:
+            out = torch.full((t, g, n), float("nan"), dtype=dtype, device="cuda")
+            ggml.mul_mat(w, int(qtype), x.to(dtype).transpose(0, 1), out=out.transpose(0, 1))
+            torch.testing.assert_close(out.float().cpu(), expected, **tol, msg=lambda m: f"{qtype.name} T={t} {dtype}: {m}")
+        if t in (3, 9):  # contiguous [G, T, K] in, a fresh [G, T, N] out
+            actual = ggml.mul_mat(w, int(qtype), x.to(torch.bfloat16).transpose(0, 1).contiguous())
+            torch.testing.assert_close(actual.float().cpu(), expected.transpose(0, 1), **tol)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

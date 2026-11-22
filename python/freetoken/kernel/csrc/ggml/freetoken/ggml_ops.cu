@@ -163,8 +163,10 @@ bool mmq_reads_16bit(ggml_type type) {
 }
 
 // x as the kernel reads it: x itself, or an fp32 copy in ``tmp`` for a kernel that reads fp32 only
-Activation activation(TensorView x, bool f16_ok, ggml_cuda_pool_alloc<float> & tmp, cudaStream_t stream) {
-    RuntimeCheck(x.IsContiguous(), "ggml activations must be contiguous");
+// strided: x may be a [(G,) M, K] view with strided rows and channels (its last dim contiguous); the fp32 copy is contiguous
+Activation activation(TensorView x, bool f16_ok, ggml_cuda_pool_alloc<float> & tmp, cudaStream_t stream, bool strided = false) {
+    RuntimeCheck(strided ? x.stride(x.ndim() - 1) == 1 : x.IsContiguous(),
+                 strided ? "ggml activations must have contiguous rows" : "ggml activations must be contiguous");
     const ggml_type type = float_type(x);
     if (type == GGML_TYPE_F32) {
         return {x.data_ptr(), type, 4};
@@ -173,7 +175,14 @@ Activation activation(TensorView x, bool f16_ok, ggml_cuda_pool_alloc<float> & t
         return {x.data_ptr(), type, 2};
     }
     float * f32 = tmp.alloc(x.numel());
-    ggml_get_to_fp32_cuda(type)(x.data_ptr(), f32, x.numel(), stream);
+    if (x.IsContiguous()) {
+        ggml_get_to_fp32_cuda(type)(x.data_ptr(), f32, x.numel(), stream);
+    } else {
+        const int nd = x.ndim();
+        const int64_t k = x.size(nd - 1), m = x.size(nd - 2), g = nd == 3 ? x.size(0) : 1;
+        const int64_t s1 = x.stride(nd - 2), s2 = nd == 3 ? x.stride(0) : s1 * m;
+        ggml_get_to_fp32_nc_cuda(type)(x.data_ptr(), f32, k, m, g, 1, s1, s2, s2 * g, stream);
+    }
     return {f32, GGML_TYPE_F32, 4};
 }
 
@@ -202,30 +211,47 @@ void op_quantize_q8_1(TensorView x, TensorView out) {
     }
 }
 
-// out[M, N] = x[M, K] @ W[N, K]^T; out may be a view with strided rows; MMVQ reads ``xq`` (op_quantize_q8_1 of x) instead of quantizing x again
+// out[M, N] = x[M, K] @ W[N, K]^T, or batched over channels: out[G, M, N] = x[G, M, K] @ W[G, N, K]^T, channel g by weight g, in one launch
+// x and out may be views with strided rows and channels (last dim contiguous); MMVQ reads ``xq`` (op_quantize_q8_1 of a 2D x) instead of quantizing x again
 void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Optional<TensorView> xq) {
-    RuntimeCheck(x.ndim() == 2 && w.ndim() == 2, "mul_mat takes w[N, row_bytes] and x[M, K]");
+    const int nd = x.ndim();
+    RuntimeCheck((nd == 2 || nd == 3) && w.ndim() == nd && out.ndim() == nd,
+                 "mul_mat takes w[N, row_bytes], x[M, K], out[M, N], or w[G, N, row_bytes], x[G, M, K], out[G, M, N]");
     const DeviceGuard guard(x.device());
     const ggml_type type = (ggml_type) type_id;
-    const int64_t m = x.size(0), k = x.size(1), n = w.size(0);
+    const int64_t g = nd == 3 ? x.size(0) : 1, m = x.size(nd - 2), k = x.size(nd - 1), n = w.size(nd - 2);
+    RuntimeCheck(nd == 2 || (w.size(0) == g && out.size(0) == g), "mul_mat needs the same G in w, x and out");
     check_weight(w, type, k);
     check_block_offsets(w, type, k);
-    RuntimeCheck(out.ndim() == 2 && out.size(0) == m && out.size(1) == n && out.stride(1) == 1, "mul_mat out must be a [M, N] view with contiguous rows");
+    RuntimeCheck(out.size(nd - 2) == m && out.size(nd - 1) == n && out.stride(nd - 1) == 1, "mul_mat out must be a [(G,) M, N] view with contiguous rows");
+    RuntimeCheck(nd == 2 || !xq.has_value(), "mul_mat takes xq for a 2D x only");
     const ggml_type otype = io_type(x, out);
-    if (m == 0) {
+    if (m == 0 || g == 0) {
         return;
     }
-    const size_t s1 = w.stride(0);
-    ggml_tensor src0 = describe(type, w.data_ptr(), {k, n, 1, 1}, {ggml_type_size(type), s1, s1 * n, s1 * n});
-    const size_t oe = ggml_type_size(otype), os = out.stride(0) * oe;
-    ggml_tensor dst = describe(otype, out.data_ptr(), {n, m, 1, 1}, {oe, os, os * m, os * m});
+    const size_t ts = ggml_type_size(type), s1 = w.stride(nd - 2), s2 = nd == 3 ? w.stride(0) : s1 * n;
+    RuntimeCheck(s1 % ts == 0 && s2 % ts == 0, "ggml weight rows and channels must start on a ", ggml_type_name(type), " block");
+    ggml_tensor src0 = describe(type, w.data_ptr(), {k, n, g, 1}, {ts, s1, s2, s2 * g});
+    const size_t oe = ggml_type_size(otype), os1 = out.stride(nd - 2) * oe, os2 = nd == 3 ? out.stride(0) * oe : os1 * m;
+    ggml_tensor dst = describe(otype, out.data_ptr(), {n, m, g, 1}, {oe, os1, os2, os2 * g});
     auto & ctx = context(x.device());
     const cudaStream_t stream = ctx.stream();
     const int cc = device_cc();
     ggml_cuda_pool_alloc<float> x32(ctx.pool());
+    // x as ggml sees it: its own strides, or a contiguous copy's
+    const auto describe_x = [&](const Activation & a) {
+        size_t xs1 = k, xs2 = k * m;
+        if (a.data == x.data_ptr() && !x.IsContiguous()) {
+            xs1 = m > 1 ? x.stride(nd - 2) : k;
+            xs2 = g > 1 ? x.stride(0) : xs1 * m;
+            // MMQ's quantizer loads 4 values at a time
+            RuntimeCheck((uintptr_t) a.data % 16 == 0 && xs1 * a.esz % 16 == 0 && xs2 * a.esz % 16 == 0, "strided mul_mat rows must start 16-byte aligned");
+        }
+        return describe(a.type, a.data, {k, m, g, 1}, {a.esz, a.esz * xs1, a.esz * xs2, a.esz * xs2 * g});
+    };
     if (ggml_cuda_should_use_mmvq(type, cc, m)) {
-        const Activation a = activation(x, true, x32, stream);
-        ggml_tensor src1 = describe(a.type, a.data, {k, m, 1, 1}, {a.esz, a.esz * k, a.esz * k * m, a.esz * k * m});
+        const Activation a = activation(x, true, x32, stream, true);
+        ggml_tensor src1 = describe_x(a);
         const void * q8 = nullptr;
         if (xq.has_value()) {
             const TensorView q = xq.value();
@@ -235,8 +261,8 @@ void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Opt
         }
         ggml_cuda_mul_mat_vec_q(ctx, &src0, &src1, nullptr, &dst, nullptr, q8);
     } else if (ggml_cuda_should_use_mmq(type, cc, m, 0)) {
-        const Activation a = activation(x, mmq_reads_16bit(type), x32, stream);
-        ggml_tensor src1 = describe(a.type, a.data, {k, m, 1, 1}, {a.esz, a.esz * k, a.esz * k * m, a.esz * k * m});
+        const Activation a = activation(x, mmq_reads_16bit(type), x32, stream, true);
+        ggml_tensor src1 = describe_x(a);
         ggml_cuda_mul_mat_q(ctx, &src0, &src1, nullptr, &dst);
     } else {
         RuntimeCheck(false, "no ggml kernel for ", ggml_type_name(type), " with M=", m);
@@ -491,6 +517,8 @@ void op_get_rows(TensorView w, int64_t type_id, int64_t k, TensorView ids, Tenso
 
 bool op_uses_mmvq(int64_t type_id, int64_t m) { return ggml_cuda_should_use_mmvq((ggml_type) type_id, device_cc(), m); }
 
+bool op_uses_mmq(int64_t type_id, int64_t m) { return ggml_cuda_should_use_mmq((ggml_type) type_id, device_cc(), m, 0); }
+
 int64_t op_mmvq_max_tokens(int64_t type_id) {
     return std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch((ggml_type) type_id, device_cc()));
 }
@@ -504,5 +532,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(mul_mat_id_glu, op_mul_mat_id_glu);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_weighted_sum, op_moe_weighted_sum);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dequantize, op_dequantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_rows, op_get_rows);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(uses_mmq, op_uses_mmq);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(uses_mmvq, op_uses_mmvq);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mmvq_max_tokens, op_mmvq_max_tokens);
