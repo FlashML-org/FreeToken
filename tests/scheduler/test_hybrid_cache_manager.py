@@ -163,11 +163,12 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
-def test_snapshot_radix_admits_a_hit_with_no_snapshot_cache():
+def test_snapshot_radix_admits_a_hit_with_no_snapshot_cache(monkeypatch):
     """swa_snapshot_radix at one running request and no snapshot cache (what a small GPU leaves):
     the hit's restore snapshot stays locked through admission, so the working set must count it,
     or the next turn of a conversation waits for slots no one will free."""
-    from freetoken.core import Context, set_global_ctx
+    from freetoken import core
+    from freetoken.core import Context
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
     from freetoken.kvcache.linear_state_pool import _linear_pool_num_slots
@@ -179,7 +180,7 @@ def test_snapshot_radix_admits_a_hit_with_no_snapshot_cache():
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    set_global_ctx(Context(page_size=1))
+    monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
     window = 4
     groups = (KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None),
               KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8, sliding_window=window))
