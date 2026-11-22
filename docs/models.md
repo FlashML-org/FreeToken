@@ -215,15 +215,15 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   The NVFP4 experts (layers 0-19) run as W4A16; the MXFP8 experts (layers 20-23) are dequantized
   to bf16 at load, about 8 GiB of the ~22 GiB resident footprint. Pass `--moe-strategy fused` when
   the GPU holds that: under `offload` every prefill streams the experts of all 48 visits over PCIe,
-  which puts a floor of about 0.75 s under the first token. `FREETOKEN_INKLING2_EXPERTS_NVFP4=1`
-  (experimental) requantizes the MXFP8 experts to NVFP4 at load instead: 2.1 GiB rather than
-  7.6 GiB, at a KL divergence from the reference 1.3-3.3x that of the shipped weights.
+  which puts a floor of about 0.75 s under the first token.
   On a small GPU the defaults shrink to fit rather than fail, each step logged as `small GPU: ...`:
   at least 1 GiB stays free for activations (lowering `--memory-ratio`), the prefill chunk is
   capped at 35% of it (192 KiB per chunk token), then cached snapshots, the window pool's prefill
   chunk room and finally `--max-running-requests` go until the window pool, state slots, one layer
   of experts and an 8K-token KV reserve fit. With 8 GiB free that is 1 running request, 1792-token
-  chunks and 8.3K tokens of context under `offload`; with 32 GiB, 4 requests and 84K tokens.
+  chunks and 8.3K tokens of context under `offload` (9.6K at most); `--embed-weights host` moves the
+  0.86 GiB input embedding to host RAM, and with `--kv-reserve-tokens 37632` the same card holds
+  37.7K tokens. With 32 GiB free the defaults give 4 requests and 84K tokens.
   `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`;
   `none` is the template's level 0.0, which the model card says does not fully disable reasoning.
   `--tp` > 1 is not served. Speculative decoding is refused at startup; serving it needs:
