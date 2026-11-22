@@ -1383,17 +1383,27 @@ class Engine:
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
         spec_fixed, draft_page = self._spec_budget(config)
-        self.kv_cache.validate_rebuild(
-            config, num_pages=num_pages,
-            num_swa_pages=num_swa_pages, target_moe=target_moe,
-            per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
-            extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
-            extra_page_bytes=draft_page,
-            extra_note=(
-                f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
-            ),
-        )
+        # swa_snapshot_radix keeps one window of KV per cached snapshot: the window pool follows the slots
+        window_follows_slots = num_mamba_slots is not None and config.cache_type == "swa_snapshot_radix"
+        prior_snapshot_slots = getattr(config, "snapshot_cache_slots", None)
+        try:
+            if window_follows_slots:
+                object.__setattr__(config, "snapshot_cache_slots", num_mamba_slots + 1 - _linear_pool_min_slots(config))
+            self.kv_cache.validate_rebuild(
+                config, num_pages=num_pages,
+                num_swa_pages=num_swa_pages, target_moe=target_moe,
+                per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
+                weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+                extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
+                extra_page_bytes=draft_page,
+                extra_note=(
+                    f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
+                ),
+            )
+        except CacheRebuildRejected:
+            if window_follows_slots:
+                object.__setattr__(config, "snapshot_cache_slots", prior_snapshot_slots)
+            raise
 
         torch.cuda.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
@@ -1427,7 +1437,7 @@ class Engine:
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
+        elif num_swa_pages is not None or window_follows_slots:
             # Window-only change: no page-count change, but re-derive the window pool at the new
             # pin against the CURRENT page count. This re-allocs the same-size full pool and
             # the resized window, both inside the pool's own rebuild_from_config.
