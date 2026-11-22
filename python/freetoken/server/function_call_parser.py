@@ -3644,6 +3644,8 @@ class Inkling2Detector(BaseFormatDetector):
                 break
             self._buffer = buf[end + len(self.eot_token) :]
             self._close_block(buf[body_at:end], tools, calls)
+            if calls:
+                break  # text after a call goes out on the next drain step, after the call
         return StreamingParseResult(normal_text="".join(normal).replace(self.eot_token, ""), calls=calls)
 
     def _stream_args(self, body: str, tools: List[Tool], calls: list[ToolCallItem]) -> None:
