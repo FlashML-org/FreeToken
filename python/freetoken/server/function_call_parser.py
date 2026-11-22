@@ -3577,16 +3577,22 @@ class Inkling2Detector(BaseFormatDetector):
         <|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Paris"}}<|end_message|>
 
     one block per call (the model's ``<|message_model|>name`` header is dropped upstream).
-    A call is emitted when its block closes: the name fragment, then the whole arguments.
+    Streaming sends the name once ``{"name":...,"args":`` is out, as the template writes it, then
+    the raw ``args`` text as it decodes; a block of any other shape goes out whole when it closes.
     """
 
     toolcall_opener = "<|content_invoke_tool_json|>"
+    _head = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"(?:args|arguments)"\s*:\s*')
+    # what may still turn out to be the closing brace of the outer object
+    _tail = re.compile(r"\s*\}?\s*$")
 
     def __init__(self):
         super().__init__()
         self.bot_token = "<|content_invoke_tool_json|>"
         self.eot_token = "<|end_message|>"
         self.tool_call_separator = ""
+        # the block being streamed: {"args_at": offset in its body, "streamed": raw args sent, "drop": unknown tool}
+        self._open: dict | None = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -3630,20 +3636,66 @@ class Inkling2Detector(BaseFormatDetector):
                 self._buffer = buf[len(buf) - hold :]
                 break
             normal.append(buf[:start])
-            end = buf.find(self.eot_token, start + len(self.bot_token))
+            body_at = start + len(self.bot_token)
+            end = buf.find(self.eot_token, body_at)
             if end == -1:
                 self._buffer = buf[start:]
+                self._stream_args(buf[body_at:], tools, calls)
                 break
             self._buffer = buf[end + len(self.eot_token) :]
-            call = self._call(buf[start + len(self.bot_token) : end], tools)
+            self._close_block(buf[body_at:end], tools, calls)
+        return StreamingParseResult(normal_text="".join(normal).replace(self.eot_token, ""), calls=calls)
+
+    def _stream_args(self, body: str, tools: List[Tool], calls: list[ToolCallItem]) -> None:
+        if self._open is None:
+            m = self._head.match(body)
+            if m is None:
+                return
+            name = json.loads(m.group(1))
+            drop = name not in self._get_tool_indices(tools)
+            if drop:
+                logger.warning(f"Model attempted to call undefined function: {name}")
+                drop = not _should_forward_unknown_tool(name)
+            self._open = {"args_at": m.end(), "streamed": "", "drop": drop}
+            if drop:
+                return
+            self.prev_tool_call_arr.append({"name": name, "arguments": {}})
+            self.streamed_args_for_tool.append("")
+            calls.append(ToolCallItem(tool_index=len(self.prev_tool_call_arr) - 1, name=name, parameters=""))
+        if self._open["drop"]:
+            return
+        args = body[self._open["args_at"] :]
+        args = args[: len(args) - self._ends_with_partial_token(args, self.eot_token)]
+        self._send_args(self._open, args[: self._tail.search(args).start()], calls)
+
+    def _send_args(self, block: dict, ready: str, calls: list[ToolCallItem]) -> None:
+        fragment = ready[len(block["streamed"]) :]
+        if fragment:
+            block["streamed"] = ready
+            self.streamed_args_for_tool[-1] = ready
+            calls.append(ToolCallItem(tool_index=len(self.prev_tool_call_arr) - 1, parameters=fragment))
+
+    def _close_block(self, body: str, tools: List[Tool], calls: list[ToolCallItem]) -> None:
+        opened, self._open = self._open, None
+        if opened is None:
+            call = self._call(body, tools)
             if call is None:
-                continue
+                return
             ordinal = len(self.prev_tool_call_arr)
             self.prev_tool_call_arr.append({"name": call.name, "arguments": json.loads(call.parameters)})
             self.streamed_args_for_tool.append(call.parameters)
             calls.append(ToolCallItem(tool_index=ordinal, name=call.name, parameters=""))
             calls.append(ToolCallItem(tool_index=ordinal, parameters=call.parameters))
-        return StreamingParseResult(normal_text="".join(normal).replace(self.eot_token, ""), calls=calls)
+            return
+        if opened["drop"]:
+            return
+        args = body[opened["args_at"] :]
+        args = args[: self._tail.search(args).start()]
+        self._send_args(opened, args, calls)
+        try:
+            self.prev_tool_call_arr[-1]["arguments"] = json.loads(args)
+        except json.JSONDecodeError:
+            logger.warning(f"inkling2: tool call body is not JSON: {body[:200]!r}")
 
 
 class FunctionCallParser:

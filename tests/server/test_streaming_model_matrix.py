@@ -488,6 +488,7 @@ ARGS_STREAMING_BLOCKS = {
         f"<atem:parameter name=\"filePath\">{LONG_VALUE}</atem:parameter>\n"
         "</atem:invoke>\n</atem:function_calls><|eot|>"
     ),
+    "inkling2": f'<|content_invoke_tool_json|>{{"name":"read","args":{json.dumps({"filePath": LONG_VALUE})}}}<|end_message|>',
 }
 
 
