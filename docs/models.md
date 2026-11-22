@@ -204,18 +204,38 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   (32 KiB per token), the window KV of the 1024 tokens before it (160 KiB per token) and a snapshot
   of the convolution state (1.83 MiB). Those points are one token before each prompt's end, the
   end of each finished request and, with `--enable-special-token-ckpt`, the tool-call anchor;
-  window KV that no snapshot reads is dropped at once. Each running request holds 2 state slots
-  (its live state and one snapshot being written) and the cache keeps 2 snapshots per running
-  request (at least 4); the window pool holds about 2.2K tokens per running request, one window per
-  cacheable snapshot and one prefill chunk. At 8 requests that is 33 state slots (60 MiB) and 42K
-  window tokens (6.5 GiB), next to 1.86M tokens of full-attention KV on a 96 GiB GPU.
+  window KV that no snapshot reads is dropped at once. Each running request holds 3 state slots
+  (its live state, the snapshot being written, and the snapshot a prefix hit restores from, locked
+  until the prompt is committed) and the cache keeps 2 snapshots per running request (at least 4);
+  the window pool holds about 2.2K tokens per running request, one window per cacheable snapshot
+  and one prefill chunk. At 8 requests that is 41 state slots (75 MiB) and 42K window tokens
+  (6.5 GiB), next to 1.86M tokens of full-attention KV on a 96 GiB GPU.
   `--cache-type naive` turns reuse off and reserves
   `(max-running-requests + 1) x (1024 + --max-extend-length)` window tokens instead (83K at 8 requests).
-  Speculative decoding is not served (the `mtp.safetensors` draft is not read), and neither is `--tp` > 1.
   The NVFP4 experts (layers 0-19) run as W4A16; the MXFP8 experts (layers 20-23) are dequantized
   to bf16 at load, about 8 GiB of the ~22 GiB resident footprint. Pass `--moe-strategy fused` when
   the GPU holds that: under `offload` every prefill streams the experts of all 48 visits over PCIe,
-  which puts a floor of about 0.75 s under the first token.
+  which puts a floor of about 0.75 s under the first token. `FREETOKEN_INKLING2_EXPERTS_NVFP4=1`
+  (experimental) requantizes the MXFP8 experts to NVFP4 at load instead: 2.1 GiB rather than
+  7.6 GiB, at a KL divergence from the reference 1.3-3.3x that of the shipped weights.
+  On a small GPU the defaults shrink to fit rather than fail, each step logged as `small GPU: ...`:
+  at least 1 GiB stays free for activations (lowering `--memory-ratio`), the prefill chunk is
+  capped at 35% of it (192 KiB per chunk token), then cached snapshots, the window pool's prefill
+  chunk room and finally `--max-running-requests` go until the window pool, state slots, one layer
+  of experts and an 8K-token KV reserve fit. With 8 GiB free that is 1 running request, 1792-token
+  chunks and 8.3K tokens of context under `offload`; with 32 GiB, 4 requests and 84K tokens.
   `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`.
+  `--tp` > 1 is not served. Speculative decoding is refused at startup; serving it needs:
+  - a `SlotVerify` for the convolution state, like `qwen4_exp`'s `PLEConvVerify`: a verify forward
+    leaves the live state as it is and stashes, per visit, its last 3 inputs followed by every
+    row's convolution input (624 KiB per row and request); `commit` keeps the 3 that end at the
+    last accepted row. The short convolution then has to take several rows per request in decode.
+  - window KV that a rejected draft does not corrupt: the engine refuses windowed targets because
+    a verify step's window frees release slots it still reads; they have to wait for the commit.
+  - a draft: the checkpoint's `mtp.safetensors` (one MTP block, 0.59 GiB) is not read. It needs a
+    loader and a proposer in the family's `spec_drafts`, and stores KV of its own, which the window
+    frees above must also allow (`target_may_be_windowed`).
+  - the finish snapshot donates the live slot, so it has to follow the last commit; prompt-end
+    and tool-call snapshots are taken in prefill and are not affected.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).
