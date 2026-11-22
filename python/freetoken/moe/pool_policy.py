@@ -80,6 +80,22 @@ def split_slots(total: int, pools: list[PoolSpec], counts: torch.Tensor | None =
     return _split_equal(total, pools) if counts is None else _split_hot(total, pools, counts)
 
 
+def stage_floor(layer_rows: list[list[int]], pools: list[PoolSpec], num_experts: int, counts: torch.Tensor | None = None) -> int:
+    """Fewest slots whose split gives every bank the bytes to stage one whole layer of its widest rows, as the offload
+    cache's shared bank bytes must (``layer_rows[l][k]``: one expert's bytes of bank k in layer l); the pools' room when
+    no size does. Row padding is left out: the cache adds the largest pad to both sides of that check."""
+    widest = [num_experts * max(rows[k] for rows in layer_rows) for k in range(len(layer_rows[0]))]
+
+    def fits(total: int) -> bool:
+        sizes = split_slots(total, pools, counts)
+        return all(sum(s * layer_rows[p.layers[0]][k] for p, s in zip(pools, sizes)) >= need for k, need in enumerate(widest))
+
+    total, room = max(num_experts, sum(p.min_num_slots for p in pools)), sum(p.max_num_slots for p in pools)
+    while total < room and not fits(total):
+        total += 1
+    return total
+
+
 def _check_budget(total: int, pools: list[PoolSpec]) -> None:
     need = sum(p.min_num_slots for p in pools)
     room = sum(p.max_num_slots for p in pools)
