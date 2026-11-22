@@ -224,7 +224,8 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   chunk room and finally `--max-running-requests` go until the window pool, state slots, one layer
   of experts and an 8K-token KV reserve fit. With 8 GiB free that is 1 running request, 1792-token
   chunks and 8.3K tokens of context under `offload`; with 32 GiB, 4 requests and 84K tokens.
-  `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`.
+  `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`;
+  `none` is the template's level 0.0, which the model card says does not fully disable reasoning.
   `--tp` > 1 is not served. Speculative decoding is refused at startup; serving it needs:
   - a `SlotVerify` for the convolution state, like `qwen4_exp`'s `PLEConvVerify`: a verify forward
     leaves the live state as it is and stashes, per visit, its last 3 inputs followed by every
