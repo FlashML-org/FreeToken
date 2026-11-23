@@ -186,6 +186,21 @@ Activation activation(TensorView x, bool f16_ok, ggml_cuda_pool_alloc<float> & t
     return {f32, GGML_TYPE_F32, 4};
 }
 
+// x as ggml sees it: its own strides, or a contiguous copy's
+// NOTE: not a lambda, nvcc 13.0 fails on RuntimeCheck inside one
+ggml_tensor describe_mul_mat_x(const Activation & a, TensorView x) {
+    const int nd = x.ndim();
+    const int64_t g = nd == 3 ? x.size(0) : 1, m = x.size(nd - 2), k = x.size(nd - 1);
+    size_t xs1 = k, xs2 = k * m;
+    if (a.data == x.data_ptr() && !x.IsContiguous()) {
+        xs1 = m > 1 ? x.stride(nd - 2) : k;
+        xs2 = g > 1 ? x.stride(0) : xs1 * m;
+        // MMQ's quantizer loads 4 values at a time
+        RuntimeCheck((uintptr_t) a.data % 16 == 0 && xs1 * a.esz % 16 == 0 && xs2 * a.esz % 16 == 0, "strided mul_mat rows must start 16-byte aligned");
+    }
+    return describe(a.type, a.data, {k, m, g, 1}, {a.esz, a.esz * xs1, a.esz * xs2, a.esz * xs2 * g});
+}
+
 }  // namespace
 
 // out[M, q8_1_row_bytes(K)] = x[M, K] as MMVQ's q8_1 blocks, for GEMVs that share one input
@@ -238,20 +253,9 @@ void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Opt
     const cudaStream_t stream = ctx.stream();
     const int cc = device_cc();
     ggml_cuda_pool_alloc<float> x32(ctx.pool());
-    // x as ggml sees it: its own strides, or a contiguous copy's
-    const auto describe_x = [&](const Activation & a) {
-        size_t xs1 = k, xs2 = k * m;
-        if (a.data == x.data_ptr() && !x.IsContiguous()) {
-            xs1 = m > 1 ? x.stride(nd - 2) : k;
-            xs2 = g > 1 ? x.stride(0) : xs1 * m;
-            // MMQ's quantizer loads 4 values at a time
-            RuntimeCheck((uintptr_t) a.data % 16 == 0 && xs1 * a.esz % 16 == 0 && xs2 * a.esz % 16 == 0, "strided mul_mat rows must start 16-byte aligned");
-        }
-        return describe(a.type, a.data, {k, m, g, 1}, {a.esz, a.esz * xs1, a.esz * xs2, a.esz * xs2 * g});
-    };
     if (ggml_cuda_should_use_mmvq(type, cc, m)) {
         const Activation a = activation(x, true, x32, stream, true);
-        ggml_tensor src1 = describe_x(a);
+        ggml_tensor src1 = describe_mul_mat_x(a, x);
         const void * q8 = nullptr;
         if (xq.has_value()) {
             const TensorView q = xq.value();
@@ -262,7 +266,7 @@ void op_mul_mat(TensorView w, int64_t type_id, TensorView x, TensorView out, Opt
         ggml_cuda_mul_mat_vec_q(ctx, &src0, &src1, nullptr, &dst, nullptr, q8);
     } else if (ggml_cuda_should_use_mmq(type, cc, m, 0)) {
         const Activation a = activation(x, mmq_reads_16bit(type), x32, stream, true);
-        ggml_tensor src1 = describe_x(a);
+        ggml_tensor src1 = describe_mul_mat_x(a, x);
         ggml_cuda_mul_mat_q(ctx, &src0, &src1, nullptr, &dst);
     } else {
         RuntimeCheck(false, "no ggml kernel for ", ggml_type_name(type), " with M=", m);
