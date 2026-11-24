@@ -68,7 +68,9 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
+        super().__init__(config)
         self.engine = Engine(config)
+        self.tp_cpu_group = self.engine.tp_cpu_group
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -157,9 +159,6 @@ class Scheduler(SchedulerIOMixin):
             decode_log_interval=config.decode_log_interval,
             moe_stats=self._moe_stats_line if config.moe_collect_stats and moe_cache is not None else None,
         )
-
-        # Initialize the I/O mixin
-        super().__init__(config, self.engine.tp_cpu_group)
 
     def _moe_stats_line(self) -> str | None:
         # on the engine stream, so the read and the zeroing fall between decode replays
