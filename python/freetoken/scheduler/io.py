@@ -49,8 +49,14 @@ class SchedulerIOMixin:
         if tp_info.size > 1:
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
+                # a request published before a rank's subscription arrives is dropped and leaves that rank waiting
+                # forever, so the first send waits until every rank has subscribed
                 self._send_into_ranks: Final = ZmqPubQueue(
-                    config.zmq_scheduler_broadcast_addr, create=True, encoder=BaseBackendMsg.encoder
+                    config.zmq_scheduler_broadcast_addr,
+                    create=True,
+                    encoder=BaseBackendMsg.encoder,
+                    subscribers=[f"rank {rank}" for rank in range(1, tp_info.size)],
+                    subscribe_timeout=config.distributed_timeout,
                 )
             else:
                 recv = self._recv_msg_multi_rank1
@@ -59,6 +65,7 @@ class SchedulerIOMixin:
                     config.zmq_scheduler_broadcast_addr,
                     create=False,
                     decoder=BaseBackendMsg.decoder,
+                    name=f"rank {tp_info.rank}",
                 )
 
         self.receive_msg = recv
