@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import torch
 
 from freetoken.layers.quantization import QuantKind
+from freetoken.layers.quantization.moe.shard import Interval
 from freetoken.utils import init_logger
 
 from .host_banks import HostBank
@@ -53,6 +54,8 @@ class ExpertBanks:
     row_tail_bytes: dict[str, list[int]] | None = None
     # per-layer quant_format of experts in several formats (``quant_format``/``kind``/``kernel`` then name the most common one); None = every layer is ``quant_format``
     layer_formats: list[str] | None = None
+    # the slice of each expert's intermediate dim the banks hold (``layout`` is packed at its width); None = all of it
+    stored: Interval | None = None
     # the residency plan holding DEFERRED layers' banks, for host_banks.probe_pin; None when nothing was deferred
     deferred_plan: object | None = None
 
@@ -84,6 +87,8 @@ def build_expert_banks(
     dummy: bool = False,
     resident: bool = False,
     layers: list[int] | None = None,
+    shard: Interval | None = None,
+    allocate=None,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -95,12 +100,24 @@ def build_expert_banks(
     ``resident`` packs into banks on ``device`` instead of host banks (the resident 'fused' experts).
     ``layers`` fills only those bank layers (the ones ``method`` serves, for experts of several
     formats): pieces of other layers are skipped and the other layers' sources are None.
+    ``shard`` packs only that slice of every expert's intermediate dim (the pieces are sliced
+    first, ``method.expert_slicing``); ``allocate(shape, dtype)`` replaces ``HostBank`` for the host banks.
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, pin_banks
     from freetoken.moe.legacy_format import legacy_format_for
 
     kernel = method.kernel
-    layout = method.layout()
+    pack, layout, stored = method.pack, method.layout(), None
+    if shard is not None:
+        # packed at the stored width, not the method's own (a GPU shard's) width
+        slicing = method.expert_slicing()
+        slicing.check(shard)
+        cfg = slicing.config_at(shard.width)
+        layout = kernel.layout(cfg)
+        stored = shard if shard.width != slicing.intermediate else None
+
+        def pack(piece, out):
+            return kernel.pack(slicing.slice_pieces(piece, shard), cfg, out)
     E = method.cfg.num_experts
     ids = list(range(num_layers)) if layers is None else sorted(layers)
     filled = set(ids)
@@ -110,7 +127,7 @@ def build_expert_banks(
         hb = None
         banks = {role: {l: torch.empty(shape, dtype=dtype, device=device) for l in ids} for role, (shape, dtype) in specs.items()}
     else:
-        hb = {role: {l: HostBank(shape, dtype) for l in ids} for role, (shape, dtype) in specs.items()}
+        hb = {role: {l: (allocate or HostBank)(shape, dtype) for l in ids} for role, (shape, dtype) in specs.items()}
         banks = {role: {l: b.tensor for l, b in per_layer.items()} for role, per_layer in hb.items()}
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
@@ -131,7 +148,7 @@ def build_expert_banks(
         return ExpertBanks(
             legacy_format_for(method.kind, kernel.name), _sources(),
             gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
-            kind=method.kind, kernel=kernel.name, layout=layout,
+            kind=method.kind, kernel=kernel.name, layout=layout, stored=stored,
         )
 
     def _fill(sink) -> None:
@@ -148,7 +165,7 @@ def build_expert_banks(
                 raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
             written[layer_id, e0:e1] = 1
             out = {role: banks[role][layer_id][e0:e1] for role in specs}
-            got = method.pack(piece, out)
+            got = pack(piece, out)
             for role, values in got.items():
                 alphas[role][layer_id * E + e0 : layer_id * E + e1] = values.to(alphas[role].dtype)
             if tracker is not None:
@@ -170,7 +187,7 @@ def build_expert_banks(
     return ExpertBanks(
         legacy_format_for(method.kind, kernel.name), _sources(),
         gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
-        streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
+        streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout, stored=stored,
     )
 
 
@@ -251,11 +268,12 @@ def _method_expert_banks(model_path, model_config, method, device, dummy, parall
     return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink, resident=resident)
 
 
-def _host_ram_fits_parallel(model_path: str) -> bool:
+def _host_ram_fits_parallel(model_path: str, readers: int = 1) -> bool:
     """Best-effort: can free host RAM hold the expert banks plus the parallel reader's one
-    extra (non-reclaimable) whole-shard buffer? Unknown (non-local path / no /proc) -> True,
-    i.e. keep the fast path. Banks ~= checkpoint size (experts dominate); transient ~= the
-    largest shard. Uses MemAvailable (counts reclaimable cache) -- the OOM-relevant figure."""
+    extra (non-reclaimable) whole-shard buffer, per reader (``readers`` processes reading at once)?
+    Unknown (non-local path / no /proc) -> True, i.e. keep the fast path. Banks ~= checkpoint size
+    (experts dominate); transient ~= the largest shard. Uses MemAvailable (counts reclaimable
+    cache) -- the OOM-relevant figure."""
     avail = None
     try:
         with open("/proc/meminfo") as f:
@@ -275,7 +293,7 @@ def _host_ram_fits_parallel(model_path: str) -> bool:
         return True
     if not sizes:
         return True
-    return avail > sum(sizes) + max(sizes)
+    return avail > sum(sizes) + readers * max(sizes)
 
 
 def ftw_bank_bytes(model_path: str) -> int | None:

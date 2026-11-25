@@ -26,6 +26,7 @@ from freetoken.utils import init_logger
 from ..registry import LayerKind, register_method
 from ..scheme import NVFP4_GROUP as GROUP, QuantKind
 from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .shard import COLS, GATE_UP_ROWS, REPLICATE, IntermediateAxis
 
 logger = init_logger(__name__)
 
@@ -39,6 +40,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    shards = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
@@ -47,8 +49,14 @@ class TritonNvfp4MoEKernel(MoEKernel):
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
+    def bank_axes(self, cfg: MoEConfig) -> dict[str, IntermediateAxis]:
+        return {
+            "gate_up": GATE_UP_ROWS, "gate_up_scale": GATE_UP_ROWS, "gate_up_global": GATE_UP_ROWS,
+            "down": COLS, "down_scale": COLS, "down_global": REPLICATE,
+        }
+
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
@@ -61,7 +69,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
         out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
+        out["gate_up_global"].copy_(fused_global(pieces, cfg.local_intermediate))
         out["down"].copy_(pieces["down"])
         out["down_scale"].copy_(pieces["down_scale"])
         out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))
@@ -100,6 +108,9 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
         from freetoken.kernel import nvfp4_moe
 
         return not backend.is_rocm() and torch.cuda.is_available() and nvfp4_moe.w4a4_available(torch.cuda.current_device())
+
+    def bank_axes(self, cfg: MoEConfig) -> dict[str, IntermediateAxis]:
+        return {**super().bank_axes(cfg), "gate_up_alpha": REPLICATE, "down_alpha": REPLICATE}
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         return {

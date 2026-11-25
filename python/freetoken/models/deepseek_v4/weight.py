@@ -242,8 +242,6 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, layers=None,
     ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""
     if kind is not QuantKind.MXFP4:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("DeepSeek-V4 expert banks support TP=1 only")
     from freetoken.models.weight import iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 

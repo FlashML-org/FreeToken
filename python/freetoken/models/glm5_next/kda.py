@@ -27,9 +27,12 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearReplicated
 from freetoken.utils import nvtx_annotate
+
+from .multi import KDA_CONV, KDA_IN_PROJ, dense_tp, kda_segments
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -52,19 +55,23 @@ class Glm5NextKDA(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm5_args
         self.layer_id = layer_id
-        self.num_heads = args.linear_num_heads
+        # under --tp N each rank runs N-th of the heads, with their state, and the outputs sum (multi.py)
+        self.tp = dense_tp(config)
+        self.num_heads = args.linear_num_heads // self.tp
         self.head_dim = args.linear_head_dim
         self.proj_size = self.num_heads * self.head_dim  # H * D
-        self.conv_dim = 3 * self.proj_size  # merged q|k|v stream
+        self.conv_dim = sum(rows for rows, _ in kda_segments(KDA_CONV, self.num_heads, self.head_dim))  # merged q|k|v stream
         self.conv_kernel_size = args.linear_conv_kernel_dim
         self.lower_bound = args.linear_lower_bound
         self.scale = self.head_dim**-0.5
 
         p, h, d = self.proj_size, self.num_heads, self.head_dim
-        # one fused input GEMM over q|k|v|b|f_a|g_a
-        self._in_proj_split = [p, p, p, h, d, d]
-        self.in_proj = LinearColParallelMerged(
-            args.hidden_size, self._in_proj_split, has_bias=False,
+        # one fused input GEMM over q|k|v|b|f_a|g_a (multi.KDA_IN_PROJ): this rank's heads of q|k|v|b, the whole f_a|g_a
+        self._in_proj_split = [rows for rows, _ in kda_segments(KDA_IN_PROJ, h, d)]
+        # the forward reads q|k|v as the one conv stream, then b, f_a, g_a
+        self._stream_split = [self.conv_dim, *self._in_proj_split[len(KDA_CONV):]]
+        self.in_proj = LinearReplicated(
+            args.hidden_size, sum(self._in_proj_split), has_bias=False, output_sizes=self._in_proj_split,
             quant_config=config.quant, prefix=f"{prefix}.in_proj",
         )
         # Low-rank gate up-projections (128 -> 8192): forget gate and output gate.
@@ -77,6 +84,7 @@ class Glm5NextKDA(BaseOP):
         self.dt_bias = torch.empty(p, dtype=torch.float32)
         self.o_norm = GatedRMSNorm(d, eps=args.norm_eps, activation="sigmoid")
         self.o_proj = LinearReplicated(p, args.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.o_proj")
+        self._comm = DistributedCommunicator()
 
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel]
@@ -109,9 +117,7 @@ class Glm5NextKDA(BaseOP):
             batch.fla_metadata = fla
 
         proj = self.in_proj.forward(hidden_states)
-        conv_in, b, f_a, g_a = torch.split(
-            proj, [self.conv_dim, h, d, d], dim=-1
-        )
+        conv_in, b, f_a, g_a = torch.split(proj, self._stream_split, dim=-1)
         g1 = self.f_b_proj.forward(f_a)  # raw forget-gate logits [T, H*D]
         g2 = self.g_b_proj.forward(g_a)  # output-gate logits [T, H*D]
         li = pool.local_index(self.layer_id)
@@ -182,7 +188,8 @@ class Glm5NextKDA(BaseOP):
 
         core_out = core_out.reshape(-1, d)
         out = self.o_norm.forward(core_out, g2.reshape(-1, d)).reshape(total, -1)
-        return self.o_proj.forward(out.to(dtype))
+        out = self.o_proj.forward(out.to(dtype))
+        return self._comm.all_reduce(out) if self.tp > 1 else out
 
 
 def _fused_recurrent(

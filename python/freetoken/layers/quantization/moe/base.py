@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
 from ..method import QuantMethod
 from ..scheme import QuantScheme
+
+if TYPE_CHECKING:
+    from .shard import ExpertSlicing, IntermediateAxis
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,8 @@ class MoEConfig:
     strategy: str = "resident"
     decode_target: str = "gpu"
     dtype: torch.dtype = torch.bfloat16
+    # [start, stop) of the intermediate dim this rank computes under expert tensor parallelism; None = all of it (or 1/tp_size under plain TP)
+    shard: tuple[int, int] | None = None
 
     @classmethod
     def from_layer(cls, layer: Any, scheme: QuantScheme | None) -> "MoEConfig":
@@ -56,10 +61,13 @@ class MoEConfig:
             strategy=layer.strategy,
             decode_target=layer.decode_target,
             dtype=torch.get_default_dtype(),
+            shard=getattr(layer, "expert_shard", None),
         )
 
     @property
     def local_intermediate(self) -> int:
+        if self.shard is not None:
+            return self.shard[1] - self.shard[0]
         return self.intermediate // self.tp_size
 
     @property
@@ -140,6 +148,8 @@ class MoEKernel(ABC):
     name: ClassVar[str]
     cpu_format: ClassVar[str | None] = None
     max_slots: ClassVar[int | None] = None
+    # Whether layout/pack/apply size the banks by ``cfg.local_intermediate``, so the kernel serves a ``cfg.shard``.
+    shards: ClassVar[bool] = False
     # Whether ``apply`` treats a slot of -1 as an inactive route (zero output, no read of any slot).
     # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
     # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
@@ -170,6 +180,21 @@ class MoEKernel(ABC):
             return f"kernel is plain-silu only, experts use ({cfg.activation}, alpha={cfg.alpha}, beta={cfg.beta}, limit={cfg.limit})"
         return None
 
+    def piece_axes(self, cfg: MoEConfig) -> dict[str, IntermediateAxis] | None:
+        """Where each checkpoint piece role carries the intermediate dim; None if pieces cannot be sliced."""
+        from .shard import standard_piece_axes
+
+        return standard_piece_axes(cfg.interleaved)
+
+    def bank_axes(self, cfg: MoEConfig) -> dict[str, IntermediateAxis] | None:
+        """Where each ``layout`` role carries the intermediate dim, for kernels whose narrow banks are
+        byte runs of a wider bank; None (repacked tiles, padded scales) means shards repack from pieces."""
+        return None
+
+    def shard_alignment(self, cfg: MoEConfig) -> int:
+        """Step a shard boundary must keep beyond what the bank layout's packing already implies."""
+        return 1
+
     @abstractmethod
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]: ...
 
@@ -184,6 +209,15 @@ class MoEKernel(ABC):
 class MoEMethod(QuantMethod):
     """Declares resident experts for its kind; layout, pack and apply go to the kernel."""
 
+    def __init__(self, cfg: MoEConfig, requested: str = "auto"):
+        if cfg.shard is not None:
+            self.candidates = tuple(c for c in self.candidates if c.shards)
+            if not self.candidates:
+                from ..method import KernelSelectionError
+
+                raise KernelSelectionError(f"no {type(self).__name__} kernel serves a slice of the experts (expert tensor parallelism)")
+        super().__init__(cfg, requested)
+
     def layout(self) -> dict[str, BankSpec]:
         return self.kernel.layout(self.cfg)
 
@@ -192,6 +226,12 @@ class MoEMethod(QuantMethod):
 
     def slot_limit(self) -> int | None:
         return self.kernel.slot_limit(self.cfg)
+
+    def expert_slicing(self) -> ExpertSlicing:
+        """How this layer's experts split along the full intermediate dim, for any shard a plan assigns."""
+        from .shard import ExpertSlicing
+
+        return ExpertSlicing(self.kernel, self.cfg)
 
     def apply(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, view: ExpertView, *, layer: Any, is_prefill: bool) -> torch.Tensor:
         return self.kernel.apply(layer, x, topk_weights, topk_ids, view, is_prefill=is_prefill)

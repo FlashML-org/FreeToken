@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from ..registry import LayerKind, register_method
 from ..scheme import MX_GROUP as GROUP, QuantKind
 from .base import BankSpec, ExpertView, fused_piece, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .shard import COLS, GATE_UP_ROWS, ONCE, ROWS, IntermediateAxis
 
 E8M0 = torch.float8_e8m0fnu
 
@@ -18,6 +21,7 @@ class TritonMxfp4MoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "ds_fp4"
     supports_inactive_slots = True
+    shards = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if cfg.interleaved:
@@ -31,8 +35,17 @@ class TritonMxfp4MoEKernel(MoEKernel):
     def cpu_options(self, cfg: MoEConfig) -> dict[str, int]:
         return {"act_block": int(cfg.act_block)}
 
+    def shard_alignment(self, cfg: MoEConfig) -> int:
+        from freetoken.moe.fused_ds_fp4 import DECODE_BLOCK_KB
+
+        # whole decode K tiles, and the down GEMM's act_block activation quant runs along I: an edge inside one changes the numerics
+        return math.lcm(2 * DECODE_BLOCK_KB, int(cfg.act_block or 1))
+
+    def bank_axes(self, cfg: MoEConfig) -> dict[str, IntermediateAxis]:
+        return {"gate_up": GATE_UP_ROWS, "gate_up_scale": GATE_UP_ROWS, "down": COLS, "down_scale": COLS}
+
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), E8M0),
@@ -66,11 +79,17 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
 
     name = "triton_gptoss"
     cpu_format = "mxfp4_triton"
+    shards = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not cfg.has_bias:
             return "gpt-oss kernel needs the expert biases"
         return None
+
+    def bank_axes(self, cfg: MoEConfig) -> dict[str, IntermediateAxis]:
+        # transposed split-K banks: gate|up interleaved along the last axis, down's I on the rows
+        cols = IntermediateAxis("split", 1)
+        return {"gate_up": cols, "gate_up_scale": cols, "gate_up_bias": ROWS, "down": ROWS, "down_scale": ROWS, "down_bias": ONCE}
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i, h = cfg.local_intermediate, cfg.hidden

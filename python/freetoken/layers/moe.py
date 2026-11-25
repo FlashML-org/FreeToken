@@ -6,13 +6,14 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
+from freetoken.moe import split_check
 from freetoken.moe.offload_cache import OffloadMoeCache
-
 
 from .base import BaseOP
 from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
 
 if TYPE_CHECKING:
+    from freetoken.distributed.plan import ExpertGroup
     from freetoken.models.config import ModelConfig
 
 # Router decision (topk_weights[float32], topk_ids[int32]) for models whose router
@@ -55,6 +56,7 @@ class MoELayer(BaseOP):
         layer_id: int | None = None,
         strategy: str = "resident",
         decode_target: str = "gpu",
+        expert_group: "ExpertGroup | None" = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -66,9 +68,21 @@ class MoELayer(BaseOP):
         self.intermediate_size = intermediate_size
         self._comm = DistributedCommunicator()
 
-        tp_info = get_tp_info()
-        self.tp_rank = tp_info.rank
-        self.tp_size = tp_size = tp_info.size
+        # expert tensor parallelism: this rank computes expert_shard of every expert and the group sums them; the shard
+        # is the kernels' whole local geometry, so they see a TP 1 layer of that width
+        self.expert_group = expert_group
+        self.expert_shard: tuple[int, int] | None = None
+        if expert_group is not None:
+            if expert_group.intermediate != intermediate_size:
+                raise ValueError(f"the expert group splits a {expert_group.intermediate}-wide expert, this MoE layer's are {intermediate_size}")
+            if expert_group.shard is None:
+                raise ValueError("the expert group has no shard placed for this rank")
+            self.expert_shard = expert_group.shard
+            self.tp_rank, self.tp_size = 0, 1
+        else:
+            tp_info = get_tp_info()
+            self.tp_rank, self.tp_size = tp_info.rank, tp_info.size
+        self._reduce = self.tp_size > 1 or (expert_group is not None and expert_group.size > 1)
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -88,8 +102,14 @@ class MoELayer(BaseOP):
     def finalize(self) -> None:
         self.quant_method.finalize(self)
 
+    def _check_routes(self, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
+        """FREETOKEN_CHECK_SPLIT_EXPERTS: ranks that split the experts must route alike (moe/split_check.py). Called where
+        the routes enter the layer, so a subclass's own data path is covered too."""
+        if self.expert_group is not None:
+            split_check.check_routes(self.layer_id, topk_ids, topk_weights)
+
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.tp_size > 1:
+        if self._reduce:
             return self._comm.all_reduce(hidden_states)
         return hidden_states
 
@@ -109,6 +129,8 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -122,9 +144,11 @@ class MoELayer(BaseOP):
 
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
+        ``reduce=False`` returns this rank's partial sum, as on ``OffloadMoELayer``.
         """
+        self._check_routes(topk_ids, topk_weights)
         out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+        return self._maybe_all_reduce(out) if reduce else out
 
     def forward(
         self,
@@ -137,6 +161,7 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        self._check_routes(topk_ids, topk_weights)
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 
@@ -159,6 +184,7 @@ class OffloadMoELayer(MoELayer):
         has_bias: bool = False,
         strategy: str = "offload",
         decode_target: str = "gpu",
+        expert_group: "ExpertGroup | None" = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -179,6 +205,7 @@ class OffloadMoELayer(MoELayer):
             layer_id=layer_id,
             strategy=strategy,
             decode_target=decode_target,
+            expert_group=expert_group,
             quant_config=quant_config,
             prefix=prefix,
         )
@@ -193,18 +220,21 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
-            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
-        else:
-            final_hidden_states = self.decode_forward(hidden_states, router_logits)
-        return self._maybe_all_reduce(final_hidden_states)
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        return self.routed_forward(hidden_states, topk_weights, topk_ids)
 
     def routed_forward(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -215,13 +245,16 @@ class OffloadMoELayer(MoELayer):
 
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
+        ``reduce=False`` returns this rank's partial sum, for a caller that adds a shared
+        expert's partial before one all-reduce.
         """
+        self._check_routes(topk_ids, topk_weights)
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+        return self._maybe_all_reduce(out) if reduce else out
 
     def decode_forward(
         self,
@@ -234,6 +267,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        self._check_routes(topk_ids, topk_weights)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -247,6 +281,7 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        self._check_routes(topk_ids, topk_weights)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
@@ -277,7 +312,10 @@ class OffloadMoELayer(MoELayer):
         assert cache is not None
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
-            assert executor is not None, "CPU MoE executor was not initialized"
+            if executor is None:
+                # a rank sharing another rank's CPU pool: the pool owner adds this layer's whole slice
+                assert cache.shares_cpu_pool, "CPU MoE executor was not initialized"
+                return torch.zeros_like(hidden_states)
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
@@ -313,12 +351,21 @@ class OffloadMoELayer(MoELayer):
         GPU-assigned routes (the C++ kernel skips id<0).
         """
         executor = cache.cpu_executor
-        assert executor is not None, "CPU MoE executor was not initialized"
+        assert executor is not None or cache.shares_cpu_pool, "CPU MoE executor was not initialized"
         # the kernel reads every route's slot: give the inactive ones slot 0, which holds a
         # complete payload or the bank's zero fill (never uninitialized storage), times weight 0
         # with several quants this holds only because the cache zeroes its staging area after prefill
         clamp = not self.skips_inactive_slots
         gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(self.layer_id, topk_ids, topk_weights, clamp=clamp)
+        if self.expert_group is not None:
+            split_check.check_split(self.layer_id, cpu_ids)
+        if executor is None:
+            # the routes split the same way on every rank; another rank's pool computes the CPU share for this one
+            cache.copy_missing()
+            return self._expert_gemm(
+                cache, hidden_states, gpu_w, gpu_slots, views=cache.pool_bank_views(self.layer_id), n=None,
+                alphas=cache.alphas_for_slots(self.layer_id), is_prefill=False,
+            )
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -455,9 +502,11 @@ def make_moe_layer(
     has_bias: bool = False,
     quant_config: QuantConfig | None = None,
     prefix: str = "",
+    expert_group: "ExpertGroup | None" = None,
 ) -> MoELayer:
     """Build the experts layer for ``config.moe_strategy`` -- the one construction
-    seam between a model and the MoE strategy.
+    seam between a model and the MoE strategy. ``expert_group``: the ranks the model's
+    parallel plan splits the routed experts over (None: whole experts).
 
     Picks ``OffloadMoELayer`` for the offload family (offload/cpu/hybrid) and
     ``MoELayer`` otherwise. Geometry defaults come from ``config``; pass overrides
@@ -489,4 +538,6 @@ def make_moe_layer(
         assert layer_id is not None, "offload MoE backends need the layer_id"
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
+    if expert_group is not None:
+        kwargs["expert_group"] = expert_group
     return layer_cls(**kwargs)

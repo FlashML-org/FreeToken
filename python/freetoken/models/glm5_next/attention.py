@@ -33,10 +33,13 @@ from typing import TYPE_CHECKING
 import torch
 from freetoken.layers.quantization import QuantKind, without_online
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 # Shared with GLM-5.2 (weight.py imports privately from the same package).
 from freetoken.models.glm_moe_dsa.attention import _IdxLayerNorm
 from freetoken.utils import nvtx_annotate
+
+from .multi import dense_tp
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -96,7 +99,10 @@ class Glm5NextAttention(BaseOP):
         args = config.glm5_args
         self.layer_id = layer_id
         self.indexer = Glm5NextIndexer(config, layer_id, prefix=f"{prefix}.indexer")
-        self.num_heads = args.num_heads
+        # under --tp N each rank attends N-th of the heads over the whole latent and the outputs sum (multi.py)
+        self.tp = dense_tp(config)
+        self.num_heads = args.num_heads // self.tp
+        self._comm = DistributedCommunicator()
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim  # 0 (NoPE)
         self.qk_head_dim = args.qk_head_dim
@@ -191,7 +197,8 @@ class Glm5NextAttention(BaseOP):
         # Absorb kv_b's v-part onto the output: o_latent[H,T,lora] @ W_uv_t[H,lora,v].
         o = torch.bmm(o_latent.transpose(0, 1), w_uv)
         del o_latent
-        return self.o_proj.forward(o.transpose(0, 1).reshape(t, self.num_heads * self.v_head_dim))
+        out = self.o_proj.forward(o.transpose(0, 1).reshape(t, self.num_heads * self.v_head_dim))
+        return self._comm.all_reduce(out) if self.tp > 1 else out
 
 
 __all__ = ["Glm5NextAttention", "Glm5NextIndexer"]

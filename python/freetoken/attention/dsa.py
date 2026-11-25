@@ -106,7 +106,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
         args = self._model_args(config)
         self.config = config
-        self.num_heads = config.num_qo_heads
+        # the query heads are read off each call's q: a model split by head under --tp passes its share
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
@@ -257,12 +257,13 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
             sel, cnt = md.sel[self._leader[layer_id]]
+        heads = q_nope.shape[1]  # this rank's heads: all of them, or N-th under --tp N
         if q_pe.shape[-1] == 0:  # NoPE: the cat would be a full-width copy
             q_cat = q_nope.unsqueeze(1)
         else:
-            q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, heads, self.latent_dim)
         o = self._attend(q_cat, layer_id, sel, cnt)
-        return o.view(bs, self.num_heads, self.kv_lora_rank)
+        return o.view(bs, heads, self.kv_lora_rank)
 
     # ----- prefill / extend (eager) ------------------------------------------------------
     def _select_prefill(
@@ -318,7 +319,8 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 )
                 for i, r in enumerate(reqs)
             ]
-        o = q_cat.new_empty(t, self.num_heads, self.kv_lora_rank)
+        heads = q_cat.shape[1]
+        o = q_cat.new_empty(t, heads, self.kv_lora_rank)
         for i, r in enumerate(reqs):
             m = qo[i + 1] - qo[i]
             if m == 0:
@@ -335,9 +337,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             # The kernel writes straight into the output slice (out=): no per-request
             # attention output next to o at the peak.
             self._attend(
-                q_cat[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.latent_dim),
+                q_cat[qo[i] : qo[i + 1]].view(1, m, heads, self.latent_dim),
                 layer_id, sel, cnt,
-                out=o[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.kv_lora_rank),
+                out=o[qo[i] : qo[i + 1]].view(1, m, heads, self.kv_lora_rank),
             )
         return o
 

@@ -291,3 +291,19 @@ def test_stacked_expert_pieces_skip_the_layers_of_other_formats():
     assert [(layer, e0, e1) for layer, e0, e1, _ in pieces] == [(0, 0, 2)]
     with pytest.raises(ValueError, match="Unexpected expert weight key"):
         list(stacked_expert_pieces(tensors, config))
+
+
+def test_parallel_expert_reader_reads_a_subset_by_range_and_everything_whole(tmp_path):
+    """Selected tensors come back intact both from per-range reads (a few layers of a shard) and from the whole-shard read."""
+    from safetensors.torch import save_file
+
+    from freetoken.models.weight import iter_expert_tensors_parallel
+
+    g = torch.Generator().manual_seed(0)
+    # sizes past the 1 MiB read-through gap and off the 4 KiB O_DIRECT grid, so the subset takes several unaligned reads
+    tensors = {f"layers.{i}.experts.w": torch.randn(300_001 + 7 * i, generator=g) for i in range(6)}
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    for wanted in ({"layers.0.experts.w", "layers.2.experts.w", "layers.5.experts.w"}, set(tensors)):
+        got = dict(iter_expert_tensors_parallel(str(tmp_path), lambda name: name in wanted, workers=2, chunk=1 << 20))
+        assert set(got) == wanted
+        assert all(torch.equal(got[name], tensors[name]) for name in wanted)

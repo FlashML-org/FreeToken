@@ -85,6 +85,17 @@ def compiled_extension_supports(activation: str) -> bool:
     return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
 
 
+def leave_cores_to_pool(pool_cores) -> None:
+    """For a rank whose NUMA node's CPU expert pool runs in another rank: cap this process's torch intra-op threads at
+    the cores no pool runs on, less one, as the pool's owner caps its own (CpuMoeExecutor)."""
+    busy = set(pool_cores)
+    spare = len([c for c in physical_core_cpus() if c not in busy]) - 1
+    clamp = max(1, min(torch.get_num_threads(), spare))
+    if clamp < torch.get_num_threads():
+        logger.info(f"torch intra-op threads: {torch.get_num_threads()} -> {clamp} (cores reserved for the node's CPU MoE pool)")
+        torch.set_num_threads(clamp)
+
+
 def physical_core_cpus() -> list[int]:
     """One logical CPU per physical core, restricted to this process's affinity.
 
@@ -177,7 +188,10 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         layer_formats: list[tuple[str, dict[str, int]]] | None = None,
+        core_ids: list[int] | None = None,
     ) -> None:
+        """``core_ids`` pins the pool to exactly these CPUs (a placement's CPU pool, one coordinator
+        among them); otherwise ``num_threads`` (0 = one per physical core) picks them."""
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
@@ -280,9 +294,10 @@ class CpuMoeExecutor:
         # ROCm 7.14 returns wrong results when it replays host-function nodes, so there only the doorbell is graph-safe.
         self._graph_capture_safe = self._flag_sync or _cpu_moe.host_func_capture_safe()
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        auto = not num_threads or bool(core_ids)
+        nthreads, core_ids = (len(core_ids), list(core_ids)) if core_ids else resolve_threads_and_affinity(num_threads)
         coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
+        if self._flag_sync and auto and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
             # oversubscribing (workers drop from N to N-1).
             coord_core = core_ids[-1]

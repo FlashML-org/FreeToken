@@ -83,6 +83,10 @@ class GgmlMoEKernel(MoEKernel):
             return "gpt-oss per-expert biases have no CPU executor format; decode must run on the GPU"
         return self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False, bias_ok=True)
 
+    def piece_axes(self, cfg: MoEConfig) -> None:
+        # ggml rows pack I in super-blocks whose byte size is not proportional to their width
+        return None
+
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         gate_up, down = expert_types(cfg)
         i, h = cfg.local_intermediate, cfg.hidden

@@ -7,8 +7,9 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.dsv4.norm import rms_norm
-from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
+from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 
 from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
@@ -25,32 +26,34 @@ class Attention(BaseOP):
     ``window_pool[L]`` / ``cmp_pool[L]`` inside the kernel -- no per-forward staging slab. Both
     prefill and decode use the same paged kernel."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, quant_config=None, prefix: str = ""):
+    def __init__(self, layer_id: int, args: DeepseekV4Args, *, tp: int = 1, quant_config=None, prefix: str = ""):
         self.layer_id = layer_id
         self.dim = args.dim
-        self.n_heads = args.n_heads
+        # under TP this rank owns a contiguous run of whole output groups and their heads (models/deepseek_v4/multi.py)
+        self.tp = tp
+        self.n_local_heads = args.n_heads // tp
+        self.n_local_groups = args.o_groups // tp
         self.q_lora_rank = args.q_lora_rank
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.n_groups = args.o_groups
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
         self.max_image_tokens = args.vision_max_n_token
 
-        self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
-        # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
+        self.attn_sink = torch.empty(self.n_local_heads, dtype=torch.float32)
+        # the latent projections are replicated; wq_b holds this rank's heads, wo_b its output groups' inputs
         self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.wq_b = LinearReplicated(self.q_lora_rank, self.n_local_heads * self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
         self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
-        wo_a_rows = self.n_groups * args.o_lora_rank
-        wo_a_k = self.n_heads * self.head_dim // self.n_groups
-        self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
-        self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
+        wo_a_k = args.n_heads * self.head_dim // args.o_groups
+        self.wo_a = torch.empty(self.n_local_groups * args.o_lora_rank, wo_a_k, dtype=torch.bfloat16)
+        self.wo_b = LinearReplicated(self.n_local_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
+        self._comm = DistributedCommunicator()
         self.softmax_scale = self.head_dim ** -0.5
 
         if self.compress_ratio:
@@ -99,10 +102,11 @@ class Attention(BaseOP):
 
 
     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
-        o = o.reshape(bsz, seqlen, self.n_groups, -1)
-        wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
+        o = o.reshape(bsz, seqlen, self.n_local_groups, -1)
+        wo_a = self.wo_a.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
-        return self.wo_b.forward(o)
+        out = self.wo_b.forward(o)
+        return self._comm.all_reduce(out) if self.tp > 1 else out
 
     @staticmethod
     def visible_window_cols(
@@ -254,7 +258,7 @@ class Attention(BaseOP):
             freqs = self._freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
 
         qr = q = self.q_norm.forward(self.wq_a.forward(x))
-        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_local_heads, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb(q[..., -rd:], freqs)
 
@@ -360,7 +364,7 @@ class Attention(BaseOP):
         freqs_t = self._freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
 
         qr = q = self.q_norm.forward(self.wq_a.forward(x))
-        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_local_heads, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb_decode(q[..., -rd:], freqs_t)  # per-row position freqs
 

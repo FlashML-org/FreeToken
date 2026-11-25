@@ -24,6 +24,10 @@ from freetoken.moe.fused import moe_align_block_size
 _TL_DTYPE = None
 
 
+# packed bytes per decode K tile; every K the decode GEMM sees (H, and I or its shard) is a multiple of twice this
+DECODE_BLOCK_KB = 128
+
+
 def _compute_type(dtype: torch.dtype):
     import triton.language as tl
 
@@ -65,7 +69,7 @@ def _grouped_decode(
     # or near the fastest split for the V4 and V4.1 decode shapes. Each K tile contains whole
     # packed FP4 scale groups.
     BLOCK_SIZE_N = 16
-    BLOCK_SIZE_KB = 128
+    BLOCK_SIZE_KB = DECODE_BLOCK_KB
     _NW = 2
     assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
     grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))

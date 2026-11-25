@@ -911,6 +911,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-host-pool",
+        choices=["numa", "rank"],
+        default=ServerArgs.moe_host_pool,
+        help=(
+            "With --tp N where the routed experts split (DeepSeek-V4, GLM-5.3): 'rank' (default) keeps a host bank and "
+            "a CPU pool per GPU, each on its GPU's node; 'numa' keeps one host copy of the expert slices of each NUMA "
+            "node's GPUs, bound to that node and shared by them, and one CPU expert pool per node computing it."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-locked-fetch",
         type=float,
         default=ServerArgs.moe_locked_fetch,

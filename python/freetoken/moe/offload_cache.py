@@ -194,6 +194,9 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        # True on a rank whose CPU-assigned routes another rank's pool computes (numa expert placement): it decodes
+        # CPU layers as zero and hybrid layers as their GPU share only, with no executor of its own
+        self.shares_cpu_pool = False
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
@@ -208,6 +211,8 @@ class OffloadMoeCache:
         # _pad_bytes[g][k]: zeroed bytes after the last row of every pool and staging buffer of layout g in bank k, for kernels that read past it (16-aligned)
         self._pad_bytes: list[list[int]] = []
         self._raw_banks = False
+        # per bank, the ByteRuns of the GPU shard inside a wider source row (set_bank_sources); None = sources are the slot rows
+        self.source_runs: dict | None = None
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size, self.pool_sizes)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -464,6 +469,7 @@ class OffloadMoeCache:
         layer_residency: list[str] | None = None,
         layer_tags: list | None = None,
         row_tail_bytes: dict[str, list[int]] | None = None,
+        source_runs: dict | None = None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -481,6 +487,10 @@ class OffloadMoeCache:
         ``layer_tags`` names each layer's quant (see :func:`bank_layouts`); layers of different tags never share a pool.
 
         ``row_tail_bytes`` gives, per bank and layer, how many bytes past the last row the kernel reads; every pool and staging buffer is then followed by that many zero bytes.
+
+        ``source_runs`` (one ``ByteRuns`` per bank) marks sources that hold a wider slice of each
+        expert's intermediate dim than this GPU computes: the slot rows follow ``layout`` and every
+        copy gathers the rows' byte runs out of the wide source rows (``kernel/triton/shard_copy.py``).
         """
         from freetoken.moe.legacy_format import canonical_role
         from freetoken.moe.host_banks import HostResidency
@@ -511,6 +521,14 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        self.source_runs = None
+        if source_runs is not None:
+            runs = {canonical_role(name): r for name, r in source_runs.items()}
+            if self.layout is None or self.layer_layouts is not None or row_tail_bytes is not None or self.device.type != "cuda":
+                raise ValueError("expert banks wider than the GPU shard need one expert kernel layout on a CUDA device")
+            if unpinned or self.locked_hybrid or self.prefill_hit_d2d:
+                raise ValueError("expert banks wider than the GPU shard are always pinned and fetched by row; no locked layers or prefill hit-D2D")
+            self.source_runs = {name: runs[canonical_role(name)] for name in self.bank_schema}
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -522,13 +540,24 @@ class OffloadMoeCache:
                     spec = self.layer_layouts[layer_id].get(name)
                     if spec is None and source.numel() != 0:
                         raise ValueError(f"layer {layer_id}'s expert kernel reads no {name!r} bank, so it takes a zero-byte placeholder")
-                if spec is not None:
+                if spec is not None and self.source_runs is not None:
+                    r, row = self.source_runs[name], source[0].numel() * source.element_size()
+                    if source.dtype != spec.dtype or r.nbytes != math.prod(spec.shape) * spec.dtype.itemsize or (
+                        not r.zero and r.offset + (r.count - 1) * r.stride + r.length > row
+                    ):
+                        raise ValueError(f"bank {name!r}: {r} does not cut the expert kernel's {tuple(spec.shape)} rows out of {row}-byte source rows")
+                elif spec is not None:
                     if tuple(source.shape[1:]) != tuple(spec.shape) or source.dtype != spec.dtype:
                         raise ValueError(
                             f"bank {name!r} rows are {tuple(source.shape[1:])} {source.dtype} but the expert kernel's layout "
                             f"wants {tuple(spec.shape)} {spec.dtype}; the banks were packed for another kernel"
                         )
             self.bank_sources[name] = list(per_layer)
+        if self.source_runs is not None:  # the slots hold the GPU shard's rows, not the source's
+            sources = {
+                name: [torch.empty((self.num_experts, *self.layout[name].shape), dtype=self.layout[name].dtype, device="meta")] * self.num_layers
+                for name in self.bank_schema
+            }
         keys = bank_layouts(sources, layer_tags)
         unique = list(dict.fromkeys(keys))
         self.layouts = [banks for _, banks in unique]
@@ -573,6 +602,9 @@ class OffloadMoeCache:
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
 
     def _build_copy_plan(self) -> None:
+        if self.source_runs is not None:
+            self._build_shard_copy_plan()
+            return
         self._build_fused_copy_plan()
         if self._copy_fused_ok or self.device.type != "cuda" or not self.banks:
             return
@@ -657,6 +689,56 @@ class OffloadMoeCache:
             self._gather_pool_ptrs.append(ptrs([dst_ptrs[k] + self._pool_offsets[k][p] for k in ids]) if ids else None)
         self._copy_blocks_per_bank = default_blocks_per_bank(self.device)
         self._copy_fused_ok = True
+
+    def _build_shard_copy_plan(self) -> None:
+        """Device descriptors of the narrow-from-wide copy: slot and staging bases, per-layer source bases, the byte runs."""
+        from freetoken.kernel.pinned import device_ptr
+        from freetoken.kernel.triton.shard_copy import _memcpy2d_module, copy_word
+
+        # build the 2D copy now, while the ranks start up together: a first-prefill JIT build outlasts the scheduler's collectives
+        _memcpy2d_module()
+
+        self._copy_fused_ok = False
+        dst = [cache.data_ptr() for _, cache in self.banks]
+        src = [[device_ptr(per_layer[layer]) for per_layer, _ in self.banks] for layer in range(self.num_layers)]
+        runs = [self.source_runs[name] for name in self.bank_schema]
+        wide = [per_layer[0][0].numel() * per_layer[0].element_size() for per_layer, _ in self.banks]
+        narrow = self._row_bytes[0]
+        stage = [[d + b * s for d, s in zip(dst, self._stage_bytes)] for b in range(2)]
+        pools = [[d + o[p] for d, o in zip(dst, self._pool_offsets)] for p in range(len(self.pool_sizes))]
+        word = copy_word(
+            *narrow, *wide, *(v for r in runs for v in (r.offset, r.length, r.stride)),
+            *(a for addrs in (*src, *stage, *pools) for a in addrs),
+        )
+
+        def ptrs(values: list[int]) -> torch.Tensor:
+            return torch.tensor(values, dtype=torch.int64, device=self.device)
+
+        self._shard_word = word
+        self._shard_runs = ptrs([v // word for v in narrow] + [v // word for v in wide] + [r.offset // word for r in runs]
+                                + [r.length // word for r in runs] + [r.stride // word for r in runs] + [int(r.zero) for r in runs]).view(6, -1)
+        self._shard_src = [ptrs(addrs) for addrs in src]
+        self._shard_dst_pool = [ptrs(addrs) for addrs in pools]
+        # whole layers (prefill) as one 2D copy per bank: a wide row is exactly count runs of stride bytes
+        E = self.num_experts
+        hosts = [[t.data_ptr() for t in per_layer] for per_layer, _ in self.banks]
+        self._shard_layer_desc = [
+            [
+                torch.tensor([
+                    [stage[b][k], E * narrow[k], 0, 0, E * narrow[k], 1] if r.zero
+                    else [stage[b][k], r.length, hosts[k][layer] + r.offset, r.stride, r.length, E * r.count]
+                    for k, r in enumerate(runs)
+                ], dtype=torch.int64)
+                for layer in range(self.num_layers)
+            ]
+            for b in range(2)
+        ]
+        assert all(r.zero or w == r.count * r.stride for r, w in zip(runs, wide)), (runs, wide)
+
+    def _shard_copy(self, dst: torch.Tensor, layer_id: int, dst_ids: torch.Tensor, src_ids: torch.Tensor, num: torch.Tensor) -> None:
+        from freetoken.kernel.triton.shard_copy import shard_copy
+
+        shard_copy(dst, self._shard_src[layer_id], self._shard_runs, dst_ids, src_ids, num, word=self._shard_word)
 
     def validate_rebuild(self, cache_size: int, pool_sizes: list[int] | None = None) -> None:
         """Pure geometry validation of a rebuild target (no GPU side effects).
@@ -901,6 +983,11 @@ class OffloadMoeCache:
 
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id, layer_id)
+            if self.source_runs is not None:
+                from freetoken.kernel.triton.shard_copy import memcpy2d
+
+                memcpy2d(self._shard_layer_desc[buffer_id][layer_id], torch.cuda.current_stream(self.device).cuda_stream)
+                return
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, buffer_id)):
                 view.copy_(per_layer[layer_id], non_blocking=True)
 
@@ -1258,6 +1345,14 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.source_runs is not None:
+            if self._pending_whole_layer:  # materialize: the whole layer into staging buffer 0, row == expert id
+                from freetoken.kernel.triton.shard_copy import memcpy2d
+
+                memcpy2d(self._shard_layer_desc[0][layer_id], torch.cuda.current_stream(self.device).cuda_stream)
+                return
+            self._shard_copy(self._shard_dst_pool[self.pool_of_layer[layer_id]], layer_id, self.evict_slots, self.src_indices, self.num_indices)
+            return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 if layer_id in self.locked_hybrid:
