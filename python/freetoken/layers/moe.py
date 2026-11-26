@@ -200,6 +200,53 @@ class OffloadMoELayer(MoELayer):
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
         return self._maybe_all_reduce(final_hidden_states)
 
+    def can_overlap_shared(self, hidden_states: torch.Tensor) -> bool:
+        """Decode batch 1, TP 1, fused GPU gather. Prefill and hybrid stay serial."""
+        from freetoken.decode_overlap import enabled
+
+        cache = self.offload_cache
+        if cache is None or cache.decode_overlap is None or not enabled():
+            return False
+        if hidden_states.shape[0] != 1 or self.tp_size != 1:
+            return False
+        if cache.decode_target != "gpu" or cache.is_cpu_layer(self.layer_id):
+            return False
+        if cache.is_unpinned_layer(self.layer_id) or not cache._copy_fused_ok:
+            return False
+        return True
+
+    def forward_with_shared(self, hidden_states, router_logits, shared):
+        """Run ``shared`` while the miss gather is in flight, then the routed GEMM.
+
+        ``shared`` must read ``hidden_states`` before the routed kernel. When the
+        overlap is off, ``shared`` still runs before the routed experts.
+        """
+        ctx = get_global_ctx()
+        if ctx.batch.is_prefill or not self.can_overlap_shared(hidden_states):
+            shared_out = shared()
+            return self.forward(hidden_states, router_logits), shared_out
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        cache = self.offload_cache
+        assert cache is not None and cache.decode_overlap is not None
+        cache.ensure_experts(self.layer_id, topk_ids)
+        shared_out = cache.decode_overlap.run(cache.copy_missing, shared)
+        routed = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.pool_bank_views(self.layer_id),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=False,
+        )
+        return self._maybe_all_reduce(routed), shared_out
+
     def routed_forward(
         self,
         hidden_states: torch.Tensor,
