@@ -25,9 +25,18 @@ def _e8m0_f32(codes):
 
 
 @constexpr_function
+def _ptx_takes_bf16x2_cvt():
+    """Whether the PTX Triton writes for sm_100+ is 9.2 or later, which cvt.rn.bf16x2.e4m3x2 needs: flashinfer hands Triton
+    the ptxas on PATH, and a CUDA 13.0 or 13.1 toolkit there writes PTX 9.0 or 9.1."""
+    from triton.backends.nvidia.compiler import get_ptxas, ptx_get_version
+
+    return ptx_get_version(get_ptxas(100).version) >= 92
+
+
+@constexpr_function
 def _bf16x2_cvt_native():
-    # ptxas takes cvt.rn.bf16x2.e4m3x2 from sm_100 on
-    return not FORCE_EMU and target_info.cuda_capability_geq(10, 0)
+    # ptxas takes cvt.rn.bf16x2.e4m3x2 from sm_100 on, in PTX 9.2 and later
+    return not FORCE_EMU and target_info.cuda_capability_geq(10, 0) and _ptx_takes_bf16x2_cvt()
 
 
 @triton.jit
