@@ -1570,7 +1570,7 @@ def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
         return False
 
 
-_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4", "gguf")
+_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "mxfp8", "nvfp4", "gguf")
 
 
 def _fused_resident_ok(model_config) -> bool:

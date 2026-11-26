@@ -155,6 +155,7 @@ def _emit_all(path: str) -> None:
     from freetoken.kernel.triton.fp8_blockscale_moe import (
         fused_experts_decode_fp8_blockscale, fused_experts_fp8_blockscale,
     )
+    from freetoken.kernel.triton.mxfp8_moe import fused_experts_decode_mxfp8, fused_experts_mxfp8
     from freetoken.kernel.triton.nvfp4_linear import (
         nvfp4_dense_linear, nvfp4_dense_linear_t, nvfp4_transpose_resident,
     )
@@ -215,6 +216,12 @@ def _emit_all(path: str) -> None:
         fused_experts_decode_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids))
     out["moe_prefill_fp8"] = f32(
         fused_experts_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids, E))
+
+    # mxfp8 offload experts: the same e4m3 rows with an e8m0 code per 32 inputs
+    gus8 = torch.randint(124, 129, (E, 2 * inter, H // 32), dtype=torch.uint8, device=dev)
+    dns8 = torch.randint(124, 129, (E, H, inter // 32), dtype=torch.uint8, device=dev)
+    out["moe_decode_mxfp8"] = f32(fused_experts_decode_mxfp8(hidden, gu, gus8, dn, dns8, tw, tids))
+    out["moe_prefill_mxfp8"] = f32(fused_experts_mxfp8(hidden, gu, gus8, dn, dns8, tw, tids, E))
 
     # nvfp4 dense: row-major + transposed resident, gemv / in-kernel gemm / scratch gemm
     N, K = 128, 256
