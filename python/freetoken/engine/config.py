@@ -110,10 +110,6 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    # swa_snapshot_radix: cached snapshots (each with its window) and whether the window pool also
-    # holds a prefill chunk; resolved at startup, a small GPU lowers them (Engine._fit_small_gpu)
-    snapshot_cache_slots: int | None = None
-    snapshot_chunk_headroom: bool = True
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True

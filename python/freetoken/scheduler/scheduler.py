@@ -930,8 +930,6 @@ class Scheduler(SchedulerIOMixin):
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        if batch.is_prefill:
-            self.cache_manager.plan_snapshots(batch.reqs)
         if self.engine.linear_backend is not None:
             self.engine.linear_backend.prepare_metadata(batch)
         if not batch.is_prefill:

@@ -1,6 +1,6 @@
 """Inkling 2 kernels against eager references written from the Hugging Face model
 (transformers PR #51050, ``modeling_inkling2_loop.py``): the attention with its distance bias,
-per-token sinks and output gate; the short convolutions with their state carried across prefill
+per-token sinks and output gate; the short convolutions with their inputs carried across prefill
 chunks and decode steps; the attention residual."""
 
 from __future__ import annotations
@@ -110,8 +110,24 @@ def _ref_conv(x, weight, scale, dyn=None, head_dim=128):
     return ((windows * taps).sum(-1).t() + xf).mul(scale).bfloat16()
 
 
+class _Rows:
+    """Per-token conv rows behind full slots, as the KV pool keeps them: a request gets rows only
+    where its cache manager gives them, every other slot maps to row 0, filled with NaN so a read
+    the cache did not plan shows up in the output."""
+
+    def __init__(self, C, num_slots=128, num_rows=64):
+        self.rows = torch.full((num_rows, C), float("nan"), device=DEV).bfloat16()
+        self.row_map = torch.zeros(num_slots + 1, dtype=torch.int64, device=DEV)
+        self.next = 1
+
+    def give(self, slots):
+        n = slots.numel()
+        self.row_map[slots.long()] = torch.arange(self.next, self.next + n, device=DEV)
+        self.next += n
+
+
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_short_conv_carries_its_state_across_chunks_and_decode(dynamic):
+def test_short_conv_carries_its_inputs_across_chunks_and_decode(dynamic):
     torch.manual_seed(2)
     T, C, K = 40, 1024, 4
     scale = 1 / math.sqrt((2 * K if dynamic else K) + 1)
@@ -120,20 +136,25 @@ def test_short_conv_carries_its_state_across_chunks_and_decode(dynamic):
     dyn = torch.randn(T, C // 128, K, device=DEV).bfloat16() if dynamic else None
     want = _ref_conv(x, w, scale, dyn)
     # two requests in one batch: request 0 prefills x in two chunks then decodes, request 1 is a fresh short prompt
-    state = torch.full((4, K - 1, C), float("nan"), device=DEV).bfloat16()
     i32 = dict(dtype=torch.int32, device=DEV)
-    slots = torch.tensor([3, 1], **i32)
+    rows = _Rows(C)
+    perm = torch.randperm(128, device=DEV).int()
+    slots0, slots1 = perm[:T], perm[T : T + 5]
     got = []
     for lo, hi in ((0, 2), (2, 30)):
         n = hi - lo
+        rows.give(slots0[max(lo, hi - (K - 1)) : hi])  # only the chunk's tail, which the next chunk reads
         xs = torch.cat([x[lo:hi], x[:5]])
         ds = torch.cat([dyn[lo:hi], dyn[:5]]) if dynamic else None
-        y = short_conv(xs, w, state, slots, scale, decode=False, q_to_req=torch.tensor([0] * n + [1] * 5, **i32),
-                       cu_q=torch.tensor([0, n, n + 5], **i32), prefix_lens=torch.tensor([lo, 0], **i32), dynamic=ds)
+        y = short_conv(xs, w, rows.rows, rows.row_map, torch.cat([slots0[:hi], slots1]), torch.tensor([0, hi, hi + 5], **i32),
+                       torch.tensor([lo, 0], **i32), scale, decode=False, q_to_req=torch.tensor([0] * n + [1] * 5, **i32),
+                       cu_q=torch.tensor([0, n, n + 5], **i32), dynamic=ds)
         got.append(y[:n])
         torch.testing.assert_close(y[n:].float(), want[:5].float(), atol=1e-2, rtol=1e-2)
     for t in range(30, T):
-        got.append(short_conv(x[t : t + 1], w, state, slots[:1], scale, decode=True, dynamic=dyn[t : t + 1] if dynamic else None))
+        rows.give(slots0[t : t + 1])
+        got.append(short_conv(x[t : t + 1], w, rows.rows, rows.row_map, slots0[: t + 1], torch.tensor([0, t + 1], **i32),
+                              torch.tensor([t], **i32), scale, decode=True, dynamic=dyn[t : t + 1] if dynamic else None))
     torch.testing.assert_close(torch.cat(got).float(), want.float(), atol=1e-2, rtol=1e-2)
 
 
@@ -142,18 +163,18 @@ def test_short_conv_epilogues():
     T, C, K = 24, 1024, 4
     x = torch.randn(T, C, device=DEV).bfloat16() * 4
     w = torch.randn(C, K, device=DEV) * 0.4
-    state = torch.zeros(1, K - 1, C, device=DEV).bfloat16()
     i32 = dict(dtype=torch.int32, device=DEV)
-    meta = dict(decode=False, q_to_req=torch.zeros(T, **i32), cu_q=torch.tensor([0, T], **i32), prefix_lens=torch.tensor([0], **i32))
-    slots = torch.zeros(1, **i32)
+    rows = _Rows(C)
+    meta = dict(decode=False, q_to_req=torch.zeros(T, **i32), cu_q=torch.tensor([0, T], **i32))
+    args = (rows.rows, rows.row_map, torch.arange(T, **i32), torch.tensor([0, T], **i32), torch.tensor([0], **i32))
     conv = _ref_conv(x, w, 0.5).float().view(T, -1, 128)
     norm = conv.norm(dim=-1, keepdim=True)
-    clipped = short_conv(x, w, state, slots, 0.5, epilogue=EPI_L2_CLIP, epi_arg=3.0, **meta)
+    clipped = short_conv(x, w, *args, 0.5, epilogue=EPI_L2_CLIP, epi_arg=3.0, **meta)
     torch.testing.assert_close(clipped.float().view(T, -1, 128), conv * (3.0 / (norm + 1e-6)).clamp(max=1.0), atol=2e-2, rtol=2e-2)
-    normed = short_conv(x, w, state, slots, 0.5, epilogue=EPI_RMS_NORM, epi_arg=1e-6, **meta)
+    normed = short_conv(x, w, *args, 0.5, epilogue=EPI_RMS_NORM, epi_arg=1e-6, **meta)
     torch.testing.assert_close(normed.float().view(T, -1, 128), conv * torch.rsqrt(conv.square().mean(-1, keepdim=True) + 1e-6), atol=2e-2, rtol=2e-2)
     r1, r2 = torch.randn(T, C, device=DEV).bfloat16(), torch.randn(T, C, device=DEV).bfloat16()
-    added = short_conv(x, w, state, slots, 0.5, epilogue=EPI_RESIDUAL, residual=r1, residual2=r2, **meta)
+    added = short_conv(x, w, *args, 0.5, epilogue=EPI_RESIDUAL, residual=r1, residual2=r2, **meta)
     torch.testing.assert_close(added.float(), (r1.float() + r2.float() + conv.view(T, C)).bfloat16().float(), atol=0, rtol=0)
 
 

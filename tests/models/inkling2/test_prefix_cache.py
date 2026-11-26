@@ -1,11 +1,11 @@
 """Prefix-cache continuation against a cold prefill on the real checkpoint (``FREETOKEN_INKLING2_MODEL``).
 
-A hit restores the convolution state from a snapshot and the window KV from the tree, then prefills
-the rest. When the cached prefix was itself prefilled, the continuation must be bitwise equal to a
-cold prefill chunked at the same point (the same forwards, nothing restored): a snapshot taken at
-the wrong row, a wrong restore slot or a window freed too early all break that. A previous turn's
-output was decoded, and no prefill reproduces decoded KV bit for bit, so a hit there must give the
-same greedy continuation and first logits within the decode-vs-prefill noise.
+A hit reads the convolution inputs of the tokens before it and the window KV from the tree, then
+prefills the rest. When the cached prefix was itself prefilled, the continuation must be bitwise
+equal to a cold prefill chunked at the same point (the same forwards, nothing restored): a row kept
+for the wrong token, a row freed too early or a window freed too early all break that. A previous
+turn's output was decoded, and no prefill reproduces decoded KV bit for bit, so a hit there must give
+the same greedy continuation and first logits within the decode-vs-prefill noise.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from freetoken.core import SamplingParams
 from freetoken.llm import LLM
 
 llm = LLM(sys.argv[1], moe_strategy="fused", max_running_req=4, memory_ratio=0.85)
-assert llm.config.cache_type == "swa_snapshot_radix", llm.config.cache_type
+assert llm.config.cache_type == "swa_radix", llm.config.cache_type
 logits, admissions = [], []
 forward = llm.engine.model.forward
 
@@ -101,7 +101,7 @@ t1 = price_list("What does item 5 cost? Answer briefly.")
 reply = turn(t1)[len(t1):]
 t2 = t1 + reply[:10] + ids(" rewritten history") + user("And item 9?")
 warm = run(t2)
-report_case("rewritten", warm, cold(t2, chunk=warm[2]), expect=len(t1) - 1)
+report_case("rewritten", warm, cold(t2, chunk=warm[2]), expect=len(t1))
 
 llm.cache_manager.flush()
 t1 = price_list("What does item 7 cost?")
@@ -114,7 +114,7 @@ a = price_list("What does item 3 cost?")
 run(a)
 b = a + user("Also, which item is the cheapest?")  # another request that extends the first one's prompt
 warm = run(b)
-report_case("cross_request", warm, cold(b, chunk=warm[2]), expect=len(a) - 1)
+report_case("cross_request", warm, cold(b, chunk=warm[2]), expect=len(a))
 
 llm.cache_manager.flush()
 t1 = turn(price_list("What does item 5 cost? Answer briefly."))
@@ -134,7 +134,7 @@ i1 = ids("<|message_user|><|content_image|><|unused_200054|><|end_message|>") + 
 expanded = run(i1, image=png)[3]
 i2 = i1 + user("How many shapes are there?")
 warm = run(i2, image=png)
-report_case("image", warm, cold(i2, chunk=warm[2], image=png), expect=expanded - 1)
+report_case("image", warm, cold(i2, chunk=warm[2], image=png), expect=expanded)
 
 llm.cache_manager.flush()
 llm.cache_manager.check_integrity()
@@ -159,23 +159,33 @@ def _bitwise_hit(row: dict) -> None:
 
 
 def test_a_rewritten_reply_resumes_at_the_end_of_its_prompt(results):
-    _bitwise_hit(results["rewritten"])  # one token before the prompt's end: a resent prompt keeps one to prefill
+    row = results["rewritten"]
+    if row["hit"] == row["expect"]:
+        return _bitwise_hit(row)
+    # with overlap the prompt is committed after the first decode step was launched, so the
+    # resume point holds that decoded token too
+    assert row["hit"] == row["expect"] + 1, row
+    _close_hit(row)
 
 
 def test_a_resent_prompt_prefills_only_its_last_token(results):
-    _bitwise_hit(results["resent"])
+    _bitwise_hit(results["resent"])  # the retain gap before the prompt's end keeps the point one token back
 
 
 def test_a_request_that_extends_another_requests_prompt_reuses_it(results):
     _bitwise_hit(results["cross_request"])
 
 
-def test_the_next_turn_resumes_at_the_end_of_the_previous_one(results):
-    row = results["next_turn"]
-    assert row["hit"] >= row["expect"], row  # everything the previous turn fed through the model
+def _close_hit(row: dict) -> None:
     assert row["tokens_equal"], row
     # decoded vs prefilled KV moves the first logits by 0.8-1.6 here; a lost state restore by 5-9
     assert row["max_diff"] < 3.0, row
+
+
+def test_the_next_turn_resumes_at_the_end_of_the_previous_one(results):
+    row = results["next_turn"]
+    assert row["hit"] >= row["expect"], row  # everything the previous turn fed through the model
+    _close_hit(row)
 
 
 def test_an_image_prefix_is_reused(results):

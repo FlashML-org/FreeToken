@@ -282,8 +282,20 @@ class SlotStateSpec:
     fill_value: float = 0.0
     # None on a model's own state: speculative decoding cannot serve the model; a proposer's state may leave it None and keep itself right in post_verify
     verify: type[SlotVerify] | None = None
-    # input rows before a track boundary the state is rebuilt from, in a pool without GDN layers
-    history: int = 0
+
+
+@dataclass(frozen=True)
+class WindowStateSpec:
+    """Per-token rows a resume needs for the last ``window`` tokens, kept beside the sliding-window KV.
+
+    Allocated as ``[len(layer_ids), num_rows, *shape]``; a token's row is reached from its full KV slot like its SWA KV, and the SWA radix tree keeps it as one more, shorter window. The owner writes a row per token it computes and reads the rows of the ``window`` tokens before it. ``shape`` is per token and TP-replicated.
+    """
+
+    name: str
+    shape: Tuple[int, ...]
+    layer_ids: Tuple[int, ...]
+    window: int
+    dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
 
 
 @dataclass(frozen=True)
@@ -393,9 +405,6 @@ class ModelConfig:
     num_kv_layers: int = 0
     # Some decoder layers (and their experts) run more than once per forward (looped models).
     revisits_layers: bool = False
-    # The model keeps per-request short-convolution state in its own buffers, keyed by
-    # Req.table_idx: the prefix caches cannot restore it and a verify step cannot roll it back.
-    recurrent_conv_state: bool = False
     # Peak transient GPU bytes a prefill forward takes per token (0: not declared). A small GPU
     # caps the prefill chunk so that peak fits the memory_ratio headroom.
     prefill_bytes_per_token: int = 0
@@ -407,6 +416,8 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # Per-token rows kept beside the sliding-window KV (see WindowStateSpec); requires an SWA group.
+    window_states: Tuple[WindowStateSpec, ...] = ()
 
     @property
     def is_moe(self) -> bool:

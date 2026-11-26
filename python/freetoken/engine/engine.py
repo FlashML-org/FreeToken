@@ -40,7 +40,7 @@ from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    SNAPSHOT_CACHE_TYPES, _linear_pool_min_slots, _linear_pool_num_slots, snapshot_cache_slots, state_pool_bytes,
+    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -625,7 +625,7 @@ class Engine:
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
-        if linear_group is not None or config.slot_states:
+        if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
             self.linear_state_pool = LinearStatePool(
@@ -674,7 +674,7 @@ class Engine:
         )
         # padded/dummy rows index the GDN padding slot (0) so gather/scatter hits scratch.
         # Naive GDN keys state by table_idx, where slot 0 is a live request and the dummy's own row is the scratch.
-        if self.linear_state_pool is not None and config.cache_type in SNAPSHOT_CACHE_TYPES:
+        if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
 
@@ -1213,11 +1213,10 @@ class Engine:
 
     def _fit_small_gpu(self, config: EngineConfig) -> None:
         """On a GPU too small for the configured plan, lower it rather than fail its first allocation:
-        the prefill chunk to what the activation headroom holds, then (swa_snapshot_radix) the cached
-        snapshots with their windows, the window pool's prefill-chunk room and the concurrency, until
-        the window pool, the minimum MoE cache and the KV reserve fit the budget. Each change is logged;
-        a plan that fits is left alone."""
-        from freetoken.engine.cache_budget import shrink_window_plan, small_gpu_chunk_cap
+        the prefill chunk to what the activation headroom holds, then (a model with window states)
+        the concurrency, until the window pools, the minimum MoE cache and the KV reserve fit the
+        budget. Each change is logged; a plan that fits is left alone."""
+        from freetoken.engine.cache_budget import small_gpu_chunk_cap
 
         def override(attr: str, value: Any, why: str) -> None:
             if getattr(config, attr) != value:
@@ -1230,37 +1229,33 @@ class Engine:
             override("memory_ratio", ratio, "keep at least 1 GiB for activations")
             override("max_extend_tokens", min(config.max_extend_tokens, cap),
                      f"a prefill chunk takes {mc.prefill_bytes_per_token // 1024} KiB per token")
-        if config.cache_type != "swa_snapshot_radix":
+        if not mc.window_states:
             return
         budget = int(config.memory_ratio * self._baseline_free) - self._weights_bytes
         experts = 0
         if is_offload_moe_strategy(config.moe_strategy) and (methods := offload_layer_methods(self.model)):
             experts = _min_expert_cache_bytes(config, methods)
 
-        names = ("snapshot_cache_slots", "snapshot_chunk_headroom", "max_running_req")
-
-        def need(*plan) -> int:
-            saved = [getattr(config, n) for n in names]
-            for n, v in zip(names, plan):
-                object.__setattr__(config, n, v)
+        def need(max_running_req: int) -> int:
+            saved = config.max_running_req
+            object.__setattr__(config, "max_running_req", max_running_req)
             try:
                 cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
-                return fixed + state_pool_bytes(config) + experts + div_ceil(config.kv_reserve_tokens, page_tokens) * cache_per_page
+                return fixed + experts + div_ceil(config.kv_reserve_tokens, page_tokens) * cache_per_page
             finally:
-                for n, v in zip(names, saved):
-                    object.__setattr__(config, n, v)
+                object.__setattr__(config, "max_running_req", saved)
 
-        start = (snapshot_cache_slots(config), True, config.max_running_req)
-        plan = shrink_window_plan(need, budget, *start)
-        if plan == start:
+        start = config.max_running_req
+        mr = start
+        while mr > 1 and need(mr) > budget:
+            mr -= 1
+        if mr == start:
             return
-        object.__setattr__(config, "snapshot_cache_slots", plan[0])
-        object.__setattr__(config, "snapshot_chunk_headroom", plan[1])
-        override("max_running_req", plan[2], "the window pool keeps ~2.2K tokens per running request")
+        override("max_running_req", mr, "the window pools keep ~2.2K tokens of window KV per running request")
         logger.warning_rank0(
-            f"small GPU: window pool, state slots, minimum MoE cache and KV reserve take {mem_GB(need(*plan))} of {mem_GB(budget)} "
-            f"(was {mem_GB(need(*start))}): {plan[0]} cached snapshots, prefill chunk room {'kept' if plan[1] else 'dropped'}"
-            + ("" if need(*plan) <= budget else f"; still {mem_GB(need(*plan) - budget)} short, startup will fail")
+            f"small GPU: window pools, minimum MoE cache and KV reserve take {mem_GB(need(mr))} of {mem_GB(budget)} "
+            f"(was {mem_GB(need(start))})"
+            + ("" if need(mr) <= budget else f"; still {mem_GB(need(mr) - budget)} short, startup will fail")
         )
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None, pool_sizes: list[int] | None) -> tuple[int, int]:
@@ -1383,27 +1378,17 @@ class Engine:
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
         spec_fixed, draft_page = self._spec_budget(config)
-        # swa_snapshot_radix keeps one window of KV per cached snapshot: the window pool follows the slots
-        window_follows_slots = num_mamba_slots is not None and config.cache_type == "swa_snapshot_radix"
-        prior_snapshot_slots = getattr(config, "snapshot_cache_slots", None)
-        try:
-            if window_follows_slots:
-                object.__setattr__(config, "snapshot_cache_slots", num_mamba_slots + 1 - _linear_pool_min_slots(config))
-            self.kv_cache.validate_rebuild(
-                config, num_pages=num_pages,
-                num_swa_pages=num_swa_pages, target_moe=target_moe,
-                per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
-                weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
-                extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
-                extra_page_bytes=draft_page,
-                extra_note=(
-                    f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
-                ),
-            )
-        except CacheRebuildRejected:
-            if window_follows_slots:
-                object.__setattr__(config, "snapshot_cache_slots", prior_snapshot_slots)
-            raise
+        self.kv_cache.validate_rebuild(
+            config, num_pages=num_pages,
+            num_swa_pages=num_swa_pages, target_moe=target_moe,
+            per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
+            weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
+            extra_page_bytes=draft_page,
+            extra_note=(
+                f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
+            ),
+        )
 
         torch.cuda.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
@@ -1437,7 +1422,7 @@ class Engine:
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None or window_follows_slots:
+        elif num_swa_pages is not None:
             # Window-only change: no page-count change, but re-derive the window pool at the new
             # pin against the CURRENT page count. This re-allocs the same-size full pool and
             # the resized window, both inside the pool's own rebuild_from_config.
@@ -1580,7 +1565,6 @@ class Engine:
                     sampling_params=None,  # type: ignore[arg-type]
                     cache_handle=None,  # type: ignore[arg-type]
                 )
-                warm_req.linear_slot_idx = self.dummy_req.linear_slot_idx
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
@@ -1590,8 +1574,6 @@ class Engine:
                         batch.positions.unsqueeze(0).expand(3, -1).contiguous()
                     )
                 batch.out_loc = dummy_row[:length]
-                if self.linear_backend is not None:
-                    self.linear_backend.prepare_metadata(batch)
                 self.attn_backend.prepare_metadata(batch)
                 with self.ctx.forward_batch(batch):
                     self.model.forward()
@@ -2121,13 +2103,6 @@ def _adjust_config(config: EngineConfig):
     if is_dsv41:
         _adjust_dsv41_config(config, override)
 
-    recurrent_conv_state = getattr(model_config, "recurrent_conv_state", False)
-    if recurrent_conv_state and getattr(config, "speculative_algorithm", None) is not None:
-        raise ValueError(
-            f"speculative decoding does not support {model_config.model_type}: its per-request "
-            "convolution state cannot be rolled back after a rejected draft"
-        )
-
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).
         if config.page_size != 1:
@@ -2143,9 +2118,6 @@ def _adjust_config(config: EngineConfig):
                     f"swa_full_tokens_ratio must be in (0, 1], got {config.swa_full_tokens_ratio}"
                 )
             override("cache_type", "swa_radix")
-        if recurrent_conv_state and config.cache_type == "swa_radix":
-            # the window radix plus a convolution-state snapshot at every reuse point
-            override("cache_type", "swa_snapshot_radix")
 
     if has_linear_attention:
         override(

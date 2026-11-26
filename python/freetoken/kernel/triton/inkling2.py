@@ -448,8 +448,10 @@ def _short_conv_kernel(
     out_ptr,
     w_ptr,
     dyn_ptr,
-    state_ptr,
-    slots_ptr,
+    rows_ptr,
+    row_map_ptr,
+    kv_indices_ptr,
+    indptr_ptr,
     q_to_req_ptr,
     cu_q_ptr,
     prefix_lens_ptr,
@@ -462,8 +464,7 @@ def _short_conv_kernel(
     stride_xt,
     stride_ot,
     stride_dt,
-    stride_ss,
-    stride_sr,
+    stride_row,
     stride_rt,
     stride_r2t,
     HEAD_DIM: tl.constexpr,
@@ -475,7 +476,6 @@ def _short_conv_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    tl.static_assert(K == 4)
     offs_t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     mask_t = offs_t < T
@@ -484,41 +484,34 @@ def _short_conv_kernel(
     if DECODE:
         req = offs_t
         local = tl.zeros((BLOCK_T,), dtype=tl.int32)
-        has_state = mask_t
     else:
         req = tl.load(q_to_req_ptr + offs_t, mask=mask_t, other=0)
         local = offs_t - tl.load(cu_q_ptr + req, mask=mask_t, other=0)
-        has_state = mask_t & (tl.load(prefix_lens_ptr + req, mask=mask_t, other=0) > 0)
-    slot = tl.load(slots_ptr + req, mask=mask_t, other=0).to(tl.int64)
-    state_rows = state_ptr + slot[:, None] * stride_ss + offs_c[None, :]
+    pos = tl.load(prefix_lens_ptr + req, mask=mask_t, other=0) + local
+    base = tl.load(indptr_ptr + req, mask=mask_t, other=0).to(tl.int64)
 
     x_raw = tl.load(x_ptr + offs_t[:, None] * stride_xt + offs_c[None, :], mask=mask, other=0.0)
     x = x_raw.to(tl.float32)
     acc = x * (tl.load(w_ptr + offs_c * K, mask=mask_c, other=0.0)[None, :] + 1.0)
     if DYNAMIC:
         acc += x * tl.load(dyn_ptr + offs_t[:, None] * stride_dt + (offs_c // HEAD_DIM)[None, :] * K, mask=mask, other=0.0).to(tl.float32)
-    prev1 = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
-    prev2 = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
     for lag in tl.static_range(1, K):
-        src = local - lag
-        in_chunk = src >= 0
+        in_chunk = local - lag >= 0
         prev = tl.load(x_ptr + (offs_t - lag)[:, None] * stride_xt + offs_c[None, :], mask=mask & in_chunk[:, None], other=0.0).to(tl.float32)
-        # the state row holds the K - 1 inputs before the chunk, oldest first
-        from_state = tl.load(state_rows + (K - 1 + src)[:, None] * stride_sr, mask=mask & (has_state & (src < 0))[:, None], other=0.0).to(tl.float32)
-        prev = tl.where(in_chunk[:, None], prev, from_state)
-        if lag == 1:
-            prev1 = prev
-        if lag == 2:
-            prev2 = prev
+        # an input before the chunk is the row of the token ``lag`` back; none before the sequence starts
+        before = mask_t & ~in_chunk & (pos - lag >= 0)
+        slot = tl.load(kv_indices_ptr + base + pos - lag, mask=before, other=0).to(tl.int64)
+        row = tl.load(row_map_ptr + slot, mask=before, other=0)
+        from_rows = tl.load(rows_ptr + row[:, None] * stride_row + offs_c[None, :], mask=mask & before[:, None], other=0.0).to(tl.float32)
+        prev = tl.where(in_chunk[:, None], prev, from_rows)
         w = tl.load(w_ptr + offs_c * K + lag, mask=mask_c, other=0.0)[None, :]
         if DYNAMIC:
             w = w + tl.load(dyn_ptr + offs_t[:, None] * stride_dt + (offs_c // HEAD_DIM)[None, :] * K + lag, mask=mask, other=0.0).to(tl.float32)
         acc += prev * w
-    if DECODE:
-        # one row per request: this program read the request's whole old state, so it can roll it in place
-        tl.store(state_rows, prev2.to(state_ptr.dtype.element_ty), mask=mask)
-        tl.store(state_rows + stride_sr, prev1.to(state_ptr.dtype.element_ty), mask=mask)
-        tl.store(state_rows + 2 * stride_sr, x_raw.to(state_ptr.dtype.element_ty), mask=mask)
+    # keep this token's input for the tokens after it, if the cache gave it a row (row 0: none)
+    slot = tl.load(kv_indices_ptr + base + pos, mask=mask_t, other=0).to(tl.int64)
+    row = tl.load(row_map_ptr + slot, mask=mask_t, other=0)
+    tl.store(rows_ptr + row[:, None] * stride_row + offs_c[None, :], x_raw.to(rows_ptr.dtype.element_ty), mask=mask & (row > 0)[:, None])
 
     # the reference rounds the convolution to bf16 before anything reads it
     y = (acc * scale).to(tl.bfloat16).to(tl.float32)
@@ -538,56 +531,19 @@ def _short_conv_kernel(
     tl.store(out_ptr + offs_t[:, None] * stride_ot + offs_c[None, :], y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit
-def _short_conv_state_kernel(
-    x_ptr,
-    state_ptr,
-    slots_ptr,
-    cu_q_ptr,
-    prefix_lens_ptr,
-    C,
-    stride_xt,
-    stride_ss,
-    stride_sr,
-    K: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    req = tl.program_id(0)
-    offs_c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
-    mask_c = offs_c < C
-    start = tl.load(cu_q_ptr + req)
-    length = tl.load(cu_q_ptr + req + 1) - start
-    has_state = tl.load(prefix_lens_ptr + req) > 0
-    row = state_ptr + tl.load(slots_ptr + req).to(tl.int64) * stride_ss + offs_c
-    # gather all three new rows before writing: the shift reads rows it then overwrites
-    tl.static_assert(K == 4)
-    r0 = _state_row(x_ptr, row, start, length - 3, stride_xt, stride_sr, offs_c, mask_c, has_state)
-    r1 = _state_row(x_ptr, row, start, length - 2, stride_xt, stride_sr, offs_c, mask_c, has_state)
-    r2 = _state_row(x_ptr, row, start, length - 1, stride_xt, stride_sr, offs_c, mask_c, has_state)
-    tl.store(row, r0.to(state_ptr.dtype.element_ty), mask=mask_c)
-    tl.store(row + stride_sr, r1.to(state_ptr.dtype.element_ty), mask=mask_c)
-    tl.store(row + 2 * stride_sr, r2.to(state_ptr.dtype.element_ty), mask=mask_c)
-
-
-@triton.jit
-def _state_row(x_ptr, row, start, src, stride_xt, stride_sr, offs_c, mask_c, has_state):
-    """Input ``src`` rows after the chunk start: from the chunk when ``src >= 0``, else from the old state."""
-    from_x = tl.load(x_ptr + (start + src) * stride_xt + offs_c, mask=mask_c & (src >= 0), other=0.0).to(tl.float32)
-    from_state = tl.load(row + (3 + src) * stride_sr, mask=mask_c & (src < 0) & has_state, other=0.0).to(tl.float32)
-    return tl.where(src >= 0, from_x, from_state)
-
-
 def short_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
-    state: torch.Tensor,
-    slots: torch.Tensor,
+    rows: torch.Tensor,
+    row_map: torch.Tensor,
+    kv_indices: torch.Tensor,
+    indptr: torch.Tensor,
+    prefix_lens: torch.Tensor,
     scale: float,
     *,
     decode: bool,
     q_to_req: torch.Tensor | None = None,
     cu_q: torch.Tensor | None = None,
-    prefix_lens: torch.Tensor | None = None,
     dynamic: torch.Tensor | None = None,
     head_dim: int = 128,
     epilogue: int = EPI_NONE,
@@ -596,19 +552,20 @@ def short_conv(
     residual2: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """``(sum_lag w[c, lag] * x[t - lag, c] + x[t, c]) * scale`` for each row, then roll the state.
+    """``(sum_lag w[c, lag] * x[t - lag, c] + x[t, c]) * scale`` for each row.
 
     ``weight`` ``[C, K]`` fp32 indexed by backward lag (lag 0 = the current row). ``dynamic``
     ``[T, C // head_dim, K]`` adds per-row taps shared by the ``head_dim`` channels of a head.
-    ``state`` ``[rows, K - 1, C]`` view (row stride may exceed C) holds each request's last
-    ``K - 1`` inputs; ``slots[r]`` is request ``r``'s row. A prefill request with
-    ``prefix_lens[r] == 0`` starts from zeros. Decode: one row per request, no metadata.
+    The inputs of the tokens before a request's chunk come from ``rows`` ``[num_rows, C]`` (row
+    stride may exceed C): token ``p`` of request ``r`` is at row ``row_map[kv_indices[indptr[r] +
+    p]]``; ``prefix_lens[r]`` is the chunk start, and the sequence starts from zeros. Every token
+    whose row is not 0 writes its input there. Decode: one row per request, no q metadata.
     The bf16-rounded output then goes through ``epilogue``: a per-head L2 clip to ``epi_arg``,
     a per-head RMSNorm with eps ``epi_arg``, or ``residual (+ residual2)`` added in fp32.
     """
     T, C = x.shape
     K = weight.shape[1]
-    assert weight.shape[0] == C and state.shape[1:] == (K - 1, C) and state.stride(-1) == 1 and x.stride(-1) == 1
+    assert weight.shape[0] == C and rows.shape[1] == C and rows.stride(-1) == 1 and x.stride(-1) == 1
     out = torch.empty((T, C), dtype=out_dtype or x.dtype, device=x.device)
     if T == 0:
         return out
@@ -616,22 +573,16 @@ def short_conv(
         assert dynamic.shape == (T, C // head_dim, K) and dynamic.stride(-1) == 1 and dynamic.stride(-2) == K
     block_t, block_c = 16, 256
     assert epilogue not in (EPI_L2_CLIP, EPI_RMS_NORM) or block_c % head_dim == 0
-    dummy = slots
     _short_conv_kernel[(triton.cdiv(T, block_t), triton.cdiv(C, block_c))](
-        x, out, weight, dynamic if dynamic is not None else x, state, slots,
-        dummy if decode else q_to_req, dummy if decode else cu_q, dummy if decode else prefix_lens,
+        x, out, weight, dynamic if dynamic is not None else x, rows, row_map, kv_indices, indptr,
+        prefix_lens if decode else q_to_req, prefix_lens if decode else cu_q, prefix_lens,
         residual if residual is not None else x, residual2 if residual2 is not None else x,
         T, C, scale, epi_arg, x.stride(0), out.stride(0), dynamic.stride(0) if dynamic is not None else 0,
-        state.stride(0), state.stride(1),
+        rows.stride(0),
         residual.stride(0) if residual is not None else 0, residual2.stride(0) if residual2 is not None else 0,
         HEAD_DIM=head_dim, K=K, DYNAMIC=dynamic is not None, DECODE=decode, EPI=epilogue, HAS_RES2=residual2 is not None,
         BLOCK_T=block_t, BLOCK_C=block_c, num_warps=4,
     )
-    if not decode:
-        _short_conv_state_kernel[(cu_q.numel() - 1, triton.cdiv(C, 1024))](
-            x, state, slots, cu_q, prefix_lens, C, x.stride(0), state.stride(0), state.stride(1),
-            K=K, BLOCK_C=1024, num_warps=4,
-        )
     return out
 
 

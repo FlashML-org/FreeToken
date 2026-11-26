@@ -113,22 +113,6 @@ def test_small_gpu_keeps_a_chunk_within_the_activation_headroom():
     assert (1 - ratio) * 7 * GiB >= GiB * 0.999 and chunk * 192 * 1024 <= 0.35 * GiB
 
 
-def test_small_gpu_lowers_cached_snapshots_then_chunk_room_then_concurrency():
-    from freetoken.engine.cache_budget import shrink_window_plan
-
-    # an Inkling-like window pool: 2195 tokens per running request, a window per cached snapshot,
-    # one 8K chunk, 160 KiB per token, next to a fixed 2 GiB of experts and KV reserve
-    def need(cached, chunk_room, mr):
-        return (mr * 2195 + cached * 1040 + (8192 if chunk_room else 0)) * 160 * 1024 + (2 << 30)
-
-    start = (8, True, 4)
-    assert shrink_window_plan(need, need(*start), *start) == start
-    assert shrink_window_plan(need, need(*start) - 1, *start) == (4, True, 4)
-    assert shrink_window_plan(need, need(0, True, 4) - 1, *start) == (0, False, 4)
-    assert shrink_window_plan(need, need(0, False, 1), *start) == (0, False, 1)
-    assert shrink_window_plan(need, 0, *start) == (0, False, 1)  # nothing fits: the smallest plan
-
-
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     sources = {
         "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)],  # row = 32*8*2 = 512

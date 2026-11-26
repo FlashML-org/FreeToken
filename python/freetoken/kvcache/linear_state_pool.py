@@ -9,9 +9,6 @@ from freetoken.env import ENV
 from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec, SlotVerify
 from freetoken.utils import div_even
 
-# cache types whose radix tree holds state snapshots in this pool (GDN, and Inkling 2's conv windows)
-SNAPSHOT_CACHE_TYPES = ("hybrid_radix", "swa_snapshot_radix")
-
 _SSM_DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
@@ -50,7 +47,7 @@ class LinearStatePool:
 
     def __init__(
         self,
-        group: LinearGatedDeltaGroupConfig | None,
+        group: LinearGatedDeltaGroupConfig,
         num_slots: int,
         dtype: torch.dtype,
         device: torch.device,
@@ -59,35 +56,28 @@ class LinearStatePool:
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
-        if group is None and not slot_states:
-            raise ValueError("LinearStatePool needs a linear-attention group or slot_states")
 
         self._group = group
         self._num_slots = num_slots
         self._device = device
         self._conv_dtype = dtype
 
-        # A model without GDN layers (group None) keeps only its declared slot_states here.
-        self.conv_states: torch.Tensor | None = None
-        self.recurrent_states: torch.Tensor | None = None
-        self._local_k_heads = 0
-        self._local_index: dict[int, int] = {}
-        if group is not None:
-            n_layers, local_conv_dim, local_v_heads, self._local_k_heads = _linear_local_dims(group, tp_size)
-            # conv left-context: the last (kernel-1) timesteps of the conv input stream.
-            self.conv_states = torch.zeros(
-                (n_layers, num_slots, local_conv_dim, group.conv_kernel_dim - 1),
-                dtype=dtype,
-                device=device,
-            )
-            # SSM recurrent state. fp32 by default (matches HF mamba_ssm_dtype); the dtype is
-            # overridable via FREETOKEN_MAMBA_SSM_DTYPE (see ssm_state_dtype).
-            self.recurrent_states = torch.zeros(
-                (n_layers, num_slots, local_v_heads, group.key_head_dim, group.value_head_dim),
-                dtype=ssm_state_dtype(),
-                device=device,
-            )
-            self._local_index = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
+        n_layers, local_conv_dim, local_v_heads, self._local_k_heads = _linear_local_dims(group, tp_size)
+
+        # conv left-context: the last (kernel-1) timesteps of the conv input stream.
+        self.conv_states = torch.zeros(
+            (n_layers, num_slots, local_conv_dim, group.conv_kernel_dim - 1),
+            dtype=dtype,
+            device=device,
+        )
+        # SSM recurrent state. fp32 by default (matches HF mamba_ssm_dtype); the dtype is
+        # overridable via FREETOKEN_MAMBA_SSM_DTYPE (see ssm_state_dtype).
+        self.recurrent_states = torch.zeros(
+            (n_layers, num_slots, local_v_heads, group.key_head_dim, group.value_head_dim),
+            dtype=ssm_state_dtype(),
+            device=device,
+        )
+        self._local_index = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
 
         self._slot_specs = tuple(slot_states)
         names = [spec.name for spec in self._slot_specs]
@@ -163,11 +153,9 @@ class LinearStatePool:
         live/snapshot state is dropped, so the caller must guarantee no running request
         holds a slot and the radix tree owning donated snapshots is discarded too.
         """
-        gdn = self.has_gdn
-        if gdn:
-            n_layers, _, local_conv_dim, km1 = self.conv_states.shape
-            _, _, local_v_heads, key_head_dim, value_head_dim = self.recurrent_states.shape
-            conv_dtype, rec_dtype = self.conv_states.dtype, self.recurrent_states.dtype
+        n_layers, _, local_conv_dim, km1 = self.conv_states.shape
+        _, _, local_v_heads, key_head_dim, value_head_dim = self.recurrent_states.shape
+        conv_dtype, rec_dtype = self.conv_states.dtype, self.recurrent_states.dtype
         device = self._device
         self.conv_states = None
         self.recurrent_states = None
@@ -175,15 +163,14 @@ class LinearStatePool:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        if gdn:
-            self.conv_states = torch.zeros(
-                (n_layers, num_slots, local_conv_dim, km1), dtype=conv_dtype, device=device
-            )
-            self.recurrent_states = torch.zeros(
-                (n_layers, num_slots, local_v_heads, key_head_dim, value_head_dim),
-                dtype=rec_dtype,
-                device=device,
-            )
+        self.conv_states = torch.zeros(
+            (n_layers, num_slots, local_conv_dim, km1), dtype=conv_dtype, device=device
+        )
+        self.recurrent_states = torch.zeros(
+            (n_layers, num_slots, local_v_heads, key_head_dim, value_head_dim),
+            dtype=rec_dtype,
+            device=device,
+        )
         self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
@@ -200,18 +187,16 @@ class LinearStatePool:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""
         if isinstance(slots, (list, tuple)):
             slots = torch.as_tensor(slots, dtype=torch.long, device=self._device)
-        if self.has_gdn:
-            self.conv_states[:, slots] = 0
-            self.recurrent_states[:, slots] = 0
+        self.conv_states[:, slots] = 0
+        self.recurrent_states[:, slots] = 0
         for spec in self._slot_specs:
             self.slot_states[spec.name][:, slots] = spec.fill_value
 
     def copy_from(self, src: int, dst: int) -> None:
         """Copy a whole-sequence snapshot (conv + recurrent, all layers) from slot ``src`` to
         ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot)."""
-        if self.has_gdn:
-            self.conv_states[:, dst].copy_(self.conv_states[:, src])
-            self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
+        self.conv_states[:, dst].copy_(self.conv_states[:, src])
+        self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
         for t in self.slot_states.values():
             t[:, dst].copy_(t[:, src])
 
@@ -229,26 +214,14 @@ class LinearStatePool:
 
     def reset(self, table_idx: int) -> None:
         """Zero a slot across all linear layers (new request takes this table_idx)."""
-        if self.has_gdn:
-            self.conv_states[:, table_idx].zero_()
-            self.recurrent_states[:, table_idx].zero_()
+        self.conv_states[:, table_idx].zero_()
+        self.recurrent_states[:, table_idx].zero_()
         for spec in self._slot_specs:
             self.slot_states[spec.name][:, table_idx] = spec.fill_value
 
     @property
     def num_linear_layers(self) -> int:
         return len(self._local_index)
-
-    @property
-    def has_gdn(self) -> bool:
-        return self.conv_states is not None
-
-    @property
-    def track_rows(self) -> int:
-        """Input rows before a prefill track boundary that the snapshot is built from."""
-        if self.has_gdn:
-            return int(self.conv_states.shape[-1])
-        return max(spec.history for spec in self._slot_specs)
 
     @property
     def num_slots(self) -> int:
@@ -282,12 +255,10 @@ class LinearStatePool:
 
     def bytes_per_slot(self) -> int:
         """Total state bytes for one request (all linear layers)."""
-        per = 0
-        if self.has_gdn:
-            per = (
-                self.conv_states[:, 0].numel() * self.conv_states.element_size()
-                + self.recurrent_states[:, 0].numel() * self.recurrent_states.element_size()
-            )
+        per = (
+            self.conv_states[:, 0].numel() * self.conv_states.element_size()
+            + self.recurrent_states[:, 0].numel() * self.recurrent_states.element_size()
+        )
         for t in self.slot_states.values():
             per += t[:, 0].numel() * t.element_size()
         return int(per)
@@ -334,21 +305,20 @@ class LinearVerifyScratch:
 
 
 def linear_state_bytes_per_req(
-    group: LinearGatedDeltaGroupConfig | None,
+    group: LinearGatedDeltaGroupConfig,
     tp_size: int,
     dtype: torch.dtype,
     slot_states: tuple[SlotStateSpec, ...] = (),
 ) -> int:
     """Linear-state bytes for one request across all linear layers (TP-local), plus any
     declared slot_states."""
-    total = 0
-    if group is not None:
-        n_layers, local_conv_dim, local_v_heads, _ = _linear_local_dims(group, tp_size)
-        conv_elems = local_conv_dim * (group.conv_kernel_dim - 1)
-        rec_elems = local_v_heads * group.key_head_dim * group.value_head_dim
-        conv_bytes = conv_elems * dtype.itemsize  # conv state in model dtype
-        rec_bytes = rec_elems * ssm_state_dtype().itemsize  # recurrent state (default fp32)
-        total = n_layers * (conv_bytes + rec_bytes)
+    n_layers, local_conv_dim, local_v_heads, _ = _linear_local_dims(group, tp_size)
+
+    conv_elems = local_conv_dim * (group.conv_kernel_dim - 1)
+    rec_elems = local_v_heads * group.key_head_dim * group.value_head_dim
+    conv_bytes = conv_elems * dtype.itemsize  # conv state in model dtype
+    rec_bytes = rec_elems * ssm_state_dtype().itemsize  # recurrent state (default fp32)
+    total = n_layers * (conv_bytes + rec_bytes)
 
     for spec in slot_states:
         item = (spec.dtype if spec.dtype is not None else dtype).itemsize
@@ -365,7 +335,9 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     the state pool is a sibling pool, not a KV tier."""
     linear_group = config.model_config.linear_attention_group()
     slot_states = getattr(config, "slot_states", ())
-    if linear_group is None and not slot_states:
+    if linear_group is None:
+        if slot_states:
+            raise ValueError("slot_states ride the linear-state slots; model has no linear group")
         return 0
     slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
     per_req = linear_state_bytes_per_req(
@@ -391,38 +363,25 @@ def verify_scratch_bytes(config, rows_per_req: int) -> int:
     return stash + window + handlers
 
 
-def _slots_per_running_req(config) -> int:
-    """Non-evictable state slots of one running request. Hybrid radix: 1 live + 2 ping-pong + 1
-    committed snapshot locked through decode. swa_snapshot_radix: 1 live + 1 track slot + the
-    snapshot a prefix hit restores from, locked from admission to the prompt's commit (its own
-    committed snapshot ends a token before the node it locks, so it stays evictable). Naive: the
-    live slot."""
-    if config.cache_type == "hybrid_radix":
-        return 4
-    if config.cache_type == "swa_snapshot_radix":
-        return 3
-    return 1
-
-
 def _linear_pool_num_slots(config) -> int:
-    """LinearStatePool slot count: every running request's working set, plus a cross-request
-    snapshot cache and a padding sink for the snapshot radixes; naive keeps (max_running_req + 1)."""
+    """LinearStatePool slot count. Hybrid-radix non-evictable peak is 4 slots per running request
+    (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
+    snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1)."""
     mr = config.max_running_req
-    if config.cache_type not in SNAPSHOT_CACHE_TYPES:
+    if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
-    n_cache = getattr(config, "snapshot_cache_slots", None)
-    if n_cache is None or config.cache_type != "swa_snapshot_radix":
-        n_cache = max(4, int(config.linear_state_cache_ratio * mr))
-    return _slots_per_running_req(config) * mr + n_cache + 1
+    ratio = config.linear_state_cache_ratio
+    n_cache = max(4, int(ratio * mr))
+    return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
 
 def _linear_pool_min_slots(config) -> int:
     """Floor on LinearStatePool slots that still runs: the non-evictable working set with a
-    zero snapshot cache, plus the padding sink. Below this, a full max_running_req batch can't
-    get its slots and admission deadlocks -- so a runtime rebuild rejects a smaller request."""
-    return _slots_per_running_req(config) * config.max_running_req + 1
-
-
-def snapshot_cache_slots(config) -> int:
-    """Pool slots left for tree-held snapshots once every running request has its working set."""
-    return _linear_pool_num_slots(config) - _linear_pool_min_slots(config)
+    zero snapshot cache. Hybrid-radix needs 4 per running request (1 live + 2 ping-pong + 1
+    committed snapshot locked through decode) + the padding sink; naive needs 1 per request +
+    padding. Below this, a full max_running_req batch can't get its slots and admission
+    deadlocks -- so a runtime rebuild rejects a smaller request."""
+    mr = config.max_running_req
+    if config.cache_type != "hybrid_radix":
+        return mr + 1
+    return 4 * mr + 1

@@ -12,12 +12,12 @@ if TYPE_CHECKING:
 
 
 class ConvState:
-    """Views of the short-convolution left context, the LinearStatePool slot state ``CONV_STATE``.
+    """Views of the short-convolution inputs kept per token, the KV pool's window state ``CONV_STATE``.
 
-    Pool layer ``v`` is visit ``v``: ``[slots, K - 1, width]``, the last ``K - 1`` inputs of the
-    visit's four convolutions (key, value, attention output, MoE output) side by side. Requests
-    index it by their state slot (``fla_metadata.cache_indices``); a prefill writes the snapshots
-    its cache manager planned (``fla_metadata.track_dst``) from the inputs before each boundary.
+    Pool layer ``v`` is visit ``v``: ``[rows, width]``, a token's inputs to the visit's four
+    convolutions (key, value, attention output, MoE output) side by side. A token's row is
+    reached from its full KV slot through ``row_map``; the cache gives rows only to the tokens a
+    later chunk, decode step or resume reads.
     """
 
     def __init__(self, args: Inkling2Args):
@@ -30,27 +30,16 @@ class ConvState:
         self._tensor: torch.Tensor | None = None
         self._views: list[dict[str, torch.Tensor]] = []
 
-    def view(self, visit: int, name: str) -> torch.Tensor:
-        pool = get_global_ctx().linear_state_pool
-        tensor = pool.slot_states[CONV_STATE]
+    def rows(self, visit: int, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rows of convolution ``name`` at ``visit``, and the full slot -> row mapping."""
+        tensor, row_map = get_global_ctx().kv_cache.state_rows(CONV_STATE)
         if tensor is not self._tensor:  # a pool rebuild replaces the tensor
             self._tensor = tensor
             self._views = [
-                {n: tensor[v, :, :, lo : lo + self.widths[n]] for n, lo in self.offsets.items()}
+                {n: tensor[v, :, lo : lo + self.widths[n]] for n, lo in self.offsets.items()}
                 for v in range(tensor.shape[0])
             ]
-        return self._views[visit][name]
-
-    @staticmethod
-    def slots() -> torch.Tensor:
-        return get_global_ctx().batch.fla_metadata.cache_indices
-
-    @staticmethod
-    def track(view: torch.Tensor, x: torch.Tensor) -> None:
-        """Snapshot the inputs before each planned boundary into its slot (prefill only)."""
-        fla = get_global_ctx().batch.fla_metadata
-        if fla.track_dst is not None:
-            view[fla.track_dst] = x[fla.track_conv_src]
+        return self._views[visit][name], row_map
 
 
 __all__ = ["ConvState"]

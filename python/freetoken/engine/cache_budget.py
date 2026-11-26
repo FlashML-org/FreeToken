@@ -118,19 +118,6 @@ def small_gpu_chunk_cap(memory_ratio: float, baseline_free: int, bytes_per_token
     return memory_ratio, max(256, int(0.35 * headroom / bytes_per_token) // 256 * 256)
 
 
-def shrink_window_plan(need, budget: int, cache_slots: int, chunk_room: bool, max_running_req: int) -> tuple[int, bool, int]:
-    """Lower ``(cache_slots, chunk_room, max_running_req)`` -- cached snapshots first (halving), then
-    the window pool's prefill-chunk room, then the concurrency -- until ``need(*plan) <= budget``.
-    Returns the plan as is when it fits, and the smallest plan when nothing does."""
-    while cache_slots > 0 and need(cache_slots, chunk_room, max_running_req) > budget:
-        cache_slots //= 2
-    if need(cache_slots, chunk_room, max_running_req) > budget:
-        chunk_room = False
-    while max_running_req > 1 and need(cache_slots, chunk_room, max_running_req) > budget:
-        max_running_req -= 1
-    return cache_slots, chunk_room, max_running_req
-
-
 def resolve_moe_cache_auto(
     *,
     baseline_free: int,

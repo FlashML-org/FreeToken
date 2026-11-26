@@ -23,8 +23,8 @@ from freetoken.models.config import (
     FullAttentionGroupConfig,
     ModelConfig,
     RotaryConfig,
-    SlotStateSpec,
     SWAAttentionGroupConfig,
+    WindowStateSpec,
 )
 
 IMAGE_TOKEN_ID = 200054
@@ -270,9 +270,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
             ),
         ),
         inkling2_args=args,
-        recurrent_conv_state=True,
         revisits_layers=args.num_passes > 1,
-        slot_states=(conv_state_spec(args),),
+        window_states=(conv_state_spec(args),),
         # measured: 190 KiB per token of a prefill chunk, at every chunk size from 1K to 8K
         prefill_bytes_per_token=192 * 1024,
     )
@@ -287,15 +286,16 @@ def conv_state_widths(args: Inkling2Args) -> dict[str, int]:
     return {"k": kv, "v": kv, "attn": args.hidden_size, "mlp": args.hidden_size}
 
 
-def conv_state_spec(args: Inkling2Args) -> SlotStateSpec:
-    """Each visit's last ``K - 1`` convolution inputs per request (bf16 projections, so bf16 is
-    exact), one pool layer per visit. A sequence without a prefix starts from zeros."""
-    return SlotStateSpec(
+def conv_state_spec(args: Inkling2Args) -> WindowStateSpec:
+    """Each visit's convolution inputs per token (bf16 projections, so bf16 is exact), one pool
+    layer per visit; a token reads those of the ``K - 1`` tokens before it. A sequence starts from
+    zeros."""
+    return WindowStateSpec(
         name=CONV_STATE,
-        shape=(args.conv_kernel - 1, sum(conv_state_widths(args).values())),
+        shape=(sum(conv_state_widths(args).values()),),
         layer_ids=tuple(range(args.num_visits)),
+        window=args.conv_kernel - 1,
         dtype=torch.bfloat16,
-        history=args.conv_kernel - 1,
     )
 
 

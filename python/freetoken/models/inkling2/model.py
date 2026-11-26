@@ -108,14 +108,10 @@ class Inkling2DecoderLayer(BaseOP):
     def _conv(self, x, weight, state: ConvState, visit: int, name: str, **kw) -> torch.Tensor:
         batch = get_global_ctx().batch
         md = batch.attn_metadata
-        view = state.view(visit, name)
-        out = short_conv(
-            x, weight, view, state.slots(), self._conv_scale,
-            decode=not batch.is_prefill, q_to_req=md.q_to_req, cu_q=md.cu_seqlens_q_gpu, prefix_lens=md.prefix_lens, **kw,
+        return short_conv(
+            x, weight, *state.rows(visit, name), md.indices, md.indptr, md.prefix_lens, self._conv_scale,
+            decode=not batch.is_prefill, q_to_req=md.q_to_req, cu_q=md.cu_seqlens_q_gpu, **kw,
         )
-        if batch.is_prefill:
-            state.track(view, x)
-        return out
 
     def _attn_inputs(self, x: torch.Tensor, blocks: torch.Tensor, nb: int, messages: torch.Tensor | None):
         if self._layer_id == 0:
