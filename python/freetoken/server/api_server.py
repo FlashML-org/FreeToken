@@ -967,7 +967,7 @@ def _install_shell_stop_handlers() -> None:
         signal.signal(sig, _flag_shutdown)
 
 
-def _serve_and_run_shell(host: str, port: int, api_key: str | None) -> None:
+def _serve_and_run_shell(host: str, port: int, api_key: str | None, http_keep_alive_s: int) -> None:
     """Shell mode: serve the API here, and attach the terminal client to it over the loopback.
 
     The shell is an ordinary API client (see ``freetoken.shell``), so shell mode is just
@@ -991,7 +991,9 @@ def _serve_and_run_shell(host: str, port: int, api_key: str | None) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=host, port=port, access_log=False, timeout_keep_alive=http_keep_alive_s,
+    ))
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1129,7 +1131,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     ).start()
 
     if run_shell:
-        _serve_and_run_shell(host, port, config.api_key)
+        _serve_and_run_shell(host, port, config.api_key, config.http_keep_alive_s)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, timeout_keep_alive=config.http_keep_alive_s)
