@@ -253,17 +253,16 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
 
 _EXPERT_TENSOR = re.compile(r"^(?P<module>.+\.mlp\.experts)\.w(13|2)_weight$")
-# hf_quant_config.json compute dtype -> the ModelOpt algo FreeToken serves it as; experts in other formats
-# (MXFP8) load through the bf16 path, dequantized by iter_expert_pieces
-_SERVED_ALGOS = {"nvfp4": "W4A16_NVFP4"}
+# hf_quant_config.json compute dtype -> the ModelOpt algo FreeToken serves it as
+_SERVED_ALGOS = {"nvfp4": "W4A16_NVFP4", "mxfp8": "MXFP8"}
 
 
 def quant_config(model_path: str, hf_config: Any, *, name_map, unquantized):
     """The checkpoint's expert formats as a ModelOpt MIXED_PRECISION config.
 
-    The config.json says ``modelopt`` / ``NVFP4`` for the whole model, but only the routed experts of some
-    layers are NVFP4; ``hf_quant_config.json`` lists the tensors of each format. The activation
-    quantization it declares for the NVFP4 experts is not applied (W4A16), as in the reference."""
+    The config.json says ``modelopt`` / ``NVFP4`` for the whole model, but only the routed experts are quantized,
+    NVFP4 on most layers and MXFP8 on the last ones; ``hf_quant_config.json`` lists the tensors of each format. The
+    activation quantization it declares for the experts is not applied (W4A16 / W8A16), as in the reference."""
     from freetoken.layers.quantization import ModelOptConfig, QuantConfig
     from freetoken.utils.hf import optional_hf_file
 

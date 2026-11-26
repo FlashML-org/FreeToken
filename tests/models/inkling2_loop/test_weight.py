@@ -51,6 +51,57 @@ def test_mxfp8_experts_match_reference():
     assert torch.equal(dequant_mxfp8(deinterleave_rows(weight), deinterleave_rows(scale)), _hf_interleave(ref))
 
 
+def test_each_layer_is_served_in_its_stored_format(tmp_path):
+    """hf_quant_config.json's groups pick each layer's expert kind, and the reader hands MXFP8 rows over as stored."""
+    import json
+
+    import pytest
+    import safetensors.torch
+
+    from freetoken.layers.quantization import QuantKind
+    from freetoken.models.inkling2_loop.config import quant_config
+    from freetoken.models.inkling2_loop.weight import deinterleave_rows, iter_expert_pieces
+
+    g = torch.Generator().manual_seed(2)
+    E, I, H = 2, 32, 64
+    base = "model.llm.layers.{}.mlp.experts."
+    nvfp4 = {
+        "w13_weight": torch.randint(0, 256, (E, 2 * I, H // 2), generator=g, dtype=torch.uint8),
+        "w13_weight_scale": torch.ones(E, 2 * I, H // 16).to(torch.float8_e4m3fn),
+        "w13_weight_amax": torch.ones(E), "w13_weight_outer_scale_denominator": torch.ones(1),
+        "w2_weight": torch.randint(0, 256, (E, H, I // 2), generator=g, dtype=torch.uint8),
+        "w2_weight_scale": torch.ones(E, H, I // 16).to(torch.float8_e4m3fn),
+        "w2_weight_amax": torch.ones(E), "w2_weight_outer_scale_denominator": torch.ones(1),
+    }
+    mxfp8 = {
+        "w13_weight": torch.randn(E, 2 * I, H, generator=g).to(torch.float8_e4m3fn),
+        "w13_weight_scale": torch.randint(110, 130, (E, 2 * I, H // 32), generator=g, dtype=torch.uint8),
+        "w2_weight": torch.randn(E, H, I, generator=g).to(torch.float8_e4m3fn),
+        "w2_weight_scale": torch.randint(110, 130, (E, H, I // 32), generator=g, dtype=torch.uint8),
+    }
+    tensors = {base.format(0) + k: v for k, v in nvfp4.items()} | {base.format(1) + k: v for k, v in mxfp8.items()}
+    safetensors.torch.save_file(tensors, str(tmp_path / "model.safetensors"))
+    groups = [
+        {"compute_dtype": dtype, "tensors": [base.format(layer) + "w13_weight", base.format(layer) + "w2_weight"]}
+        for layer, dtype in ((0, "nvfp4"), (1, "mxfp8"))
+    ]
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"model": {"parameter_groups": groups}}))
+
+    config = quant_config(str(tmp_path), None, name_map=None, unquantized=())
+    assert [config.scheme_for_name(f"model.llm.layers.{layer}.mlp.experts").kind for layer in (0, 1)] == [QuantKind.NVFP4, QuantKind.MXFP8]
+
+    model = SimpleNamespace(num_moe_layers=2, num_experts=E)
+    ((layer, _, _, piece),) = iter_expert_pieces(str(tmp_path), model, QuantKind.MXFP8, layers=[1])
+    assert layer == 1 and set(piece) == {"gate_up", "gate_up_scale", "down", "down_scale"}
+    for role, name in (("gate_up", "w13_weight"), ("gate_up_scale", "w13_weight_scale")):
+        assert piece[role].dtype == mxfp8[name].dtype
+        assert torch.equal(piece[role].view(torch.uint8), deinterleave_rows(mxfp8[name]).view(torch.uint8))
+    assert torch.equal(piece["down"].view(torch.uint8), mxfp8["w2_weight"].view(torch.uint8))
+    assert torch.equal(piece["down_scale"], mxfp8["w2_weight_scale"])
+    with pytest.raises(ValueError, match="layer 0 experts are NVFP4; the quant config serves them as MXFP8"):
+        list(iter_expert_pieces(str(tmp_path), model, QuantKind.MXFP8, layers=[0]))
+
+
 def test_message_queries_merge():
     from freetoken.models.inkling2_loop.weight import merge_message_queries
 

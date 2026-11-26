@@ -205,7 +205,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   one window plus one prefill chunk on all 40 sliding layers (about 1.4 GiB at the default
   `--max-extend-length 8192`); lower `--max-extend-length` to run many requests at once. The NVFP4
   experts (layers 0-19) run W4A16, since the checkpoint declares only per-token activation scales; the
-  MXFP8 experts (layers 20-23) are dequantized to bf16 at load. Speculative decoding uses the
+  MXFP8 experts (layers 20-23) run W8A16 from their stored blocks. Speculative decoding uses the
   checkpoint's DSpark draft (`mtp.safetensors`). On a 16 GB card start with `--memory-ratio 0.85`: the
   prefill activations are not in the memory budget, and at the default 0.9 a 4K-token prompt runs out of
   memory in the expert GEMM.

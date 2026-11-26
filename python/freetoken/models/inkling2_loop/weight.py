@@ -2,8 +2,8 @@
 
 Routed experts are stacked per layer (``mlp.experts.w13_weight`` [E, 2I, ...] with gate and up rows
 interleaved, ``w2_weight`` [E, H, ...]). NVFP4 layers carry fp8 block scales and a per-expert global scale
-``w*_weight_amax / w*_weight_outer_scale_denominator``; MXFP8 layers carry e8m0 block scales and are dequantized
-to bf16 here, since FreeToken has no MXFP8 expert kernel.
+``w*_weight_amax / w*_weight_outer_scale_denominator``; MXFP8 layers carry one e8m0 code per 32 inputs of a row.
+Both are served as stored, with gate and up de-interleaved.
 """
 
 from __future__ import annotations
@@ -183,13 +183,13 @@ def _layer_tensors(f, layer: int) -> dict[str, torch.Tensor]:
 
 
 def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers: Collection[int] | None = None, parallel=False, workers=8, chunk=8 << 20):
-    """``(layer, 0, E, {role: tensor})`` per MoE layer whose experts are served as ``kind``: NVFP4 rows as stored
-    (gate / up de-interleaved, the per-expert global from amax / denominator), MXFP8 dequantized to bf16 for ``NONE``."""
+    """``(layer, 0, E, {role: tensor})`` per MoE layer whose experts are served as ``kind``: NVFP4 and MXFP8 rows as
+    stored (gate / up de-interleaved, the NVFP4 per-expert global from amax / denominator), dequantized to bf16 for ``NONE``."""
     import safetensors
 
     from freetoken.models.loader import iter_weight_files
 
-    if kind not in (QuantKind.NVFP4, QuantKind.NONE):
+    if kind not in (QuantKind.NVFP4, QuantKind.MXFP8, QuantKind.NONE):
         return None
     want = set(range(config.num_moe_layers)) if layers is None else set(layers)
 
@@ -203,8 +203,8 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers: Collectio
                         continue
                     t = _layer_tensors(f, layer)
                     nvfp4 = "w13_weight_amax" in t
-                    if kind is QuantKind.NVFP4 and not nvfp4:
-                        raise ValueError(f"layer {layer} experts are not NVFP4; the quant config serves them as NVFP4")
+                    if kind is not QuantKind.NONE and (kind is QuantKind.NVFP4) != nvfp4:
+                        raise ValueError(f"layer {layer} experts are {'NVFP4' if nvfp4 else 'not NVFP4'}; the quant config serves them as {kind.name}")
                     if nvfp4:
                         g13 = t["w13_weight_amax"].float() / t["w13_weight_outer_scale_denominator"].float()
                         g2 = t["w2_weight_amax"].float() / t["w2_weight_outer_scale_denominator"].float()
@@ -225,10 +225,18 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers: Collectio
                     else:
                         if t["w13_weight"].dtype != torch.float8_e4m3fn:
                             raise ValueError(f"layer {layer} experts are neither NVFP4 nor MXFP8 ({t['w13_weight'].dtype})")
-                        piece = {
-                            "gate_up": deinterleave_rows(dequant_mxfp8(t["w13_weight"], t["w13_weight_scale"])).to(torch.bfloat16),
-                            "down": dequant_mxfp8(t["w2_weight"], t["w2_weight_scale"]).to(torch.bfloat16),
-                        }
+                        if kind is QuantKind.MXFP8:
+                            piece = {
+                                "gate_up": deinterleave_rows(t["w13_weight"]),
+                                "gate_up_scale": deinterleave_rows(t["w13_weight_scale"]),
+                                "down": t["w2_weight"],
+                                "down_scale": t["w2_weight_scale"],
+                            }
+                        else:
+                            piece = {
+                                "gate_up": deinterleave_rows(dequant_mxfp8(t["w13_weight"], t["w13_weight_scale"])).to(torch.bfloat16),
+                                "down": dequant_mxfp8(t["w2_weight"], t["w2_weight_scale"]).to(torch.bfloat16),
+                            }
                     seen.add(layer)
                     yield layer, 0, config.num_experts, piece
         if missing := sorted(want - seen):
