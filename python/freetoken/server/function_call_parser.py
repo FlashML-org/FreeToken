@@ -362,14 +362,15 @@ class BaseFormatDetector(ABC):
 
     def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
         """Convert parameter value based on schema type. Safe alternative to eval()."""
-        if value.lower() == "null":
+        prop = param_config.get(param_name, {})
+        param_type = str(prop.get("type", "string")).strip().lower() if isinstance(prop, dict) else "string"
+        if value.lower() == "null" and not (
+            isinstance(prop, dict) and "type" in prop and param_type in ("string", "str", "enum")
+        ):
             return None
 
         if param_name not in param_config:
             return value
-
-        prop = param_config.get(param_name, {})
-        param_type = str(prop.get("type", "string")).strip().lower() if isinstance(prop, dict) else "string"
 
         if param_type in ("string", "str", "enum"):
             return value
