@@ -113,7 +113,8 @@ class ZmqPubQueue(Generic[T]):
         subscribe_timeout: float | None = None,
     ):
         """``subscribers``: the names of the ``ZmqSubQueue``s that must have subscribed before the first send, since PUB
-        silently drops what it sends before a subscription reaches it. ``subscribe_timeout`` (seconds) bounds that wait."""
+        silently drops what it sends before a subscription reaches it. ``subscribe_timeout`` (seconds) bounds that wait,
+        which ``wait_for_subscribers`` runs up front and the first send runs if no one did."""
         self.context = zmq.Context()
         # an XPUB reports every subscription, including the topic each named subscriber adds (ZmqSubQueue)
         self.socket = self.context.socket(zmq.XPUB if subscribers else zmq.PUB)
@@ -124,7 +125,8 @@ class ZmqPubQueue(Generic[T]):
         self._unjoined = set(subscribers)
         self._subscribe_timeout = subscribe_timeout
 
-    def _wait_for_subscribers(self):
+    def wait_for_subscribers(self) -> None:
+        """Block until every named subscriber has subscribed; raise naming the missing ones after ``subscribe_timeout``."""
         deadline = None if self._subscribe_timeout is None else time.monotonic() + self._subscribe_timeout
         while self._unjoined:
             wait = None if deadline is None else max(0, int((deadline - time.monotonic()) * 1000))
@@ -139,7 +141,7 @@ class ZmqPubQueue(Generic[T]):
 
     def put_raw(self, raw: bytes):
         if self._unjoined:
-            self._wait_for_subscribers()
+            self.wait_for_subscribers()
         self.socket.send(raw, copy=False)
 
     def put(self, obj: T):

@@ -27,6 +27,8 @@ class SchedulerIOMixin:
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
         self.tp_cpu_group: Final = tp_cpu_group
+        # rank 0's request fan-out to the other ranks (wait_for_ranks); None on every other rank and with one rank
+        self._fanout: ZmqPubQueue | None = None
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -50,7 +52,7 @@ class SchedulerIOMixin:
             if tp_info.is_primary():
                 recv = self._recv_msg_multi_rank0
                 # a request published before a rank's subscription arrives is dropped and leaves that rank waiting
-                # forever, so the first send waits until every rank has subscribed
+                # forever: wait_for_ranks waits for every rank's subscription before the server reports ready
                 self._send_into_ranks: Final = ZmqPubQueue(
                     config.zmq_scheduler_broadcast_addr,
                     create=True,
@@ -58,6 +60,7 @@ class SchedulerIOMixin:
                     subscribers=[f"rank {rank}" for rank in range(1, tp_info.size)],
                     subscribe_timeout=config.distributed_timeout,
                 )
+                self._fanout = self._send_into_ranks
             else:
                 recv = self._recv_msg_multi_rank1
                 send = self._reply_tokenizer_rank1
@@ -82,6 +85,13 @@ class SchedulerIOMixin:
 
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
+
+    def wait_for_ranks(self) -> None:
+        """On rank 0 of a TP group, after ``sync_all_ranks`` (every rank has built its subscriber): wait until every rank's
+        subscription has reached the request fan-out, so a request sent once the server is ready reaches every rank. A rank
+        that never subscribes fails start-up, naming it, after ``distributed_timeout``."""
+        if self._fanout is not None:
+            self._fanout.wait_for_subscribers()
 
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
