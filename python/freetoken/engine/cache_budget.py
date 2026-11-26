@@ -103,21 +103,6 @@ def plan_cache_budget(
     return moe_cache_size, num_pages, overlap
 
 
-MIN_ACTIVATION_HEADROOM = 1 << 30
-
-
-def small_gpu_chunk_cap(memory_ratio: float, baseline_free: int, bytes_per_token: int) -> tuple[float, int]:
-    """(memory_ratio, largest prefill chunk) for a model whose prefill takes ``bytes_per_token`` of
-    transient memory. The ``(1 - memory_ratio)`` headroom is raised to at least
-    ``MIN_ACTIVATION_HEADROOM`` (autotune scratch, cuBLAS workspaces, graph pools and encoder blocks
-    need ~0.5 GiB of it besides the chunk), and a chunk gets 35% of it."""
-    headroom = (1.0 - memory_ratio) * baseline_free
-    if headroom < MIN_ACTIVATION_HEADROOM:
-        headroom = MIN_ACTIVATION_HEADROOM
-        memory_ratio = round(1.0 - headroom / baseline_free, 3)
-    return memory_ratio, max(256, int(0.35 * headroom / bytes_per_token) // 256 * 256)
-
-
 def resolve_moe_cache_auto(
     *,
     baseline_free: int,

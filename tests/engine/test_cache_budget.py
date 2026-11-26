@@ -104,15 +104,6 @@ def test_mixed_formats_floor_the_cache_at_one_layer_of_the_widest():
     assert plan_cache_budget(budget_bytes=5000, **{**plan, "min_slots": 0})[0] < 410
 
 
-def test_small_gpu_keeps_a_chunk_within_the_activation_headroom():
-    from freetoken.engine.cache_budget import small_gpu_chunk_cap
-
-    GiB = 1 << 30
-    assert small_gpu_chunk_cap(0.9, 94 * GiB, 192 * 1024) == (0.9, 9.4 * 0.35 * GiB // (192 * 1024) // 256 * 256)
-    ratio, chunk = small_gpu_chunk_cap(0.9, 7 * GiB, 192 * 1024)  # an 8 GB card
-    assert (1 - ratio) * 7 * GiB >= GiB * 0.999 and chunk * 192 * 1024 <= 0.35 * GiB
-
-
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     sources = {
         "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)],  # row = 32*8*2 = 512

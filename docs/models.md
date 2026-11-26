@@ -219,17 +219,12 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   the GPU holds that: under `offload` every prefill streams the experts of all 48 visits over PCIe,
   each visit's while the one before it computes (with 1024 experts cached, a 2K-token prompt
   prefills in 0.62 s and a 32K one in 3.1 s).
-  On a small GPU the defaults shrink to fit rather than fail, each step logged as `small GPU: ...`:
-  at least 1 GiB stays free for activations (lowering `--memory-ratio`), the prefill chunk is
-  capped at 35% of it (192 KiB per chunk token), then `--max-running-requests` goes until the
-  window pools, one layer of experts and the KV reserve fit. Under `offload` the experts take
-  whatever the KV reserve leaves, so the context stays at `--kv-reserve-tokens` (8K) until every
-  expert is cached: with 7.3 GiB free (an 8 GB card) that is 1 running request, 1792-token chunks
-  and 8.2K tokens, with 32 GiB free 4 requests, 5888-token chunks and 120K tokens. Set
-  `--kv-reserve-tokens` to the context you need: 32K starts with 8.5 GiB free, 128K with 13.4 GiB,
-  256K with 20.1 GiB and 1M with 61 GiB, and `--embed-weights host` (the 0.86 GiB input embedding
-  in host RAM) with `--max-running-requests 1` gives an 8 GB card 29.8K tokens. At one running
-  request the window pool caps a prefill chunk at about 1.2K tokens, which halves prefill speed.
+  On a small GPU `--max-running-requests` goes down until the window pools, one layer of experts
+  and the KV reserve fit, logged as `small GPU: ...`. Under `offload` the experts take whatever the
+  KV reserve leaves, so the context stays at `--kv-reserve-tokens` (8K) until every expert is
+  cached: set it to the context you need. `--embed-weights host` moves the 0.86 GiB input embedding
+  to host RAM. At one running request the window pool caps a prefill chunk at about 1.2K tokens,
+  which halves prefill speed.
   `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`;
   `none` is the template's level 0.0, which the model card says does not fully disable reasoning.
   `--tp` > 1 is not served. Speculative decoding is refused at startup; serving it needs:

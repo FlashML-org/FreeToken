@@ -406,9 +406,6 @@ class ModelConfig:
     # The MoE layer of each MoE call in one forward, when it is not each layer once in order (a looped model
     # runs some layers several times); () -> ascending. The offload prefill stages experts in this order.
     moe_layer_order: Tuple[int, ...] = ()
-    # Peak transient GPU bytes a prefill forward takes per token (0: not declared). A small GPU
-    # caps the prefill chunk so that peak fits the memory_ratio headroom.
-    prefill_bytes_per_token: int = 0
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

@@ -1213,11 +1213,9 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def _fit_small_gpu(self, config: EngineConfig) -> None:
-        """On a GPU too small for the configured plan, lower it rather than fail its first allocation:
-        the prefill chunk to what the activation headroom holds, then (a model with window states)
-        the concurrency, until the window pools, the minimum MoE cache and the KV reserve fit the
-        budget. Each change is logged; a plan that fits is left alone."""
-        from freetoken.engine.cache_budget import small_gpu_chunk_cap
+        """On a GPU too small for the configured plan of a model with window states, lower the
+        concurrency rather than fail its first allocation, until the window pools, the minimum MoE
+        cache and the KV reserve fit the budget. The change is logged; a plan that fits is left alone."""
 
         def override(attr: str, value: Any, why: str) -> None:
             if getattr(config, attr) != value:
@@ -1225,11 +1223,6 @@ class Engine:
                 object.__setattr__(config, attr, value)
 
         mc = config.model_config
-        if mc.prefill_bytes_per_token:
-            ratio, cap = small_gpu_chunk_cap(config.memory_ratio, self._baseline_free, mc.prefill_bytes_per_token)
-            override("memory_ratio", ratio, "keep at least 1 GiB for activations")
-            override("max_extend_tokens", min(config.max_extend_tokens, cap),
-                     f"a prefill chunk takes {mc.prefill_bytes_per_token // 1024} KiB per token")
         if not mc.window_states:
             return
         budget = int(config.memory_ratio * self._baseline_free) - self._weights_bytes
