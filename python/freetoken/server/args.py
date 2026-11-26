@@ -891,7 +891,7 @@ def parse_args(
             "cannot serve lock head+tail layers from a size estimate instead. Under hybrid, locked layers still decode from GPU slots "
             "(--moe-locked-fetch). Any value, 'auto' included, commits to CPU "
             "decode before the model is built, so the expert format must have a CPU executor "
-            "path (bf16, fp8_block, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
+            "path (bf16, fp8_block, mxfp8, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
             "GPU; a boot whose banks exceed a known pin budget stops and asks for this flag."
         ),
     )

@@ -68,9 +68,9 @@ logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
 # else is offload-only here.
-_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block", "gguf", "gguf_scaled"})
+_CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block", "mxfp8", "gguf", "gguf_scaled"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
-_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
+_BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp8", "mxfp4_triton", "ds_fp4"})
 # Friendlier CLI/display aliases for the internal quant_format strings.
 _FORMAT_ALIASES = {"fp8": "fp8_block", "mxfp4": "mxfp4_triton"}
 _FORMAT_DISPLAY = {"fp8_block": "fp8", "mxfp4_triton": "mxfp4"}
@@ -321,6 +321,11 @@ def _offload_bank_specs(fmt: str, H: int, I: int, opts: dict | None = None) -> d
             "gate_up": (2 * I * H, f8), "gate_up_scale": ((2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128), bf16),
             "down": (H * I, f8), "down_scale": ((H // 128) * fp8_block_scale_pad(H // 128, I // 128), bf16),
         }
+    if fmt == "mxfp8":
+        return {
+            "gate_up": (2 * I * H, f8), "gate_up_scale": (2 * I * (H // 32), u8),
+            "down": (H * I, f8), "down_scale": (H * (I // 32), u8),
+        }
     if fmt == "nvfp4":
         return {
             "gate_up_packed": (2 * I * (H // 2), u8), "gate_up_scale": (2 * I * (H // 16), u8),
@@ -400,6 +405,18 @@ def _cpu_moe_bank_sources(fmt: str, H: int, I: int, E: int, opts: dict | None = 
         b["down"].view(torch.uint8).fill_(0x38)
         b["gate_up_scale"].fill_(1.0)
         b["down_scale"].fill_(1.0)
+        return b
+    if fmt == "mxfp8":
+        b = {
+            "gate_up": pin(E, 2 * I, H, dtype=torch.float8_e4m3fn),
+            "gate_up_scale": pin(E, 2 * I, H // 32, dtype=torch.uint8),
+            "down": pin(E, H, I, dtype=torch.float8_e4m3fn),
+            "down_scale": pin(E, H, I // 32, dtype=torch.uint8),
+        }
+        b["gate_up"].view(torch.uint8).fill_(0x38)  # 1.0
+        b["down"].view(torch.uint8).fill_(0x38)
+        b["gate_up_scale"].fill_(127)  # e8m0 unit exponent
+        b["down_scale"].fill_(127)
         return b
     if fmt == "nvfp4":
         b = {
@@ -704,7 +721,7 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
                                  "(avx512 runs W4A8 with AVX512-VNNI, avx2 with AVX-VNNI; "
                                  "a tier without its VNNI runs fp32 W4A16)")
-                elif fmt in ("mxfp4_triton", "ds_fp4", "fp8_block"):
+                elif fmt in ("mxfp4_triton", "ds_fp4", "fp8_block", "mxfp8"):
                     _note(entry, "isa tier labels are nominal: avx512bf16 == avx512f here "
                                  "(3 real kernels: scalar/avx2/avx512, no bf16/VNNI variant)")
                 elif fmt in ("gguf", "gguf_scaled"):

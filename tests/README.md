@@ -19,7 +19,7 @@ directories (`kvcache/test_dsv4_pool.py`) or in `dsv4/`, and will move there.
 | `kernels/`   | `freetoken.kernel` / `freetoken.layers` — attention, rope, fused ops, JIT cache, pinned memory |
 | `attention/` | `freetoken.attention` — attention backends against eager references |
 | `layers/`    | `freetoken.layers` — whole layer modules (mHC, GatedDeltaNet); a layer's kernels and fused ops go in `kernels/` |
-| `moe/`       | `freetoken.moe` — offload cache, CPU/GPU expert kernels, quantized backends (fp8/nvfp4/mxfp4/gguf) |
+| `moe/`       | `freetoken.moe` — offload cache, CPU/GPU expert kernels, quantized backends (fp8/mxfp8/nvfp4/mxfp4/gguf) |
 | `models/`    | `freetoken.models` — the registry, and the loading machinery every model shares (sharding, qkv/expert merge, streaming layers into banks); one directory per model for tests specific to it |
 | `mm/`        | `freetoken.mm` — multimodal processor, placeholder expansion, encoder cache |
 | `checkpoint/` | `freetoken.checkpoint` — FTW read/write and replay |

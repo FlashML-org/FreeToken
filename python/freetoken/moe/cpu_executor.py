@@ -508,6 +508,22 @@ class CpuMoeExecutor:
         options = dict(gu_scale_stride=int(gus[rep].stride(1)), dn_scale_stride=int(dns[rep].stride(1)))
         return banks, options, (H, I)
 
+    def _resolve_mxfp8_banks(self, banks: dict, rep: int = 0) -> tuple[dict, dict, tuple[int, int]]:
+        """MXFP8 schema: row-major e4m3 + one e8m0 code per 32 elements of a row."""
+        gu, gus = banks["gate_up"], banks["gate_up_scale"]
+        dn, dns = banks["down"], banks["down_scale"]
+        assert gu[rep].dtype == torch.float8_e4m3fn and dn[rep].dtype == torch.float8_e4m3fn, (gu[rep].dtype, dn[rep].dtype)
+        assert gus[rep].element_size() == 1 and dns[rep].element_size() == 1, "block scales must be 1 byte"
+        I = int(gu[rep].shape[1] // 2)
+        H = int(gu[rep].shape[2])
+        assert gu[rep].shape[1] == 2 * I
+        assert H % 32 == 0 and I % 32 == 0, (H, I)
+        assert tuple(dn[rep].shape[1:]) == (H, I), (dn[rep].shape, H, I)
+        assert tuple(gus[rep].shape[1:]) == (2 * I, H // 32), (gus[rep].shape, I, H)
+        assert tuple(dns[rep].shape[1:]) == (H, I // 32), (dns[rep].shape, H, I)
+        banks = self._tables(gate_up=gu, down=dn, gate_up_scale=gus, down_scale=dns)
+        return banks, {}, (H, I)
+
     def _resolve_banks(self, banks: dict, fmt: str, rep: int = 0, opts: dict | None = None) -> tuple[dict, dict, tuple[int, int]]:
         """Return (banks, options, (H, I)) for the C++ ctor: banks maps each canonical role
         the format reads to its per-layer table's address, options holds its integer settings.
@@ -542,6 +558,9 @@ class CpuMoeExecutor:
 
         if fmt == "fp8_block":
             return self._resolve_fp8_block_banks(banks, rep)
+
+        if fmt == "mxfp8":
+            return self._resolve_mxfp8_banks(banks, rep)
 
         # nvfp4: packed e2m1 (2/byte) + fp8-e4m3 per-16 block scales + fp32 row globals.
         gup, gus, gug = banks["gate_up"], banks["gate_up_scale"], banks["gate_up_global"]

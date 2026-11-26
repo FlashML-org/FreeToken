@@ -1,7 +1,7 @@
-"""Experts of several formats in one model: bf16 layers next to NVFP4 layers.
+"""Experts of several formats in one model: bf16 and MXFP8 layers next to NVFP4 layers.
 
 A checkpoint may leave some MoE layers unquantized (Muse Spark keeps its first and last layer's
-experts bf16). Each format fills its own layers' banks, the banks merge over the union of roles with
+experts bf16) or store them in another format (Inkling-2 keeps its last layers' experts MXFP8). Each format fills its own layers' banks, the banks merge over the union of roles with
 zero-byte placeholders, the slot cache keeps one pool per format, the FTW stores each layer's own
 banks, and the CPU executor computes each layer in its format.
 """
@@ -18,7 +18,7 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 E, H, I, TOPK = 8, 256, 128, 2
-FORMATS = ["bf16", "nvfp4", "nvfp4", "nvfp4", "bf16"]
+FORMATS = ["bf16", "nvfp4", "nvfp4", "nvfp4", "bf16", "mxfp8"]
 L = len(FORMATS)
 
 _E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -36,6 +36,8 @@ def _layer(layer_id: int, fmt: str):
     _init_tp()
     if fmt == "bf16":
         quant = NoQuantConfig()
+    elif fmt == "mxfp8":
+        quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "MXFP8", "ignore": ["lm_head"]}})
     else:
         set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
         quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
@@ -58,6 +60,14 @@ def _pieces(seed: int = 0):
                 "gate_up": (torch.randn(E, 2 * I, H, generator=g) / 16).to(torch.bfloat16),
                 "down": (torch.randn(E, H, I, generator=g) / 16).to(torch.bfloat16),
             }
+        elif fmt == "mxfp8":
+            # e8m0 codes 119..122 are 2^-8..2^-5, another one per 32 inputs of a row
+            pieces[layer] = {
+                "gate_up": (torch.randn(E, 2 * I, H, generator=g) * 8).to(torch.float8_e4m3fn),
+                "gate_up_scale": torch.randint(119, 123, (E, 2 * I, H // 32), dtype=torch.uint8, generator=g),
+                "down": (torch.randn(E, H, I, generator=g) * 8).to(torch.float8_e4m3fn),
+                "down_scale": torch.randint(119, 123, (E, H, I // 32), dtype=torch.uint8, generator=g),
+            }
         else:
             pieces[layer] = {
                 "gate_up": torch.randint(0, 256, (E, 2 * I, H // 2), dtype=torch.uint8, generator=g),
@@ -74,7 +84,7 @@ def _reader(pieces, kind):
     """A family reader for one storage form: it yields only the layers stored that way."""
     from freetoken.layers.quantization import QuantKind
 
-    want = "bf16" if kind is QuantKind.NONE else "nvfp4"
+    want = {QuantKind.NONE: "bf16", QuantKind.MXFP8: "mxfp8", QuantKind.NVFP4: "nvfp4"}[kind]
     for layer, fmt in enumerate(FORMATS):
         if fmt == want:
             yield layer, 0, E, pieces[layer]
@@ -85,6 +95,8 @@ def _weights(pieces, layer):
     p = pieces[layer]
     if FORMATS[layer] == "bf16":
         return p["gate_up"].float(), p["down"].float()
+    if FORMATS[layer] == "mxfp8":
+        return tuple(p[w].float() * torch.exp2(p[w + "_scale"].float() - 127).repeat_interleave(32, dim=-1) for w in ("gate_up", "down"))
     gu = torch.stack([_dequant(p["gate_up"][e], p["gate_up_scale"][e], p["gate_up_global"][e]) for e in range(E)])
     dn = torch.stack([_dequant(p["down"][e], p["down_scale"][e], p["down_global"][e]) for e in range(E)])
     return gu, dn
@@ -126,7 +138,7 @@ def _mixed_cache(device, pieces, *, decode_target="gpu", prefill_overlap=False):
     slot_bytes = layer_slot_bytes(banks.sources)
     groups = group_layers("unified", bank_layouts(banks.sources, banks.layer_tags), slot_bytes)
     pools = make_pools(groups, E, TOPK, None)
-    sizes = split_slots(4 * E, pools)
+    sizes = split_slots(6 * E, pools)
     cache = OffloadMoeCache(
         num_layers=L, num_experts=E, cache_size=sum(sizes), device=device, quant_format=banks.quant_format,
         decode_target=decode_target, hybrid_max_fetch=1, prefill_overlap=prefill_overlap,
@@ -152,10 +164,10 @@ def test_engine_binds_the_most_common_format_and_checks_every_layer():
 
     model = Model()
     methods = offload_layer_methods(model)
-    assert [m.kind for m in methods] == [QuantKind.NONE if f == "bf16" else QuantKind.NVFP4 for f in FORMATS]
+    assert [m.kind for m in methods] == [{"bf16": QuantKind.NONE, "mxfp8": QuantKind.MXFP8, "nvfp4": QuantKind.NVFP4}[f] for f in FORMATS]
     assert shared_offload_method(model).kind is QuantKind.NVFP4
     _check_layer_formats(ExpertBanks("nvfp4", {}, layer_formats=list(FORMATS)), methods)
-    with pytest.raises(ValueError, match=r"MoE layers \[0, 4\]"):
+    with pytest.raises(ValueError, match=r"MoE layers \[0, 4, 5\]"):
         _check_layer_formats(ExpertBanks("nvfp4", {}), methods)
 
 
@@ -171,6 +183,9 @@ def test_mixed_dummy_banks_merge_the_roles_with_placeholders():
         if fmt == "bf16":
             assert banks.sources["gate_up"][layer].shape == (E, 2 * I, H) and banks.sources["gate_up"][layer].dtype == torch.bfloat16
             assert banks.sources["down_scale"][layer].shape == (E, 0)
+        elif fmt == "mxfp8":
+            assert banks.sources["gate_up"][layer].shape == (E, 2 * I, H) and banks.sources["gate_up"][layer].dtype == torch.float8_e4m3fn
+            assert banks.sources["down_scale"][layer].shape == (E, H, I // 32) and banks.sources["down_global"][layer].shape == (E, 0)
         else:
             assert banks.sources["gate_up"][layer].shape == (E, 2 * I, H // 2) and banks.sources["gate_up"][layer].dtype == torch.uint8
     with pytest.raises(ValueError, match="several formats"):
@@ -200,8 +215,8 @@ def test_mixed_banks_give_each_reader_its_layers_and_resolve_every_reader_first(
     monkeypatch.setattr(expert_pieces, "iter_expert_pieces", fake_reader)
     config = SimpleNamespace(num_moe_layers=L, num_experts=E)
     banks = _mixed_expert_banks("", config, methods, torch.device("cpu"), False, False, 8, 0)
-    assert sorted(layers for step, layers in events if step == "resolve") == [[0, 4], [1, 2, 3]]
-    assert [step for step, _ in events[:2]] == ["resolve", "resolve"]
+    assert sorted(layers for step, layers in events if step == "resolve") == [[0, 4], [1, 2, 3], [5]]
+    assert [step for step, _ in events[:3]] == ["resolve", "resolve", "resolve"]
     assert banks.layer_formats == FORMATS
 
 
@@ -211,8 +226,8 @@ def test_mixed_layers_decode_and_prefill_through_their_pools():
     device = torch.device("cuda")
     pieces = _pieces()
     cache, layers, banks = _mixed_cache(device, pieces, prefill_overlap=True)
-    assert len(cache.pool_sizes) == 2 and cache._raw_banks
-    # a staging buffer holds one bf16 layer (the widest rows); two of them still fit the 13 + 19 slots
+    assert len(cache.pool_sizes) == 3 and cache._raw_banks
+    # a staging buffer holds one bf16 layer (the widest rows); two of them still fit the 16 + 8 + 24 slots
     assert cache.prefill_overlap
     hidden = torch.randn(1, H, dtype=torch.bfloat16, device=device) / 4
     weights = torch.rand(1, TOPK, device=device)
