@@ -198,7 +198,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             }
             rows = engine_config.decode_rows_per_req
             disk_table = DiskRowTable(
-                resolve_row_source(engine_config.model_path),
+                resolve_row_source(engine_config.model_path, args),
                 constants,
                 # verify graphs stop at max_running_req requests, decode graphs at cuda_graph_max_bs
                 max_graph_rows=engine_config.max_running_req * rows if rows > 1 else max(256, engine_config.cuda_graph_max_bs or 0),
