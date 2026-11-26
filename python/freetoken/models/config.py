@@ -388,8 +388,18 @@ class ModelConfig:
     # (layer, source) pairs: the layer attends over the KV the source layer stored and stores none
     kv_shared_layers: Tuple[Tuple[int, int], ...] = ()
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
-    # () for models without any. Requires a linear-attention group to ride on.
+    # () for models without any. A model without linear-attention layers gets a pool of these alone.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # KV layers when some layers run more than once per forward with their own KV each (looped
+    # models): the attention groups then list cache-layer ids in [0, num_kv_layers). None = num_layers.
+    num_kv_layers: int | None = None
+    # why this model cannot resume from a cached prefix (forces --cache-type naive), or None
+    no_prefix_reuse: str | None = None
+    # KV formats the model's own attention kernel reads (--kv-cache-dtype names); None = what the pool and backend take
+    kv_formats: frozenset[str] | None = None
+    # Inkling 2 Mini (inkling2_loop) payload (Inkling2LoopArgs): the loop schedule and the attention /
+    # MoE scalars. Opaque to model-agnostic engine code; None for every other model.
+    inkling2_args: Any | None = None
 
     @property
     def is_moe(self) -> bool:

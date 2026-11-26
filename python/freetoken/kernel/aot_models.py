@@ -115,6 +115,14 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             "down_scales": (I // 32) * H,
             "down_bias": H * 2,
         }
+    if fmt == "mxfp8":
+        # layers/quantization/moe/mxfp8.py: e4m3 weights + one e8m0 code per 32 inputs of a row
+        return {
+            "gate_up": 2 * I * H,
+            "gate_up_scale": 2 * I * (H // 32),
+            "down": H * I,
+            "down_scale": H * (I // 32),
+        }
     if fmt == "ds_fp4":
         # deepseek_v4/weight.py load_dsfp4_expert_sources: packed e2m1 + e8m0 per-32 scales
         return {
@@ -391,6 +399,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((2, 128),),  # sliding and full (NoPE) layers share the same geometry
         aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
         arch_aliases=("MuseGlimmerGGUFForCausalLM",),
+    ),
+    AotModel(
+        name="thinkingmachines/Inkling-2-Mini",
+        architecture="Inkling2LoopForConditionalGeneration",
+        hidden_size=2304,
+        kv_groups=((8, 128),),  # sliding and global layers share the same geometry
+        top_k=8,
+        moe_intermediate_size=1152,
+        # NVFP4 experts on layers 0-19, MXFP8 on layers 20-23
+        expert_formats=_NVFP4_FORMATS + ("mxfp8",),
     ),
     AotModel(
         name="ricursiveAI/Ripple-65B-Preview",

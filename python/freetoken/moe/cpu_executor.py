@@ -65,6 +65,7 @@ _ACT_IDS = {
     "gpt_oss_swiglu": 3,
     "swigluoai": 3,
     "swiglu_clamp": 4,
+    "swiglu_softcap": 5,
 }
 
 
@@ -208,6 +209,9 @@ class CpuMoeExecutor:
             raise NotImplementedError(f"CPU MoE backend: unsupported activation {activation!r}")
         if apply_router_weight_on_input and (output_only := {"mxfp4_triton", "ds_fp4"} & set(names)):
             raise NotImplementedError(f"CPU MoE backend: {sorted(output_only)} experts apply the router weight on the output only")
+        # these kernels fuse their own activation and never read the act id
+        if activation == "swiglu_softcap" and (fixed := {"mxfp4_triton", "ds_fp4"} & set(names)):
+            raise NotImplementedError(f"CPU MoE backend: {sorted(fixed)} experts have no swiglu_softcap epilogue")
         # ABI probe: a stale prebuilt _cpu_moe.so accepts newer act ids without
         # error and silently computes the wrong activation in the generic
         # epilogue -- fail loudly with the rebuild instruction instead. (mxfp4

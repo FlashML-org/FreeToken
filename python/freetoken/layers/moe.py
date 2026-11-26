@@ -354,6 +354,7 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        cache.start_prefill_call(self.layer_id)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -389,11 +390,10 @@ class OffloadMoELayer(MoELayer):
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0:
-            cache.begin_prefill()
-        cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
-        return cache.wait_prefill_layer(self.layer_id)
+        step = cache.prefill_step(self.layer_id)
+        cache.prefetch_prefill_layer(self.layer_id, step)
+        cache.prefetch_prefill_layer(cache.next_prefill_layer(self.layer_id), step + 1)
+        return cache.wait_prefill_layer(self.layer_id, step)
 
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.

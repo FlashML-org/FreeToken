@@ -34,8 +34,13 @@ from .reasoning_parser import (
     ATEM_MESSAGE,
     ATEM_RECIPIENT_RE,
     ATEM_START,
+    TML_END_MESSAGE,
+    TML_HEADER_SPAN,
+    TML_MESSAGE_MODEL,
+    TML_TOOL_JSON,
     atem_hold_len,
     atem_marker_inside,
+    tml_hold_len,
 )
 
 try:
@@ -81,6 +86,7 @@ TOOLS_TAG_LIST = [
     "<｜DSML｜ calls>",
     "<｜DSML｜ invoke",
     "<atem:function_calls>",
+    TML_TOOL_JSON,
 ]
 
 
@@ -3570,6 +3576,236 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     param_tag = " parameter"
 
 
+class Inkling2Detector(BaseFormatDetector):
+    """Inkling 2's TMLv0 calls, one message each, as ``chat_template.jinja`` renders them and the checkpoint's
+    response_template reads them: ``<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>``.
+
+    The ``args`` value streams as the raw text the model writes, so the fragments are a prefix of the final
+    arguments; a call whose JSON does not open with ``name`` then ``args`` is parsed whole at its end marker.
+    """
+
+    toolcall_opener = TML_TOOL_JSON
+    _HEAD_RE = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"args"\s*:\s*')
+    _CALL_RE = re.compile(
+        rf"(?:{re.escape(TML_MESSAGE_MODEL)}([^<]*))?{re.escape(TML_TOOL_JSON)}(.*?)(?:{re.escape(TML_END_MESSAGE)}|$)",
+        re.DOTALL,
+    )
+    # a call head longer than this without the name/args prefix is parsed whole
+    _HEAD_SPAN = 512
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = TML_TOOL_JSON
+        self.eot_token = TML_END_MESSAGE
+        self.tool_call_separator = ""
+        self._reset()
+
+    def _reset(self) -> None:
+        self._mode = "text"  # text | header | head | args | tail | whole | swallow
+        self._header_name = ""
+        self._sent = 0  # chars of the args value already emitted
+        self._scan = 0  # chars of the args value already scanned
+        self._depth = 0
+        self._in_str = False
+        self._esc = False
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def _call_items(self, header_name: str, body: str, tools: List[Tool]) -> List[ToolCallItem]:
+        try:
+            obj = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(f"Failed to parse Inkling 2 tool call JSON: {body!r}")
+            return []
+        if not isinstance(obj, dict):
+            return []
+        name = obj.get("name") or header_name.strip()
+        if name not in self._get_tool_indices(tools) and not _should_forward_unknown_tool(name):
+            logger.warning(f"Model attempted to call undefined function: {name}")
+            return []
+        args = obj.get("args", obj.get("arguments", {}))
+        return [ToolCallItem(tool_index=-1, name=name, parameters=json.dumps(args, ensure_ascii=False))]
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        matches = list(self._CALL_RE.finditer(text))
+        if not matches:
+            return StreamingParseResult(normal_text=text)
+        calls: List[ToolCallItem] = []
+        for m in matches:
+            calls.extend(self._call_items(m.group(1) or "", m.group(2), tools))
+        for i, call in enumerate(calls):
+            call.tool_index = i
+        return StreamingParseResult(normal_text=text[: matches[0].start()], calls=calls)
+
+    def _value_end(self, buf: str) -> int | None:
+        """End of the JSON value at the start of ``buf``, or None while it is still arriving."""
+        i = self._scan
+        while i < len(buf):
+            ch = buf[i]
+            if self._in_str:
+                if self._esc:
+                    self._esc = False
+                elif ch == "\\":
+                    self._esc = True
+                elif ch == '"':
+                    self._in_str = False
+                    if self._depth == 0:
+                        return i + 1
+            elif ch == '"':
+                self._in_str = True
+            elif ch in "{[":
+                self._depth += 1
+            elif ch in "}]" and self._depth > 0:
+                self._depth -= 1
+                if self._depth == 0:
+                    return i + 1
+            elif self._depth == 0 and i > 0 and (ch in ",}]" or ch.isspace()):
+                return i  # a bare number, boolean or null
+            i += 1
+        self._scan = i
+        return None
+
+    def _open_call(self, name: str, tools: List[Tool], calls: List[ToolCallItem]) -> bool:
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        if name not in self._tool_indices and not _should_forward_unknown_tool(name):
+            logger.warning(f"Model attempted to call undefined function: {name}")
+            return False
+        self.current_tool_id = max(self.current_tool_id, 0)
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+        self.prev_tool_call_arr[self.current_tool_id] = {"name": name, "arguments": {}}
+        calls.append(ToolCallItem(tool_index=self.current_tool_id, name=name, parameters=""))
+        return True
+
+    def _emit_args(self, fragment: str, calls: List[ToolCallItem]) -> None:
+        if not fragment:
+            return
+        tid = self.current_tool_id
+        self.streamed_args_for_tool[tid] += fragment
+        calls.append(ToolCallItem(tool_index=tid, name=None, parameters=fragment))
+        try:
+            parsed, _ = _partial_json_loads(self.streamed_args_for_tool[tid], Allow.ALL)
+        except (MalformedJSON, ValueError):
+            return
+        if isinstance(parsed, dict):
+            self.prev_tool_call_arr[tid]["arguments"] = parsed
+
+    def _close_call(self) -> None:
+        self.current_tool_id += 1
+        self._sent = self._scan = self._depth = 0
+        self._in_str = self._esc = False
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        self._buffer += new_text
+        normal: List[str] = []
+        calls: List[ToolCallItem] = []
+        while self._buffer:
+            buf = self._buffer
+            if self._mode == "text":
+                if calls:
+                    break  # text after a call goes out on the next step, in wire order
+                hits = [(buf.find(tok), tok) for tok in (TML_MESSAGE_MODEL, TML_TOOL_JSON) if tok in buf]
+                if not hits:
+                    hold = tml_hold_len(buf, (TML_MESSAGE_MODEL, TML_TOOL_JSON))
+                    normal.append(buf[: len(buf) - hold])
+                    self._buffer = buf[len(buf) - hold:]
+                    break
+                pos, tok = min(hits)
+                if pos > 0:
+                    normal.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                if tok == TML_MESSAGE_MODEL:
+                    self._mode = "header"
+                else:
+                    self._buffer, self._header_name, self._mode = buf[len(tok):], "", "head"
+                continue
+
+            if self._mode == "header":
+                rest = buf[len(TML_MESSAGE_MODEL):]
+                lt = rest.find("<")
+                if lt == -1:
+                    if len(rest) <= TML_HEADER_SPAN:
+                        break
+                elif rest[lt:].startswith(TML_TOOL_JSON):
+                    self._header_name = rest[:lt]
+                    self._buffer, self._mode = rest[lt + len(TML_TOOL_JSON):], "head"
+                    continue
+                elif TML_TOOL_JSON.startswith(rest[lt:]):
+                    break
+                # another message's header: not a call, leave it to the content
+                cut = len(rest) if lt == -1 else lt
+                normal.append(TML_MESSAGE_MODEL + rest[:cut])
+                self._buffer, self._mode = rest[cut:], "text"
+                continue
+
+            if self._mode == "head":
+                m = self._HEAD_RE.match(buf)
+                if m is not None:
+                    self._buffer = buf[m.end():]
+                    self._mode = "args" if self._open_call(json.loads(m.group(1)), tools, calls) else "swallow"
+                    continue
+                if TML_END_MESSAGE in buf or len(buf) > self._HEAD_SPAN:
+                    self._mode = "whole"
+                    continue
+                break
+
+            if self._mode == "args":
+                if self._sent == 0 and buf[:1].isspace():
+                    self._buffer = buf.lstrip()
+                    continue
+                end = self._value_end(buf)
+                if end is None:
+                    stop = buf.find(TML_END_MESSAGE)
+                    if stop == -1:
+                        self._emit_args(buf[self._sent:], calls)
+                        self._sent = len(buf)
+                        break
+                    # the end marker before the value closed: what streamed is all the call has
+                    self._emit_args(buf[self._sent:stop], calls)
+                    self._buffer, self._mode = buf[stop + len(TML_END_MESSAGE):], "text"
+                    self._close_call()
+                    continue
+                self._emit_args(buf[self._sent:end], calls)
+                self._buffer, self._mode = buf[end:], "tail"
+                self._close_call()
+                continue
+
+            if self._mode == "whole":
+                stop = buf.find(TML_END_MESSAGE)
+                if stop == -1:
+                    break
+                for item in self._call_items(self._header_name, buf[:stop], tools):
+                    if self._open_call(item.name, tools, calls):
+                        self._emit_args(item.parameters, calls)
+                        self._close_call()
+                self._buffer, self._mode = buf[stop + len(TML_END_MESSAGE):], "text"
+                continue
+
+            # tail (the outer brace after the args) or swallow (a call to an unknown tool): skip to the end
+            # marker, or to the next message when the model left this one without it
+            hits = [(buf.find(tok), tok) for tok in (TML_END_MESSAGE, TML_MESSAGE_MODEL) if tok in buf]
+            if not hits:
+                hold = tml_hold_len(buf, (TML_END_MESSAGE, TML_MESSAGE_MODEL))
+                self._buffer = buf[len(buf) - hold:]
+                break
+            pos, tok = min(hits)
+            self._buffer = buf[pos + len(tok):] if tok == TML_END_MESSAGE else buf[pos:]
+            self._mode = "text"
+        return StreamingParseResult(normal_text="".join(normal), calls=calls)
+
+    def finish_streaming(self) -> str:
+        residual, mode = self._buffer, self._mode
+        self._buffer = ""
+        self._reset()
+        # an unfinished call's markup never reaches the content
+        return residual if mode in ("text", "header") else ""
+
+
 class FunctionCallParser:
     """
     Parser for function/tool calls in model outputs.
@@ -3586,6 +3822,7 @@ class FunctionCallParser:
         "gpt-oss": GptOssDetector,
         "gpt_oss": GptOssDetector,
         "glm47": Glm47Detector,
+        "inkling2": Inkling2Detector,
         "llama3": Llama32Detector,
         "minimax": MiniMaxDetector,
         "minimax_m3": MiniMaxM3Detector,

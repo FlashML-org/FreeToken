@@ -36,6 +36,9 @@ class ModelSpec:
     encoders: tuple[EncoderSpec, ...] = ()
     # speculative method -> "module:Class" of the family's draft for it
     spec_drafts: tuple[tuple[str, str], ...] = ()
+    # "module:function" building the QuantConfig when the checkpoint's quantization_config does not describe its tensors;
+    # called as function(model_path, hf_config, name_map=, unquantized=)
+    quant_config: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -109,6 +112,9 @@ _RICURSIVE_PACKED = (("qk_proj", ("q_proj", "k_proj")), ("gate_up_proj", ("gate_
 # language model's rather than under a section of their own.
 _DSV4_PROCESSOR = "freetoken.mm.processors.deepseek_v4:DSV4MMProcessor"
 _DSV4_ENCODERS = (EncoderSpec("vision", "vision_n_layers", ("image",)),)
+
+# Inkling 2 Mini keeps the original checkpoint names (model.llm.*); hf_quant_config.json lists each format's tensors.
+_INKLING2_LOOP_ROOTS = (("model", "model.llm"), ("lm_head", "model.llm.unembed"))
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "FlintGGUFForCausalLM": ModelSpec(
@@ -564,6 +570,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
         unquantized_modules=("*.self_attn.kv_b_proj",),
     ),
+    # Inkling 2 Mini (model_type inkling2_loop): 24 decoder layers, layers 6-17 run three times with their own
+    # KV and convolution state per pass; relative-bias attention with sinks, short convolutions, block attention
+    # residuals, sigmoid-routed experts (NVFP4 on layers 0-19, MXFP8 on 20-23); the ViT
+    # tower under model.visual serves image input.
+    "Inkling2LoopForConditionalGeneration": ModelSpec(
+        "freetoken.models.inkling2_loop",
+        "Inkling2LoopForConditionalGeneration",
+        checkpoint_roots=_INKLING2_LOOP_ROOTS,
+        quant_config="freetoken.models.inkling2_loop.config:quant_config",
+        mm_processor="freetoken.mm.processors.inkling2:Inkling2MMProcessor",
+        encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
+        spec_drafts=(("dspark_mtp", "freetoken.models.inkling2_loop.dspark:Inkling2DSparkDraft"),),
+    ),
 }
 
 
@@ -594,6 +613,9 @@ def checkpoint_quant_config(
 
         types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
         quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+    elif spec.quant_config is not None:
+        build = _load_attr(*spec.quant_config.split(":"))
+        quant = build(model_path, hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
     else:
         quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
     return quant.with_online(QuantKind(online), online_modules) if online else quant
