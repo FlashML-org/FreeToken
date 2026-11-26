@@ -109,6 +109,24 @@ def _fast_index_copy_update_flag_spec() -> KernelSpec:
     return KernelSpec(name=_make_name("fast_index_copy_update_flag"), build=build)
 
 
+def _decode_gather_spec() -> KernelSpec:
+    from .decode_gather import module_spec
+    from freetoken.decode_gather import TUNED_DECODE_GATHER
+
+    stem, args, wrapper = module_spec(TUNED_DECODE_GATHER)
+
+    def build(build_directory: pathlib.Path) -> object:
+        return load_jit(
+            stem,
+            *args,
+            cuda_files=["decode_gather.cuh"],
+            cuda_wrappers=[("launch", wrapper)],
+            build_directory=str(build_directory),
+        )
+
+    return KernelSpec(name=_make_name(stem, *args), build=build)
+
+
 def _fast_index_copy_multi_spec(num_threads: int, blocks_per_bank: int) -> KernelSpec:
     args = make_cpp_args(num_threads, blocks_per_bank)
 
@@ -161,6 +179,7 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
         _fast_index_copy_spec(feature_size)
         for feature_size in DEFAULT_FAST_INDEX_COPY_FEATURE_SIZES
     )
+    specs.append(_decode_gather_spec())
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=8))
     specs.append(_fast_index_copy_multi_spec(num_threads=1024, blocks_per_bank=32))
     # prefill hit-D2D gather (HBM-bound: wide grid) + its miss-side batch H2D binding.
