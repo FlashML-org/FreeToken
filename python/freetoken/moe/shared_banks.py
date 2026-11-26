@@ -250,8 +250,16 @@ def load_placed_expert_banks(placement, rank: int, method, read_pieces: Callable
     bank = placement.bank_of(rank)
     i = placement.banks.index(bank)
     buffer, addr, size = mappings[i]
-    host_register(addr, size)  # pin after fill; every rank pins the one bank it fetches from
-    dist.barrier(group=group)
+    # pin after fill, ranks sharing a bank (numa) one at a time: concurrent cudaHostRegister of the same pages
+    # fails now and then with "invalid argument". Each turn ends in _raise_any, so a refused pin fails every rank.
+    for turn in range(max(len(b.ranks) for b in placement.banks)):
+        failure = None
+        if bank.ranks.index(rank) == turn:
+            try:
+                host_register(addr, size)
+            except BaseException as exc:
+                failure = exc
+        _raise_any(group, failure)
     logger.info(
         f"expert banks: rank {rank} read MoE layers {mine[0] if mine else '-'}..{mine[-1] if mine else '-'} of {L} once into "
         f"{len(placement.banks)} bank(s); serving slice [{bank.interval.start}, {bank.interval.stop}) from NUMA node {bank.node}"
