@@ -262,6 +262,174 @@ def test_parser_accepts_family_specific_tool_call_shapes(
     assert json.loads(result.calls[0].parameters) == expected_args
 
 
+@pytest.mark.parametrize("parser_name", SUPPORTED_TOOL_CALL_PARSERS)
+@pytest.mark.parametrize(
+    "param_schema",
+    [
+        pytest.param(None, id="undeclared"),
+        pytest.param({"type": "number"}, id="number"),
+        pytest.param({"type": "array"}, id="array"),
+        pytest.param({"type": "object"}, id="object"),
+        pytest.param({"anyOf": [{"type": "number"}, {"type": "string"}]}, id="number-or-string"),
+    ],
+)
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "1e9999"])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_non_finite_argument_text_stays_a_string(parser_name, param_schema, raw, streaming):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": param_schema} if param_schema else {},
+                },
+            },
+        }
+    ]
+    blocks = {
+        "glm47": "<tool_call>get_weather<arg_key>x</arg_key><arg_value>VALUE</arg_value></tool_call>",
+        "qwen3_coder": "<tool_call><function=get_weather><parameter=x>VALUE</parameter></function></tool_call>",
+        "minimax": (
+            '<minimax:tool_call><invoke name="get_weather"><parameter name="x">'
+            'VALUE</parameter></invoke></minimax:tool_call>'
+        ),
+        "minimax_m3": (
+            ']<]minimax[>[<tool_call>]<]minimax[>[<invoke name="get_weather">'
+            ']<]minimax[>[<x>VALUE]<]minimax[>[</x>'
+            ']<]minimax[>[</invoke>]<]minimax[>[</tool_call>'
+        ),
+        "deepseekv32": (
+            '<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+            '<｜DSML｜parameter name="x" string="false">VALUE</｜DSML｜parameter>'
+            '</｜DSML｜invoke></｜DSML｜function_calls>'
+        ),
+        "deepseekv41": (
+            '<｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+            '<｜DSML｜ parameter name="x" string="false">VALUE</｜DSML｜ parameter>'
+            '</｜DSML｜ invoke></｜DSML｜ calls>'
+        ),
+        "gemma4": "<|tool_call>call:get_weather{x:VALUE}<tool_call|>",
+        "muse_glimmer": (
+            '<|start|>assistant to=get_weather<|message|><atem:function_calls>'
+            '<atem:invoke name="get_weather"><atem:parameter name="x">VALUE</atem:parameter>'
+            '</atem:invoke></atem:function_calls><|eot|>'
+        ),
+    }
+    json_call = json.dumps({"name": "get_weather", "arguments": {"x": raw}})
+    blocks.update(
+        {
+            "qwen25": "<tool_call>" + json_call + "</tool_call>",
+            "qwen": "<tool_call>" + json_call + "</tool_call>",
+            "mistral": "[TOOL_CALLS] [" + json_call + "]",
+            "llama3": "<|python_tag|>" + json_call,
+            "gpt_oss": (
+                '<|start|>assistant<|channel|>commentary to=functions.get_weather '
+                '<|constrain|>json<|message|>' + json.dumps({"x": raw}) + '<|end|>'
+            ),
+        }
+    )
+    blocks["gpt-oss"] = blocks["gpt_oss"]
+    text = blocks[parser_name].replace("VALUE", raw)
+    parser = FunctionCallParser(tools, tool_call_parser=parser_name)
+
+    if streaming:
+        _, calls = _feed(parser, [text[i : i + 3] for i in range(0, len(text), 3)])
+        assert parser.finish_stream() == ""
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        arguments = "".join(call.parameters for call in calls)
+    else:
+        result = parser.parse_non_stream(text)
+        assert result.normal_text == ""
+        assert [call.name for call in result.calls] == ["get_weather"]
+        arguments = result.calls[0].parameters
+
+    decoded = json.loads(arguments, parse_constant=pytest.fail)
+    assert json.loads(json.dumps(decoded, allow_nan=False)) == {"x": raw}
+
+
+@pytest.mark.parametrize(
+    ("param_type", "raw"),
+    [
+        ("array", "[1e9999]"),
+        ("object", '{"nested": [NaN]}'),
+        ("object", "{'nested': [1e9999]}"),
+    ],
+)
+@pytest.mark.parametrize("streaming", [False, True])
+def test_non_finite_container_argument_stays_text(param_type, raw, streaming):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"x": {"type": param_type}}},
+            },
+        }
+    ]
+    parser = FunctionCallParser(tools, tool_call_parser="qwen3_coder")
+    text = f"<tool_call><function=get_weather><parameter=x>{raw}</parameter></function></tool_call>"
+
+    if streaming:
+        _, calls = _feed(parser, list(text))
+        assert parser.finish_stream() == ""
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        arguments = "".join(call.parameters for call in calls)
+    else:
+        result = parser.parse_non_stream(text)
+        assert len(result.calls) == 1
+        arguments = result.calls[0].parameters
+
+    assert json.loads(arguments, parse_constant=pytest.fail) == {"x": raw}
+
+
+@pytest.mark.parametrize(
+    ("parser_name", "template"),
+    [
+        ("qwen25", '<tool_call>{"name":"get_weather","arguments":{"x":VALUE}}</tool_call>'),
+        ("mistral", '[TOOL_CALLS] [{"name":"get_weather","arguments":{"x":VALUE}}]'),
+        ("llama3", '<|python_tag|>{"name":"get_weather","arguments":{"x":VALUE}}'),
+        ("gpt_oss", '<|channel|>commentary to=functions.get_weather<|message|>{"x":VALUE}<|end|>'),
+    ],
+)
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "1e9999"])
+def test_non_finite_json_call_is_not_serialized(parser_name, template, raw, caplog):
+    parser = FunctionCallParser(TOOLS, tool_call_parser=parser_name)
+
+    result = parser.parse_non_stream(template.replace("VALUE", raw))
+
+    assert result.calls == []
+    assert "function.arguments" in caplog.text
+    assert "non-finite" in caplog.text
+
+
+@pytest.mark.parametrize("parser_name", ["qwen25", "mistral", "llama3"])
+@pytest.mark.parametrize("raw", ["NaN", "Infinity", "-Infinity", "1e9999"])
+@pytest.mark.parametrize("split_argument", [False, True])
+def test_non_finite_json_stream_keeps_following_valid_call(parser_name, raw, split_argument, caplog):
+    bad = '{"name":"get_weather","arguments":{"x":' + raw + '}}'
+    good = '{"name":"get_weather","arguments":{"city":"Paris"}}'
+    text = {
+        "qwen25": f"<tool_call>{bad}</tool_call><tool_call>{good}</tool_call>",
+        "mistral": f"[TOOL_CALLS] [{bad}, {good}]",
+        "llama3": f"<|python_tag|>{bad};{good}",
+    }[parser_name]
+    parser = FunctionCallParser(TOOLS, tool_call_parser=parser_name)
+
+    split = text.index(raw)
+    chunks = [text[:split], text[split:]] if split_argument else [text]
+    _, calls = _feed(parser, chunks)
+
+    arguments = {}
+    for call in calls:
+        arguments[call.tool_index] = arguments.get(call.tool_index, "") + call.parameters
+    assert json.loads(arguments[max(arguments)], parse_constant=pytest.fail) == {"city": "Paris"}
+    assert all("NaN" not in value and "Infinity" not in value for value in arguments.values())
+    assert parser.finish_stream() == ""
+    assert "function.arguments" in caplog.text
+
+
 # --------------------------------------------------------------------------- #
 # Streaming incremental parsing (parse_stream_chunk)
 # --------------------------------------------------------------------------- #
