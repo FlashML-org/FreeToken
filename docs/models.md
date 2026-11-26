@@ -208,10 +208,10 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   anchor; each keeps 1040 window tokens and 19 convolution rows (174 MiB), and window KV or rows
   that no point reads go back at once. A prefill chunk gives rows only to its last 3 tokens, which
   the next chunk reads. Each running request holds about 2.2K window tokens and 41 rows (25 MiB);
-  the window pool adds `swa_full_tokens_ratio` (0.2) of the full-attention tokens, and the row
-  pool 19 rows per 1040 of those. On a 96 GiB GPU at 4 requests that is 946K tokens of
-  full-attention KV (28.9 GiB), 189K window tokens (28.9 GiB, about 170 resume points past the
-  running requests) and 3.6K rows (2.2 GiB).
+  the window pool adds a tenth of the full-attention tokens (the model's `swa_full_tokens_ratio`),
+  and the row pool 19 rows per 1040 of those. On a 96 GiB GPU at 4 requests that is 1.32M tokens
+  of full-attention KV (40.2 GiB; a request still stops at the model's 1M), 132K window tokens
+  (20.1 GiB, about 120 resume points past the running requests) and 2.6K rows (1.5 GiB).
   `--cache-type naive` turns reuse off and reserves
   `(max-running-requests + 1) x (1024 + --max-extend-length)` window tokens instead (83K at 8 requests).
   The NVFP4 experts (layers 0-19) run as W4A16; the MXFP8 experts (layers 20-23) are dequantized
@@ -221,10 +221,14 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   On a small GPU the defaults shrink to fit rather than fail, each step logged as `small GPU: ...`:
   at least 1 GiB stays free for activations (lowering `--memory-ratio`), the prefill chunk is
   capped at 35% of it (192 KiB per chunk token), then `--max-running-requests` goes until the
-  window pools, one layer of experts and an 8K-token KV reserve fit. With 8 GiB free that is 4
-  running requests, 2816-token chunks and 8.3K tokens of context under `offload`; with 32 GiB free,
-  4 requests, 5888-token chunks and 72K tokens. `--embed-weights host` moves the 0.86 GiB input
-  embedding to host RAM.
+  window pools, one layer of experts and the KV reserve fit. Under `offload` the experts take
+  whatever the KV reserve leaves, so the context stays at `--kv-reserve-tokens` (8K) until every
+  expert is cached: with 7.3 GiB free (an 8 GB card) that is 1 running request, 1792-token chunks
+  and 8.2K tokens, with 32 GiB free 4 requests, 5888-token chunks and 120K tokens. Set
+  `--kv-reserve-tokens` to the context you need: 32K starts with 8.5 GiB free, 128K with 13.4 GiB,
+  256K with 20.1 GiB and 1M with 61 GiB, and `--embed-weights host` (the 0.86 GiB input embedding
+  in host RAM) with `--max-running-requests 1` gives an 8 GB card 29.8K tokens. At one running
+  request the window pool caps a prefill chunk at about 1.2K tokens, which halves prefill speed.
   `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`;
   `none` is the template's level 0.0, which the model card says does not fully disable reasoning.
   `--tp` > 1 is not served. Speculative decoding is refused at startup; serving it needs:

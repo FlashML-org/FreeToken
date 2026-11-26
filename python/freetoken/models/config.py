@@ -418,6 +418,8 @@ class ModelConfig:
     slot_states: Tuple[SlotStateSpec, ...] = ()
     # Per-token rows kept beside the sliding-window KV (see WindowStateSpec); requires an SWA group.
     window_states: Tuple[WindowStateSpec, ...] = ()
+    # EngineConfig.swa_full_tokens_ratio when the caller leaves it unset; None -> 0.2.
+    swa_full_tokens_ratio: float | None = None
 
     @property
     def is_moe(self) -> bool:

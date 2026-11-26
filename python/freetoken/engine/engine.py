@@ -2054,6 +2054,8 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    if getattr(config, "swa_full_tokens_ratio", 0.2) is None:
+        override("swa_full_tokens_ratio", getattr(model_config, "swa_full_tokens_ratio", None) or 0.2)
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     is_dsv41 = getattr(model_config, "dsv41_args", None) is not None
