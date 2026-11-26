@@ -34,6 +34,8 @@ from freetoken.kernel.triton.e4m3_compat import (
     f32_to_e4m3,
 )
 
+from freetoken.utils.arch import get_rocm_gfx_arch
+
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
@@ -217,6 +219,12 @@ def _gemm(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     out = torch.empty((M, N), dtype=compute, device=a.device)
     BLOCK_M = 64 if M >= 64 else 32
     BLOCK_N, BLOCK_K = 128, 64
+    if (
+        M == 4 and (N, K) == (2560, 6144) and a.dtype == torch.bfloat16
+        and weight.is_contiguous() and weight_scale.is_contiguous()
+        and get_rocm_gfx_arch() == "gfx1201"
+    ):
+        BLOCK_M, BLOCK_N = 16, 32
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _gemm_kernel[grid](
         a, weight, weight_scale, out, M, N, K,
