@@ -333,11 +333,14 @@ def test_resident_layers_each_read_their_own_format(monkeypatch):
 
     _init_tp()
     set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
-    nvfp4 = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    quants = {"bf16": NoQuantConfig()} | {
+        fmt: QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": algo, "ignore": ["lm_head"]}})
+        for fmt, algo in (("nvfp4", "NVFP4"), ("mxfp8", "MXFP8"))
+    }
     # resident experts compute in the model dtype the engine builds them under
     with torch_dtype(torch.bfloat16):
         layers = [
-            MoELayer(E, TOPK, H, I, layer_id=layer, quant_config=NoQuantConfig() if fmt == "bf16" else nvfp4, prefix=f"model.layers.{layer}.mlp.experts")
+            MoELayer(E, TOPK, H, I, layer_id=layer, quant_config=quants[fmt], prefix=f"model.layers.{layer}.mlp.experts")
             for layer, fmt in enumerate(FORMATS)
         ]
     pieces = _pieces(seed=3)
@@ -410,7 +413,7 @@ def test_cpu_strategy_stages_every_format_twice():
     device = torch.device("cuda")
     pieces = _pieces(seed=3)
     cache, layers, _ = _mixed_cache(device, pieces, decode_target="cpu", prefill_overlap=True, staging_only=True)
-    assert cache.prefill_overlap and len(cache.pool_sizes) == 2
+    assert cache.prefill_overlap and len(cache.pool_sizes) == len(set(FORMATS))
     cache.cpu_layer_ids = frozenset(range(L))
     _executor(cache, "silu", device)
     M = 16
