@@ -217,7 +217,8 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   The NVFP4 experts (layers 0-19) run as W4A16; the MXFP8 experts (layers 20-23) are dequantized
   to bf16 at load, about 8 GiB of the ~22 GiB resident footprint. Pass `--moe-strategy fused` when
   the GPU holds that: under `offload` every prefill streams the experts of all 48 visits over PCIe,
-  which puts a floor of about 0.75 s under the first token.
+  each visit's while the one before it computes (with 1024 experts cached, a 2K-token prompt
+  prefills in 0.62 s and a 32K one in 3.1 s).
   On a small GPU the defaults shrink to fit rather than fail, each step logged as `small GPU: ...`:
   at least 1 GiB stays free for activations (lowering `--memory-ratio`), the prefill chunk is
   capped at 35% of it (192 KiB per chunk token), then `--max-running-requests` goes until the

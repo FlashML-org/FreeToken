@@ -403,8 +403,9 @@ class ModelConfig:
     # KV layers the attention groups index, when looped decoder layers attend once per visit
     # with their own KV (Inkling 2 Mini: 48 over 24 decoder layers); 0 means num_layers.
     num_kv_layers: int = 0
-    # Some decoder layers (and their experts) run more than once per forward (looped models).
-    revisits_layers: bool = False
+    # The MoE layer of each MoE call in one forward, when it is not each layer once in order (a looped model
+    # runs some layers several times); () -> ascending. The offload prefill stages experts in this order.
+    moe_layer_order: Tuple[int, ...] = ()
     # Peak transient GPU bytes a prefill forward takes per token (0: not declared). A small GPU
     # caps the prefill chunk so that peak fits the memory_ratio headroom.
     prefill_bytes_per_token: int = 0

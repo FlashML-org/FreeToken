@@ -270,7 +270,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             ),
         ),
         inkling2_args=args,
-        revisits_layers=args.num_passes > 1,
+        moe_layer_order=tuple(visit_layers) if args.num_passes > 1 else (),
         window_states=(conv_state_spec(args),),
         # its window KV serves only the resume points, not every cached token
         swa_full_tokens_ratio=0.1,

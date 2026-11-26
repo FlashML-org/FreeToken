@@ -1014,6 +1014,7 @@ class Engine:
             max_slots=max_slots,
             pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
             pool_sizes=pool_sizes,
+            layer_order=config.model_config.moe_layer_order or None,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
@@ -2332,19 +2333,6 @@ def _adjust_config(config: EngineConfig):
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):
             override("moe_cpu_layers", None)
-
-    if (
-        is_moe
-        and getattr(model_config, "revisits_layers", False)
-        and is_offload_moe_strategy(config.moe_strategy)
-        and config.moe_prefill_overlap
-    ):
-        # the overlap double buffer streams each MoE layer once, in layer order
-        logger.info_rank0(
-            f"{model_config.model_type} runs some MoE layers more than once per forward; offload prefill "
-            "loads each visit's experts synchronously (no prefill overlap)"
-        )
-        override("moe_prefill_overlap", False)
 
     if is_moe:
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
