@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, Generic, TypeVar
+import time
+from typing import Callable, Collection, Dict, Generic, TypeVar
 
 import msgpack
 import zmq
@@ -108,18 +109,43 @@ class ZmqPubQueue(Generic[T]):
         addr: str,
         create: bool,
         encoder: Callable[[T], Dict],
+        subscribers: Collection[str] = (),
+        subscribe_timeout: float | None = None,
     ):
+        """``subscribers``: the names of the ``ZmqSubQueue``s that must have subscribed before the first send, since PUB
+        silently drops what it sends before a subscription reaches it. ``subscribe_timeout`` (seconds) bounds that wait,
+        which ``wait_for_subscribers`` runs up front and the first send runs if no one did."""
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PUB)
+        # an XPUB reports every subscription, including the topic each named subscriber adds (ZmqSubQueue)
+        self.socket = self.context.socket(zmq.XPUB if subscribers else zmq.PUB)
+        if subscribers:
+            self.socket.setsockopt(zmq.XPUB_VERBOSE, 1)
         self.socket.bind(addr) if create else self.socket.connect(addr)
         self.encoder = encoder
+        self._unjoined = set(subscribers)
+        self._subscribe_timeout = subscribe_timeout
+
+    def wait_for_subscribers(self) -> None:
+        """Block until every named subscriber has subscribed; raise naming the missing ones after ``subscribe_timeout``."""
+        deadline = None if self._subscribe_timeout is None else time.monotonic() + self._subscribe_timeout
+        while self._unjoined:
+            wait = None if deadline is None else max(0, int((deadline - time.monotonic()) * 1000))
+            if not self.socket.poll(wait):
+                missing = ", ".join(sorted(self._unjoined))
+                raise RuntimeError(f"{missing} never subscribed to this publisher within {self._subscribe_timeout:g} s")
+            msg = self.socket.recv()
+            # 0x01 + topic is a subscribe (0x00 an unsubscribe); a subscriber that reconnects subscribes again, which the
+            # set absorbs, and the unnamed "" subscriptions name no one
+            if msg[:1] == b"\x01":
+                self._unjoined.discard(msg[1:].decode(errors="replace"))
 
     def put_raw(self, raw: bytes):
+        if self._unjoined:
+            self.wait_for_subscribers()
         self.socket.send(raw, copy=False)
 
     def put(self, obj: T):
-        event = msgpack.packb(self.encoder(obj), use_bin_type=True)
-        self.socket.send(event, copy=False)
+        self.put_raw(msgpack.packb(self.encoder(obj), use_bin_type=True))
 
     def stop(self):
         self.socket.close()
@@ -132,11 +158,16 @@ class ZmqSubQueue(Generic[T]):
         addr: str,
         create: bool,
         decoder: Callable[[Dict], T],
+        name: str | None = None,
     ):
+        """``name``: also subscribe to that topic, which nothing is published on, so a ``ZmqPubQueue`` waiting for its
+        ``subscribers`` can tell this subscriber's arrival from the others'."""
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.SUB)
         self.socket.bind(addr) if create else self.socket.connect(addr)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        if name is not None:
+            self.socket.setsockopt_string(zmq.SUBSCRIBE, name)
         self.decoder = decoder
 
     def get(self) -> T:

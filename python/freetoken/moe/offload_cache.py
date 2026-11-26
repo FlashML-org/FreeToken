@@ -84,6 +84,8 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # DeepSeek-V4 FP4: packed e2m1 codes + e8m0 per-32 block scales, no global scale
     # (4 banks). Read by DeepSeek-V4's own DS-FP4 grouped GEMV kernels via pool_bank_views().
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
+    # OCP MXFP8: fp8-e4m3 weights gate_up [L*E, 2I, H] and down [L*E, H, I], e8m0 codes per 32 inputs of a row
+    "mxfp8": ("gate_up", "gate_up_scale", "down", "down_scale"),
 }
 
 # lives in kernel/aot_models.py: the AOT row table shares it and must stay importable in the torch-only kernel-cache build env, which cannot import freetoken.moe
@@ -101,6 +103,7 @@ _BANK_BYTES_PER_EXPERT = {
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 4) + H * (I // 2 + I // 16 + 4),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
+    "mxfp8": lambda H, I: 2 * I * (H + H // 32) + H * (I + I // 32),
 }
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert

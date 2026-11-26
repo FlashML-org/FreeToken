@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING, Iterator
 
 import torch
 
-from freetoken.layers.quantization.ggml_types import row_bytes
+from freetoken.layers.quantization.ggml_types import is_quantized, row_bytes
 from freetoken.models.gguf.config import routed_expert_count, uniform_swiglu_clamp
 from freetoken.models.gguf.reader import GgufTensorInfo, gguf_tensor_index
-from freetoken.models.gguf.tensors import check_scales, dequantized_tensor, fused, matrix
+from freetoken.models.gguf.tensors import check_scales, dequantized_tensor, fused, matrix, packed_rows
 
 from .args import DeepseekV41Args, Mode
 from .config import model_config_from_args
@@ -34,6 +34,7 @@ _LAYER_LEAVES: dict[str, tuple[str, ...]] = {
     "attn.wq_a": ("attn_q_a",),
     "attn.wq_b": ("attn_q_b",),
     "attn.wkv": ("attn_kv",),
+    "attn.wo_a": ("attn_output_a",),
     "attn.wo_b": ("attn_output_b",),
     "attn.compressor.wkv": ("attn_compressor_kv",),
     "attn.indexer.wk": ("indexer.attn_k",),
@@ -161,6 +162,9 @@ def parse_gguf_config(shim: GgufConfigShim) -> ModelConfig:
         raise NotImplementedError(f"{shim.model_path}: Engram tensors without {shim.model_type}.ple.layers, so not llama.cpp's deepseek41 layout (converted for an earlier branch?)")
     if args.engram_layer_ids:
         _check_engram(shim, args, index)
+    # check_scales lets an NVFP4 tensor's .scale through, and wo_a multiplies without one (as llama.cpp's deepseek41 graph does)
+    if any(name.endswith(".attn_output_a.scale") for name in index):
+        raise NotImplementedError(f"{shim.model_path}: an attn_output_a with a per-tensor .scale is not served")
     config = model_config_from_args(args, max_position=int(shim.metadata[f"{shim.model_type}.context_length"]))
     return replace(config, expert_quant="gguf")
 
@@ -256,8 +260,9 @@ def iter_gguf_weights(
         yield from linear(f"{m}.wq_b", f"{blk}.attn_q_b", args.q_lora_rank)
         yield from linear(f"{m}.wkv", f"{blk}.attn_kv", args.dim)
         yield f"{m}.kv_norm.weight", bf16(f"{blk}.attn_kv_a_norm")
-        # wo_a feeds a grouped bf16 einsum, not the quant method
-        yield f"{m}.wo_a", bf16(f"{blk}.attn_output_a")
+        # wo_a is not a Linear: a quantized one stays packed for the layer's ggml mul_mat, a float one feeds the bf16 einsum
+        wo_a = t(f"{blk}.attn_output_a")
+        yield f"{m}.wo_a", packed_rows(wo_a) if is_quantized(wo_a.ggml_type) else bf16(f"{blk}.attn_output_a")
         yield from linear(f"{m}.wo_b", f"{blk}.attn_output_b", args.o_groups * args.o_lora_rank)
         yield f"{m}.attn_sink", dequantized_tensor(t(f"{blk}.attn_sinks"))
         if role.mode is Mode.FULL:

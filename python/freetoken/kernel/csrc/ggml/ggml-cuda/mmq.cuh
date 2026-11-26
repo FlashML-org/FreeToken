@@ -1431,13 +1431,14 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
-// FreeToken: copies an fp32 result with dst's layout into dst
+// FreeToken: copies an fp32 result with dst's layout into dst, one channel per grid z
 template <typename dst_t>
-static __global__ void mmq_store_dst(const float * __restrict__ src, dst_t * __restrict__ dst, const int nrows, const int stride) {
-    const int64_t col = blockIdx.x;
-    const int     row = blockIdx.y*blockDim.x + threadIdx.x;
+static __global__ void mmq_store_dst(const float * __restrict__ src, dst_t * __restrict__ dst, const int nrows, const int stride,
+                                     const int64_t stride_channel) {
+    const int row = blockIdx.y*blockDim.x + threadIdx.x;
     if (row < nrows) {
-        dst[col*stride + row] = mmq_cast<dst_t>(src[col*stride + row]);
+        const int64_t i = blockIdx.z*stride_channel + (int64_t) blockIdx.x*stride + row;
+        dst[i] = mmq_cast<dst_t>(src[i]);
     }
 }
 
@@ -1514,9 +1515,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 #endif // GGML_MMQ_F16_DST
         ggml_cuda_pool_alloc<float> dst_f32(ctx.pool(id));
         float * dst_float = args.dst.type == GGML_TYPE_F32 ? (float *) args.dst.p : nullptr;
+        // a dense batch keeps dst's channel stride in the fp32 copy, which may be below the column stride (a transposed dst)
+        const int64_t nchannels_store = args.ids_dst ? 1 : args.nchannels_y;
         if (via_f32) {
-            GGML_ASSERT(args.ids_dst || (args.nchannels_y == 1 && args.nsamples_y == 1));
-            dst_float = dst_f32.alloc(args.ncols_dst * args.nrows_dst);
+            GGML_ASSERT(args.ids_dst || args.nsamples_y == 1);
+            dst_float = dst_f32.alloc(args.ids_dst ? args.ncols_dst * args.nrows_dst
+                                                   : (nchannels_store - 1) * args.stride_channel_dst + (args.ncols_dst - 1) * args.nrows_dst + args.nrows_x);
         }
 
         if (dst_float) {
@@ -1542,11 +1546,11 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
         if (via_f32) {
             CUDA_CHECK(cudaGetLastError());
-            const dim3 block_nums_store(args.ncols_dst, (args.nrows_x + 255) / 256, 1);
+            const dim3 block_nums_store(args.ncols_dst, (args.nrows_x + 255) / 256, nchannels_store);
             if (args.dst.type == GGML_TYPE_BF16) {
-                mmq_store_dst<<<block_nums_store, 256, 0, stream>>>(dst_float, (nv_bfloat16 *) args.dst.p, args.nrows_x, args.nrows_dst);
+                mmq_store_dst<<<block_nums_store, 256, 0, stream>>>(dst_float, (nv_bfloat16 *) args.dst.p, args.nrows_x, args.nrows_dst, args.stride_channel_dst);
             } else {
-                mmq_store_dst<<<block_nums_store, 256, 0, stream>>>(dst_float, (half *) args.dst.p, args.nrows_x, args.nrows_dst);
+                mmq_store_dst<<<block_nums_store, 256, 0, stream>>>(dst_float, (half *) args.dst.p, args.nrows_x, args.nrows_dst, args.stride_channel_dst);
             }
         }
     };

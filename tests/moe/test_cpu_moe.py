@@ -1,7 +1,7 @@
 """CPU MoE executor (``CpuMoeExecutor``) tests.
 
 Part 1 -- numerical alignment: the CPU SwiGLU MoE GEMV vs FreeToken's production
-GPU decode kernels (bf16/nvfp4/mxfp4/ds_fp4) on identical banks and routing across
+GPU decode kernels (bf16/nvfp4/mxfp4/ds_fp4/mxfp8) on identical banks and routing across
 batch sizes (fp32-accumulate, so the only spread is reduction order -> tight tol).
 
 Part 2 -- CUDA-graph capture/replay: the cudaLaunchHostFunc submit/sync host nodes
@@ -452,11 +452,77 @@ def test_cpu_decode_dsfp4_matches_gpu(bs):
     assert rel < 4e-2, f"ds_fp4 bs={bs} rel err {rel.item()}"
 
 
+def _make_mxfp8_cache(L, E, H, I, seed=0):
+    """MXFP8 banks: e4m3 rows over every finite code, one e8m0 code per 32 inputs of a row."""
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    g = torch.Generator().manual_seed(seed)
+    finite = torch.tensor([c for c in range(256) if c not in (0x7F, 0xFF)], dtype=torch.uint8)
+
+    def rows(OUT, IN):
+        w = alloc_pinned_tensor(L * E, OUT, IN, dtype=torch.float8_e4m3fn)
+        w.view(torch.uint8).copy_(finite[torch.randint(0, len(finite), (L * E, OUT, IN), generator=g)])
+        s = alloc_pinned_tensor(L * E, OUT, IN // 32, dtype=torch.uint8)
+        s.copy_(torch.randint(113, 117, s.shape, dtype=torch.uint8, generator=g))
+        return w, s
+
+    gu, gus = rows(2 * I, H)
+    dn, dns = rows(H, I)
+    return SimpleNamespace(
+        quant_format="mxfp8",
+        bank_sources={
+            "gate_up": list(gu.split(E)), "gate_up_scale": list(gus.split(E)),
+            "down": list(dn.split(E)), "down_scale": list(dns.split(E)),
+        },
+        num_layers=L,
+        num_experts=E,
+        decode_target="cpu",
+        cpu_executor=None,
+    )
+
+
+@pytest.mark.parametrize("isa", list(_NVFP4_TIERS))
+@pytest.mark.parametrize("bs", [1, 3, 8])
+def test_cpu_decode_mxfp8_matches_gpu_decode_kernel(bs, isa, monkeypatch):
+    """CPU MXFP8 GEMV vs the Triton decode kernel on the same banks, per ISA tier; both are W8A16 with fp32 sums."""
+    from freetoken.kernel.triton.mxfp8_moe import fused_experts_decode_mxfp8
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(300 + bs)
+    L, E, H, I, top_k = 2, 8, 288, 160, 4  # 9 and 5 scale groups: the unrolled SIMD loops run their tails
+    layer = 1
+    dev = torch.device("cuda")
+    cache = _make_mxfp8_cache(L, E, H, I, seed=bs)
+
+    monkeypatch.setenv("FREETOKEN_CPU_MOE_ISA", isa)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False, num_threads=0,
+                        max_tokens=bs, device=dev)
+    if ex.isa != _NVFP4_TIERS[isa]:
+        pytest.skip(f"asked for {isa}, host/build selected {ex.isa}: not supported here")
+
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16) * 0.1
+    ids = torch.stack([torch.randperm(E, device=dev)[:top_k] for _ in range(bs)]).to(torch.int32)
+    w = torch.rand(bs, top_k, device=dev, dtype=torch.float32)
+
+    cpu_out = ex.decode(layer, hidden, w, ids).float()
+    torch.cuda.synchronize()
+
+    b = cache.bank_sources
+    gpu_out = fused_experts_decode_mxfp8(
+        hidden, b["gate_up"][layer].to(dev), b["gate_up_scale"][layer].to(dev),
+        b["down"][layer].to(dev), b["down_scale"][layer].to(dev), w, ids.clone(),
+    ).float()
+
+    rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
+    assert rel < 2e-2, f"mxfp8 bs={bs} isa={ex.isa} rel err {rel.item()}"
+
+
 # mxfp4 and ds_fp4 apply the router weight on the output only
 @pytest.mark.parametrize("make_cache, opts, apply_in", [
     (_make_cache, {}, False), (_make_cache, {}, True), (_make_nvfp4_cache, {}, False), (_make_nvfp4_cache, {}, True),
     (_make_mxfp4_cache, {}, False), (_make_dsfp4_cache, {"activation": "silu", "act_block": 128}, False),
-], ids=["bf16-w-out", "bf16-w-in", "nvfp4-w-out", "nvfp4-w-in", "mxfp4-w-out", "ds_fp4-w-out"])
+    (_make_mxfp8_cache, {}, False),
+], ids=["bf16-w-out", "bf16-w-in", "nvfp4-w-out", "nvfp4-w-in", "mxfp4-w-out", "ds_fp4-w-out", "mxfp8-w-out"])
 # 7 tokens on 3 threads split pass 2 into token groups of 4 and 3; 70 tokens on one thread share expert 0, so each of
 # its pass 1 items runs 70 routes and one pass 2 item holds every token
 @pytest.mark.parametrize("bs, threads", [(7, 3), (70, 1)], ids=["groups", "one-wide-group"])
