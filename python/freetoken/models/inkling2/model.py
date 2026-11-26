@@ -17,10 +17,15 @@ from .state import ConvState
 from .vision import Inkling2VisionModel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
     from .config import Inkling2Args
+
+# loop-pass prefill chunks of at least this many tokens mix message rows and run the attention gates one at a time, to bound their fp32 temporaries
+_SPLIT_TOKENS = 2048
 
 
 class Inkling2MessageGates(BaseOP):
@@ -39,6 +44,40 @@ class Inkling2MessageGates(BaseOP):
         z = torch.bmm(gate_inputs(x, m, self.eps), self.down.transpose(1, 2))
         forget_gain = torch.bmm(z.float(), self.up.transpose(1, 2))
         return gate_combine(forget_gain, x, m, norm_weight=norm_weight, norm_eps=norm_eps, out_dtype=self.down.dtype)
+
+    def forward_each(
+        self, x: Callable[[int], torch.Tensor], m: Callable[[int], torch.Tensor], T: int, norm_weight: torch.Tensor, norm_eps: float
+    ) -> torch.Tensor:
+        """``forward`` one gate at a time, so only one gate's ``[1, T, *]`` temporaries are live; ``x(g)`` / ``m(g)`` build gate ``g``'s rows."""
+        G, H = self.down.shape[0], self.down.shape[2] // 2
+        out = self.down.new_empty((G, T, H))
+        for g in range(G):
+            xg, mg = x(g), m(g)
+            z = torch.bmm(gate_inputs(xg, mg, self.eps), self.down[g : g + 1].transpose(1, 2))
+            forget_gain = torch.bmm(z.float(), self.up[g : g + 1].transpose(1, 2))
+            del z
+            gate_combine(forget_gain, xg, mg, norm_weight=norm_weight[g : g + 1], norm_eps=norm_eps, out=out[g : g + 1])
+            del xg, mg, forget_gain
+        return out
+
+
+class Inkling2Message:
+    """A loop layer's four message rows (q, k, v input, then MLP input), mixed from the previous pass's blocks and output.
+
+    A split message mixes rows only when asked, so none outlives its gate; otherwise all four are mixed at once.
+    """
+
+    def __init__(self, blocks: torch.Tensor, nb: int, x: torch.Tensor, queries: torch.Tensor, split: bool):
+        self.split = split
+        self._sources = (blocks, nb, x)
+        self._queries = queries
+        self._rows = None if split else attn_res(blocks, nb, x, queries)
+
+    def rows(self, lo: int, hi: int) -> torch.Tensor:
+        """Rows ``lo:hi``, fp32 ``[hi - lo, T, H]``."""
+        if self._rows is not None:
+            return self._rows[lo:hi]
+        return attn_res(*self._sources, self._queries[lo:hi])
 
 
 class Inkling2MoE(BaseOP):
@@ -113,23 +152,30 @@ class Inkling2DecoderLayer(BaseOP):
             decode=not batch.is_prefill, q_to_req=md.q_to_req, cu_q=md.cu_seqlens_q_gpu, **kw,
         )
 
-    def _attn_inputs(self, x: torch.Tensor, blocks: torch.Tensor, nb: int, messages: torch.Tensor | None):
+    def _attn_inputs(self, x: torch.Tensor, blocks: torch.Tensor, nb: int, msg: Inkling2Message | None):
         if self._layer_id == 0:
             xq = self.input_norm.forward(x)
             return xq, xq, xq
         T, H = x.shape
         norms = self.input_norm.weight.view(1, H).expand(3, H) if self.is_swa else self.qkv_input_norm
-        if messages is None:
+        if msg is None:
             mixes = attn_res(blocks, nb, x, self.attention_input, norm_weight=norms[: self.attention_input.shape[0]], norm_eps=self.eps, out_dtype=x.dtype)
             return (mixes[0],) * 3 if self.is_swa else tuple(mixes)
-        mixes = attn_res(blocks, nb, x, self.attention_input)
-        gated = self.attn_gates.forward(mixes.expand(3, T, H), messages[:3], norms, self.eps)
-        return tuple(gated)
+        if not msg.split:
+            mixes = attn_res(blocks, nb, x, self.attention_input)
+            return tuple(self.attn_gates.forward(mixes.expand(3, T, H), msg.rows(0, 3), norms, self.eps))
+        swa_mix = attn_res(blocks, nb, x, self.attention_input) if self.is_swa else None
+
+        def mix(g: int) -> torch.Tensor:
+            return swa_mix if swa_mix is not None else attn_res(blocks, nb, x, self.attention_input[g : g + 1])
+
+        return tuple(self.attn_gates.forward_each(mix, lambda g: msg.rows(g, g + 1), T, norms, self.eps))
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, x: torch.Tensor, blocks: torch.Tensor, nb: int, messages: torch.Tensor | None, visit: int, state: ConvState):
-        xq, xk, xv = self._attn_inputs(x, blocks, nb, messages)
+    def forward(self, x: torch.Tensor, blocks: torch.Tensor, nb: int, msg: Inkling2Message | None, visit: int, state: ConvState):
+        xq, xk, xv = self._attn_inputs(x, blocks, nb, msg)
         h = self.self_attn.forward(xq, xk, xv, visit, state)
+        del xq, xk, xv
         h = self._conv(h, self.attn_conv, state, visit, "attn")
         if self.is_boundary:
             blocks[:, nb].copy_(x)
@@ -137,11 +183,11 @@ class Inkling2DecoderLayer(BaseOP):
             res, res2 = h, None
         else:
             res, res2 = x, h
-        if messages is None:
+        if msg is None:
             m = attn_res(blocks, nb, res, self.mlp_input, partial2=res2, norm_weight=self.mlp_norm, norm_eps=self.eps, out_dtype=x.dtype)[0]
         else:
             m = attn_res(blocks, nb, res, self.mlp_input, partial2=res2)
-            m = self.mlp_gate.forward(m, messages[3:], self.mlp_norm, self.eps)[0]
+            m = self.mlp_gate.forward(m, msg.rows(3, 4), self.mlp_norm, self.eps)[0]
         y = self.mlp.forward(m)
         return self._conv(y, self.mlp_conv, state, visit, "mlp", epilogue=EPI_RESIDUAL, residual=res, residual2=res2), nb
 
@@ -162,12 +208,10 @@ class Inkling2Model(BaseOP):
 
     def _run(self, layers: range, x: torch.Tensor, blocks: torch.Tensor, nb: int, pass_idx: int, prev: tuple | None):
         args = self.args
+        split = prev is not None and get_global_ctx().batch.is_prefill and x.shape[0] >= _SPLIT_TOKENS
         for layer in layers:
-            messages = None
-            if prev is not None:
-                prev_blocks, prev_nb, prev_x = prev
-                messages = attn_res(prev_blocks, prev_nb, prev_x, self.message_queries[layer - args.loop_start])
-            x, nb = self.layers.op_list[layer].forward(x, blocks, nb, messages, args.visit(layer, pass_idx), self._state)
+            msg = None if prev is None else Inkling2Message(*prev, self.message_queries[layer - args.loop_start], split)
+            x, nb = self.layers.op_list[layer].forward(x, blocks, nb, msg, args.visit(layer, pass_idx), self._state)
         return x, nb
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -180,11 +224,13 @@ class Inkling2Model(BaseOP):
         pre_x, pre_nb = x, nb
         loop = range(args.loop_start, args.loop_end)
         x, nb = self._run(loop, x, blocks, nb, 0, None)
+        prev = None
         for pass_idx in range(1, args.num_passes):
             # every later pass restarts from the prelude and reads the previous pass's message:
             # the blocks it closed after its first one, plus its output
             prev = (blocks[:, pre_nb + 1 : nb].clone(), nb - pre_nb - 1, x)
             x, nb = self._run(loop, pre_x, blocks, pre_nb, pass_idx, prev)
+        del pre_x, prev
         x, nb = self._run(range(args.loop_end, args.num_layers), x, blocks, nb, 0, None)
         return attn_res(blocks, nb, x, self.final_query, norm_weight=self.norm, norm_eps=args.rms_norm_eps, out_dtype=x.dtype)[0]
 

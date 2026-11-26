@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from .state import ConvState
 
 # query rows whose bias table is materialized at once: [rows, heads, rel_extent] bf16
-_BIAS_ROWS = 4096
+_BIAS_ROWS = 2048
 
 
 class Inkling2Attention(BaseOP):
@@ -111,6 +111,7 @@ class Inkling2Attention(BaseOP):
                     q, k_cache, v_cache, gate, bias, sinks, md.cu_seqlens_q_gpu, md.indptr, indices, md.prefix_lens,
                     md.max_q_len, self._sm_scale, self.sliding_window, self.rel_extent, out, row_lo=lo, row_hi=hi,
                 )
+                del bias  # else the next table is built while this one is still live
         else:
             bias = torch.matmul(rel, self.rel_proj).view(T, Hq, self.rel_extent)
             decode_attention(

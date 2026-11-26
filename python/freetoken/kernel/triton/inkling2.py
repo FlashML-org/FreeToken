@@ -774,11 +774,14 @@ def gate_combine(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     out_dtype: torch.dtype = torch.float32,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``(1 - tanh(F z)) * x + tanh(G z) * m`` per gate, ``forget_gain`` ``[G, T, 2H]`` holding
-    ``[F z, G z]``; with ``norm_weight`` ``[G, H]`` the result is RMS-normalized and scaled."""
+    ``[F z, G z]``; with ``norm_weight`` ``[G, H]`` the result is RMS-normalized and scaled.
+    Written into ``out`` when given, else into a new ``out_dtype`` tensor."""
     G, T, H = m.shape
-    out = torch.empty((G, T, H), dtype=out_dtype, device=m.device)
+    if out is None:
+        out = torch.empty((G, T, H), dtype=out_dtype, device=m.device)
     if T == 0:
         return out
     w = norm_weight if norm_weight is not None else m
