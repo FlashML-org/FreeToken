@@ -911,6 +911,7 @@ def _extend_attend_tile(
     q, m_i, l_i, acc, qk_scale, k_base, v_base, k_rows, v_rows, k_scales, v_scales, offs_d, offs_dv, mask_d, mask_dv, mask_n, mask,
     MASKED: tl.constexpr,
     KV_FMT: tl.constexpr,
+    F16_KV: tl.constexpr = False,
 ):
     if MASKED:
         k_mask = mask_n[None, :] & mask_d[:, None]
@@ -921,8 +922,11 @@ def _extend_attend_tile(
         v_mask = mask_dv[None, :]
         scale_mask = tl.full(k_rows.shape, 1, tl.int1)
     # scales first: loading them after the staged decode ran slower at head_dim 128
-    scale_k = kv_row_scale(k_scales, scale_mask, KV_FMT)
-    k = kv_tile_staged(k_base + k_rows[None, :] + offs_d[:, None], k_mask, KV_FMT)
+    scale_k = kv_row_scale(k_scales, scale_mask, KV_FMT, F16_KV)
+    if F16_KV:
+        k = _kv_tile_gfx11_f16(k_base + k_rows[None, :] + offs_d[:, None], k_mask)
+    else:
+        k = kv_tile_staged(k_base + k_rows[None, :] + offs_d[:, None], k_mask, KV_FMT)
     scores = tl.dot(q.to(k.dtype), k) * scale_k[None, :]
     if MASKED:
         scores = tl.where(mask, scores, -float("inf"))
@@ -931,8 +935,11 @@ def _extend_attend_tile(
         m_new = tl.where(m_new == -float("inf"), -1e20, m_new)
     alpha = tl.math.exp2(m_i - m_new)
     p = tl.math.exp2(scores * qk_scale - m_new[:, None])
-    scale_v = kv_row_scale(v_scales, scale_mask, KV_FMT)
-    v = kv_tile_staged(v_base + v_rows[:, None] + offs_dv[None, :], v_mask, KV_FMT)
+    scale_v = kv_row_scale(v_scales, scale_mask, KV_FMT, F16_KV)
+    if F16_KV:
+        v = _kv_tile_gfx11_f16(v_base + v_rows[:, None] + offs_dv[None, :], v_mask)
+    else:
+        v = kv_tile_staged(v_base + v_rows[:, None] + offs_dv[None, :], v_mask, KV_FMT)
     acc = acc * alpha[:, None] + tl.dot((p * scale_v[None, :]).to(v.dtype), v)
     l_i = l_i * alpha + tl.sum(p, axis=1)
     return m_new, l_i, acc
@@ -996,6 +1003,7 @@ def _extend_attention_split_kernel(
     HAS_BLOCKS: tl.constexpr,
     KV_OFFSET_DTYPE: tl.constexpr,
     KV_FMT: tl.constexpr,
+    F16_KV: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -1019,14 +1027,11 @@ def _extend_attention_split_kernel(
     # Scores live in the log2 domain: exp2 lowers to ex2.approx.ftz, while tl.exp adds a denormal fixup per element.
     qk_scale = sm_scale * 1.4426950408889634
 
-    q = tl.load(
-        q_ptr
-        + (q_start + offs_m[:, None]) * stride_qt
-        + q_head * stride_qh
-        + offs_d[None, :],
-        mask=mask_m[:, None] & mask_d[None, :],
-        other=0.0,
-    )
+    q_ptrs = q_ptr + (q_start + offs_m[:, None]) * stride_qt + q_head * stride_qh + offs_d[None, :]
+    q_mask = mask_m[:, None] & mask_d[None, :]
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    if F16_KV:
+        q = q.to(tl.float16)
 
     if HAS_SINKS:
         sink = tl.load(sinks_ptr + q_head).to(tl.float32) * 1.4426950408889634
@@ -1050,7 +1055,7 @@ def _extend_attention_split_kernel(
         m_i, l_i, acc = _extend_attend_tile(
             q, m_i, l_i, acc, qk_scale, kc_base, vc_base, slots * stride_kcs, slots * stride_vcs,
             ks_base + slots * stride_kss, vs_base + slots * stride_vss,
-            offs_d, offs_dv, mask_d, mask_dv, None, None, False, KV_FMT,
+            offs_d, offs_dv, mask_d, mask_dv, None, None, False, KV_FMT, F16_KV,
         )
     n_left = (u0 - lo) // BLOCK_N
     for i in tl.range(0, n_left + tl.cdiv(prefix_end - u1, BLOCK_N)):
@@ -1063,9 +1068,12 @@ def _extend_attention_split_kernel(
         m_i, l_i, acc = _extend_attend_tile(
             q, m_i, l_i, acc, qk_scale, kc_base, vc_base, slots * stride_kcs, slots * stride_vcs,
             ks_base + slots * stride_kss, vs_base + slots * stride_vss,
-            offs_d, offs_dv, mask_d, mask_dv, mask_n, final_mask, True, KV_FMT,
+            offs_d, offs_dv, mask_d, mask_dv, mask_n, final_mask, True, KV_FMT, F16_KV,
         )
 
+    if F16_KV:
+        # reload (volatile, so it is not merged with the first load) rather than keep both copies of q live
+        q = tl.load(q_ptrs, mask=q_mask, other=0.0, volatile=True)
     # this chunk's K and V are raw compute-dtype tensors, not pool rows
     ke_base = k_extend_ptr + kv_head * stride_keh
     ve_base = v_extend_ptr + kv_head * stride_veh
@@ -1164,8 +1172,14 @@ def extend_paged_attention(
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
+    # only the split kernel's paged prefix reads take the gfx11 reader
+    f16_kv = _use_gfx11_f16_reader(kv_format)
     if kv_format.quantized:
         block_m, block_n = _quantized_extend_tile(head_dim, block_d, block_ends is not None)
+        if f16_kv and k_extend is not None and block_ends is None and 128 < head_dim <= 256:
+            # keeps the reader's spills under ROCr's single-dispatch scratch limit; past it every launch
+            # spends ~0.2 ms allocating scratch (gfx1100 sweep)
+            block_m, block_n = 64, 16
     else:
         block_m, block_n = _select_extend_tile(
             head_dim, block_d, _optin_smem_bytes(q.device.index)
@@ -1211,6 +1225,7 @@ def extend_paged_attention(
             o.stride(1),
             KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
             KV_FMT=kv_format.name,
+            F16_KV=f16_kv,
             GROUP=num_q_heads // num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,

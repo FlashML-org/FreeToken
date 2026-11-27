@@ -147,7 +147,7 @@ def _quantized_pool(fmt_name: str, k, v, slots, capacity: int, num_kv_heads: int
 
 
 def _decode_kv(fmt_name: str | None, k_cache: torch.Tensor, v_cache: torch.Tensor):
-    """The caches a decode test passes, the values its reference reads, and the kernel's KV arguments."""
+    """The caches a test passes, the values its reference reads, and the kernel's KV arguments."""
     if fmt_name is None:
         return k_cache, v_cache, k_cache, v_cache, {}
     total, heads, head_dim = k_cache.shape
@@ -837,6 +837,7 @@ def test_decode_triton_attention_multi_row_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize("fmt_name", [None, *KV_QUANT_FORMATS])
 @pytest.mark.parametrize("use_split_inputs", [False, True])
 @pytest.mark.parametrize(
     ("head_dim", "num_kv_heads", "sliding_window", "cached_lens", "extend_lens"),
@@ -844,6 +845,9 @@ def test_decode_triton_attention_multi_row_matches_reference(
         (256, 8, None, [0, 0], [5, 3]),
         (256, 8, 4, [3, 2], [4, 3]),
         (512, 2, None, [2, 4], [3, 2]),
+        # prefixes of many key tiles, chunks of several query blocks, and a window inside the prefix
+        (256, 2, None, [1500, 300], [130, 200]),
+        (256, 2, 100, [700, 40], [150, 9]),
     ],
 )
 def test_extend_triton_attention_matches_reference(
@@ -853,6 +857,7 @@ def test_extend_triton_attention_matches_reference(
     sliding_window: int | None,
     cached_lens: list[int],
     extend_lens: list[int],
+    fmt_name: str | None,
 ):
     from freetoken.kernel.triton.attention import extend_paged_attention
 
@@ -896,6 +901,15 @@ def test_extend_triton_attention_matches_reference(
         offset += extend_len
         kv_offset += cached_len + extend_len
     sm_scale = head_dim**-0.5
+    k_cache, v_cache, k_ref, v_ref, kv_args = _decode_kv(fmt_name, k_cache, v_cache)
+    if fmt_name is not None and use_split_inputs:
+        # the split kernel reads this chunk's keys from k_extend / v_extend, not from the quantized pool
+        kv_offset = 0
+        for cached_len, extend_len, start in zip(cached_lens, extend_lens, qo_indptr.tolist()):
+            rows = slice(kv_offset + cached_len, kv_offset + cached_len + extend_len)
+            k_ref[rows] = k_extend[start : start + extend_len].float()
+            v_ref[rows] = v_extend[start : start + extend_len].float()
+            kv_offset += cached_len + extend_len
 
     actual = extend_paged_attention(
         q,
@@ -910,11 +924,12 @@ def test_extend_triton_attention_matches_reference(
         sliding_window=sliding_window,
         k_extend=k_extend if use_split_inputs else None,
         v_extend=v_extend if use_split_inputs else None,
+        **kv_args,
     )
     expected = _reference_paged_attention(
         q,
-        k_cache,
-        v_cache,
+        k_ref,
+        v_ref,
         kv_indptr,
         indices,
         q_to_req,
