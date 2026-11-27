@@ -2,8 +2,9 @@
 becomes one soft token; the template's single image placeholder expands to rows x cols of them.
 
 The checkpoint's processor class (``Inkling2ImageProcessor``) needs a newer transformers than FreeToken
-pins, so its preprocessing is reproduced here: pad bottom/right with -1 on the 0-255 scale, rescale by
-1/255, normalize with mean = std = 0.5, cut into cells in raster order.
+pins, so its preprocessing is reproduced here: blend transparent pixels onto a gray checkerboard of
+8-pixel squares, pad bottom/right with -1 on the 0-255 scale, rescale by 1/255, normalize with
+mean = std = 0.5, cut into cells in raster order.
 """
 
 from __future__ import annotations
@@ -20,6 +21,20 @@ from freetoken.mm import mm_pad_value
 from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.processor import MMProcessor, PromptReplacement, content_hash
 from freetoken.models.inkling2.config import IMAGE_TOKEN_ID
+
+
+def _flatten_alpha(pil: Any) -> Any:
+    """RGB ``pil``, transparent pixels blended onto the 8-pixel 204 / 153 checkerboard."""
+    if not pil.has_transparency_data:
+        return pil.convert("RGB")
+    from PIL import Image
+
+    rgba = np.asarray(pil.convert("RGBA"), dtype=np.int32)
+    height, width = rgba.shape[:2]
+    board = np.where((np.arange(height)[:, None] // 8 + np.arange(width)[None, :] // 8) % 2 == 0, 204, 153)[..., None]
+    alpha = rgba[..., 3:]
+    rgb = (rgba[..., :3] * alpha + board * (255 - alpha) + 127) // 255
+    return Image.fromarray(rgb.astype(np.uint8), "RGB")
 
 
 def _get(cfg: Any, key: str, default: Any) -> Any:
@@ -66,7 +81,7 @@ class Inkling2MMProcessor(MMProcessor):
     def process(self, images: list[Any]) -> list[MMItem]:
         items: list[MMItem] = []
         for pil in images:
-            cells, rows, cols = self.pixel_cells(self._fit(pil))
+            cells, rows, cols = self.pixel_cells(self._fit(_flatten_alpha(pil)))
             # the tower casts the pixels to its own dtype first; hashing the bf16 wire buffer keys exactly that
             feature = cells.to(torch.bfloat16)
             item_hash = content_hash(feature, struct.pack("<3i", 1, rows, cols))

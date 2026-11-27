@@ -415,6 +415,16 @@ def test_inkling2_pads_to_whole_cells_and_cuts_them_in_raster_order():
     (small,) = capped.process([Image.fromarray(pixels)])
     _, rows, cols = small.grid_thw
     assert rows * cols <= 4 and small.feature.shape[0] == rows * cols
+    # a transparent pixel shows the checkerboard behind it, a half-transparent one a blend
+    rgba = np.zeros((16, 16, 4), dtype=np.uint8)
+    rgba[0, 0] = (255, 255, 255, 0)
+    rgba[0, 8] = (255, 255, 255, 0)
+    rgba[8, 8] = (0, 0, 0, 128)
+    rgba[15, 0] = (10, 20, 30, 255)
+    (item,) = proc.process([Image.fromarray(rgba, "RGBA")])
+    got = ((item.feature[0].float() * 0.5 + 0.5) * 255).round()
+    assert got[0, 0].tolist() == [204] * 3 and got[0, 8].tolist() == [153] * 3
+    assert got[8, 8].tolist() == [102] * 3 and got[15, 0].tolist() == [10, 20, 30]
 
 
 def test_registry_resolves_by_architecture(monkeypatch):
