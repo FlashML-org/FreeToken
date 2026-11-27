@@ -7,6 +7,7 @@ stored-tensor scan also reads $FREETOKEN_TEST_MODELS_ROOT.
 from __future__ import annotations
 
 import glob
+import importlib
 import json
 import os
 import re
@@ -622,6 +623,14 @@ def _tensor_info(p: Path, weight_map: dict[str, str]) -> dict[str, dict]:
 
 
 def _expected_kinds(suffixes: set[str], tensors: dict[str, dict], module: str) -> set[QuantKind]:
+    if suffixes and all(x.startswith(("w13_", "w2_")) for x in suffixes):
+        # stacked experts stored per projection (Inkling 2): NVFP4 carries an amax, MXFP8 u8 scale codes
+        if "w13_weight_amax" in suffixes:
+            return {QuantKind.NVFP4}
+        if "w13_weight_scale" not in suffixes:
+            return {QuantKind.NONE}
+        scale = (tensors.get(f"{module}.w13_weight_scale") or {}).get("dtype")
+        return {QuantKind.MXFP8} if scale == "U8" else {QuantKind.NVFP4, QuantKind.MXFP8} if scale is None else {QuantKind.NONE}
     s = suffixes - _META_SUFFIXES
     if not s & {"weight", "weight_packed", "gate_up_proj_blocks"} or not s & _QUANT_SUFFIXES:
         return {QuantKind.NONE}
@@ -687,7 +696,12 @@ def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
         spec = get_model_spec((cfg.get("architectures") or [""])[0])
     except Exception:
         spec = None
-    qc = QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else ())
+    # a family whose config.json carries only a stub names the file it reads instead, as the loader does
+    q = None
+    if spec is not None and spec.quantization_config:
+        module_path, func = spec.quantization_config.split(":")
+        q = getattr(importlib.import_module(module_path), func)(str(ckpt))
+    qc = QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else (), quantization_config=q)
     weight_map = _weight_map(ckpt)
     tensors = _tensor_info(ckpt, weight_map)
     mismatches, checked = [], 0
