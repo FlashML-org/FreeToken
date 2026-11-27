@@ -209,14 +209,16 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   that no point reads go back at once. A prefill chunk gives rows only to its last 3 tokens, which
   the next chunk reads. Each running request holds about 2.2K window tokens and 41 rows (25 MiB);
   the window pool adds a tenth of the full-attention tokens (the model's `swa_full_tokens_ratio`),
-  and the row pool 19 rows per 1040 of those. On a 96 GiB GPU at 4 requests that is 1.32M tokens
-  of full-attention KV (40.2 GiB; a request still stops at the model's 1M), 132K window tokens
-  (20.1 GiB, about 120 resume points past the running requests) and 2.6K rows (1.5 GiB).
+  and the row pool 19 rows per 1040 of those. On a 96 GiB GPU at 4 requests that is 1.40M tokens
+  of full-attention KV (42.6 GiB; a request still stops at the model's 1M), 140K window tokens
+  (21.3 GiB, about 125 resume points past the running requests) and 2.7K rows (1.6 GiB).
   `--cache-type naive` turns reuse off and reserves
   `(max-running-requests + 1) x (1024 + --max-extend-length)` window tokens instead (83K at 8 requests).
-  The NVFP4 experts (layers 0-19) run as W4A16; the MXFP8 experts (layers 20-23) are dequantized
-  to bf16 at load, about 8 GiB of the ~22 GiB resident footprint. Pass `--moe-strategy fused` when
-  the GPU holds that: under `offload` every prefill streams the experts of all 48 visits over PCIe,
+  The NVFP4 experts (layers 0-19) run as W4A16 and the MXFP8 experts (layers 20-23) as W8A16, as
+  the reference implementation does (the activation quantization the checkpoint records is not
+  served); the model takes about 18 GiB resident. A prefill chunk's activations peak at about
+  100 KiB per token (797 MiB for 8K tokens). Pass `--moe-strategy fused` when the GPU holds that:
+  under `offload` every prefill streams the experts of all 48 visits over PCIe,
   each visit's while the one before it computes (with 1024 experts cached, a 2K-token prompt
   prefills in 0.62 s and a 32K one in 3.1 s).
   On a small GPU `--max-running-requests` goes down until the window pools, one layer of experts
@@ -227,7 +229,8 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   which halves prefill speed.
   `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`;
   `none` is the template's level 0.0, which the model card says does not fully disable reasoning.
-  `--tp` > 1 is not served. Speculative decoding is refused at startup; serving it needs:
+  `--tp` > 1 is not served, and a quantized `--kv-cache-dtype` is refused at startup (the attention
+  reads bf16 KV). Speculative decoding is refused at startup; serving it needs:
   - the short convolution and the attention to take several rows per request in decode. The rows
     need nothing more: a rejected row's convolution inputs go back with its KV slot.
   - window KV that a rejected draft does not corrupt: the engine refuses windowed targets because
