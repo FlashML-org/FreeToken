@@ -28,8 +28,8 @@ from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks,
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
-from freetoken.moe.pool_policy import group_layers, make_pools, method_rows, min_cache_bytes, pool_of_layer, resolve_profile, split_slots, stage_floor
-from freetoken.utils import align_ceil, div_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots, stage_floor
+from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
@@ -566,7 +566,6 @@ class Engine:
         # unlike a query-time mem_get_info it doesn't drift with allocator caching, CUDA
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
-        self._fit_small_gpu(config)
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
@@ -1212,47 +1211,6 @@ class Engine:
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
-
-    def _fit_small_gpu(self, config: EngineConfig) -> None:
-        """On a GPU too small for the configured plan of a model with window states, lower the
-        concurrency rather than fail its first allocation, until the window pools, the minimum MoE
-        cache and the KV reserve fit the budget. The change is logged; a plan that fits is left alone."""
-
-        def override(attr: str, value: Any, why: str) -> None:
-            if getattr(config, attr) != value:
-                logger.warning_rank0(f"small GPU: {attr} {getattr(config, attr)} -> {value} ({why})")
-                object.__setattr__(config, attr, value)
-
-        mc = config.model_config
-        if not mc.window_states:
-            return
-        budget = int(config.memory_ratio * self._baseline_free) - self._weights_bytes
-        experts = 0
-        if is_offload_moe_strategy(config.moe_strategy) and (methods := offload_layer_methods(self.model)):
-            min_num_slots = min(mc.num_experts, mc.num_experts_per_tok * config.decode_rows_per_req)
-            experts = min_cache_bytes(method_rows(methods), config.moe_cache_scope, mc.num_experts, min_num_slots, _slot_limit(methods))
-
-        def need(max_running_req: int) -> int:
-            saved = config.max_running_req
-            object.__setattr__(config, "max_running_req", max_running_req)
-            try:
-                cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
-                return fixed + experts + div_ceil(config.kv_reserve_tokens, page_tokens) * cache_per_page
-            finally:
-                object.__setattr__(config, "max_running_req", saved)
-
-        start = config.max_running_req
-        mr = start
-        while mr > 1 and need(mr) > budget:
-            mr -= 1
-        if mr == start:
-            return
-        override("max_running_req", mr, "the window pools keep ~2.2K tokens of window KV per running request")
-        logger.warning_rank0(
-            f"small GPU: window pools, minimum MoE cache and KV reserve take {mem_GB(need(mr))} of {mem_GB(budget)} "
-            f"(was {mem_GB(need(start))})"
-            + ("" if need(mr) <= budget else f"; still {mem_GB(need(mr) - budget)} short, startup will fail")
-        )
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None, pool_sizes: list[int] | None) -> tuple[int, int]:
         cache = self.moe_offload_cache

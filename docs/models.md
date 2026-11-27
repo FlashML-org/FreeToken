@@ -221,12 +221,10 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   under `offload` every prefill streams the experts of all 48 visits over PCIe,
   each visit's while the one before it computes (with 1024 experts cached, a 2K-token prompt
   prefills in 0.62 s and a 32K one in 3.1 s).
-  On a small GPU `--max-running-requests` goes down until the window pools, one layer of experts
-  and the KV reserve fit, logged as `small GPU: ...`. Under `offload` the experts take whatever the
-  KV reserve leaves, so the context stays at `--kv-reserve-tokens` (8K) until every expert is
-  cached: set it to the context you need. `--embed-weights host` moves the 0.86 GiB input embedding
-  to host RAM. At one running request the window pool caps a prefill chunk at about 1.2K tokens,
-  which halves prefill speed.
+  Under `offload` the experts take whatever the KV reserve leaves, so the context stays at
+  `--kv-reserve-tokens` (8K) until every expert is cached: set it to the context you need.
+  `--embed-weights host` moves the 0.86 GiB input embedding to host RAM. At one running request the
+  window pool caps a prefill chunk at about 1.2K tokens, which halves prefill speed.
   `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`;
   `none` is the template's level 0.0, which the model card says does not fully disable reasoning.
   `--tp` > 1 is not served, and a quantized `--kv-cache-dtype` is refused at startup (the attention

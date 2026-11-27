@@ -11,7 +11,6 @@ Pure functions. The engine supplies the constraints and hands the result to ``Of
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -95,24 +94,6 @@ def stage_floor(layer_rows: list[list[int]], pools: list[PoolSpec], num_experts:
     while total < room and not fits(total):
         total += 1
     return total
-
-
-def method_rows(layer_methods) -> list[list[int]]:
-    """``layer_rows`` for ``stage_floor`` from the expert kernels' bank layouts, before any bank loads; 0 where a layer's kernel has no such bank."""
-    roles = list(dict.fromkeys(role for m in layer_methods for role, spec in m.layout().items() if not spec.resident))
-
-    def row(method, role) -> int:
-        spec = method.layout().get(role)
-        return 0 if spec is None or spec.resident else math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
-
-    return [[row(m, role) for role in roles] for m in layer_methods]
-
-
-def min_cache_bytes(layer_rows: list[list[int]], scope: str, num_experts: int, min_num_slots: int, slot_limit: int | None) -> int:
-    """Bytes of the smallest expert cache --moe-cache-auto plans: ``stage_floor`` slots of the equal split, each priced at the mean slot as the planner does."""
-    slot = [sum(rows) for rows in layer_rows]
-    pools = make_pools(group_layers(scope, [tuple(rows) for rows in layer_rows], slot), num_experts, min_num_slots, slot_limit)
-    return stage_floor(layer_rows, pools, num_experts) * -(-sum(slot) // len(slot))
 
 
 def _check_budget(total: int, pools: list[PoolSpec]) -> None:
