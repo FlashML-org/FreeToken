@@ -79,8 +79,9 @@ class EffortProfile:
     ``default`` is the supported name whose rendering is byte-identical to
     passing no effort at all. ``consumes_effort`` False means no probe round
     ever changed its output or raised -- the template ignores the knob, so
-    requests should not carry it. ``validates`` True means the probe observed a
-    rejection: only then is ``supported`` a real vocabulary rather than "this
+    requests should not carry it. ``validates`` True means the probe saw a known
+    name rejected, or a made-up name rejected by a template that reads the effort:
+    only then is ``supported`` a real vocabulary rather than "this
     template interpolates anything". ``strength_dialect`` True means the
     template reads the ``reasoning_strength`` spelling (muse-glimmer's family,
     whose documented ladder tops out at xhigh) rather than only
@@ -306,7 +307,7 @@ def probe_thinking_profile(
 def thinking_off_kwargs(chat_template_kwargs: dict[str, Any], profile: ThinkingProfile) -> dict[str, Any]:
     """A thinking-off request (``enable_thinking`` False, no effort) on a template without a
     thinking toggle renders its "none" effort gear when it has one (Inkling 2: level 0.0)."""
-    if chat_template_kwargs.get("enable_thinking") is not False or "reasoning_effort" in chat_template_kwargs:
+    if chat_template_kwargs.get("enable_thinking") is not False or chat_template_kwargs.get("reasoning_effort") is not None:
         return chat_template_kwargs
     if profile.toggleable or "none" not in effective_efforts(profile.efforts):
         return chat_template_kwargs
