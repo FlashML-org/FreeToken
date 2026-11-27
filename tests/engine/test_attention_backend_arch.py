@@ -56,7 +56,6 @@ def _engine_config(**overrides):
             is_moe=False,
             num_layers=10,
             expert_quant="none",
-            bf16_kv_only=False,
         ),
     )
     return config

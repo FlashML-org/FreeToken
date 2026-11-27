@@ -248,8 +248,6 @@ def _validate_kv_format(config, model_config) -> None:
     pool_cls = resolve_pool_class(model_config)
     if kv_format.name not in pool_cls.kv_formats:
         raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
-    if model_config.bf16_kv_only:
-        raise ValueError(f"--kv-cache-dtype {kv_format.name}: {model_config.architectures[0]} attention reads bf16 KV only")
     if config.dtype != torch.bfloat16:
         raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
     if config.tp_info.size != 1:
