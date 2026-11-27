@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from freetoken.server.api_server import FrontendManager, dispatch_rebuild
+from freetoken.server.stats import StatsTracker
 from freetoken.server.supervisor import (
     BackendHandle,
     LoadProgress,
@@ -229,7 +230,12 @@ def test_a_worker_death_ends_the_inflight_generations():
     connections: every in-flight generation must end with the failure instead of waiting forever."""
 
     async def _run():
-        state = SimpleNamespace(ack_map={7: []}, event_map={7: asyncio.Event()}, _loop=asyncio.get_running_loop())
+        stats = StatsTracker()
+        for uid in (7, 8):
+            stats.on_new_user(uid)
+        stats.on_abort(8)  # client already gone: no ack queue, still active until a terminal reply
+        state = SimpleNamespace(ack_map={7: []}, event_map={7: asyncio.Event()}, stats=stats,
+                                _loop=asyncio.get_running_loop())
         acks = []
 
         async def consume():
@@ -242,6 +248,7 @@ def test_a_worker_death_ends_the_inflight_generations():
         await asyncio.wait_for(task, timeout=5.0)
         assert acks[-1].finished and acks[-1].error == "scheduler exited"
         assert state.ack_map == {} and state.event_map == {}
+        assert stats.active == 0
 
     asyncio.run(_run())
 
