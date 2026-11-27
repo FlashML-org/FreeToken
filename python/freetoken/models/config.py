@@ -418,6 +418,8 @@ class ModelConfig:
     window_states: Tuple[WindowStateSpec, ...] = ()
     # EngineConfig.swa_full_tokens_ratio when the caller leaves it unset; None -> 0.2.
     swa_full_tokens_ratio: float | None = None
+    # The model's own attention kernels read bf16 KV only, so a quantized --kv-cache-dtype is refused at startup.
+    bf16_kv_only: bool = False
 
     @property
     def is_moe(self) -> bool:
