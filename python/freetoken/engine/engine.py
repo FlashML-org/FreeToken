@@ -851,10 +851,10 @@ class Engine:
         layer_methods = offload_layer_methods(self.model)
         if not is_mixed(layer_methods):
             layer_methods = None
-        elif config.moe_strategy == "cpu" or config.moe_cpu_layers:
+        elif config.moe_cpu_layers:
             raise ValueError(
                 "this model's experts come in several formats, which are served from per-format GPU slot pools; "
-                "they do not combine with --moe-strategy cpu or --moe-cpu-layers (use offload or hybrid)"
+                "they do not combine with --moe-cpu-layers (use offload, hybrid or cpu)"
             )
         # Fast path: an FTW checkpoint loads its repacked banks directly.
         # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -875,7 +875,9 @@ class Engine:
             reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
             cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
             _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
-            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
+            decode_target, split_residency = self._residency_split(
+                config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None, layer_methods=layer_methods
+            )
             requested_residency = None
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency
@@ -918,7 +920,9 @@ class Engine:
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
-        if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch:
+        # --moe-strategy cpu decodes no layer from the slots, which only back the prefill staging (sized below)
+        staging_only = config.moe_strategy == "cpu" and config.moe_cache_scope == "unified"
+        if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch and not staging_only:
             raise ValueError(
                 "several MoE slot pools (--moe-cache-scope per-layer, or experts in several quant formats) need every MoE "
                 "layer to decode from the GPU slot cache; they combine with --moe-cpu-layers only for locked layers under "
@@ -966,6 +970,11 @@ class Engine:
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
                 f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
+        if staging_only and len(pools) > 1:
+            # 2 * num_experts slots split over the pools leave a bank short of two layers of its widest format
+            size = stage_floor(layer_bank_bytes(banks.sources), pools, config.model_config.num_experts, self._moe_expert_counts, buffers=2)
+            object.__setattr__(config, "moe_cache_size", max(config.moe_cache_size, size))
+            logger.info_rank0(f"MoE backend 'cpu': {len(pools)} slot pools, prefill double buffer of moe_cache_size={config.moe_cache_size}")
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
         if len(pools) > 1:
@@ -1034,7 +1043,7 @@ class Engine:
         self.moe_offload_cache = cache
         return cache
 
-    def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
+    def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool, layer_methods=None):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
@@ -1050,13 +1059,16 @@ class Engine:
         )
         if config.moe_strategy == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
-            from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
-
             budget = _pin_budget_bytes(self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
-                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
+                bank_bytes = _bank_bytes(config, method, layer_methods)
             if bank_bytes and bank_bytes > budget:
+                if layer_methods is not None:
+                    raise ValueError(
+                        f"--moe-strategy cpu: the expert banks ({bank_bytes / 2**30:.2f} GiB) exceed this host's pin budget, and "
+                        "experts of several formats cannot be OS-locked instead"
+                    )
                 split_residency = True
                 logger.info_rank0(
                     f"--moe-strategy cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
@@ -1764,7 +1776,7 @@ def _decode_target(config: EngineConfig) -> str:
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    "swiglu_clamp",
+    "swiglu_clamp", "softcap_swiglu",
 )
 
 
