@@ -7,7 +7,6 @@ stored-tensor scan also reads $FREETOKEN_TEST_MODELS_ROOT.
 from __future__ import annotations
 
 import glob
-import importlib
 import json
 import os
 import re
@@ -47,7 +46,7 @@ from freetoken.models import create_model
 from freetoken.models.gpt_oss.moe import GptOssMoELayer, GptOssOffloadMoELayer
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
 from freetoken.third_party import gguf
-from freetoken.utils.hf import sidecar_quantization_config
+from freetoken.utils.hf import merged_quantization_config
 from freetoken.utils.torch_utils import torch_dtype
 
 MODELS = "/mnt/nvme/models"
@@ -685,23 +684,21 @@ DIRS = _candidate_dirs()
 @pytest.mark.parametrize("ckpt", DIRS, ids=_label)
 def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
     cfg = json.load(open(ckpt / "config.json"))
-    quant = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
+    own = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config")
+    # hf_quant_config.json folds in as the loader folds it
+    merged = merged_quantization_config(own, str(ckpt))
+    if merged is not own:
+        cfg["quantization_config"] = merged
+    quant = merged or {}
     if str(quant.get("quant_method") or "").lower() in _UNSUPPORTED:
         with pytest.raises(NotImplementedError):
             QuantConfig.from_hf(cfg)
         return
-    if not quant:
-        cfg["quantization_config"] = sidecar_quantization_config(str(ckpt))
     try:
         spec = get_model_spec((cfg.get("architectures") or [""])[0])
     except Exception:
         spec = None
-    # a family whose config.json carries only a stub names the file it reads instead, as the loader does
-    q = None
-    if spec is not None and spec.quantization_config:
-        module_path, func = spec.quantization_config.split(":")
-        q = getattr(importlib.import_module(module_path), func)(str(ckpt))
-    qc = QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else (), quantization_config=q)
+    qc = QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else ())
     weight_map = _weight_map(ckpt)
     tensors = _tensor_info(ckpt, weight_map)
     mismatches, checked = [], 0

@@ -8,7 +8,6 @@ MXFP8 layers ue8m0 scales per 32 inputs.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Iterator
 
@@ -16,7 +15,6 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.layers.quantization import QuantKind
 from freetoken.models.loader import ShardReader
-from freetoken.utils.hf import optional_hf_file
 from tqdm import tqdm
 
 from .config import Inkling2Args
@@ -32,18 +30,6 @@ _GATES = {
     "v": ("attn_gates", ("attn", "k", "v")),
     "mlp": ("mlp_gate", ("mlp",)),
 }
-
-
-def quantization_config(model_path: str) -> dict:
-    """``hf_quant_config.json``: config.json's ``quantization_config`` is only a ModelOpt stub."""
-    path = optional_hf_file(model_path, "hf_quant_config.json")
-    if path is None:
-        raise ValueError(f"{model_path}: Inkling 2 checkpoints describe their quantization in hf_quant_config.json, which is missing")
-    with open(path, encoding="utf-8") as f:
-        q = json.load(f)
-    if q.get("quant_method") != "inkling2":
-        raise ValueError(f"{model_path}: hf_quant_config.json quant_method {q.get('quant_method')!r}, expected 'inkling2'")
-    return q
 
 
 def _args(model_path: str) -> Inkling2Args:
@@ -265,4 +251,4 @@ def _iter_expert_pieces(model_path: str, config, kind: QuantKind, layers) -> Ite
         reader.close()
 
 
-__all__ = ["iter_expert_pieces", "iter_vision_weights", "iter_weights", "quantization_config"]
+__all__ = ["iter_expert_pieces", "iter_vision_weights", "iter_weights"]

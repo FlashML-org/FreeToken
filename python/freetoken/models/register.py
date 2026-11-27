@@ -36,8 +36,6 @@ class ModelSpec:
     encoders: tuple[EncoderSpec, ...] = ()
     # speculative method -> "module:Class" of the family's draft for it
     spec_drafts: tuple[tuple[str, str], ...] = ()
-    # "module:function" (model_path -> dict) reading the quantization_config when config.json holds only a stub
-    quantization_config: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -559,7 +557,6 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.inkling2",
         "Inkling2LoopForConditionalGeneration",
         checkpoint_roots=(("model", "model.llm"),),
-        quantization_config="freetoken.models.inkling2:quantization_config",
         mm_processor="freetoken.mm.processors.inkling2:Inkling2MMProcessor",
         encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
     ),
@@ -609,8 +606,7 @@ def checkpoint_quant_config(
         types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
         quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
     else:
-        q = _load_attr(*spec.quantization_config.split(":"))(model_path) if spec.quantization_config else None
-        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules, quantization_config=q)
+        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
     return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 

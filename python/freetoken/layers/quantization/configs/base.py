@@ -151,13 +151,11 @@ class QuantConfig(ABC):
         *,
         name_map: NameMap | None = None,
         unquantized: tuple[str, ...] = (),
-        quantization_config: dict[str, Any] | None = None,
     ) -> "QuantConfig":
         """``unquantized`` lists the modules the family keeps bf16 when the checkpoint's config does not (DeepSeek-V4's compressors).
 
-        ``hf_config`` comes from ``cached_load_hf_config``, which folds an old ModelOpt ``hf_quant_config.json`` into ``quantization_config``.
-        ``quantization_config`` replaces the one ``hf_config`` carries (a family that reads it from elsewhere)."""
-        q = quantization_config if quantization_config is not None else quantization_config_of(hf_config)
+        ``hf_config`` comes from ``cached_load_hf_config``, which folds an old ModelOpt ``hf_quant_config.json`` into ``quantization_config``."""
+        q = quantization_config_of(hf_config)
         if q is None:
             return NoQuantConfig(name_map, unquantized)
         for cls in dialects():
