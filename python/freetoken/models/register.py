@@ -549,10 +549,6 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
-    # Inkling 2 Mini (model_type inkling2_loop): 24 MoE decoder layers whose middle 12 run three
-    # times (48 visits, each with its own KV and conv state), NoPE attention with a learned
-    # relative bias and per-token sinks over a 5:1 sliding/global mix, attention residuals
-    # across 6-layer blocks; experts NVFP4 (20 layers) and MXFP8 (4 layers), the rest bf16.
     "Inkling2LoopForConditionalGeneration": ModelSpec(
         "freetoken.models.inkling2",
         "Inkling2LoopForConditionalGeneration",

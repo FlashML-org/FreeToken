@@ -396,9 +396,6 @@ class ModelConfig:
     # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
     # layers. Opaque to model-agnostic engine code; None for every other model.
     gemma4_e_args: Any | None = None
-    # Inkling 2 Mini (inkling2_loop) payload (Inkling2Args): the loop schedule, the attention
-    # residual blocks and the relative-bias / clip / softcap scalars. Opaque to model-agnostic
-    # engine code; None for every other model.
     inkling2_args: Any | None = None
     # KV layers the attention groups index, when looped decoder layers attend once per visit
     # with their own KV (Inkling 2 Mini: 48 over 24 decoder layers); 0 means num_layers.
