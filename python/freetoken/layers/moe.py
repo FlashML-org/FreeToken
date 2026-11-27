@@ -354,8 +354,9 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        step = cache.prefill_step(self.layer_id)
         if cache.prefill_overlap:
-            views = self._wait_prefill_overlap(cache)
+            views = self._wait_prefill_overlap(cache, step)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -366,7 +367,7 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
-            cache.release_prefill_layer(self.layer_id)
+            cache.release_prefill_layer(self.layer_id, step)
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
@@ -380,20 +381,18 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
-        cache.release_prefill_layer(self.layer_id)
+        cache.release_prefill_layer(self.layer_id, step)
         return out
 
-    def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
+    def _wait_prefill_overlap(self, cache: OffloadMoeCache, step: int) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
         next layer's full-layer H2D copy, then return this layer's bank views (in
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0:
-            cache.begin_prefill()
-        cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
-        return cache.wait_prefill_layer(self.layer_id)
+        cache.prefetch_prefill_layer(self.layer_id, step)
+        cache.prefetch_prefill_layer(cache.next_prefill_layer(step), step + 1)
+        return cache.wait_prefill_layer(self.layer_id, step)
 
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.

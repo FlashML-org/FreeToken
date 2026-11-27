@@ -46,7 +46,7 @@ from freetoken.models import create_model
 from freetoken.models.gpt_oss.moe import GptOssMoELayer, GptOssOffloadMoELayer
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
 from freetoken.third_party import gguf
-from freetoken.utils.hf import sidecar_quantization_config
+from freetoken.utils.hf import merged_quantization_config
 from freetoken.utils.torch_utils import torch_dtype
 
 MODELS = "/mnt/nvme/models"
@@ -622,6 +622,14 @@ def _tensor_info(p: Path, weight_map: dict[str, str]) -> dict[str, dict]:
 
 
 def _expected_kinds(suffixes: set[str], tensors: dict[str, dict], module: str) -> set[QuantKind]:
+    if suffixes and all(x.startswith(("w13_", "w2_")) for x in suffixes):
+        # stacked experts stored per projection (Inkling 2): NVFP4 carries an amax, MXFP8 u8 scale codes
+        if "w13_weight_amax" in suffixes:
+            return {QuantKind.NVFP4}
+        if "w13_weight_scale" not in suffixes:
+            return {QuantKind.NONE}
+        scale = (tensors.get(f"{module}.w13_weight_scale") or {}).get("dtype")
+        return {QuantKind.MXFP8} if scale == "U8" else {QuantKind.NVFP4, QuantKind.MXFP8} if scale is None else {QuantKind.NONE}
     s = suffixes - _META_SUFFIXES
     if not s & {"weight", "weight_packed", "gate_up_proj_blocks"} or not s & _QUANT_SUFFIXES:
         return {QuantKind.NONE}
@@ -676,13 +684,16 @@ DIRS = _candidate_dirs()
 @pytest.mark.parametrize("ckpt", DIRS, ids=_label)
 def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
     cfg = json.load(open(ckpt / "config.json"))
-    quant = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
+    own = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config")
+    # hf_quant_config.json folds in as the loader folds it
+    merged = merged_quantization_config(own, str(ckpt))
+    if merged is not own:
+        cfg["quantization_config"] = merged
+    quant = merged or {}
     if str(quant.get("quant_method") or "").lower() in _UNSUPPORTED:
         with pytest.raises(NotImplementedError):
             QuantConfig.from_hf(cfg)
         return
-    if not quant:
-        cfg["quantization_config"] = sidecar_quantization_config(str(ckpt))
     try:
         spec = get_model_spec((cfg.get("architectures") or [""])[0])
     except Exception:

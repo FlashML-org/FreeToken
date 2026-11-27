@@ -253,6 +253,34 @@ def test_mixed_layers_decode_and_prefill_through_their_pools():
 
 
 @cuda
+def test_the_planned_floor_is_the_fewest_slots_that_stage_a_layer():
+    # the nvfp4 scale banks hold bytes that cannot stage bf16 weight rows, so the floor is per bank, not per slot
+    from freetoken.engine.cache_budget import layer_bank_bytes, layer_slot_bytes
+    from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
+    from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, split_slots, stage_floor
+
+    device = torch.device("cuda")
+    banks, methods = _mixed_banks(_pieces(), device)
+    pools = make_pools(group_layers("unified", bank_layouts(banks.sources, banks.layer_tags), layer_slot_bytes(banks.sources)), E, TOPK, None)
+    rows = layer_bank_bytes(banks.sources)
+    # expert use that sends every slot past the minimums to the nvfp4 pool
+    counts = torch.tensor([[0.0 if fmt == "bf16" else 1.0] * E for fmt in FORMATS])
+    floor = stage_floor(rows, pools, E, counts)
+
+    def build(size):
+        cache = OffloadMoeCache(
+            num_layers=L, num_experts=E, cache_size=size, device=device, quant_format=banks.quant_format,
+            decode_target="gpu", hybrid_max_fetch=1, prefill_overlap=False,
+            layer_layouts=[m.layout() for m in methods], pool_of_layer=pool_of_layer(pools, L), pool_sizes=split_slots(size, pools, counts),
+        )
+        cache.set_bank_sources(banks.sources, layer_tags=banks.layer_tags)
+
+    build(floor)
+    with pytest.raises(ValueError, match="cannot stage one whole layer"):
+        build(floor - 1)
+
+
+@cuda
 def test_cpu_executor_computes_each_layer_in_its_format():
     pytest.importorskip("freetoken.kernel._cpu_moe")
     from freetoken.moe.cpu_executor import CpuMoeExecutor

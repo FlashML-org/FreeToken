@@ -105,6 +105,8 @@ CALL_BLOCKS = {
         "<atem:parameter name=\"filePath\">/tmp/test_calc.py</atem:parameter>\n"
         "</atem:invoke>\n</atem:function_calls><|eot|>"
     ),
+    # as Inkling2ReasoningParser hands it over: the <|message_model|>read header is dropped upstream
+    "inkling2": '<|content_invoke_tool_json|>{"name":"read","args":{"filePath":"/tmp/test_calc.py"}}<|end_message|>',
 }
 
 # Substrings that must never leak into user-visible content.
@@ -122,6 +124,7 @@ MARKUP_MARKERS = {
     "llama3": ["<|python_tag|>"],
     "gpt_oss": ["<|channel|>", "to=functions."],
     "muse_glimmer": ["<atem:", "<|message|>", "<|eot|>"],
+    "inkling2": ["<|content_invoke_tool_json|>", "<|end_message|>", "<|message_model|>"],
 }
 
 # (tool_call_parser, reasoning_parser, think_open, think_close) per reasoning-capable
@@ -142,6 +145,7 @@ REASONING_FAMILIES = {
     "gemma4": ("gemma4", "gemma4", "<|channel>thought\n", "<channel|>"),
     "gpt-oss": ("gpt_oss", "gpt_oss", None, None),  # harmony channels; custom fixture
     "muse-glimmer": ("muse_glimmer", "muse_glimmer", None, None),  # ATEM channels; custom fixture
+    "inkling2": ("inkling2", "inkling2", None, None),  # message segments; custom fixture
 }
 
 
@@ -300,6 +304,15 @@ def _reasoning_fixture(name):
             f" to=self<|message|>{THINKING}<|eom|>"
             f"<|start|>assistant to=user<|message|>{ANSWER}<|eom|>"
             + CALL_BLOCKS[tool]
+        )
+        return tool, reasoning, text
+    if name == "inkling2":
+        # the model writes the role token of every segment and ends its turn with the sampling end
+        text = (
+            f"<|message_model|><|content_thinking|>{THINKING}<|end_message|>"
+            f"<|message_model|><|content_text|>{ANSWER}<|end_message|>"
+            f'<|message_model|>read<|content_invoke_tool_json|>{{"name":"read","args":{json.dumps(READ_ARGS)}}}<|end_message|>'
+            "<|content_model_end_sampling|>"
         )
         return tool, reasoning, text
     text = f"{think_open}{THINKING}{think_close}{ANSWER} {CALL_BLOCKS[tool]}"
@@ -475,6 +488,7 @@ ARGS_STREAMING_BLOCKS = {
         f"<atem:parameter name=\"filePath\">{LONG_VALUE}</atem:parameter>\n"
         "</atem:invoke>\n</atem:function_calls><|eot|>"
     ),
+    "inkling2": f'<|content_invoke_tool_json|>{{"name":"read","args":{json.dumps({"filePath": LONG_VALUE})}}}<|end_message|>',
 }
 
 
@@ -697,7 +711,7 @@ def test_empty_arguments_call_emitted_exactly_once(tool, block):
 @pytest.mark.parametrize(
     "family",
     ["qwen25", "qwen3_coder", "glm47", "gemma4", "minimax", "minimax_m3",
-     "deepseekv32", "gpt_oss", "muse_glimmer"],
+     "deepseekv32", "gpt_oss", "muse_glimmer", "inkling2"],
 )
 def test_call_then_trailing_text_in_one_chunk_keeps_order(family):
     # Worst case: the whole generation arrives as ONE chunk. Text after the call

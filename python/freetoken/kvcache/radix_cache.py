@@ -35,12 +35,13 @@ class RadixTreeNode:
         self.mamba_ref_count: int = 0
 
         # SWA second currency (SWARadixCache). Unlike the GDN snapshot above, SWA stores NO
-        # separate slot: ``value`` (full-pool page indices) is canonical and the swa KV is
-        # reached via the pool's full->swa mapping. ``swa_tombstone`` marks that the swa KV for
-        # these tokens was freed (slid out of window) while the full KV survives; ``swa_ref_count``
-        # is the trailing-window lock; ``swa_uuid`` is the window-boundary handle (lock release).
-        # All default off -> the plain KV radix and the GDN hybrid radix are unaffected.
-        self.swa_tombstone: bool = False
+        # separate slot: ``value`` (full-pool page indices) is canonical and each window tier's
+        # rows are reached via the pool's full->row mapping. ``swa_level`` counts the tiers still
+        # live for these tokens, longest window first (0 = a tombstone: only the full KV
+        # survives); ``swa_ref_count`` is the trailing-window lock; ``swa_uuid`` is the
+        # window-boundary handle (lock release). The plain KV radix and the GDN hybrid radix
+        # never read them; their nodes read as live.
+        self.swa_level: int = 1
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
 
@@ -54,6 +55,10 @@ class RadixTreeNode:
         self._key = key
         self._value = value
         self._length = len(key)
+
+    @property
+    def swa_tombstone(self) -> bool:
+        return self.swa_level == 0
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
@@ -92,11 +97,11 @@ class RadixTreeNode:
         new_node.set_key_value(self._key[:pos], self._value[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
-        # SWA: a tombstone covers all the node's tokens, so both halves inherit it; both halves
+        # SWA: a level covers all the node's tokens, so both halves inherit it; both halves
         # stay within a locked window, so the swa lock copies; the window-boundary uuid migrates
         # to the root-side (prefix) node and is cleared on the suffix (matches sglang _split_node).
         new_node.swa_ref_count = self.swa_ref_count
-        new_node.swa_tombstone = self.swa_tombstone
+        new_node.swa_level = self.swa_level
         new_node.swa_uuid = self.swa_uuid
         self.swa_uuid = None
 

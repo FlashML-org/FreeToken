@@ -174,8 +174,17 @@ class OffloadMoeCache:
     # Each layer belongs to one pool: a contiguous slot range with its own LRU scope; pool p owns slots [sum(pool_sizes[:p]), +pool_sizes[p]). Slot ids in slot_for_id are local to the pool. None = one pool for all layers.
     pool_of_layer: list[int] | None = None
     pool_sizes: list[int] | None = None
+    # The MoE layer of each prefill MoE call of one forward, when that is not 0..num_layers-1 once each (a looped
+    # model runs some layers several times). The overlap prefill stages the next call's layer. None = ascending.
+    layer_order: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
+        if self.layer_order is not None:
+            self.layer_order = tuple(self.layer_order)
+            assert self.layer_order and all(0 <= l < self.num_layers for l in self.layer_order), self.layer_order
+            # the first call marks a new forward, so its layer runs once
+            assert self.layer_order.count(self.layer_order[0]) == 1, self.layer_order
+        self._prefill_step = 0
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
@@ -863,6 +872,26 @@ class OffloadMoeCache:
         for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
             tail.zero_()
 
+    def prefill_step(self, layer_id: int) -> int:
+        """Start a prefill MoE call of ``layer_id`` and return its step in the forward (its index in ``layer_order``,
+        else the layer id); the forward's first call begins the prefill."""
+        if self.layer_order is None:
+            step = layer_id
+        else:
+            if layer_id == self.layer_order[0]:
+                self._prefill_step = 0
+            step = self._prefill_step
+            assert self.layer_order[step] == layer_id, f"MoE layer {layer_id} ran out of its order at step {step}"
+        if step == 0:
+            self.begin_prefill()
+        return step
+
+    def next_prefill_layer(self, step: int) -> int:
+        """The MoE layer of the call after ``step`` (``num_layers`` after the forward's last)."""
+        if self.layer_order is None:
+            return step + 1
+        return self.layer_order[step + 1] if step + 1 < len(self.layer_order) else self.num_layers
+
     def begin_prefill(self) -> None:
         if not self.prefill_overlap:
             return
@@ -886,7 +915,8 @@ class OffloadMoeCache:
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
             self.prefill_copy_stream.synchronize()
 
-    def prefetch_prefill_layer(self, layer_id: int) -> None:
+    def prefetch_prefill_layer(self, layer_id: int, step: int | None = None) -> None:
+        """Stage ``layer_id`` in the overlap buffer of ``step`` (``prefill_step``; the layer id by default)."""
         if not self.prefill_overlap or layer_id >= self.num_layers:
             return
         if layer_id < 0:
@@ -894,7 +924,7 @@ class OffloadMoeCache:
 
         assert self.banks and self._stage_views
 
-        buffer_id = layer_id % 2
+        buffer_id = (layer_id if step is None else step) % 2
         if self._prefill_buffer_layer[buffer_id] == layer_id:
             return
         if self._prefill_buffer_layer[buffer_id] is not None:
@@ -1041,22 +1071,27 @@ class OffloadMoeCache:
                 )
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
-    def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+    def wait_prefill_layer(self, layer_id: int, step: int | None = None) -> tuple[torch.Tensor, ...]:
         """Full-layer ``[num_experts, ...]`` bank views for ``layer_id``, one per
         registered bank in registration order: bf16 ``(gate_up, down)``; nvfp4
         marlin/b12x ``(gate_up_packed, gate_up_scale, down_packed, down_scale)``;
         nvfp4 native adds the two global banks after each scale bank."""
         assert self.prefill_overlap
         assert self._stage_views
-        self.prefetch_prefill_layer(layer_id)
-        buffer_id = layer_id % 2
+        self.prefetch_prefill_layer(layer_id, step)
+        buffer_id = (layer_id if step is None else step) % 2
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
         return self.stage_views(layer_id, buffer_id)
 
-    def release_prefill_layer(self, layer_id: int) -> None:
-        if layer_id == self.num_layers - 1:
+    def release_prefill_layer(self, layer_id: int, step: int | None = None) -> None:
+        if step is None:
+            step = layer_id
+        last = step == (len(self.layer_order) if self.layer_order is not None else self.num_layers) - 1
+        if self.layer_order is not None:
+            self._prefill_step = 0 if last else step + 1
+        if last:
             # the staged slots were invalidated and nothing registers them within the forward, so their bytes are free to clear
             for b in range(2):
                 if self._stage_dirty[b]:
@@ -1066,7 +1101,7 @@ class OffloadMoeCache:
                     self._stage_dirty[b] = False
         if not self.prefill_overlap:
             return
-        buffer_id = layer_id % 2
+        buffer_id = step % 2
         if self._prefill_buffer_layer[buffer_id] != layer_id:
             return
         if self.prefill_release_events:

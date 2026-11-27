@@ -977,6 +977,138 @@ class MuseGlimmerReasoningParser(BaseReasoningParser):
         )
 
 
+INKLING_HEADER = "<|message_model|>"
+INKLING_END = "<|end_message|>"
+INKLING_EOS = "<|content_model_end_sampling|>"
+INKLING_TOOL_JSON = "<|content_invoke_tool_json|>"
+# content markers -> where their body goes
+INKLING_KINDS = {
+    "<|content_thinking|>": "reasoning",
+    "<|content_text|>": "content",
+    "<|content_tool_error|>": "content",
+    "<|content_invoke_tool_text|>": "content",
+    INKLING_TOOL_JSON: "tool",
+}
+INKLING_TOKENS = (INKLING_HEADER, INKLING_END, INKLING_EOS, *INKLING_KINDS)
+# longest tool name a <|message_model|> header may carry before its content marker
+INKLING_HEADER_SPAN = 256
+
+
+def _inkling_hold_len(text: str) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of an Inkling marker."""
+    best = 0
+    for tok in INKLING_TOKENS:
+        for k in range(min(len(tok) - 1, len(text)), best, -1):
+            if text.endswith(tok[:k]):
+                best = k
+                break
+    return best
+
+
+def _earliest(text: str, tokens) -> tuple[int, str | None]:
+    best = (len(text), None)
+    for tok in tokens:
+        pos = text.find(tok)
+        if pos != -1 and pos < best[0]:
+            best = (pos, tok)
+    return best
+
+
+class Inkling2ReasoningParser(BaseReasoningParser):
+    """Reasoning parser for Inkling 2's message segments.
+
+    The model writes its turn as segments ``<|message_model|>[name]<|content_KIND|>body<|end_message|>``
+    and ends it with ``<|content_model_end_sampling|>``. ``thinking`` bodies are reasoning;
+    ``text`` / ``tool_error`` / ``invoke_tool_text`` bodies are content, unwrapped; an
+    ``invoke_tool_json`` segment is handed to ``Inkling2Detector`` as
+    ``<|content_invoke_tool_json|>body<|end_message|>`` (its header only repeats the tool
+    name the JSON carries). Text outside any segment is content. Streaming consumes the
+    buffer as it emits, holding back only a suffix that could still grow into a marker.
+    """
+
+    def __init__(self, force_reasoning: bool = False, stream_reasoning: bool = True) -> None:
+        super().__init__(think_start_token="", think_end_token="", force_reasoning=force_reasoning, stream_reasoning=stream_reasoning)
+        self._mode = "seek"  # "seek" (between segments) | "header" (after <|message_model|>) | "body"
+        self._kind = "content"
+        self._buffer = ""
+
+    def detect_and_parse(self, text: str) -> ReasoningParseResult:
+        clone = type(self)()
+        first = clone.parse_streaming_increment(text)
+        rest = clone.flush()
+        return ReasoningParseResult(
+            reasoning_text=first.reasoning_text + rest.reasoning_text,
+            normal_text=first.normal_text + rest.normal_text,
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
+        self._buffer += new_text
+        return self._drain(final=False)
+
+    def flush(self) -> ReasoningParseResult:
+        return self._drain(final=True)
+
+    def _drain(self, *, final: bool) -> ReasoningParseResult:
+        reasoning: list[str] = []
+        content: list[str] = []
+
+        def emit(kind: str, piece: str) -> None:
+            if piece:
+                (reasoning if kind == "reasoning" else content).append(piece)
+
+        def begin_body(marker: str) -> None:
+            self._kind = INKLING_KINDS[marker]
+            self._mode = "body"
+            if self._kind == "tool":
+                content.append(INKLING_TOOL_JSON)
+
+        while self._buffer:
+            buf = self._buffer
+            if self._mode == "seek":
+                pos, tok = _earliest(buf, INKLING_TOKENS)
+                if tok is None:
+                    hold = 0 if final else _inkling_hold_len(buf)
+                    emit("content", buf[: len(buf) - hold])
+                    self._buffer = buf[len(buf) - hold :]
+                    break
+                emit("content", buf[:pos])
+                self._buffer = buf[pos + len(tok) :]
+                if tok == INKLING_HEADER:
+                    self._mode = "header"
+                elif tok in INKLING_KINDS:
+                    begin_body(tok)
+                continue
+            if self._mode == "header":
+                pos, tok = _earliest(buf, INKLING_TOKENS)
+                if tok in INKLING_KINDS and pos <= INKLING_HEADER_SPAN:
+                    self._buffer = buf[pos + len(tok) :]
+                    begin_body(tok)
+                    continue
+                if tok is not None or len(buf) > INKLING_HEADER_SPAN or final:
+                    # not a header after all: what followed <|message_model|> is content
+                    self._mode = "seek"
+                    if tok is None:
+                        emit("content", buf)
+                        self._buffer = ""
+                    continue
+                break
+            # body
+            pos, tok = _earliest(buf, (INKLING_END, INKLING_EOS, INKLING_HEADER))
+            if tok is None:
+                hold = 0 if final else _inkling_hold_len(buf)
+                emit(self._kind, buf[: len(buf) - hold])
+                self._buffer = buf[len(buf) - hold :]
+                if final and self._kind == "tool":
+                    content.append(INKLING_END)
+                break
+            emit(self._kind, buf[:pos])
+            if self._kind == "tool":
+                content.append(INKLING_END)
+            self._buffer = buf[pos + len(INKLING_END) :] if tok == INKLING_END else buf[pos:]
+            self._mode = "seek"
+        return ReasoningParseResult(reasoning_text="".join(reasoning), normal_text="".join(content))
+
+
 class ReasoningParser:
     """Wraps a reasoning detector for streaming and non-streaming use."""
 
@@ -991,6 +1123,7 @@ class ReasoningParser:
         "minimax_m3": MiniMaxM3ReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
+        "inkling2": Inkling2ReasoningParser,
     }
 
     def __init__(

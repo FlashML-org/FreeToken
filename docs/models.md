@@ -21,6 +21,7 @@ for them; other checkpoints of the same architectures work too.
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
 | Flint | [FutureMLS-Lab/flint-nvfp4-coldgptq](https://huggingface.co/FutureMLS-Lab/flint-nvfp4-coldgptq), [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) |
+| Inkling 2 Mini | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) |
 | Ripple-65B Preview | [ricursiveAI/Ripple-65B-Preview](https://huggingface.co/ricursiveAI/Ripple-65B-Preview), [ricursiveAI/Ripple-65B-Preview-NVFP4](https://huggingface.co/ricursiveAI/Ripple-65B-Preview-NVFP4), [AtomicChat/Ripple-65B-Preview-GGUF](https://huggingface.co/AtomicChat/Ripple-65B-Preview-GGUF) |
 
 ### GGUF
@@ -60,6 +61,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 | GLM-5.3-Flash (`glm5_next`: ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, dynamic resolution on a canvas zero-padded to a 28-multiple | token counts, passed through as the processor's `min_image_tokens` / `max_image_tokens`; checkpoint defaults 16 to 8000 tokens | `{"max_image_tokens": 2048}` |
 | Muse-Glimmer-30B (windowed ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, aspect ratio kept under a token cap; checkpoint default 4096 tokens | the maximum is the cap (`max_image_tokens`); the minimum has no effect | `{"max_image_tokens": 1024}` |
 | MiniMax-M3 (`minimax_m3`: CLIP-style ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, dynamic resolution | pixel areas in `size.shortest_edge` / `longest_edge`; checkpoint defaults 4 to 576 tokens | `{"size": {"longest_edge": 1048576}}` |
+| Inkling 2 Mini (`inkling2_loop`: ViT tower, streamed under `--mm-encoder-weights host`) | no resize: one token per 40x40-pixel cell of the image padded at the bottom and right to whole cells, no checkpoint cap | the maximum downscales (aspect kept) an image that needs more cells; the minimum has no effect | not read |
 | DeepSeek-V4-Flash-Vision (`deepseek_v4`: native-resolution ViT tower, streamed under `--mm-encoder-weights host`) | one token per 3x3 grid of 14x14 patches, against a per-image cap; the block carries sentinel tokens and lead pads that align it to a 4-token compression stride, so its length depends on where it lands in the prompt | the maximum is a cap on the block (`vision_max_n_token`, checkpoint default 384) and lowers it, the minimum is read as the checkpoint's upscale floor and has no effect | not read |
 
 A GGUF model takes image input from a separate llama.cpp mmproj file, found in the model file's own folder or passed with `--mmproj` (see the
@@ -196,5 +198,15 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   template kwargs with thinking on, `"chat_template_kwargs": {"enable_thinking": true,
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
+- Inkling 2 Mini runs its middle 12 decoder layers three times per token (48 KV layers, 40 of them
+  with a 1024-token window). The SWA radix cache keeps its short-convolution inputs as a second,
+  3-token window, so a prompt resumes within the last 16 tokens of an earlier prompt, at the end of
+  a finished request, or at a tool-call anchor (`--enable-special-token-ckpt`); each such point holds
+  1040 window tokens and 19 convolution rows (174 MiB). The model takes about 18 GiB resident: pass
+  `--moe-strategy fused` when the GPU holds that, since under `offload` every prefill streams the
+  experts of all 48 layer visits over PCIe, and the context stays at `--kv-reserve-tokens` (8K) until
+  every expert is cached. `reasoning_effort` takes `none` to `max` (default `high`); `none` does not
+  fully disable reasoning. `--tp` > 1, a quantized `--kv-cache-dtype` and speculative decoding are
+  refused at startup.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).

@@ -104,8 +104,8 @@ class EngineConfig:
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
     # DSV4 window/full ratio directly. Used only when swa_num_pages_override is None (a runtime
-    # rebuild can pin an absolute window instead).
-    swa_full_tokens_ratio: float = 0.2
+    # rebuild can pin an absolute window instead). None: the model's own default, else 0.2.
+    swa_full_tokens_ratio: float | None = None
     # Absolute window-pool size in the pool's own pages (usable, dummy excluded); None -> use the
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.

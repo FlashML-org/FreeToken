@@ -14,6 +14,12 @@ if TYPE_CHECKING:
     import torch
 
 
+def layer_bank_bytes(sources: dict[str, "list[torch.Tensor]"]) -> list[list[int]]:
+    """One expert's bytes in each bank of each layer, read off the loaded (TP-sharded) banks."""
+    num_layers = len(next(iter(sources.values())))
+    return [[t[l][0].numel() * t[l].element_size() for t in sources.values()] for l in range(num_layers)]
+
+
 def layer_slot_bytes(sources: dict[str, "list[torch.Tensor]"]) -> list[int]:
     """Bytes one expert slot of each layer occupies on GPU: its row bytes summed over all banks.
 
@@ -25,8 +31,7 @@ def layer_slot_bytes(sources: dict[str, "list[torch.Tensor]"]) -> list[int]:
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
     # tensor[0].numel() is the per-row element count (one expert slot); see the matching
     # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4/v4_pool.py.
-    num_layers = len(next(iter(sources.values())))
-    return [sum(t[l][0].numel() * t[l].element_size() for t in sources.values()) for l in range(num_layers)]
+    return [sum(rows) for rows in layer_bank_bytes(sources)]
 
 
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
@@ -61,6 +66,7 @@ def plan_cache_budget(
     prefill_overlap: bool,
     kv_reserve_pages: int,
     max_slots: int,
+    min_slots: int = 0,
 ) -> tuple[int, int, bool]:
     """Split ``budget_bytes`` MoE-first into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -68,7 +74,7 @@ def plan_cache_budget(
     weights + fixed_cache_size; the (1-memory_ratio) remainder is the graph headroom).
     Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
     to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
-    overlap is feasible else ``num_experts``); KV pages take whatever remains.
+    overlap is feasible else ``num_experts``, and at least ``min_slots``); KV pages take whatever remains.
     """
     assert per_expert_bytes > 0, "per_expert_bytes must be positive"
     assert cache_per_page > 0, "cache_per_page must be positive (owned-KV models unsupported here)"
@@ -77,7 +83,7 @@ def plan_cache_budget(
     # Prefill overlap borrows two full expert-layer buffers, so it needs >= 2*num_experts
     # slots; disable it (and lower the floor) if the cap cannot fit that.
     overlap = prefill_overlap and hi >= 2 * num_experts
-    lo = 2 * num_experts if overlap else num_experts
+    lo = max(2 * num_experts if overlap else num_experts, min(min_slots, hi))
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
     kv_reserve_bytes = kv_reserve_pages * cache_per_page
@@ -116,6 +122,7 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    min_slots: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -137,4 +144,5 @@ def resolve_moe_cache_auto(
         prefill_overlap=prefill_overlap,
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
+        min_slots=min_slots,
     )

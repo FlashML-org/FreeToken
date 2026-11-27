@@ -285,6 +285,20 @@ class SlotStateSpec:
 
 
 @dataclass(frozen=True)
+class WindowStateSpec:
+    """Per-token rows a resume needs for the last ``window`` tokens, kept beside the sliding-window KV.
+
+    Allocated as ``[len(layer_ids), num_rows, *shape]``; a token's row is reached from its full KV slot like its SWA KV, and the SWA radix tree keeps it as one more, shorter window. The owner writes a row per token it computes and reads the rows of the ``window`` tokens before it. ``shape`` is per token and TP-replicated.
+    """
+
+    name: str
+    shape: Tuple[int, ...]
+    layer_ids: Tuple[int, ...]
+    window: int
+    dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     num_layers: int
     num_qo_heads: int
@@ -382,6 +396,13 @@ class ModelConfig:
     # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
     # layers. Opaque to model-agnostic engine code; None for every other model.
     gemma4_e_args: Any | None = None
+    inkling2_args: Any | None = None
+    # KV layers the attention groups index, when looped decoder layers attend once per visit
+    # with their own KV (Inkling 2 Mini: 48 over 24 decoder layers); 0 means num_layers.
+    num_kv_layers: int = 0
+    # The MoE layer of each MoE call in one forward, when it is not each layer once in order (a looped model
+    # runs some layers several times); () -> ascending. The offload prefill stages experts in this order.
+    moe_layer_order: Tuple[int, ...] = ()
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
@@ -390,10 +411,18 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # Per-token rows kept beside the sliding-window KV (see WindowStateSpec); requires an SWA group.
+    window_states: Tuple[WindowStateSpec, ...] = ()
+    # EngineConfig.swa_full_tokens_ratio when the caller leaves it unset; None -> 0.2.
+    swa_full_tokens_ratio: float | None = None
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type or self.moe_enabled
+
+    @property
+    def kv_layer_count(self) -> int:
+        return self.num_kv_layers or self.num_layers
 
     @property
     def num_moe_layers(self) -> int:

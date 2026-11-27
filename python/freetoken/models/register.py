@@ -549,6 +549,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    "Inkling2LoopForConditionalGeneration": ModelSpec(
+        "freetoken.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+        checkpoint_roots=(("model", "model.llm"),),
+        mm_processor="freetoken.mm.processors.inkling2:Inkling2MMProcessor",
+        encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
+    ),
     # llama.cpp glm5-next GGUF (unsloth GLM-5.3-Flash-GGUF): the same model classes
     # with every tensor in its packed ggml type; a glm5v mmproj adds the vision tower
     "Glm5NextGGUFForCausalLM": ModelSpec(

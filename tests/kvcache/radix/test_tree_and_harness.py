@@ -73,7 +73,7 @@ def test_split_at_keeps_the_original_object_as_the_suffix() -> None:
 
     node.ref_count = 2
     node.swa_ref_count = 1
-    node.swa_tombstone = True
+    node.swa_level = 0
     node.swa_uuid = 77
     node.mamba_value = 99
     node.mamba_ref_count = 1

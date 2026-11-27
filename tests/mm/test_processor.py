@@ -391,6 +391,42 @@ def test_minimax_token_budget_becomes_pixel_bounds_and_the_span_gets_start_end_t
     assert dummy.feature.shape == (4, 1176) and dummy.num_tokens == 1
 
 
+def test_inkling2_pads_to_whole_cells_and_cuts_them_in_raster_order():
+    import numpy as np
+    from PIL import Image
+
+    from freetoken.mm.processors.inkling2 import Inkling2MMProcessor
+
+    # the checkpoint config names no image_token_id; the processor falls back to <|image_pad|>
+    hf = SimpleNamespace(architectures=["Inkling2LoopForConditionalGeneration"],
+                         vision_config=SimpleNamespace(native_patch_size=20, adapter_merge_size=2))
+    pixels = np.random.default_rng(0).integers(0, 256, size=(53, 87, 3), dtype=np.uint8)
+    proc = Inkling2MMProcessor(hf, "/nonexistent", MultimodalConfig())
+    (item,) = proc.process([Image.fromarray(pixels)])
+    assert item.grid_thw == [1, 2, 3] and proc.prompt_replacement(item).full == [200054] * 6
+    # no resize: bottom/right padding at -1 on the 0-255 scale, each 40x40 cell one row of the feature
+    padded = np.full((80, 120, 3), -1.0, dtype=np.float32)
+    padded[:53, :87] = pixels
+    want = torch.from_numpy((padded / 255.0 - 0.5) / 0.5).bfloat16()
+    for r in range(2):
+        for c in range(3):
+            assert torch.equal(item.feature[r * 3 + c], want[r * 40 : (r + 1) * 40, c * 40 : (c + 1) * 40])
+    capped = Inkling2MMProcessor(hf, "/nonexistent", MultimodalConfig(image_max_tokens=4))
+    (small,) = capped.process([Image.fromarray(pixels)])
+    _, rows, cols = small.grid_thw
+    assert rows * cols <= 4 and small.feature.shape[0] == rows * cols
+    # a transparent pixel shows the checkerboard behind it, a half-transparent one a blend
+    rgba = np.zeros((16, 16, 4), dtype=np.uint8)
+    rgba[0, 0] = (255, 255, 255, 0)
+    rgba[0, 8] = (255, 255, 255, 0)
+    rgba[8, 8] = (0, 0, 0, 128)
+    rgba[15, 0] = (10, 20, 30, 255)
+    (item,) = proc.process([Image.fromarray(rgba, "RGBA")])
+    got = ((item.feature[0].float() * 0.5 + 0.5) * 255).round()
+    assert got[0, 0].tolist() == [204] * 3 and got[0, 8].tolist() == [153] * 3
+    assert got[8, 8].tolist() == [102] * 3 and got[15, 0].tolist() == [10, 20, 30]
+
+
 def test_registry_resolves_by_architecture(monkeypatch):
     import freetoken.utils
     from freetoken.mm.processor import get_mm_processor

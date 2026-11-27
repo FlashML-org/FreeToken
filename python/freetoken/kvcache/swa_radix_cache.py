@@ -10,9 +10,16 @@ marked ``swa_tombstone`` (full KV survives). A matched prefix is reusable for SW
 the deepest node with ``>= sliding_window`` contiguous live (non-tombstone) tokens back to the last
 tombstone, or tombstone-free to root (sglang ``_match_prefix_helper``).
 
-Two-tier lock (``full_ref >= swa_ref``): full pins node..root; swa pins only the trailing window,
-bounded by ``swa_uuid``. Two-tier eviction: full pass = unlocked leaf LRU (frees both pools); swa
-pass = unlocked node LRU incl. internal -> tombstone in place (free swa only).
+A model may keep more than one sliding window: ``windows`` lists them longest first, and tier ``k``
+(1-based) holds per-token rows a resume needs for the last ``windows[k - 1]`` tokens. Tiers nest
+(a token with tier k live also has every longer tier live), so a node carries one ``swa_level``,
+the number of its live tiers. A resume point needs, for every tier, ``>= windows[k - 1]`` tokens of
+level ``>= k`` before it. With one window this is the plain SWA tree above.
+
+Two-tier lock (``full_ref >= swa_ref``): full pins node..root; swa pins only the trailing longest
+window, bounded by ``swa_uuid``, at every level. Two-tier eviction: full pass = unlocked leaf LRU
+(frees every pool); window pass = unlocked node LRU incl. internal -> drop the tier and the
+shorter ones in place (full KV stays). A leaf below the top level resumes nowhere and is unlinked.
 
 LRU: FreeToken heapq + timestamp, but ``match_prefix`` stamps the matched path with strictly
 DECREASING timestamps toward root (sglang ``_match_post_processor``) so the heap evicts near-root
@@ -22,7 +29,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -60,15 +67,23 @@ class SWAMatch(NamedTuple):
 
 class SWAEvictResult(NamedTuple):
     kv_indices: torch.Tensor   # full-pool page indices removed from the tree (-> free_slots)
-    swa_indices: torch.Tensor  # full-pool indices whose swa slots to free_swa (tombstoned + removed)
+    window_indices: Tuple[torch.Tensor, ...]  # per tier: full-pool indices whose rows to free
+
+    @property
+    def swa_indices(self) -> torch.Tensor:
+        return self.window_indices[0]
 
 
 class SWARadixCache:
-    def __init__(self, device: torch.device, page_size: int, sliding_window_size: int) -> None:
-        assert sliding_window_size > 0, "SWARadixCache requires a positive sliding window"
+    def __init__(self, device: torch.device, page_size: int, sliding_window_size: int | Sequence[int]) -> None:
+        windows = (sliding_window_size,) if isinstance(sliding_window_size, int) else tuple(sliding_window_size)
+        assert windows and all(w > 0 for w in windows), "SWARadixCache requires positive sliding windows"
+        assert all(a > b for a, b in zip(windows, windows[1:])), f"windows must be longest first: {windows}"
         self.device = device
         self.page_size = page_size
-        self.sliding_window_size = sliding_window_size
+        self.windows = windows
+        self.levels = len(windows)
+        self.sliding_window_size = windows[0]
         self.key_fn = _get_key_fn(page_size)
         # Page-index dtype: matches the engine's int32 page_table / free_slots so an empty result
         # (returned by insert/evict/match) never promotes them to int64 when concatenated.
@@ -78,22 +93,30 @@ class SWARadixCache:
         self.root.ref_count = 1  # root is always protected
         self.full_evictable = 0
         self.full_protected = 0
-        self.swa_evictable = 0   # tokens of live (non-tombstone), unlocked swa
-        self.swa_protected = 0
+        # per tier: tokens of live, unlocked (evictable) / locked (protected) rows
+        self.window_evictable = [0] * self.levels
+        self.window_protected = [0] * self.levels
         self._clk = 0            # logical access clock (tie-free, for near-root-first order)
         self._uuid = 0           # monotonic swa window-boundary handle counter
-        self._revives = 0        # observability: # of insert-side tombstone revives (Branches 1/2)
+        self._revives = 0        # observability: # of insert-side revives (a tree node adopts the request's rows)
+
+    @property
+    def swa_evictable(self) -> int:
+        return self.window_evictable[0]
+
+    @property
+    def swa_protected(self) -> int:
+        return self.window_protected[0]
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> SWAMatch:
         """Match the token prefix for the full layers, then truncate the reusable length to the
-        windowed-reuse boundary for the swa layers: the deepest node whose run of contiguous live
-        (non-tombstone) tokens back to the last tombstone is ``>= sliding_window_size`` (or the
-        path is tombstone-free to root). Mirrors sglang ``_match_prefix_helper``."""
+        deepest node end where every tier has its window of live tokens behind it (or the path
+        is live in that tier back to root)."""
         node = self.root
         value: List[torch.Tensor] = []
-        # path connected to root without a tombstone is always reusable -> start at +inf.
-        match_since_tomb = float("inf")
+        # path connected to root without a dead token is always reusable -> start at +inf.
+        runs = [float("inf")] * self.levels
         best_value_len = 0       # number of leading entries of ``value`` that are windowed-safe
         best_node = self.root
         prefix_pos, total = 0, len(input_ids)
@@ -102,61 +125,55 @@ class SWARadixCache:
             child = node.children.get(self.key_fn(input_ids[prefix_pos:]))
             if child is None:
                 break
-            if child.swa_tombstone:
-                # commit the windowed-safe boundary at the PARENT (before this tombstone) if the
-                # live run leading up to it already covers the window; then reset the run.
-                if match_since_tomb >= self.sliding_window_size:
-                    best_value_len = len(value)
-                    best_node = node
-                match_since_tomb = 0
             match_len = align_down(child.get_match_len(input_ids[prefix_pos:]), self.page_size)
             if match_len == 0:
                 break
-            if match_len < child.length:
+            partial = match_len < child.length
+            if partial:
                 child = child.split_at(match_len)  # child := the matched prefix segment
-                value.append(child.value)
-                if not child.swa_tombstone:
-                    match_since_tomb += child.length
-                node = child
-                prefix_pos += match_len
-                break
             value.append(child.value)
-            if not child.swa_tombstone:
-                match_since_tomb += child.length
+            for k in range(self.levels):
+                runs[k] = runs[k] + child.length if child.swa_level > k else 0
+            if all(run >= w for run, w in zip(runs, self.windows)):
+                best_value_len = len(value)
+                best_node = child
             node = child
             prefix_pos += match_len
-
-        if match_since_tomb >= self.sliding_window_size:
-            best_value_len = len(value)
-            best_node = node
+            if partial:
+                break
 
         self._stamp_path(best_node)
         kv = torch.cat(value[:best_value_len]) if best_value_len else self.empty
         return SWAMatch(kv, int(kv.numel()), best_node)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
+               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0,
+               live: Optional[Sequence[Sequence[Tuple[int, int]]]] = None,
                ) -> Tuple[int, torch.Tensor]:
         """Insert the committed full KV prefix. ``kv_indices`` are the request's full-pool page
-        indices (the swa rides along via the full->swa mapping, live where the request allocated
-        it). Two frontiers drive the sglang ``_insert_helper`` reconcile:
+        indices (the window rows ride along via the full->row mappings, live where the request
+        allocated them). Two frontiers drive the reconcile:
 
         - ``update_kv_after_len`` (= the request's old reused-prefix length): only nodes extending
-          PAST it carry the request's freshly-(re)computed live-swa indices. Nodes entirely within
-          it are tree-shared slots and are left untouched.
-        - ``swa_evicted_seqlen`` (= positions whose swa the request itself freed during decode):
-          below it the request's swa is the sentinel; at/above it it is live.
+          PAST it carry the request's freshly-(re)computed live rows. Nodes entirely within it
+          are tree-shared slots and are left untouched.
+        - ``swa_evicted_seqlen`` (= positions whose swa the request itself freed): below it the
+          request's swa is the sentinel; at/above it it is live. A tree with window states takes
+          ``live`` instead: per tier, the ``[lo, hi)`` spans where the request's rows are live.
 
-        A matched node that is ``swa_tombstone`` (swa freed by an earlier ``evict_swa``) and extends
-        into the fresh region is REVIVED -- not by rewriting the mapping but by adopting the
-        request's live-swa indices into ``node.value`` and clearing the tombstone (sglang Branches
-        1/2/3). Tokens of the new suffix before ``swa_evicted_seqlen`` are inserted as a tombstone;
-        a live (non-tombstone) leaf is always added (the free_swa ``-page_size`` margin guarantees a
-        live tail). Returns ``(matched_prefix_len, freed_full_indices)``: the full-pool slots the
-        caller must return to BOTH pools (displaced old tree slots + non-adopted request dups;
-        ``free_swa`` is idempotent on the already-sentinel ones)."""
+        A matched node in the fresh region whose level is below the request's there is REVIVED
+        -- not by rewriting the mapping but by adopting the request's slots into ``node.value``
+        and raising its level (Branches 1/2, split where the request's level changes).
+        Otherwise the tree keeps its slots and the request's dup is freed (Branch 3). New suffix
+        tokens get the request's level; with ``swa_evicted_seqlen`` the last page is kept live
+        (the free_swa ``-page_size`` margin guarantees it). Returns ``(matched_prefix_len,
+        freed_full_indices)``: the full-pool slots the caller must return to EVERY pool
+        (displaced old tree slots + non-adopted request dups; the frees are idempotent on the
+        already-sentinel rows)."""
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
+        frontier = live is None
+        live = self._live(swa_evicted_seqlen, insert_len, live)
         freed: List[torch.Tensor] = []
         node = self.root
         total = 0
@@ -170,67 +187,48 @@ class SWARadixCache:
             partial = match_len < child.length
             if partial:
                 child = child.split_at(match_len)
-            seg_kv = kv_indices[total:total + match_len]   # request's fresh slots for this span
             if update_kv_after_len < total + match_len:
-                if child.swa_tombstone:
-                    assert child.swa_ref_count == 0, "a tombstoned node cannot hold a swa lock"
-                    if child.ref_count > 0:
-                        # A full-locked reader still gathers the node's CURRENT slots through its
-                        # own row; freeing them on revive would hand live KV to the next alloc.
-                        # Keep the tombstone + the tree's value, drop the request's dup (Branch 3
-                        # shape) -- the window simply stays unrevived until the lock clears.
-                        freed.append(seg_kv.clone())
-                    elif swa_evicted_seqlen <= total:
-                        # Branch 1: the node's swa is live in the request -> revive it whole. Free
-                        # the old (sentinel-mapped) tree slots; adopt the request's live-swa slots.
-                        freed.append(child.value)
-                        child.set_key_value(child._key, seg_kv.clone())
-                        child.swa_tombstone = False
-                        child.timestamp = self._tick()
-                        self.swa_evictable += child.length
-                        self._revives += 1
-                    elif swa_evicted_seqlen < total + match_len:
-                        # Branch 2: the request's freed-swa frontier falls inside the node. Split;
-                        # the head [:start] stays tombstone (full KV kept), revive the live tail.
-                        start = swa_evicted_seqlen - total
-                        child.split_at(start)            # head=[:start] tombstone; child=tail[start:]
-                        freed.append(child.value)        # tail's old (sentinel) tree slots
-                        freed.append(seg_kv[:start].clone())   # dup for the still-tombstone head
-                        child.set_key_value(child._key, seg_kv[start:].clone())
-                        child.swa_tombstone = False
-                        child.timestamp = self._tick()
-                        self.swa_evictable += child.length
+                for piece, start in reversed(self._split_at(child, total, live)):
+                    seg_kv = kv_indices[start:start + piece.length]   # request's fresh slots for this span
+                    level = self._level_at(start, live)
+                    if level > piece.swa_level and piece.ref_count == 0:
+                        # Branch 1/2: the request holds more live tiers here -> adopt its slots.
+                        # Free the old tree slots (with their rows) for the request's.
+                        assert piece.swa_ref_count == 0
+                        freed.append(piece.value)
+                        piece.set_key_value(piece._key, seg_kv.clone())
+                        self._set_level(piece, level)
+                        piece.timestamp = self._tick()
                         self._revives += 1
                     else:
-                        # Branch 3: node still wholly out-of-window -> keep tombstone, drop the dup.
+                        # The tree slots are canonical; drop the request's dup. A full-locked
+                        # reader still gathers the node's CURRENT slots through its own row, so a
+                        # locked node is never revived -- it stays as is until the lock clears.
                         freed.append(seg_kv.clone())
-                else:
-                    # Matched a live node -> tree slots are canonical; drop the request's dup.
-                    freed.append(seg_kv.clone())
             total += match_len
             node = child
             if partial:
                 break
-        # Suffix: tokens [total:insert_len) not yet in the tree. Tombstone [total, swa_evicted_seqlen),
-        # then a live (non-tombstone) leaf for the in-window remainder (never a tombstone leaf --
-        # the clamp + the free_swa -page_size margin guarantee a live tail).
+        # Suffix: tokens [total:insert_len) not yet in the tree, one node per request level.
         if total < insert_len:
-            # Both suffix nodes can share this copy without retaining the request buffer.
+            # The suffix nodes can share this copy without retaining the request buffer.
             suffix_ids = input_ids[total:].clone()
             suffix_kv = kv_indices[total:].clone()
-            boundary = max(0, min(swa_evicted_seqlen, insert_len) - total)
-            boundary = min(boundary, max(0, len(suffix_ids) - self.page_size))
-            if boundary > 0:
-                node = self._add_child(node, suffix_ids[:boundary], suffix_kv[:boundary],
-                                       tombstone=True)
-                suffix_ids, suffix_kv = suffix_ids[boundary:], suffix_kv[boundary:]
-            if len(suffix_ids):
-                self._add_child(node, suffix_ids, suffix_kv, tombstone=False)
+            if frontier:
+                # never a tombstone leaf: the clamp + the free_swa -page_size margin keep a live tail
+                boundary = max(0, min(swa_evicted_seqlen, insert_len) - total)
+                boundary = min(boundary, max(0, len(suffix_ids) - self.page_size))
+                live = (((total + boundary, insert_len),),)
+            for lo, hi, level in self._segments(total, insert_len, live):
+                node = self._add_child(node, suffix_ids[lo - total:hi - total],
+                                       suffix_kv[lo - total:hi - total], level=level)
         return total, (torch.cat(freed) if freed else self.empty)
 
-    def has_locked_tombstone(self, input_ids: torch.Tensor, after_len: int) -> bool:
-        """True if insert(input_ids, update_kv_after_len=after_len) would keep a tombstone that
-        another request still full-locks, freeing the caller's copy of it."""
+    def has_locked_tombstone(self, input_ids: torch.Tensor, after_len: int, swa_evicted_seqlen: int = 0,
+                             live: Optional[Sequence[Sequence[Tuple[int, int]]]] = None) -> bool:
+        """True if the same insert would keep a node below the request's level because another
+        request still full-locks it, freeing the caller's copy of it."""
+        live = self._live(swa_evicted_seqlen, len(input_ids), live)
         node, total = self.root, 0
         while total < len(input_ids):
             child = node.children.get(self.key_fn(input_ids[total:]))
@@ -239,23 +237,75 @@ class SWARadixCache:
             match_len = align_down(child.get_match_len(input_ids[total:]), self.page_size)
             if match_len == 0:
                 return False
-            if child.swa_tombstone and child.ref_count > 0 and after_len < total + match_len:
+            if child.ref_count > 0 and after_len < total + match_len and any(
+                    level > child.swa_level for _, _, level in self._segments(total, total + match_len, live)):
                 return True
             if match_len < child.length:
                 return False
             node, total = child, total + match_len
         return False
 
+    def _live(self, swa_evicted_seqlen: int, end: int,
+              live: Optional[Sequence[Sequence[Tuple[int, int]]]]) -> Tuple[Tuple[Tuple[int, int], ...], ...]:
+        if live is None:
+            assert self.levels == 1, "a tree with window states takes the request's live spans"
+            return (((swa_evicted_seqlen, end),),)
+        assert len(live) == self.levels, f"live spans for {len(live)} tiers, tree has {self.levels}"
+        return tuple(tuple(tier) for tier in live)
+
+    @staticmethod
+    def _level_at(pos: int, live: Tuple[Tuple[Tuple[int, int], ...], ...]) -> int:
+        """The request's level at ``pos``: its leading tiers live there (a shorter tier counts only inside the longer ones)."""
+        level = 0
+        for tier in live:
+            if not any(lo <= pos < hi for lo, hi in tier):
+                break
+            level += 1
+        return level
+
+    def _segments(self, lo: int, hi: int, live) -> List[Tuple[int, int, int]]:
+        """``[lo, hi)`` cut where the request's level changes: ``(start, end, level)`` runs."""
+        cuts = sorted({lo, hi, *(e for tier in live for span in tier for e in span if lo < e < hi)})
+        segs: List[Tuple[int, int, int]] = []
+        for a, b in zip(cuts, cuts[1:]):
+            level = self._level_at(a, live)
+            if segs and segs[-1][2] == level:
+                segs[-1] = (segs[-1][0], b, level)
+            else:
+                segs.append((a, b, level))
+        return segs
+
+    def _split_at(self, node: RadixTreeNode, start: int, live) -> List[Tuple[RadixTreeNode, int]]:
+        """Split an unlocked ``node`` (covering ``[start, start + length)``) below the top level
+        where the request's level changes, so each piece it can adopt has one request level.
+        Returns ``(piece, piece_start)`` root-side first; the last piece is ``node`` itself."""
+        pieces = []
+        if node.ref_count == 0 and node.swa_level < self.levels:
+            for lo, _, _ in self._segments(start, start + node.length, live)[1:]:
+                pieces.append((node.split_at(lo - start), start))
+                start = lo
+        pieces.append((node, start))
+        return pieces
+
     def _add_child(self, parent: RadixTreeNode, ids: torch.Tensor, kv: torch.Tensor,
-                   *, tombstone: bool) -> RadixTreeNode:
+                   *, level: int) -> RadixTreeNode:
         child = RadixTreeNode(self.key_fn, self._tick())
         child.set_key_value(ids, kv)
         child.set_parent(parent)
-        child.swa_tombstone = tombstone
+        child.swa_level = 0
         self.full_evictable += child.length
-        if not tombstone:
-            self.swa_evictable += child.length
+        self._set_level(child, level)
         return child
+
+    def _set_level(self, node: RadixTreeNode, level: int, drops: Optional[List[List[torch.Tensor]]] = None) -> None:
+        """Move ``node`` to ``level``, keeping the tier counters; the tiers it loses go to ``drops``."""
+        counts = self.window_protected if node.swa_ref_count else self.window_evictable
+        old = node.swa_level
+        for k in range(min(old, level), max(old, level)):
+            counts[k] += node.length if level > old else -node.length
+            if level < old and drops is not None:
+                drops[k].append(node.value)
+        node.swa_level = level
 
     # ---------------------------------------------------------------- locking (dual)
     def inc_lock(self, node: RadixTreeNode) -> Optional[int]:
@@ -273,8 +323,9 @@ class SWARadixCache:
             cur.ref_count += 1
             if swa_locked < self.sliding_window_size and not cur.swa_tombstone:
                 if cur.swa_ref_count == 0:
-                    self.swa_evictable -= cur.length
-                    self.swa_protected += cur.length
+                    for k in range(cur.swa_level):
+                        self.window_evictable[k] -= cur.length
+                        self.window_protected[k] += cur.length
                 cur.swa_ref_count += 1
                 swa_locked += cur.length
                 if swa_locked >= self.sliding_window_size:
@@ -298,8 +349,9 @@ class SWARadixCache:
             if dec_swa and not cur.swa_tombstone and cur.swa_ref_count > 0:
                 cur.swa_ref_count -= 1
                 if cur.swa_ref_count == 0:
-                    self.swa_evictable += cur.length
-                    self.swa_protected -= cur.length
+                    for k in range(cur.swa_level):
+                        self.window_evictable[k] += cur.length
+                        self.window_protected[k] -= cur.length
                 if swa_uuid_for_lock is not None and cur.swa_uuid == swa_uuid_for_lock:
                     dec_swa = False  # window boundary reached (inclusive); stop swa decrement
             cur = cur.parent
@@ -307,65 +359,57 @@ class SWARadixCache:
     # ---------------------------------------------------------------- eviction (dual)
     def evict_full(self, num_tokens: int) -> SWAEvictResult:
         """Evict full KV by LRU over UNLOCKED LEAF nodes (an internal node's KV is a prefix
-        dependency). Frees both pools for each evicted leaf; cascade-reclaims exposed swa-tombstone
-        leaves' full KV. Mirrors sglang ``evict`` full pass."""
+        dependency). Frees every pool for each evicted leaf; cascade-reclaims the leaves it
+        exposes that resume nowhere."""
         leaves = [n for n in self._leaves() if n.ref_count == 0]
         heapq.heapify(leaves)
-        kv, swa, freed = [], [], 0
+        kv: List[torch.Tensor] = []
+        drops = self._no_drops()
+        freed = 0
         while freed < num_tokens and leaves:
             node = heapq.heappop(leaves)
             if node.ref_count != 0 or not node.is_leaf() or node.is_root():
                 continue
-            freed += node.length
-            kv.append(node.value)
-            self.full_evictable -= node.length
-            if not node.swa_tombstone:
-                swa.append(node.value)          # its swa is still live -> free it too
-                self.swa_evictable -= node.length
-            parent, casc = self._cascade_swa_tombstone_leaves(self._unlink(node), kv)
+            freed += self._remove_leaf(node, kv, drops)
+            parent, casc = self._cascade_dead_leaves(self._unlink(node), kv, drops)
             freed += casc
             # Re-push the SURVIVING ancestor the cascade returned (the original parent may have
             # been unlinked/freed by the cascade -- re-pushing it would double-free / KeyError).
             if parent.is_leaf() and parent.ref_count == 0 and not parent.is_root():
                 heapq.heappush(leaves, parent)
-        return SWAEvictResult(torch.cat(kv) if kv else self.empty,
-                              torch.cat(swa) if swa else self.empty)
+        return self._evicted(kv, drops)
 
     def evict_swa(self, num_tokens: int) -> SWAEvictResult:
-        """Evict swa KV by LRU over UNLOCKED, non-tombstone swa-bearing nodes -- internal nodes
-        too. Internal (or full-locked) node -> TOMBSTONE in place (free swa, keep full KV +
-        children). Free leaf -> free both pools, unlink, cascade. Mirrors sglang ``evict`` swa
-        pass + the leaf-with-full-lock edge."""
-        cands = [n for n in self._swa_nodes() if n.swa_ref_count == 0]
+        return self.evict_window(1, num_tokens)
+
+    def evict_window(self, level: int, num_tokens: int) -> SWAEvictResult:
+        """Free tier-``level`` rows by LRU over UNLOCKED nodes holding it -- internal nodes too.
+        Internal (or full-locked) node -> drop the tier and the shorter ones in place (keep full
+        KV + children). Free leaf -> free every pool, unlink, cascade."""
+        cands = [n for n in self._all_nodes() if n.swa_level >= level and n.swa_ref_count == 0]
         heapq.heapify(cands)
-        kv, swa, freed = [], [], 0
+        kv: List[torch.Tensor] = []
+        drops = self._no_drops()
+        freed = 0
         while freed < num_tokens and cands:
             node = heapq.heappop(cands)
-            if node.swa_tombstone or node.swa_ref_count != 0 or node.is_root():
+            if node.swa_level < level or node.swa_ref_count != 0 or node.is_root():
                 continue
+            freed += node.length
             if node.is_leaf() and node.ref_count == 0:
-                kv.append(node.value)
-                swa.append(node.value)
-                self.full_evictable -= node.length
-                self.swa_evictable -= node.length
-                freed += node.length
-                node.swa_tombstone = True
-                self._cascade_swa_tombstone_leaves(self._unlink(node), kv)
+                self._remove_leaf(node, kv, drops)
+                self._cascade_dead_leaves(self._unlink(node), kv, drops)
             else:
-                swa.append(node.value)          # tombstone internal / full-locked leaf in place
-                self.swa_evictable -= node.length
-                freed += node.length
-                node.swa_tombstone = True
-        return SWAEvictResult(torch.cat(kv) if kv else self.empty,
-                              torch.cat(swa) if swa else self.empty)
+                self._set_level(node, level - 1, drops)
+        return self._evicted(kv, drops)
 
     def trim_head_swa(self, input_ids: torch.Tensor, keep_from: int) -> torch.Tensor:
-        """Tombstone the swa currency of the path strictly below ``keep_from`` (full KV stays),
-        returning the freed swa-bearing full indices for the caller to release. Retention
-        companion of the finish-time soft pin: only the trailing window ``[keep_from, P)``
-        needs to stay swa-live for a next-turn cut near P, so the head is reclaimed eagerly
-        instead of lingering as LRU litter. Locked (swa_ref>0), tombstoned and leaf nodes are
-        left untouched; ``keep_from`` must be page-aligned."""
+        """Tombstone the path strictly below ``keep_from`` in every tier (full KV stays),
+        returning the full indices whose rows the caller must free. Retention companion of the
+        finish-time soft pin: only the trailing window ``[keep_from, P)`` needs to stay live for
+        a next-turn cut near P, so the head is reclaimed eagerly instead of lingering as LRU
+        litter. Locked (swa_ref>0), tombstoned and leaf nodes are left untouched; ``keep_from``
+        must be page-aligned."""
         if keep_from <= 0:
             return self.empty
         self.match_prefix(input_ids[:keep_from])  # ensure a node boundary at keep_from (splits)
@@ -377,8 +421,7 @@ class SWARadixCache:
                 break
             if not child.swa_tombstone and child.swa_ref_count == 0 and not child.is_leaf():
                 freed.append(child.value)
-                self.swa_evictable -= child.length
-                child.swa_tombstone = True
+                self._set_level(child, 0)
             node, pos = child, pos + child.length
         return torch.cat(freed) if freed else self.empty
 
@@ -388,7 +431,7 @@ class SWARadixCache:
 
     @property
     def swa_evictable_size(self) -> int:
-        return self.swa_evictable
+        return self.window_evictable[0]
 
     @property
     def size_info(self):
@@ -399,29 +442,42 @@ class SWARadixCache:
         for n in self._all_nodes():
             assert n.ref_count >= 0 and n.swa_ref_count >= 0
             assert n.ref_count >= n.swa_ref_count, "full_ref must be >= swa_ref"
+            assert 0 <= n.swa_level <= self.levels
             if n.swa_tombstone:
                 assert n.swa_ref_count == 0, "a tombstoned node cannot hold a swa lock"
 
     # ---------------------------------------------------------------- helpers
+    def _no_drops(self) -> List[List[torch.Tensor]]:
+        return [[] for _ in range(self.levels)]
+
+    def _evicted(self, kv: List[torch.Tensor], drops: List[List[torch.Tensor]]) -> SWAEvictResult:
+        return SWAEvictResult(torch.cat(kv) if kv else self.empty,
+                              tuple(torch.cat(d) if d else self.empty for d in drops))
+
+    def _remove_leaf(self, node: RadixTreeNode, kv: List[torch.Tensor], drops: List[List[torch.Tensor]]) -> int:
+        """Account a leaf about to be unlinked: its full KV to ``kv``, its live rows to ``drops``."""
+        kv.append(node.value)
+        self.full_evictable -= node.length
+        self._set_level(node, 0, drops)
+        return node.length
+
     def _unlink(self, node: RadixTreeNode) -> RadixTreeNode:
         parent = node.parent
         del parent.children[self.key_fn(node._key)]
         return parent
 
-    def _cascade_swa_tombstone_leaves(
-        self, parent: RadixTreeNode, kv_out: List[torch.Tensor]
+    def _cascade_dead_leaves(
+        self, parent: RadixTreeNode, kv_out: List[torch.Tensor], drops: List[List[torch.Tensor]]
     ) -> Tuple[RadixTreeNode, int]:
-        """After a leaf is unlinked, eagerly reclaim the swa-tombstone leaves it exposes upward
-        (full KV still present, no children, unlocked): free their full KV and unlink. Keeps the
-        'a live leaf always carries live swa' invariant (sglang _iteratively_delete_tombstone_leaf).
-        Returns ``(surviving_ancestor, freed_full_tokens)`` -- the caller MUST use the returned
-        ancestor (the passed-in ``parent`` may itself have been unlinked/freed by the cascade)."""
+        """After a leaf is unlinked, eagerly reclaim the leaves it exposes upward that resume
+        nowhere (below the top level: some tier is gone at their end), unlocked: free their full
+        KV and rows and unlink. Keeps the 'a leaf always resumes' invariant. Returns ``(surviving_ancestor, freed_full_tokens)``
+        -- the caller MUST use the returned ancestor (the passed-in ``parent`` may itself have
+        been unlinked/freed by the cascade)."""
         freed = 0
-        while (parent.swa_tombstone and parent.is_leaf()
+        while (parent.swa_level < self.levels and parent.is_leaf()
                and parent.ref_count == 0 and not parent.is_root()):
-            kv_out.append(parent.value)
-            self.full_evictable -= parent.length
-            freed += parent.length
+            freed += self._remove_leaf(parent, kv_out, drops)
             parent = self._unlink(parent)
         return parent, freed
 
@@ -450,15 +506,6 @@ class SWARadixCache:
                     out.append(n)
             else:
                 stack.extend(n.children.values())
-        return out
-
-    def _swa_nodes(self) -> List[RadixTreeNode]:
-        out, stack = [], [self.root]
-        while stack:
-            n = stack.pop()
-            if not n.is_root() and not n.swa_tombstone:
-                out.append(n)
-            stack.extend(n.children.values())
         return out
 
     def _all_nodes(self) -> List[RadixTreeNode]:
