@@ -11,13 +11,14 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
+from freetoken.kernel.triton.mxfp8_linear import mxfp8_dequant  # noqa: E402
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4  # noqa: E402
 from freetoken.layers.quantization import QuantKind  # noqa: E402
 from freetoken.layers.quantization.moe.base import fused_global, fused_piece, global_rows  # noqa: E402
 from freetoken.models.inkling2.config import parse_config  # noqa: E402
 from freetoken.models.inkling2.weight import iter_expert_pieces  # noqa: E402
 
-E, H, I = 20, 64, 32  # 20 experts: the MXFP8 reader dequantizes 16 at a time
+E, H, I = 20, 64, 32
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
 
@@ -78,10 +79,12 @@ def test_expert_pieces_dequantize_like_the_reference(tmp_path):
             want = _hf_interleave(want)
         torch.testing.assert_close(got.cpu().float(), want.float(), atol=0, rtol=1e-2)
 
-    pieces = list(iter_expert_pieces(str(tmp_path), config, QuantKind.NONE, layers=[1]))
-    assert [(e0, e1) for _, e0, e1, _ in pieces] == [(0, 16), (16, E)]
+    ((layer, e0, e1, piece),) = list(iter_expert_pieces(str(tmp_path), config, QuantKind.MXFP8, layers=[1]))
+    assert (layer, e0, e1) == (1, 0, E)
     p = "model.llm.layers.1.mlp.experts."
-    gate_up = torch.cat([pc["gate_up"].cpu() for *_, pc in pieces])
-    down = torch.cat([pc["down"].cpu() for *_, pc in pieces])
-    assert torch.equal(gate_up, _hf_interleave(_hf_dequant(t[p + "w13_weight"], t[p + "w13_weight_scale"])))
-    assert torch.equal(down, _hf_dequant(t[p + "w2_weight"], t[p + "w2_weight_scale"]))
+    for proj, role in (("w13", "gate_up"), ("w2", "down")):
+        got = mxfp8_dequant(piece[role].flatten(0, 1), piece[f"{role}_scale"].flatten(0, 1), torch.float32).view(piece[role].shape)
+        want = _hf_dequant(t[p + f"{proj}_weight"], t[p + f"{proj}_weight_scale"])
+        if proj == "w13":
+            want = _hf_interleave(want)
+        assert torch.equal(got, want.float())

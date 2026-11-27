@@ -2,15 +2,9 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from freetoken.utils import init_logger
-
-from ..quant_backend import get_quant_backend
-from ..registry import LayerKind, method_class, register_dialect
+from ..registry import register_dialect
 from ..scheme import QuantKind, QuantScheme, mxfp8_scheme, nvfp4_scheme
 from .base import QuantConfig, Stored
-
-logger = init_logger(__name__)
-
 
 @register_dialect
 class Inkling2QuantConfig(QuantConfig):
@@ -19,9 +13,8 @@ class Inkling2QuantConfig(QuantConfig):
 
     Stacked routed experts are ``nvfp4`` (packed e2m1, e4m3 scales per 16, a per-expert global
     ``amax / outer_scale_denominator``) or ``mxfp8`` (e4m3, ue8m0 scales per 32); everything
-    else is bf16 or fp32. The NVFP4 activation quantization the checkpoint records is not
-    served: experts run W4A16, as the reference implementation does. MXFP8 experts have no
-    expert kernel yet, so they are served bf16, dequantized by the family's reader.
+    else is bf16 or fp32. The activation quantization the checkpoint records is not served:
+    experts run W4A16 / W8A16, as the reference implementation does.
     """
 
     dialect = "inkling2"
@@ -45,11 +38,3 @@ class Inkling2QuantConfig(QuantConfig):
         if dtype == "mxfp8":
             return mxfp8_scheme()
         return None
-
-    def get_quant_method(self, layer: Any, prefix: str):
-        scheme = self.scheme_for(prefix)
-        if layer.quant_layer_kind is LayerKind.MOE and scheme is not None and scheme.kind is QuantKind.MXFP8:
-            logger.info_once("inkling2: MXFP8 experts are served dequantized to bf16 (no MXFP8 expert kernel yet)")
-            cls = method_class(QuantKind.NONE, LayerKind.MOE)
-            return cls(self.layer_config(layer, LayerKind.MOE, None), get_quant_backend().select(LayerKind.MOE, QuantKind.NONE))
-        return super().get_quant_method(layer, prefix)

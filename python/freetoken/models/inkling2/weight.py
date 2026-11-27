@@ -231,15 +231,9 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
         reader.close()
 
 
-def _mxfp8_dequant(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """e4m3 ``[..., K]`` times ``2 ** (scale - 127)`` per 32 inputs -> bf16 (exact)."""
-    blocks = values.float().unflatten(-1, (-1, 32)) * torch.exp2(scales.float() - 127.0)[..., None]
-    return blocks.flatten(-2).to(torch.bfloat16)
-
-
 def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, layers=None, parallel=False, workers: int = 8, chunk: int = 8 << 20):
-    """NVFP4 layers as NVFP4 pieces; MXFP8 layers (no expert kernel yet) dequantized to bf16 pieces."""
-    if kind not in (QuantKind.NVFP4, QuantKind.NONE):
+    """NVFP4 layers as NVFP4 pieces, MXFP8 layers as e4m3 rows with their ue8m0 codes."""
+    if kind not in (QuantKind.NVFP4, QuantKind.MXFP8):
         return None
     if parallel:
         raise NotImplementedError("inkling2 has no parallel expert reader")
@@ -249,7 +243,6 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, layers=None,
 def _iter_expert_pieces(model_path: str, config, kind: QuantKind, layers) -> Iterator:
     args: Inkling2Args = config.inkling2_args
     want = range(args.num_layers) if layers is None else sorted(layers)
-    dequant_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     reader = ShardReader(model_path, torch.device("cpu"))
     try:
         for layer in want:
@@ -257,25 +250,17 @@ def _iter_expert_pieces(model_path: str, config, kind: QuantKind, layers) -> Ite
             stored_fp4 = reader.has(p + "w13_weight_amax")
             if stored_fp4 != (kind is QuantKind.NVFP4):
                 raise ValueError(f"layer {layer} experts are stored {'nvfp4' if stored_fp4 else 'mxfp8'} but were asked for as {kind}")
-            if stored_fp4:
-                piece = {}
-                for proj, role in (("w13", "gate_up"), ("w2", "down")):
-                    w, s = reader.get_tensor(p + f"{proj}_weight"), reader.get_tensor(p + f"{proj}_weight_scale")
-                    if proj == "w13":
-                        w, s = _deinterleave(w), _deinterleave(s)
+            piece = {}
+            for proj, role in (("w13", "gate_up"), ("w2", "down")):
+                w, s = reader.get_tensor(p + f"{proj}_weight"), reader.get_tensor(p + f"{proj}_weight_scale")
+                if proj == "w13":
+                    w, s = _deinterleave(w), _deinterleave(s)
+                piece[role], piece[f"{role}_scale"] = w, s
+                if stored_fp4:
                     amax = reader.get_tensor(p + f"{proj}_weight_amax").float()
                     denom = reader.get_tensor(p + f"{proj}_weight_outer_scale_denominator").float()
-                    piece[role], piece[f"{role}_scale"], piece[f"{role}_global"] = w, s, amax / denom
-                yield layer, 0, args.num_experts, piece
-                continue
-            w13, s13 = reader.get_tensor(p + "w13_weight"), reader.get_tensor(p + "w13_weight_scale")
-            w2, s2 = reader.get_tensor(p + "w2_weight"), reader.get_tensor(p + "w2_weight_scale")
-            step = 16
-            for e0 in range(0, args.num_experts, step):
-                e1 = min(args.num_experts, e0 + step)
-                gate_up = _mxfp8_dequant(w13[e0:e1].to(dequant_device), s13[e0:e1].to(dequant_device))
-                down = _mxfp8_dequant(w2[e0:e1].to(dequant_device), s2[e0:e1].to(dequant_device))
-                yield layer, e0, e1, {"gate_up": _deinterleave(gate_up), "down": down}
+                    piece[f"{role}_global"] = amax / denom
+            yield layer, 0, args.num_experts, piece
     finally:
         reader.close()
 
