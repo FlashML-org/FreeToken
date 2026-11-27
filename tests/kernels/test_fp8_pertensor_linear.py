@@ -20,6 +20,7 @@ if not torch.cuda.is_available():  # pragma: no cover
     pytest.skip("CUDA required", allow_module_level=True)
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_native
+from freetoken.kernel.triton.fp8_pertensor_linear import SMALL_M_MAX
 
 DEV = "cuda"
 FP8 = torch.float8_e4m3fn
@@ -103,6 +104,81 @@ def test_batch_size_does_not_change_the_numeric_scheme():
     batched = fp8_pertensor_linear(x, w8, scale, None, input_scale, False)
     alone = fp8_pertensor_linear(x[:1], w8, scale, None, input_scale, False)
     assert torch.equal(alone, batched[:1])
+    # a server on the split-K kernel forms decode steps of 1..SMALL_M_MAX rows and no others
+    for rows in range(1, SMALL_M_MAX + 1):
+        batched = fp8_pertensor_linear(x[:rows], w8, scale, None, input_scale, False, small_m=True)
+        for r in range(rows):
+            alone = fp8_pertensor_linear(x[r : r + 1], w8, scale, None, input_scale, False, small_m=True)
+            assert torch.equal(alone, batched[r : r + 1]), (rows, r)
+
+
+def _bf16_steps(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    def order(t):
+        i = t.contiguous().view(torch.int16).to(torch.int32)
+        return torch.where(i < 0, -(i & 0x7FFF), i)
+    return (order(a) - order(b)).abs()
+
+
+@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+@pytest.mark.parametrize("M", range(1, SMALL_M_MAX + 1))
+# Qwen3.6-35B-A3B's fused in_proj_qkvz, fused qkv and out_proj / o_proj; the last is wide
+# enough to run as one K split, where the kernel writes the output itself
+@pytest.mark.parametrize("K,part_rows", [
+    (2048, [8192, 4096]), (2048, [8192, 512, 512]), (4096, [2048]), (256, [20480]),
+])
+@pytest.mark.parametrize("gain", [1.0, 40.0])  # 40: most of the activation saturates at the clamp
+def test_small_m_kernel_agrees_with_scaled_mm(M: int, K: int, part_rows: list[int], gain: float):
+    """The split-K kernel quantizes the activation itself and sums the same fp8 x fp8 products
+    in another order, so against ``_scaled_mm`` an output may round the other way and nothing
+    more: one bf16 step, on under 0.1% of elements. An output that cancels to almost zero is
+    the exception: bf16 steps are tiny there, so it is held to the output's scale instead."""
+    from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear, weight_scale_segments
+
+    w8, scale = _quant_parts(part_rows, K, seed=M)
+    uniform = len(part_rows) == 1
+    seg = None if uniform else weight_scale_segments(scale)
+    x = (torch.randn(M, K, device=DEV) * gain).to(torch.bfloat16)
+    input_scale = torch.tensor(0.02, device=DEV)
+    ref = fp8_pertensor_linear(x, w8, scale, None, input_scale, uniform, scale_segments=seg)
+    got = fp8_pertensor_linear(x, w8, scale, None, input_scale, uniform, scale_segments=seg, small_m=True)
+    d = _bf16_steps(got, ref)
+    near_zero = (got.float() - ref.float()).abs() <= 1e-4 * ref.float().pow(2).mean().sqrt()
+    assert bool(((d <= 1) | near_zero).all())
+    assert (d == 0).float().mean().item() >= 0.999
+
+
+@pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
+@pytest.mark.parametrize("reqs,draft_steps,kernel", [
+    (1, None, "triton-w8a8"),
+    (SMALL_M_MAX, None, "triton-w8a8"),
+    (1, SMALL_M_MAX - 1, "triton-w8a8"),  # one request whose verify step is SMALL_M_MAX rows
+    (1, 5, "triton-w8a8"),  # MTP depth 5 verifies 6 rows a step
+    (SMALL_M_MAX, 1, "torch"),
+    (SMALL_M_MAX + 1, None, "torch"),
+])
+def test_split_k_kernel_is_picked_only_when_every_decode_step_fits(reqs: int, draft_steps: int | None, kernel: str):
+    """The two W8A8 kernels sum in different orders, so one server must not mix them across
+    decode steps: the split-K kernel is the pick only when the widest step the server can form
+    (running requests x rows per request) fits it, and asking for it by name beyond that fails."""
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.layers.quantization import Fp8TensorLinearMethod, KernelSelectionError, LinearConfig
+    from freetoken.layers.quantization.linear.fp8_tensor import set_max_decode_rows
+    from freetoken.layers.quantization.scheme import fp8_tensor_scheme
+
+    config = EngineConfig(
+        model_path="", tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, max_running_req=reqs,
+        speculative_algorithm=None if draft_steps is None else "mtp", speculative_num_steps=draft_steps or 0,
+    )
+    cfg = LinearConfig(2048, 4096, scheme=fp8_tensor_scheme("fp32", per_row=True, input_scale=True))
+    set_max_decode_rows(config.max_decode_rows)
+    try:
+        assert Fp8TensorLinearMethod(cfg).kernel.name == kernel
+        if kernel == "torch":
+            with pytest.raises(KernelSelectionError):
+                Fp8TensorLinearMethod(cfg, "triton-w8a8")
+    finally:
+        set_max_decode_rows(None)
 
 
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")

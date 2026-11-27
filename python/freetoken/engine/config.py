@@ -214,6 +214,11 @@ class EngineConfig:
         return self.speculative_num_steps + 1 if self.speculative_algorithm is not None else 1
 
     @property
+    def max_decode_rows(self) -> int:
+        """The most rows a decode step can carry: the largest batch, or the graph size it is padded to, of decode_rows_per_req rows each."""
+        return max(self.max_running_req, self.cuda_graph_max_bs or 0, *(self.cuda_graph_bs or []), 1) * self.decode_rows_per_req
+
+    @property
     def slot_states(self) -> tuple[SlotStateSpec, ...]:
         """Every per-request state the linear-state pool holds: the model's own, then the proposer's."""
         return self.model_config.slot_states + self.spec_slot_states
