@@ -40,7 +40,7 @@ from freetoken.kvcache.format import FP8_DS_MLA, NONE, NVFP4_DS_MLA, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
-    _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
+    _linear_local_dims, _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
 )
 
 logger = init_logger(__name__)
@@ -117,6 +117,38 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     what the resident model consumed. Kept as a pure function so the composition with the
     pool families' ``solve_num_pages`` stays CPU-testable."""
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
+
+
+def _prefill_working_bytes(config) -> tuple[int, int]:
+    """(tokens, bytes): the longest prefill chunk (--max-prefill-length, at most the context) and the GPU memory its
+    temporaries hold at their peak on ``config``'s model, per rank (cache_budget.prefill_working_bytes). The bytes
+    are 0 for a model whose prefill is not counted there, which is any model without GatedDeltaNet layers: its plan
+    and its startup stay as they were."""
+    from freetoken.engine.cache_budget import prefill_working_bytes
+
+    model = config.model_config
+    tokens = min(config.max_forward_len, config.max_seq_len)
+    group = model.linear_attention_group()
+    if group is None or group.variant != "gdn":
+        return tokens, 0
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+    _, _, value_heads, key_heads = _linear_local_dims(group, config.tp_info.size)
+    return tokens, prefill_working_bytes(
+        tokens, hidden=model.hidden_size, key_dim=key_heads * group.key_head_dim,
+        value_dim=value_heads * group.value_head_dim, value_heads=value_heads, head_dim=group.value_head_dim,
+        chunk=CHUNK_SIZE, itemsize=config.dtype.itemsize,
+    )
+
+
+def _prefill_kv_tokens(config, chunk: int) -> int:
+    """KV tokens the --moe-cache-auto plan holds ahead of expert slots next to its prefill reserve, so that a prompt of
+    one ``chunk`` is answered: the prompt, 1024 tokens of reply, and the rows a verify step adds (_seq_limits). The
+    default --kv-reserve-tokens is the default chunk, and a pool of exactly that refuses such a prompt for length.
+    0 when the KV size is the user's: a --kv-reserve-tokens other than the default, or a typed --num-tokens / --num-pages."""
+    if config.kv_reserve_tokens != EngineConfig.kv_reserve_tokens or config.num_page_override is not None:
+        return 0
+    return chunk + 1024 + config.decode_rows_per_req - 1
 
 
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
@@ -691,6 +723,23 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self._warn_if_prefill_short(config)
+
+    def _warn_if_prefill_short(self, config: EngineConfig) -> None:
+        """One warning when startup or a cache resize left less GPU memory free than one prefill chunk works in.
+        --moe-cache-auto keeps that much out of its plan; a typed cache size, a resize, a model with resident experts
+        and a plan held at its floors do not."""
+        tokens, need = _prefill_working_bytes(config)
+        if not need:
+            return
+        # what the driver has free and what the allocator holds unused: the caches stay as they are
+        free = get_free_memory(self.device) + torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
+        if free < need:
+            logger.warning_rank0(
+                f"{mem_GB(free)} of GPU memory is free with the caches in place, and a prefill chunk of {tokens} tokens "
+                f"works in about {mem_GB(need)}: a prompt that long can end the server with a CUDA out-of-memory error. "
+                "Lower --max-prefill-length, or leave more free (a smaller --moe-cache-size or --num-tokens, a lower --memory-ratio)"
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -810,11 +859,14 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None, min_slots=0) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(
+        self, config: EngineConfig, banks, method=None, max_slots=None, min_slots=0, reserve_bytes: int = 0, kv_soft_tokens: int = 0
+    ) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
-        without a GPU. Reused by the Phase-2 runtime rebuild.
+        without a GPU. Reused by the Phase-2 runtime rebuild. ``reserve_bytes`` stay out
+        of both caches and ``kv_soft_tokens`` is the soft KV floor (plan_cache_budget).
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
 
@@ -840,6 +892,8 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             max_slots=max_slots if max_slots is not None or method is None else method.slot_limit(),
+            reserve_bytes=reserve_bytes,
+            kv_soft_tokens=kv_soft_tokens,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -937,7 +991,26 @@ class Engine:
         if config.moe_cache_auto:
             # experts of several formats: the cache must still stage one whole layer of each through the shared bank bytes
             floor = stage_floor(layer_bank_bytes(banks.sources), pools, config.model_config.num_experts, self._moe_expert_counts)
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap, min_slots=floor)
+            # The (1 - memory_ratio) headroom does not grow with the prefill chunk: on a small card it is less than
+            # the chunk's temporaries, and a long prompt then ends the server. The plan keeps them out of the caches.
+            chunk, reserve = _prefill_working_bytes(config)
+            # A plan that keeps a chunk's working memory free also keeps the KV a prompt of one chunk needs.
+            kv_hold = _prefill_kv_tokens(config, chunk) if reserve else 0
+            size, pages, overlap = self._resolve_auto_moe_cache_size(
+                config, banks, method, max_slots=size_cap, min_slots=floor, reserve_bytes=reserve, kv_soft_tokens=kv_hold
+            )
+            if reserve:
+                plain = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap, min_slots=floor)
+                page_bytes, _, page_tokens, _ = self._pool_cls.kv_cost(config)
+                # the plan takes the reserve from KV pages above the floor first; a typed --num-tokens / --num-pages drops
+                # those pages, so only the slots' share is kept and the startup warning covers the rest
+                kv_pages = 0 if config.num_page_override is not None else plain[1] - pages
+                kept = (plain[0] - size) * expert_bytes_per_slot(banks.sources) + kv_pages * (page_bytes + self._spec_budget(config)[1])
+                held = f" and {pages * page_tokens} KV tokens for a prompt that long" if 0 < kv_hold <= pages * page_tokens else ""
+                logger.info_rank0(
+                    f"--moe-cache-auto keeps {mem_GB(kept)} free for a prefill chunk of {chunk} tokens (--max-prefill-length; "
+                    f"it works in about {mem_GB(reserve)}){held}: {-kv_pages * page_tokens:+d} KV tokens, {size - plain[0]:+d} expert slots"
+                )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -1395,6 +1468,7 @@ class Engine:
             self.spec.attach(self)
         # reuse the startup-resolved bs set (see above)
         self.graph_runner = self._make_graph_runner(prior_graph_bs, free_min, aligned_max_seq_len)
+        self._warn_if_prefill_short(config)
 
     def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
         """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
