@@ -181,3 +181,19 @@ def test_adjust_config_resolves_swa_cache_type():
     _adjust_config(naive)
     assert naive.attention_backend == "triton"
     assert naive.cache_type == "naive"
+
+
+def test_unit_bytes_counts_window_state_rows():
+    _init_tp()
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
+    from freetoken.models.config import KVCacheGroupSpec, WindowStateSpec
+
+    groups = (KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None),
+              KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8, sliding_window=16))
+    state = WindowStateSpec(name="conv", shape=(8,), layer_ids=(0, 1), window=3)
+    pool = HybridSWAKVCache(groups=groups, num_layers=2, num_full_pages=64, page_size=1, dtype=torch.bfloat16,
+                            device=torch.device("cpu"), num_swa_tokens=32, window_states=(state,), num_state_rows=(5,))
+    kv, swa = pool.unit_bytes()
+    # per window token: K + V of one 8-wide head in bf16, plus 2 layers x 5 rows x 8 bf16 over the 32 window tokens
+    assert kv == 2 * 8 * 2
+    assert swa == 2 * 8 * 2 + 2 * 5 * 8 * 2 // 32

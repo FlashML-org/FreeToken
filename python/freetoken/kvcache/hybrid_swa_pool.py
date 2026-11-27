@@ -501,7 +501,10 @@ class HybridSWAKVCache(BaseKVCachePool):
 
         full = self.full_kv_pool.buffer
         full_tokens = int(full.shape[2]) * int(full.shape[3])
-        return group_bytes(self.full_kv_pool) // full_tokens, group_bytes(self.swa_kv_pool) // self._swa_num_tokens
+        swa = group_bytes(self.swa_kv_pool) // self._swa_num_tokens
+        # the window-state rows grow with the window pool (kv_cost)
+        swa += sum(int(t.rows.numel() * t.rows.element_size()) for t in self._state_tiers) // self._swa_num_tokens
+        return group_bytes(self.full_kv_pool) // full_tokens, swa
 
 
 # ---- SWA pool sizing (pure arithmetic; the pool family's geometry formulas) ----
