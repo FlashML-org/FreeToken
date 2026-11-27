@@ -224,6 +224,28 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
     asyncio.run(_run())
 
 
+def test_a_worker_death_ends_the_inflight_generations():
+    """A dead scheduler never replies, and the orderly stop that follows waits for open
+    connections: every in-flight generation must end with the failure instead of waiting forever."""
+
+    async def _run():
+        state = SimpleNamespace(ack_map={7: []}, event_map={7: asyncio.Event()}, _loop=asyncio.get_running_loop())
+        acks = []
+
+        async def consume():
+            async for ack in FrontendManager.wait_for_ack(state, 7):
+                acks.append(ack)
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0)
+        threading.Thread(target=FrontendManager.fail_inflight_requests, args=(state, "scheduler exited")).start()
+        await asyncio.wait_for(task, timeout=5.0)
+        assert acks[-1].finished and acks[-1].error == "scheduler exited"
+        assert state.ack_map == {} and state.event_map == {}
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # The maintenance gate seen from the request side: what a client hits while the server is
 # loading or rebuilding, on both the OpenAI generation routes and the rebuild route itself.

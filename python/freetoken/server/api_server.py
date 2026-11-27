@@ -332,6 +332,25 @@ class FrontendManager:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
 
+    def fail_inflight_requests(self, message: str) -> None:
+        """End every in-flight generation with ``message``: after a worker death no reply comes,
+        and the orderly stop that follows waits for these connections to close. Marshalled onto
+        the event loop like ``fail_pending_rebuilds``."""
+        loop = self._loop
+        if loop is None:
+            return
+
+        def _fail_all() -> None:
+            for uid in list(self.ack_map):
+                self.ack_map[uid].append(UserReply(uid=uid, incremental_output="", finished=True, error=message,
+                                                   error_code="backend_failed"))
+                self.event_map[uid].set()
+
+        try:
+            loop.call_soon_threadsafe(_fail_all)
+        except RuntimeError:
+            pass
+
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
@@ -1091,6 +1110,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        _GLOBAL_STATE.fail_inflight_requests(message)
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:
