@@ -126,7 +126,9 @@ def fused_experts_nvfp4(
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
-    materialized ``[:E]`` slot view or the overlap double buffer), raw ids."""
+    materialized ``[:E]`` slot view or the overlap double buffer), raw ids.
+
+    Returns ``hidden_states`` itself, overwritten with the routed output. A caller that still needs the input afterwards (a shared expert, a residual) must read it BEFORE this call or pass a copy."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
@@ -138,7 +140,8 @@ def fused_experts_nvfp4(
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
-    ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
+    cache = torch.empty(M * top_k * max(two_i, H), device=dev, dtype=dt)
+    ic1 = cache[: M * top_k * two_i].view(M, top_k, two_i)
     nvfp4_moe.prefill_gemm(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
         tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
@@ -146,15 +149,15 @@ def fused_experts_nvfp4(
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
-    ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
+    # the gate_up output is dead after the activation, so the down output reuses its storage
+    ic3 = cache[: M * top_k * H].view(M, top_k, H)
     nvfp4_moe.prefill_gemm(
         ic2, down_packed, down_scale, down_global, ic3,
         tw, sorted_ids, expert_ids, ntpp, num_valid, 1,
         not apply_router_weight_on_input, cfg,
     )
-    out = torch.empty_like(hidden_states)
-    moe_sum_reduce_triton(ic3, out)
-    return out
+    moe_sum_reduce_triton(ic3, hidden_states)
+    return hidden_states
 
 
 def fused_experts_nvfp4_w4a4(
