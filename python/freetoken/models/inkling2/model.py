@@ -4,7 +4,6 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.inkling2 import EPI_RESIDUAL, attn_res, gate_combine, gate_inputs, short_conv
 from freetoken.kernel.triton.moe_router import fused_topk_sigmoid
@@ -86,7 +85,7 @@ class Inkling2MoE(BaseOP):
     def __init__(self, config: ModelConfig, args: Inkling2Args, layer_id: int, *, prefix: str):
         self.top_k = args.top_k
         self.route_scale = args.route_scale
-        self.router_weight = torch.empty(args.num_experts, args.hidden_size, dtype=torch.float32)
+        self.router_weight = torch.empty(args.num_experts, args.hidden_size)
         self.router_bias = torch.empty(args.num_experts, dtype=torch.float32)
         self.experts = make_moe_layer(
             config,
@@ -101,7 +100,7 @@ class Inkling2MoE(BaseOP):
 
     @nvtx_annotate("MoE")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits = F.linear(x.float(), self.router_weight)
+        logits = torch.mm(x, self.router_weight.t(), out_dtype=torch.float32)
         weights, ids = fused_topk_sigmoid(logits, self.router_bias, self.top_k, renormalize=True, routed_scale=self.route_scale)
         return self.experts.routed_forward(x, weights, ids)
 

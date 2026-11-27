@@ -161,7 +161,7 @@ def _layer_tensor(layer: int, leaf: str, name: str, get, args: Inkling2Args) -> 
     elif leaf == "mlp_sconv.weight":
         yield p + "mlp_conv", _lag_taps(get(name))
     elif leaf == "mlp.gate.weight":
-        yield p + "mlp.router_weight", get(name).float()
+        yield p + "mlp.router_weight", get(name)
     elif leaf == "mlp.gate.bias":
         yield p + "mlp.router_bias", get(name).float()
     elif leaf.startswith("controllers."):
