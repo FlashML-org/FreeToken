@@ -146,6 +146,18 @@ def _quantized_pool(fmt_name: str, k, v, slots, capacity: int, num_kv_heads: int
     return k_cache, v_cache, k_scale, v_scale
 
 
+def _decode_kv(fmt_name: str | None, k_cache: torch.Tensor, v_cache: torch.Tensor):
+    """The caches a decode test passes, the values its reference reads, and the kernel's KV arguments."""
+    if fmt_name is None:
+        return k_cache, v_cache, k_cache, v_cache, {}
+    total, heads, head_dim = k_cache.shape
+    slots = torch.arange(total, device=k_cache.device, dtype=torch.int32)
+    k_codes, v_codes, k_scale, v_scale = _quantized_pool(
+        fmt_name, k_cache.view(total, -1), v_cache.view(total, -1), slots, total, heads, head_dim
+    )
+    kv_args = {"kv_format": KV_FORMATS[fmt_name], "k_scale": k_scale, "v_scale": v_scale}
+    return k_codes, v_codes, _dequantize(fmt_name, k_codes, k_scale), _dequantize(fmt_name, v_codes, v_scale), kv_args
+
 def _attend(path: str, q, k_cache, v_cache, indices, kv_args: dict, k_extend=None, v_extend=None):
     from freetoken.kernel.triton.attention import (
         decode_paged_attention,
@@ -264,16 +276,16 @@ def test_quantized_kv_attention_matches_dequantized_reference(fmt_name: str, pat
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is None, reason="needs ROCm")
-@pytest.mark.parametrize("transpose", [False, True])
-def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool):
+@pytest.mark.parametrize(("arch", "transpose"), [("gfx1201", False), ("gfx1201", True), ("gfx11", False)])
+def test_rocm_kv_decode_preserves_every_finite_fp8_code(arch: str, transpose: bool):
     import triton
     import triton.language as tl
 
-    from freetoken.kernel.triton.kv_rows import kv_tile_rows
+    from freetoken.kernel.triton.kv_rows import _kv_tile_gfx11_f16, kv_tile_rows
     from freetoken.utils.arch import get_rocm_gfx_arch
 
-    if get_rocm_gfx_arch() != "gfx1201":
-        pytest.skip("packed KV conversion requires gfx1201")
+    if not (get_rocm_gfx_arch() or "").startswith(arch):
+        pytest.skip(f"this fp8 KV reader requires {arch}")
 
     @triton.jit
     def decode_codes(x, y, TRANSPOSE: tl.constexpr):
@@ -284,10 +296,21 @@ def test_rdna4_kv_decode_preserves_every_finite_fp8_code(transpose: bool):
             values = tl.trans(values)
         tl.store(y + rows[:, None] * 128 + tl.arange(0, 128)[None, :], values)
 
+    @triton.jit
+    def decode_codes_f16(x, y):
+        offs = tl.arange(0, 64)[:, None] * 128 + tl.arange(0, 128)[None, :]
+        tl.store(y + offs, _kv_tile_gfx11_f16(x + offs, tl.full((64, 128), True, tl.int1)))
+
     codes = torch.arange(256, dtype=torch.uint8).repeat(32)
-    expected = codes.view(torch.float8_e4m3fn).bfloat16().cuda()
-    actual = torch.empty_like(expected)
-    decode_codes[(1,)](codes.cuda(), actual, transpose, num_warps=4)
+    if arch == "gfx1201":
+        expected = codes.view(torch.float8_e4m3fn).bfloat16().cuda()
+        actual = torch.empty_like(expected)
+        decode_codes[(1,)](codes.cuda(), actual, transpose, num_warps=4)
+    else:
+        # value / 256 is exact in fp16, E4M3 subnormals included
+        expected = (codes.view(torch.float8_e4m3fn).float() / 256).half().cuda()
+        actual = torch.empty_like(expected)
+        decode_codes_f16[(1,)](codes.cuda(), actual, num_warps=4)
     finite = expected.isfinite()
     # Integer comparison also checks signed zero and the byte order in each word.
     assert torch.equal(actual.view(torch.int16)[finite], expected.view(torch.int16)[finite])
@@ -707,6 +730,7 @@ def test_decode_triton_attention_with_sinks_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize("fmt_name", [None, *KV_QUANT_FORMATS])
 @pytest.mark.parametrize(
     ("seq_lens", "num_kv_heads", "sliding_window", "scratch_splits", "use_sinks"),
     [
@@ -721,6 +745,7 @@ def test_decode_triton_attention_splits_long_requests(
     sliding_window: int | None,
     scratch_splits: int,
     use_sinks: bool,
+    fmt_name: str | None,
 ):
     """Requests of many splits next to short ones, a scratch smaller than the split cap, and windows that span several splits."""
     from freetoken.kernel.triton.attention import decode_paged_attention
@@ -734,6 +759,7 @@ def test_decode_triton_attention_splits_long_requests(
     q = torch.randn(batch, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
     k_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     v_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_cache, v_cache, k_ref, v_ref, kv_args = _decode_kv(fmt_name, k_cache, v_cache)
     indptr = torch.tensor([0, *seq_lens], dtype=torch.int32, device=device).cumsum(0).to(torch.int32)
     indices = torch.randperm(total_kv, device=device).to(torch.int32)
     q_positions = torch.tensor([n - 1 for n in seq_lens], dtype=torch.int64, device=device)
@@ -746,15 +772,16 @@ def test_decode_triton_attention_splits_long_requests(
     actual = decode_paged_attention(
         q, k_cache, v_cache, indptr, indices, q_positions,
         attn_logits, attn_lse, sm_scale,
-        sliding_window=sliding_window, sinks=sinks,
+        sliding_window=sliding_window, sinks=sinks, **kv_args,
     )
     expected = _reference_paged_attention(
-        q, k_cache, v_cache, indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, sinks=sinks,
+        q, k_ref, v_ref, indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, sinks=sinks,
     )
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize("fmt_name", [None, *KV_QUANT_FORMATS])
 @pytest.mark.parametrize(
     ("num_q_heads", "num_kv_heads", "head_dim", "cached_lens", "q_lens", "sliding_window", "scratch_splits", "use_sinks"),
     [
@@ -774,6 +801,7 @@ def test_decode_triton_attention_multi_row_matches_reference(
     sliding_window: int | None,
     scratch_splits: int,
     use_sinks: bool,
+    fmt_name: str | None,
 ):
     """Several causal query rows per request: rows that see no key of a split (1017 + 8 keys leave one key in the last split), a window shorter than the rows, short requests next to many-split ones, and fewer heads per program at head_dim 512."""
     from freetoken.kernel.triton.attention import decode_paged_attention
@@ -786,6 +814,7 @@ def test_decode_triton_attention_multi_row_matches_reference(
     q = torch.randn(num_rows, num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
     k_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
     v_cache = torch.randn(total_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_cache, v_cache, k_ref, v_ref, kv_args = _decode_kv(fmt_name, k_cache, v_cache)
     indptr = torch.tensor([0, *kv_lens], device=device).cumsum(0).to(torch.int32)
     qo_indptr = torch.tensor([0, *q_lens], device=device).cumsum(0).to(torch.int32)
     indices = torch.randperm(total_kv, device=device).to(torch.int32)
@@ -798,10 +827,10 @@ def test_decode_triton_attention_multi_row_matches_reference(
 
     actual = decode_paged_attention(
         q, k_cache, v_cache, indptr, indices, q_positions, attn_logits, attn_lse, sm_scale,
-        sliding_window=sliding_window, sinks=sinks, qo_indptr=qo_indptr, max_q_len=max(q_lens),
+        sliding_window=sliding_window, sinks=sinks, qo_indptr=qo_indptr, max_q_len=max(q_lens), **kv_args,
     )
     expected = _reference_paged_attention(
-        q, k_cache, v_cache, indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, sinks=sinks,
+        q, k_ref, v_ref, indptr, indices, q_to_req, q_positions, sm_scale, sliding_window, sinks=sinks,
     )
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
@@ -1186,7 +1215,7 @@ def test_triton_backend_applies_the_batch_block_ends_only_when_the_spec_asks(mon
 def test_triton_backend_replay_metadata_uses_capture_buffers(monkeypatch):
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
 
-    class FakeKVCache:
+    class FakeKVCache(_PlainKVStorage):
         def __init__(self, device: torch.device):
             self.device = device
 
