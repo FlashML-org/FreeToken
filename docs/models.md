@@ -198,43 +198,15 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   template kwargs with thinking on, `"chat_template_kwargs": {"enable_thinking": true,
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
-- Inkling 2 Mini runs its middle 12 decoder layers three times per token, so it attends over 48 KV
-  layers (40 with a 1024-token window) and runs four short convolutions per visit. The SWA radix
-  cache keeps the convolution inputs as a second, 3-token window beside the window KV: a prompt
-  resumes at a point where the cache holds the full-attention KV before it (32 KiB per token), the
-  window KV of the 1024 tokens before it (160 KiB per token) and the convolution inputs of the 3
-  tokens before it (624 KiB per token). Those points are anywhere in the last 16 tokens of each
-  prompt, the end of each finished request and, with `--enable-special-token-ckpt`, the tool-call
-  anchor; each keeps 1040 window tokens and 19 convolution rows (174 MiB), and window KV or rows
-  that no point reads go back at once. A prefill chunk gives rows only to its last 3 tokens, which
-  the next chunk reads. Each running request holds about 2.2K window tokens and 41 rows (25 MiB);
-  the window pool adds a tenth of the full-attention tokens (the model's `swa_full_tokens_ratio`),
-  and the row pool 19 rows per 1040 of those. On a 96 GiB GPU at 4 requests that is 1.40M tokens
-  of full-attention KV (42.6 GiB; a request still stops at the model's 1M), 140K window tokens
-  (21.3 GiB, about 125 resume points past the running requests) and 2.7K rows (1.6 GiB).
-  `--cache-type naive` turns reuse off and reserves
-  `(max-running-requests + 1) x (1024 + --max-extend-length)` window tokens instead (83K at 8 requests).
-  The NVFP4 experts (layers 0-19) run as W4A16 and the MXFP8 experts (layers 20-23) as W8A16, as
-  the reference implementation does (the activation quantization the checkpoint records is not
-  served); the model takes about 18 GiB resident. A prefill chunk's activations peak at about
-  100 KiB per token (797 MiB for 8K tokens). Pass `--moe-strategy fused` when the GPU holds that:
-  under `offload` every prefill streams the experts of all 48 visits over PCIe,
-  each visit's while the one before it computes (with 1024 experts cached, a 2K-token prompt
-  prefills in 0.62 s and a 32K one in 3.1 s).
-  Under `offload` the experts take whatever the KV reserve leaves, so the context stays at
-  `--kv-reserve-tokens` (8K) until every expert is cached: set it to the context you need.
-  `--embed-weights host` moves the 0.86 GiB input embedding to host RAM. At one running request the
-  window pool caps a prefill chunk at about 1.2K tokens, which halves prefill speed.
-  `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high` (default), `xhigh` and `max`;
-  `none` is the template's level 0.0, which the model card says does not fully disable reasoning.
-  `--tp` > 1 is not served, and a quantized `--kv-cache-dtype` is refused at startup (the attention
-  reads bf16 KV). Speculative decoding is refused at startup; serving it needs:
-  - the short convolution and the attention to take several rows per request in decode. The rows
-    need nothing more: a rejected row's convolution inputs go back with its KV slot.
-  - window KV that a rejected draft does not corrupt: the engine refuses windowed targets because
-    a verify step's window frees release slots it still reads; they have to wait for the commit.
-  - a draft: the checkpoint's `mtp.safetensors` (one MTP block, 0.59 GiB) is not read. It needs a
-    loader and a proposer in the family's `spec_drafts`, and stores KV of its own, which the window
-    frees above must also allow (`target_may_be_windowed`).
+- Inkling 2 Mini runs its middle 12 decoder layers three times per token (48 KV layers, 40 of them
+  with a 1024-token window). The SWA radix cache keeps its short-convolution inputs as a second,
+  3-token window, so a prompt resumes within the last 16 tokens of an earlier prompt, at the end of
+  a finished request, or at a tool-call anchor (`--enable-special-token-ckpt`); each such point holds
+  1040 window tokens and 19 convolution rows (174 MiB). The model takes about 18 GiB resident: pass
+  `--moe-strategy fused` when the GPU holds that, since under `offload` every prefill streams the
+  experts of all 48 layer visits over PCIe, and the context stays at `--kv-reserve-tokens` (8K) until
+  every expert is cached. `reasoning_effort` takes `none` to `max` (default `high`); `none` does not
+  fully disable reasoning. `--tp` > 1, a quantized `--kv-cache-dtype` and speculative decoding are
+  refused at startup.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).
