@@ -14,6 +14,12 @@ if TYPE_CHECKING:
     import torch
 
 
+def layer_bank_bytes(sources: dict[str, "list[torch.Tensor]"]) -> list[list[int]]:
+    """One expert's bytes in each bank of each layer, read off the loaded (TP-sharded) banks."""
+    num_layers = len(next(iter(sources.values())))
+    return [[t[l][0].numel() * t[l].element_size() for t in sources.values()] for l in range(num_layers)]
+
+
 def layer_slot_bytes(sources: dict[str, "list[torch.Tensor]"]) -> list[int]:
     """Bytes one expert slot of each layer occupies on GPU: its row bytes summed over all banks.
 
@@ -25,8 +31,7 @@ def layer_slot_bytes(sources: dict[str, "list[torch.Tensor]"]) -> list[int]:
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
     # tensor[0].numel() is the per-row element count (one expert slot); see the matching
     # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4/v4_pool.py.
-    num_layers = len(next(iter(sources.values())))
-    return [sum(t[l][0].numel() * t[l].element_size() for t in sources.values()) for l in range(num_layers)]
+    return [sum(rows) for rows in layer_bank_bytes(sources)]
 
 
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:

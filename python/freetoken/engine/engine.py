@@ -28,7 +28,7 @@ from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks,
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
-from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots, stage_floor
+from freetoken.moe.pool_policy import group_layers, make_pools, method_rows, min_cache_bytes, pool_of_layer, resolve_profile, split_slots, stage_floor
 from freetoken.utils import align_ceil, div_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -911,7 +911,7 @@ class Engine:
         if probe:
             cpu_layer_ids = probed
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_bank_bytes, layer_slot_bytes
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
@@ -939,8 +939,7 @@ class Engine:
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
             # experts of several formats: the cache must still stage one whole layer of each through the shared bank bytes
-            rows = [[t[layer][0].numel() * t[layer].element_size() for t in banks.sources.values()] for layer in range(num_moe_layers)]
-            floor = stage_floor(rows, pools, config.model_config.num_experts, self._moe_expert_counts)
+            floor = stage_floor(layer_bank_bytes(banks.sources), pools, config.model_config.num_experts, self._moe_expert_counts)
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap, min_slots=floor)
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
@@ -1230,7 +1229,8 @@ class Engine:
         budget = int(config.memory_ratio * self._baseline_free) - self._weights_bytes
         experts = 0
         if is_offload_moe_strategy(config.moe_strategy) and (methods := offload_layer_methods(self.model)):
-            experts = _min_expert_cache_bytes(config, methods)
+            min_num_slots = min(mc.num_experts, mc.num_experts_per_tok * config.decode_rows_per_req)
+            experts = min_cache_bytes(method_rows(methods), config.moe_cache_scope, mc.num_experts, min_num_slots, _slot_limit(methods))
 
         def need(max_running_req: int) -> int:
             saved = config.max_running_req
@@ -1981,22 +1981,6 @@ def _slot_limit(layer_methods) -> int | None:
     """The tightest slot cap of the layers' expert kernels (a pool never mixes kernels, but the limit is checked per pool against the largest)."""
     limits = [limit for limit in (m.slot_limit() for m in layer_methods) if limit is not None]
     return min(limits) if limits else None
-
-
-def _min_expert_cache_bytes(config: EngineConfig, layer_methods) -> int:
-    """Bytes of the smallest expert cache --moe-cache-auto plans, from the kernels' bank layouts, before the banks load."""
-    roles = list(dict.fromkeys(role for m in layer_methods for role, spec in m.layout().items() if not spec.resident))
-
-    def row(method, role) -> int:
-        spec = method.layout().get(role)
-        return 0 if spec is None or spec.resident else math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
-
-    rows = [[row(m, role) for role in roles] for m in layer_methods]
-    slot = [sum(r) for r in rows]
-    num_experts = config.model_config.num_experts
-    min_num_slots = min(num_experts, config.model_config.num_experts_per_tok * config.decode_rows_per_req)
-    pools = make_pools(group_layers(config.moe_cache_scope, [tuple(r) for r in rows], slot), num_experts, min_num_slots, _slot_limit(layer_methods))
-    return stage_floor(rows, pools, num_experts) * -(-sum(slot) // len(slot))
 
 
 def _check_layer_formats(banks, layer_methods) -> None:

@@ -255,15 +255,14 @@ def test_mixed_layers_decode_and_prefill_through_their_pools():
 @cuda
 def test_the_planned_floor_is_the_fewest_slots_that_stage_a_layer():
     # the nvfp4 scale banks hold bytes that cannot stage bf16 weight rows, so the floor is per bank, not per slot
-    from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
-    from freetoken.engine.engine import _min_expert_cache_bytes
+    from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_bank_bytes, layer_slot_bytes
     from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
-    from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, split_slots, stage_floor
+    from freetoken.moe.pool_policy import group_layers, make_pools, method_rows, min_cache_bytes, pool_of_layer, split_slots, stage_floor
 
     device = torch.device("cuda")
     banks, methods = _mixed_banks(_pieces(), device)
     pools = make_pools(group_layers("unified", bank_layouts(banks.sources, banks.layer_tags), layer_slot_bytes(banks.sources)), E, TOPK, None)
-    rows = [[t[layer][0].numel() * t[layer].element_size() for t in banks.sources.values()] for layer in range(L)]
+    rows = layer_bank_bytes(banks.sources)
     # expert use that sends every slot past the minimums to the nvfp4 pool
     counts = torch.tensor([[0.0 if fmt == "bf16" else 1.0] * E for fmt in FORMATS])
     floor = stage_floor(rows, pools, E, counts)
@@ -280,8 +279,7 @@ def test_the_planned_floor_is_the_fewest_slots_that_stage_a_layer():
     with pytest.raises(ValueError, match="cannot stage one whole layer"):
         build(floor - 1)
     # the small-GPU plan prices the floor of the equal split from the kernels' layouts, before the banks load
-    config = SimpleNamespace(model_config=SimpleNamespace(num_experts=E, num_experts_per_tok=TOPK), decode_rows_per_req=1, moe_cache_scope="unified")
-    assert _min_expert_cache_bytes(config, methods) == stage_floor(rows, pools, E) * expert_bytes_per_slot(banks.sources)
+    assert min_cache_bytes(method_rows(methods), "unified", E, TOPK, None) == stage_floor(rows, pools, E) * expert_bytes_per_slot(banks.sources)
 
 
 @cuda
