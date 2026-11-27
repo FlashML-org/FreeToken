@@ -21,8 +21,6 @@ from .config import Inkling2Args
 
 _LLM = "model.llm."
 _LAYER = re.compile(r"model\.llm\.layers\.(\d+)\.(.+)")
-_EXPERT_SUFFIXES = ("w13_weight", "w13_weight_scale", "w13_weight_amax", "w13_weight_outer_scale_denominator",
-                    "w2_weight", "w2_weight_scale", "w2_weight_amax", "w2_weight_outer_scale_denominator")
 # checkpoint controller -> (model gate group, the group's controllers in order)
 _GATES = {
     "attn": ("attn_gates", ("attn", "k", "v")),
