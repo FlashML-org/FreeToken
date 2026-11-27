@@ -22,6 +22,8 @@ from freetoken.kernel.triton.inkling2 import (  # noqa: E402
     extend_attention,
     short_conv,
 )
+from freetoken.kernel.triton.kv_rows import store_kv_rows  # noqa: E402
+from freetoken.kvcache.format import KV_FORMATS  # noqa: E402
 
 DEV = "cuda"
 HQ, HKV, D, E = 24, 8, 128, 1024
@@ -47,21 +49,41 @@ def _ref_attention(q, k, v, gate, bias, sinks, q_pos, window):
     return (out.bfloat16().float() * torch.sigmoid(gate.float())).bfloat16()
 
 
-def _paged(S):
-    """K/V rows scattered over a larger pool through a shuffled slot list."""
+def _paged(S, kv_format="none"):
+    """K/V rows scattered over a larger pool through a shuffled slot list and stored in ``kv_format``:
+    ``(slots, k_cache, v_cache, the kernels' format arguments, the K / V rows they decode, the bf16 K / V rows)``."""
     pool = S + 37
     slots = torch.randperm(pool, device=DEV)[:S].int()
-    k_cache = torch.randn(pool, HKV, D, device=DEV).bfloat16()
-    v_cache = torch.randn(pool, HKV, D, device=DEV).bfloat16()
-    return slots, k_cache, v_cache
+    k = torch.randn(pool, HKV, D, device=DEV).bfloat16()
+    v = torch.randn(pool, HKV, D, device=DEV).bfloat16()
+    fmt = KV_FORMATS[kv_format]
+    if not fmt.quantized:
+        return slots, k, v, {}, k, v, k, v
+    k_cache, v_cache = (torch.zeros(pool, HKV, D, dtype=fmt.elem_store_dtype, device=DEV) for _ in range(2))
+    k_scale, v_scale = (torch.zeros(pool, HKV, 1, dtype=fmt.scale_store_dtype, device=DEV) for _ in range(2))
+    store_kv_rows(fmt, k.view(pool, -1), v.view(pool, -1), torch.arange(pool, device=DEV), k_cache, v_cache, k_scale, v_scale)
+
+    def decoded(codes, scale):
+        elems = codes.view(fmt.elem_dtype) if fmt.elem_dtype != codes.dtype else codes
+        return elems.float() * scale
+
+    quant = dict(kv_format=fmt, k_scale=k_scale, v_scale=v_scale)
+    return slots, k_cache, v_cache, quant, decoded(k_cache, k_scale), decoded(v_cache, v_scale), k, v
 
 
+@pytest.mark.parametrize("kv_format", ["none", "fp8_per_token_head", "int8_per_token_head"])
 @pytest.mark.parametrize("window", [None, 300])
-def test_extend_attention_over_a_cached_prefix(window):
+# a long prefix ends in keys past the bias extent; a long chunk also attends to its own keys past it
+@pytest.mark.parametrize("prefix, T", [(1100, 333), (200, 1500)])
+def test_extend_attention_over_a_cached_prefix(window, kv_format, prefix, T):
     torch.manual_seed(0)
-    prefix, T = 1100, 333
     S = prefix + T
-    slots, k_cache, v_cache = _paged(S)
+    slots, k_cache, v_cache, quant, k_rows, v_rows, k, v = _paged(S, kv_format)
+    # this chunk's own keys come from its K/V rows, only the prefix from the cache
+    chunk = slots[prefix:].long()
+    quant.update(k_extend=k[chunk], v_extend=v[chunk])
+    k_rows, v_rows = k_rows.float(), v_rows.float()
+    k_rows[chunk], v_rows[chunk] = k[chunk].float(), v[chunk].float()
     q = torch.randn(T, HQ, D, device=DEV).bfloat16()
     gate = torch.randn(T, HQ * D, device=DEV).bfloat16()
     bias = torch.randn(T, HQ, E, device=DEV).bfloat16()
@@ -72,28 +94,29 @@ def test_extend_attention_over_a_cached_prefix(window):
     for lo, hi in ((0, 200), (200, T)):
         extend_attention(
             q, k_cache, v_cache, gate, bias[lo:hi].contiguous(), sinks, torch.tensor([0, T], **i32), torch.tensor([0, S], **i32),
-            slots, torch.tensor([prefix], **i32), T, D**-0.5, window, E, out, row_lo=lo, row_hi=hi,
+            slots, torch.tensor([prefix], **i32), T, D**-0.5, window, E, out, row_lo=lo, row_hi=hi, **quant,
         )
-    want = _ref_attention(q, k_cache[slots.long()], v_cache[slots.long()], gate, bias, sinks, prefix + torch.arange(T, device=DEV), window)
+    want = _ref_attention(q, k_rows[slots.long()], v_rows[slots.long()], gate, bias, sinks, prefix + torch.arange(T, device=DEV), window)
     torch.testing.assert_close(out.float(), want.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("kv_format", ["none", "fp8_per_token_head", "int8_per_token_head"])
 @pytest.mark.parametrize("window", [None, 300])
-def test_decode_attention_splits_match_the_reference(window):
+def test_decode_attention_splits_match_the_reference(window, kv_format):
     torch.manual_seed(1)
     lens = [1, 290, 1500, 4000]
     B = len(lens)
-    slots, k_cache, v_cache = _paged(sum(lens))
+    slots, k_cache, v_cache, quant, k_rows, v_rows, _, _ = _paged(sum(lens), kv_format)
     indptr = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=DEV)
     q = torch.randn(B, HQ, D, device=DEV).bfloat16()
     gate = torch.randn(B, HQ * D, device=DEV).bfloat16()
     bias = torch.randn(B, HQ, E, device=DEV).bfloat16()
     sinks = torch.randn(B, HQ, device=DEV) + 6
     out = torch.empty(B, HQ * D, device=DEV, dtype=torch.bfloat16)
-    decode_attention(q, k_cache, v_cache, gate, bias, sinks, indptr, slots, D**-0.5, window, E, out)
+    decode_attention(q, k_cache, v_cache, gate, bias, sinks, indptr, slots, D**-0.5, window, E, out, **quant)
     for b, n in enumerate(lens):
         rows = slots[indptr[b] : indptr[b + 1]].long()
-        want = _ref_attention(q[b : b + 1], k_cache[rows], v_cache[rows], gate[b : b + 1], bias[b : b + 1], sinks[b : b + 1],
+        want = _ref_attention(q[b : b + 1], k_rows[rows], v_rows[rows], gate[b : b + 1], bias[b : b + 1], sinks[b : b + 1],
                               torch.tensor([n - 1], device=DEV), window)
         torch.testing.assert_close(out[b : b + 1].float(), want.float(), atol=2e-2, rtol=2e-2)
 

@@ -206,7 +206,9 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   `--moe-strategy fused` when the GPU holds that, since under `offload` every prefill streams the
   experts of all 48 layer visits over PCIe, and the context stays at `--kv-reserve-tokens` (8K) until
   every expert is cached. `reasoning_effort` takes `none` to `max` (default `high`); `none` does not
-  fully disable reasoning. `--tp` > 1, a quantized `--kv-cache-dtype` and speculative decoding are
+  fully disable reasoning. `--kv-cache-dtype fp8_per_token_head` or `int8_per_token_head` holds
+  1.9x the tokens of bf16 in the same budget, same GSM8K accuracy; on an RTX PRO 6000, decode is
+  +15% at 128K and prefill -2% at 32K, -8% to -12% at 128K. `--tp` > 1 and speculative decoding are
   refused at startup.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).
