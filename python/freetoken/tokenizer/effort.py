@@ -79,8 +79,9 @@ class EffortProfile:
     ``default`` is the supported name whose rendering is byte-identical to
     passing no effort at all. ``consumes_effort`` False means no probe round
     ever changed its output or raised -- the template ignores the knob, so
-    requests should not carry it. ``validates`` True means the probe observed a
-    rejection: only then is ``supported`` a real vocabulary rather than "this
+    requests should not carry it. ``validates`` True means the probe saw a known
+    name rejected, or a made-up name rejected by a template that reads the effort:
+    only then is ``supported`` a real vocabulary rather than "this
     template interpolates anything". ``strength_dialect`` True means the
     template reads the ``reasoning_strength`` spelling (muse-glimmer's family,
     whose documented ladder tops out at xhigh) rather than only
@@ -165,6 +166,8 @@ _PROBE_TOOLS = [
     }
 ]
 
+_UNKNOWN_EFFORT = "__freetoken_unknown_effort__"
+
 #: (extra chat_template_kwargs, tools) per probe round: templates read effort
 #: unconditionally, under tool-forced thinking, or only under an explicit
 #: thinking opt-in -- one round per shape.
@@ -189,6 +192,9 @@ def probe_effort_profile(
     matches_baseline: dict[str, bool] = {name: True for name in KNOWN_REASONING_EFFORTS}
     ran_rounds = 0
     integer_range = None
+    # a template that rejects a name off every scale checks its vocabulary, even when it
+    # accepts every known name (Inkling 2 grades all seven)
+    rejects_unknown = False
 
     for base_kwargs, tools in _PROBE_ROUNDS:
         try:
@@ -196,6 +202,10 @@ def probe_effort_profile(
         except Exception:  # noqa: BLE001 -- template rejects the probe shape, not the effort
             continue
         ran_rounds += 1
+        try:
+            render({**base_kwargs, "reasoning_effort": _UNKNOWN_EFFORT}, tools)
+        except Exception:  # noqa: BLE001 -- any raise means "not accepted"
+            rejects_unknown = True
         for name in KNOWN_REASONING_EFFORTS:
             try:
                 rendering = render({**base_kwargs, "reasoning_effort": name}, tools)
@@ -236,7 +246,7 @@ def probe_effort_profile(
         supported=supported,
         default=default,
         consumes_effort=consumes,
-        validates=bool(rejected),
+        validates=bool(rejected) or (consumes and rejects_unknown),
         strength_dialect=strength_dialect,
         integer_range=integer_range,
     )
@@ -292,6 +302,16 @@ def probe_thinking_profile(
         has_adaptive=has_adaptive,
         default_state=default_state,
     )
+
+
+def thinking_off_kwargs(chat_template_kwargs: dict[str, Any], profile: ThinkingProfile) -> dict[str, Any]:
+    """A thinking-off request (``enable_thinking`` False, no effort) on a template without a
+    thinking toggle renders its "none" effort gear when it has one (Inkling 2: level 0.0)."""
+    if chat_template_kwargs.get("enable_thinking") is not False or chat_template_kwargs.get("reasoning_effort") is not None:
+        return chat_template_kwargs
+    if profile.toggleable or "none" not in effective_efforts(profile.efforts):
+        return chat_template_kwargs
+    return {**chat_template_kwargs, "reasoning_effort": "none"}
 
 
 def _renderings_differ(a: Any, b: Any) -> bool:

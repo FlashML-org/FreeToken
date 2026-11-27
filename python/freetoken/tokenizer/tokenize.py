@@ -22,6 +22,7 @@ from .effort import (
     probe_effort_profile,
     probe_thinking_profile,
     quantize_effort,
+    thinking_off_kwargs,
 )
 from .inline_system import has_inline_system, normalize_inline_system, probe_inline_system
 
@@ -108,6 +109,8 @@ class TokenizeManager:
         if not isinstance(msg.text, list):
             return msg.text
         kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
+        if kwargs.get("enable_thinking") is False:
+            kwargs = thinking_off_kwargs(kwargs, self.thinking_profile())
         messages = msg.text
         if msg.inline_system_policy is not None:
             if msg.inline_system_policy not in ("auto", "preserve", "fold"):
