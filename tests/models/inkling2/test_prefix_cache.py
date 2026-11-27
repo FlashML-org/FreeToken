@@ -4,8 +4,9 @@ A hit reads the convolution inputs of the tokens before it and the window KV fro
 prefills the rest. When the cached prefix was itself prefilled, the continuation must be bitwise
 equal to a cold prefill chunked at the same point (the same forwards, nothing restored): a row kept
 for the wrong token, a row freed too early or a window freed too early all break that. A previous
-turn's output was decoded, and no prefill reproduces decoded KV bit for bit, so a hit there must give
-the same greedy continuation and first logits within the decode-vs-prefill noise.
+turn's output was decoded, and no prefill reproduces decoded KV bit for bit, so a hit there is held to
+the decode-vs-prefill noise of its first logits. A greedy continuation is not compared there, as any
+near tie may flip it.
 """
 from __future__ import annotations
 
@@ -177,8 +178,7 @@ def test_a_request_that_extends_another_requests_prompt_reuses_it(results):
 
 
 def _close_hit(row: dict) -> None:
-    assert row["tokens_equal"], row
-    # decoded vs prefilled KV moves the first logits by 0.8-1.6 here; a lost state restore by 5-9
+    # decoded vs prefilled KV moves the first logits by 0.8-1.9 here; a lost state restore by 5-9
     assert row["max_diff"] < 3.0, row
 
 
