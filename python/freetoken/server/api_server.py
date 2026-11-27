@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from starlette.datastructures import Headers
 
 from .args import ServerArgs
+from .generation import BACKEND_FAILED
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
@@ -332,6 +333,26 @@ class FrontendManager:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
 
+    def fail_inflight_requests(self, message: str) -> None:
+        """End every admitted request with ``message``; a dead worker never replies. Marshalled onto the loop like ``fail_pending_rebuilds``."""
+        loop = self._loop
+        if loop is None:
+            return
+
+        def _fail_all() -> None:
+            # stats too, not just ack_map: client-aborted requests still count as active until a terminal reply
+            for uid in set(self.ack_map) | set(self.stats.inflight_uids):
+                reply = UserReply(uid=uid, incremental_output="", finished=True, error=message, error_code=BACKEND_FAILED)
+                self.stats.observe(reply)
+                if uid in self.ack_map:
+                    self.ack_map[uid].append(reply)
+                    self.event_map[uid].set()
+
+        try:
+            loop.call_soon_threadsafe(_fail_all)
+        except RuntimeError:
+            pass
+
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
@@ -366,6 +387,9 @@ class FrontendManager:
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                yield f"data: {json.dumps({'error': ack.error, 'code': getattr(ack, 'error_code', None)})}\n\n".encode()
+                break
             if ack.incremental_output:
                 # SSE: JSON-encode (so a newline inside a token can't break the frame)
                 # and terminate every event with a blank line.
@@ -1091,6 +1115,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        _GLOBAL_STATE.fail_inflight_requests(message)
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:

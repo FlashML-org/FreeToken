@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from freetoken.server.api_server import FrontendManager, dispatch_rebuild
+from freetoken.server.stats import StatsTracker
 from freetoken.server.supervisor import (
     BackendHandle,
     LoadProgress,
@@ -220,6 +221,34 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
         assert (await asyncio.wait_for(flush_fut, timeout=5.0)).status == "failed"
         assert state.flush_futures == {}
         sup.join(timeout=1.0)
+
+    asyncio.run(_run())
+
+
+def test_a_worker_death_ends_the_inflight_generations():
+    """A dead scheduler never replies, and the orderly stop that follows waits for open
+    connections: every in-flight generation must end with the failure instead of waiting forever."""
+
+    async def _run():
+        stats = StatsTracker()
+        for uid in (7, 8):
+            stats.on_new_user(uid)
+        stats.on_abort(8)  # client already gone: no ack queue, still active until a terminal reply
+        state = SimpleNamespace(ack_map={7: []}, event_map={7: asyncio.Event()}, stats=stats,
+                                _loop=asyncio.get_running_loop())
+        acks = []
+
+        async def consume():
+            async for ack in FrontendManager.wait_for_ack(state, 7):
+                acks.append(ack)
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0)
+        threading.Thread(target=FrontendManager.fail_inflight_requests, args=(state, "scheduler exited")).start()
+        await asyncio.wait_for(task, timeout=5.0)
+        assert acks[-1].finished and acks[-1].error == "scheduler exited"
+        assert state.ack_map == {} and state.event_map == {}
+        assert stats.active == 0
 
     asyncio.run(_run())
 
