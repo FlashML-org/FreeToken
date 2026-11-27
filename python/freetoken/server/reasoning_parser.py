@@ -1037,8 +1037,8 @@ class Inkling2ReasoningParser(BaseReasoningParser):
         first = clone.parse_streaming_increment(text)
         rest = clone.flush()
         return ReasoningParseResult(
-            reasoning_text=(first.reasoning_text + rest.reasoning_text).strip(),
-            normal_text=(first.normal_text + rest.normal_text).strip(),
+            reasoning_text=first.reasoning_text + rest.reasoning_text,
+            normal_text=first.normal_text + rest.normal_text,
         )
 
     def parse_streaming_increment(self, new_text: str) -> ReasoningParseResult:
