@@ -40,6 +40,16 @@ def _kv_tile_gfx12_bf16(ptrs, mask, TRANSPOSE: tl.constexpr):
 
 
 @triton.jit
+def _kv_tile_gfx11_f16(ptrs, mask):
+    """E4M3FN codes as fp16 holding ``value / 256``, exact for every finite code; ``kv_row_scale(F16=True)`` restores the 256."""
+    codes = tl.load(ptrs, mask=mask, other=0).to(tl.uint16)
+    bits = ((codes & 0x80) << 8) | ((codes & 0x7F) << 7)
+    # keep the decode in the load layout: Triton otherwise repeats it for every dot-operand replica
+    bits = tl.inline_asm_elementwise("v_mov_b32 $0, $1", "=v,v", [bits], dtype=tl.uint16, is_pure=False, pack=2)
+    return bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
 def kv_tile(ptrs, mask, FMT: tl.constexpr):
     """One K or V tile in the dtype ``tl.dot`` takes."""
     if FMT == "none":
@@ -101,12 +111,14 @@ def kv_tile_staged(ptrs, mask, FMT: tl.constexpr):
 
 
 @triton.jit
-def kv_row_scale(ptrs, mask, FMT: tl.constexpr):
-    """Row scales of a tile; all ones without scales, so the caller's multiply folds away."""
+def kv_row_scale(ptrs, mask, FMT: tl.constexpr, F16: tl.constexpr = False):
+    """Row scales of a tile; all ones without scales, so the caller's multiply folds away. ``F16`` pairs with ``_kv_tile_gfx11_f16``."""
     if FMT == "none":
         scale = tl.full(mask.shape, 1.0, tl.float32)
     else:
         scale = tl.load(ptrs, mask=mask, other=0.0)
+        if F16:
+            scale = scale * 256.0
     return scale
 
 
