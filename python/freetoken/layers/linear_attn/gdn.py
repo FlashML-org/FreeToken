@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
+
+# A decode or verify step of up to this many rows takes the b|a projection inside the recurrence kernel when that
+# projection is its own bf16 linear (see GatedDeltaNet._ba_weight_in_kernel). FREETOKEN_GDN_BA_IN_KERNEL=0 launches it.
+_BA_IN_KERNEL = os.getenv("FREETOKEN_GDN_BA_IN_KERNEL", "1") != "0"
+_BA_IN_KERNEL_MAX_ROWS = 64
+_BA_SAID = False  # the b|a fold's one line a process
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -71,6 +82,8 @@ class GatedDeltaNet(BaseOP):
                 hidden_size, self._in_proj_split, has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
+        self._ba_weight: torch.Tensor | None | bool = False  # False until the first decode step decides
+        self._ba_off: str | None = None
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
@@ -133,6 +146,63 @@ class GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def _ba_weight_off(self, hidden: int) -> str | None:
+        """Why decode cannot take b and a inside the recurrence kernel, or None when it can: a separate b|a linear
+        (qkv|z quantized, b|a not) run by torch in bf16 without a bias, its weight [2 * num_v_heads, hidden], on
+        NVIDIA. Unsplit, b and a come out of the one input GEMM, with no launch of their own to save."""
+        if not self._split_in_proj:
+            return "b and a come out of the one input projection"
+        if not _BA_IN_KERNEL:
+            return "FREETOKEN_GDN_BA_IN_KERNEL=0"
+        from freetoken.kernel.backend import is_rocm
+        from freetoken.layers.quantization.linear.unquantized import TorchLinearKernel
+
+        layer = self.in_proj_ba
+        w = layer.weight
+        if layer.bias is not None:
+            return "the b|a projection has a bias"
+        if not isinstance(layer.quant_method.kernel, TorchLinearKernel):
+            return f"the b|a projection runs {type(layer.quant_method.kernel).__name__}, not the torch linear"
+        if is_rocm():
+            return "the GPU is not NVIDIA"
+        if not w.is_cuda:
+            return f"the b|a weight is on {w.device}"
+        if w.dtype != torch.bfloat16:
+            return f"the b|a weight is {w.dtype}"
+        if tuple(w.shape) != (2 * self.num_v_heads, hidden) or not w.is_contiguous():
+            return f"the b|a weight is not a contiguous ({2 * self.num_v_heads}, {hidden}) matrix (shape {tuple(w.shape)}, strides {w.stride()})"
+        return None
+
+    def _ba_weight_in_kernel(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """The b|a projection's weight when a decode or verify step of ``hidden_states`` takes b and a inside the
+        recurrence kernel (bf16 rows of unit inner stride, 1 to 64 of them), else None. b and a then differ from
+        F.linear's only in the summation order of each dot. The weight is decided at the first decode step, when the
+        weights are final, and again whenever in_proj_ba holds another weight tensor than the one decided on (a
+        captured CUDA graph keeps the pointer it captured either way). The first decision also logs, once a process,
+        whether decode-sized steps fold and why not (the step's own row count is left out, as CUDA-graph capture also
+        runs steps past the cap)."""
+        global _BA_SAID
+        if self._ba_weight is False or (self._ba_weight is not None and self._ba_weight is not self.in_proj_ba.weight):
+            self._ba_off = self._ba_weight_off(hidden_states.shape[1])
+            self._ba_weight = self.in_proj_ba.weight if self._ba_off is None else None
+        w = self._ba_weight
+        steps_off = None
+        if hidden_states.dtype != torch.bfloat16:
+            steps_off = f"the hidden states are {hidden_states.dtype}"
+        elif hidden_states.stride(1) != 1:
+            steps_off = "the hidden states' rows are not contiguous"
+        if not _BA_SAID:
+            _BA_SAID = True
+            off = self._ba_off if w is None else steps_off
+            if off is None:
+                logger.info_rank0("gdn b|a in the recurrence kernel on decode: on (no b|a launch for decode-sized steps)")
+            else:
+                logger.info_rank0(f"gdn b|a in the recurrence kernel on decode: off ({off})")
+        if w is None or steps_off is not None:
+            return None
+        rows = hidden_states.shape[0]
+        return w if 0 < rows <= _BA_IN_KERNEL_MAX_ROWS and hidden_states.shape[1] == w.shape[1] else None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -150,11 +220,14 @@ class GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device, pool)
             batch.fla_metadata = fla
 
+        ba_weight = None if batch.is_prefill else self._ba_weight_in_kernel(hidden_states)
         if self._split_in_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
-            ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            b = a = None  # the recurrence kernel takes them from hidden_states (ba_weight)
+            if ba_weight is None:
+                ba = self.in_proj_ba.forward(hidden_states)
+                b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
@@ -185,6 +258,7 @@ class GatedDeltaNet(BaseOP):
                 initial_state_indices=fla.cache_indices,  # already int32 (built int32 by build_fla_metadata)
                 scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
                 disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
+                ba_fold=None if ba_weight is None else (hidden_states, ba_weight),
             )[0]  # [total, num_v, V]
         else:
             from freetoken.kernel.fla import chunk_gated_delta_rule
