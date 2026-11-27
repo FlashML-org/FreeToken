@@ -37,12 +37,12 @@ class Inkling2MessageGates(BaseOP):
         H = args.hidden_size
         self.eps = args.rms_norm_eps
         self.down = torch.empty(num, args.gate_rank, 2 * H)
-        self.up = torch.empty(num, 2 * H, args.gate_rank, dtype=torch.float32)
+        self.up = torch.empty(num, 2 * H, args.gate_rank)
 
     def forward(self, x: torch.Tensor, m: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float) -> torch.Tensor:
         """``x`` / ``m`` ``[num, T, H]``; the gated rows, RMS-normalized with ``norm_weight`` ``[num, H]``, in bf16."""
         z = torch.bmm(gate_inputs(x, m, self.eps), self.down.transpose(1, 2))
-        forget_gain = torch.bmm(z.float(), self.up.transpose(1, 2))
+        forget_gain = torch.bmm(z, self.up.transpose(1, 2), out_dtype=torch.float32)
         return gate_combine(forget_gain, x, m, norm_weight=norm_weight, norm_eps=norm_eps, out_dtype=self.down.dtype)
 
     def forward_each(
@@ -54,7 +54,7 @@ class Inkling2MessageGates(BaseOP):
         for g in range(G):
             xg, mg = x(g), m(g)
             z = torch.bmm(gate_inputs(xg, mg, self.eps), self.down[g : g + 1].transpose(1, 2))
-            forget_gain = torch.bmm(z.float(), self.up[g : g + 1].transpose(1, 2))
+            forget_gain = torch.bmm(z, self.up[g : g + 1].transpose(1, 2), out_dtype=torch.float32)
             del z
             gate_combine(forget_gain, xg, mg, norm_weight=norm_weight[g : g + 1], norm_eps=norm_eps, out=out[g : g + 1])
             del xg, mg, forget_gain

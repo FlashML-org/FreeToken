@@ -177,7 +177,7 @@ def _layer_tensor(layer: int, leaf: str, name: str, get, args: Inkling2Args) -> 
             yield p + f"{group}.down", torch.stack([get(ctl + f"{m}.down_weight") for m in members])
         else:
             up = [torch.cat([get(ctl + f"{m}.forget_weight"), get(ctl + f"{m}.gain_weight")]) for m in members]
-            yield p + f"{group}.up", torch.stack(up).float()
+            yield p + f"{group}.up", torch.stack(up)
     else:
         raise ValueError(f"unexpected inkling2 tensor {name}")
 
