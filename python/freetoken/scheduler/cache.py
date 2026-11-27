@@ -219,7 +219,7 @@ class CacheManager:
             dst = r.mamba_ping_pong[r.mamba_next_track_idx]
             pool.copy_from(r.linear_slot_idx, dst)
             r.mamba_last_track_seqlen = a
-            r.mamba_next_track_idx = (r.mamba_next_track_idx + 1) % len(r.mamba_ping_pong)
+            r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
 
     def maybe_free_swa_out_of_window(self, reqs: List[Req]) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
