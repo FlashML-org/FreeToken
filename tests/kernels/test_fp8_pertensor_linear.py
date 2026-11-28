@@ -53,8 +53,9 @@ def _dequant(w8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     (5120, [12288, 1024, 1024]),
     (1024, [6144]),
     (6112, [512, 128]),
+    (6144, [2560]),
 ])
-def test_w8a16_matches_dequant_reference(M: int, K: int, part_rows: list[int]):
+def test_w8a16_matches_dequant_reference(M: int, K: int, part_rows: list[int], monkeypatch):
     """Without an ``input_scale`` every M stays on the W8A16 kernels, activation exact."""
     from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
 
@@ -64,6 +65,14 @@ def test_w8a16_matches_dequant_reference(M: int, K: int, part_rows: list[int]):
     y_ref = (x.float() @ _dequant(w8, scale).t()).to(torch.bfloat16)
     rel = (y.float() - y_ref.float()).abs().max() / y_ref.float().abs().max().clamp(min=1e-6)
     assert rel.item() < 2e-2, rel.item()
+    if M == 4 and K == 6144 and sum(part_rows) == 2560:
+        import freetoken.kernel.triton.fp8_pertensor_linear as mod
+
+        # Decode rounding changes can amplify through MoE routing.
+        with monkeypatch.context() as patch:
+            patch.setattr(mod, "get_rocm_gfx_arch", lambda: None)
+            original = mod.fp8_pertensor_linear(x, w8, scale)
+        assert torch.equal(y.view(torch.uint8), original.view(torch.uint8))
 
 
 @pytest.mark.skipif(not e4m3_native(), reason="torch._scaled_mm needs sm_89+")
