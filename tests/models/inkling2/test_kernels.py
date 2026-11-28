@@ -17,6 +17,7 @@ from freetoken.kernel.triton.inkling2 import (  # noqa: E402
     EPI_L2_CLIP,
     EPI_RESIDUAL,
     EPI_RMS_NORM,
+    _decode_split_caps,
     attn_res,
     decode_attention,
     extend_attention,
@@ -142,6 +143,15 @@ def test_extend_attention_batches_requests(window, kv_format, splits):
         torch.testing.assert_close(out[lo:hi].float(), want.float(), atol=2e-2, rtol=2e-2)
 
 
+def _two_round_pairs():
+    """Fewest [33, 600] pairs to add to the 4-request decode batch so long full-layer requests take a second round of splits."""
+    for n in range(1, 256):
+        cap, short = _decode_split_caps(4 + 2 * n, HKV, None, torch.cuda.current_device())
+        if cap > short:
+            return n
+    raise AssertionError("no batch width takes two rounds of splits on this GPU")
+
+
 @pytest.mark.parametrize("kv_format", ["none", "fp8_per_token_head", "int8_per_token_head"])
 @pytest.mark.parametrize("window", [None, 300])
 @pytest.mark.parametrize("wide", [False, True])
@@ -149,8 +159,7 @@ def test_decode_attention_splits_match_the_reference(window, kv_format, wide):
     torch.manual_seed(1)
     lens = [1, 290, 1500, 4000]
     if wide:
-        # a batch wide enough that long requests take a second round of splits
-        lens += [33, 600] * (3 * torch.cuda.get_device_properties(DEV).multi_processor_count // 64)
+        lens += [33, 600] * _two_round_pairs()
     B = len(lens)
     slots, k_cache, v_cache, quant, k_rows, v_rows, _, _ = _paged(sum(lens), kv_format)
     indptr = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=DEV)
