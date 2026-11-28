@@ -40,6 +40,7 @@ std::unique_ptr<MoeFormat> make_nvfp4_format(const MoeParams& p, const FormatArg
 std::unique_ptr<MoeFormat> make_mxfp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_ds_fp4_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_fp8_block_format(const MoeParams& p, const FormatArgs& a);
+std::unique_ptr<MoeFormat> make_mxfp8_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_gguf_format(const MoeParams& p, const FormatArgs& a);
 std::unique_ptr<MoeFormat> make_gguf_scaled_format(const MoeParams& p, const FormatArgs& a);
 void set_ggml_cpu(uintptr_t addr);
@@ -73,7 +74,7 @@ inline MoeTask from_word(uint64_t w) {
 const std::pair<const char*, std::unique_ptr<MoeFormat> (*)(const MoeParams&, const FormatArgs&)> kFormats[] = {
     {"bf16", make_bf16_format},     {"nvfp4", make_nvfp4_format},         {"mxfp4_triton", make_mxfp4_format},
     {"ds_fp4", make_ds_fp4_format}, {"fp8_block", make_fp8_block_format}, {"gguf", make_gguf_format},
-    {"gguf_scaled", make_gguf_scaled_format},
+    {"gguf_scaled", make_gguf_scaled_format}, {"mxfp8", make_mxfp8_format},
 };
 
 std::unique_ptr<MoeFormat> make_format(const std::string& name, const MoeParams& p, const FormatArgs& a) {

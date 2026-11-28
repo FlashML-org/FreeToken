@@ -210,25 +210,36 @@ def _raw_config_json(model_path: str) -> dict:
 
 
 def sidecar_quantization_config(model_path: str) -> dict | None:
-    """The ``quantization_config`` an old ModelOpt export keeps only in ``hf_quant_config.json``, or None."""
+    """The ``quantization_config`` kept in ``hf_quant_config.json``: the whole file when it names its own
+    ``quant_method`` (Inkling 2), an old ModelOpt export's ``quantization`` section, or None."""
     sidecar = optional_hf_file(model_path, "hf_quant_config.json")
     if sidecar is None:
         return None
     with open(sidecar, encoding="utf-8") as f:
-        quant = json.load(f).get("quantization")
+        data = json.load(f)
+    if isinstance(data.get("quant_method"), str):
+        return data
+    quant = data.get("quantization")
     if not isinstance(quant, dict):
         return None
     return {"quant_method": "modelopt", **quant}
 
 
-def _merge_sidecar_quantization_config(config: Any, model_path: str) -> None:
-    # config.json wins when it has one; the sidecar is only read for exports that never wrote it there
-    if getattr(config, "quantization_config", None) is not None:
-        return
-    if getattr(getattr(config, "text_config", None), "quantization_config", None) is not None:
-        return
+def merged_quantization_config(own: Any, model_path: str) -> Any:
+    """config.json's ``quantization_config`` ``own`` with the sidecar applied: a sidecar that names its own
+    ``quant_method`` replaces ``own`` (config.json then holds only a stub); an old ModelOpt one fills in a missing ``own``."""
     quant = sidecar_quantization_config(model_path)
-    if quant is None:
+    if quant is None or (own is not None and quant["quant_method"] == "modelopt"):
+        return own
+    return quant
+
+
+def _merge_sidecar_quantization_config(config: Any, model_path: str) -> None:
+    own = getattr(config, "quantization_config", None)
+    if own is None:
+        own = getattr(getattr(config, "text_config", None), "quantization_config", None)
+    quant = merged_quantization_config(own, model_path)
+    if quant is own:
         return
     if isinstance(config, RawConfigShim):
         config._data["quantization_config"] = quant

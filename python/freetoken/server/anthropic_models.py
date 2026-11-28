@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class AnthropicError(BaseModel):
@@ -67,6 +67,14 @@ class AnthropicTool(BaseModel):
     name: str
     description: str | None = None
     input_schema: dict[str, Any]
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_anthropic_defined_tools(cls, v):
+        # Anthropic-defined tools (web_search_*, bash_*, text_editor_*, ...) have a versioned type and no input_schema: name the type, not the missing field.
+        if isinstance(v, dict) and "input_schema" not in v and v.get("type") not in (None, "custom"):
+            raise ValueError(f"tool type {v['type']!r} is not supported; only custom tools with an input_schema are")
+        return v
 
     @field_validator("input_schema")
     @classmethod

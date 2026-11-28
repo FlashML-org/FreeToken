@@ -3,13 +3,18 @@ from __future__ import annotations
 
 import pytest
 
+from freetoken.core import SamplingParams
+from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import (
     EFFORT_SCALE,
     EffortProfile,
     KNOWN_REASONING_EFFORTS,
     probe_effort_profile,
+    probe_thinking_profile,
     quantize_effort,
+    thinking_off_kwargs,
 )
+from freetoken.tokenizer.tokenize import TokenizeManager
 
 QWEN38 = EffortProfile(
     supported=frozenset({"xhigh", "medium", "low"}), default="xhigh", consumes_effort=True
@@ -122,6 +127,54 @@ def test_probe_marks_an_interpolating_template_as_not_validating():
     profile = probe_effort_profile(lambda kwargs, tools: f"p|{kwargs.get('reasoning_effort')}")
     assert profile.consumes_effort
     assert not profile.validates
+
+
+def _inkling2_render(kwargs, tools):
+    # Inkling 2's template: every known name maps onto a numeric level (default high, 0.9),
+    # floats in [0, 0.99] pass through, any other string raises.
+    levels = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99}
+    effort = kwargs.get("reasoning_effort")
+    if effort is None:
+        effort = 0.9
+    if isinstance(effort, str):
+        if effort not in levels:
+            raise ValueError(f"Unknown reasoning_effort: {effort}")
+        effort = levels[effort]
+    return f"Thinking effort level: {effort}|tools={bool(tools)}"
+
+
+def test_probe_serves_every_gear_of_a_template_that_rejects_unknown_names():
+    profile = probe_effort_profile(_inkling2_render)
+    assert profile.validates
+    for name in KNOWN_REASONING_EFFORTS:
+        assert quantize_effort(name, profile) == name
+
+
+def test_thinking_off_renders_the_none_gear_only_without_a_toggle():
+    off = {"enable_thinking": False, "thinking_mode": "disabled"}
+    inkling = probe_thinking_profile(_inkling2_render, probe_effort_profile(_inkling2_render))
+    assert _inkling2_render(thinking_off_kwargs(off, inkling), None) == _inkling2_render({"reasoning_effort": 0.0}, None)
+
+    def toggled(kwargs, tools):  # same gears, plus a thinking switch the template honors
+        return f"{_inkling2_render(kwargs, tools)}|think={kwargs.get('enable_thinking', True)}"
+
+    profile = probe_thinking_profile(toggled, probe_effort_profile(toggled))
+    assert thinking_off_kwargs(off, profile) == off
+
+
+class _Inkling2Tokenizer:
+    chat_template = "inkling-shaped"
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
+        return _inkling2_render(kwargs, kwargs.get("tools"))
+
+
+def test_render_prompt_renders_thinking_off_as_the_none_gear():
+    manager = TokenizeManager(_Inkling2Tokenizer())
+    messages = [{"role": "user", "content": "hi"}]
+    for kwargs in ({"enable_thinking": False}, {"enable_thinking": False, "reasoning_effort": None}):
+        msg = TokenizeMsg(uid=0, text=messages, sampling_params=SamplingParams(), chat_template_kwargs=kwargs)
+        assert manager.render_prompt(msg) == _inkling2_render({"reasoning_effort": 0.0}, None), kwargs
 
 
 def test_probe_skips_rounds_whose_baseline_fails():

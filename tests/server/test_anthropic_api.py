@@ -872,6 +872,11 @@ def test_validation_error_uses_anthropic_envelope():
     r = client.post("/v1/messages", json={"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
+    # Claude Code's WebSearch: an Anthropic server tool, no input_schema
+    r = client.post("/v1/messages", json={"model": "claude-x", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}],
+                                          "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]})
+    assert r.status_code == 400
+    assert "tool type 'web_search_20250305' is not supported" in r.json()["error"]["message"]
     # non-Anthropic routes keep FastAPI's default 422 shape
     r = client.post("/v1/chat/completions", json={})
     assert r.status_code == 422

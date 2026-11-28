@@ -28,7 +28,7 @@ from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks,
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
-from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
+from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots, stage_floor
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -833,7 +833,8 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None, slot_sources=None) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None, slot_sources=None,
+                                     min_slots=0) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
@@ -848,13 +849,15 @@ class Engine:
         cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
+        per_expert_bytes = expert_bytes_per_slot(banks.sources if slot_sources is None else slot_sources)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources if slot_sources is None else slot_sources),
+            per_expert_bytes=per_expert_bytes,
+            min_slots=min_slots,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
@@ -937,7 +940,7 @@ class Engine:
         if probe:
             cpu_layer_ids = probed
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
+        from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_bank_bytes, layer_slot_bytes
 
         source_runs, slot_sources = self.split_experts.slot_rows(config, method, banks) if self.split_experts else (None, banks.sources)
         self._moe_layer_slot_bytes = layer_slot_bytes(slot_sources)
@@ -965,7 +968,11 @@ class Engine:
         pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap, slot_sources=slot_sources)
+            # experts of several formats: the cache must still stage one whole layer of each through the shared bank bytes
+            floor = stage_floor(layer_bank_bytes(slot_sources), pools, config.model_config.num_experts, self._moe_expert_counts)
+            size, pages, overlap = self._resolve_auto_moe_cache_size(
+                config, banks, method, max_slots=size_cap, slot_sources=slot_sources, min_slots=floor
+            )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -1040,6 +1047,7 @@ class Engine:
             max_slots=max_slots,
             pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
             pool_sizes=pool_sizes,
+            layer_order=config.model_config.moe_layer_order or None,
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
@@ -1630,7 +1638,7 @@ def _is_unified_memory_gpu(index: "int | None" = None) -> bool:
         return False
 
 
-_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "nvfp4", "gguf")
+_RESIDENT_EXPERT_QUANTS = ("none", "fp8_block", "mxfp8", "nvfp4", "gguf")
 
 
 def _fused_resident_ok(model_config) -> bool:
@@ -2068,6 +2076,8 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    if getattr(config, "swa_full_tokens_ratio", 0.2) is None:
+        override("swa_full_tokens_ratio", getattr(model_config, "swa_full_tokens_ratio", None) or 0.2)
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     is_dsv41 = getattr(model_config, "dsv41_args", None) is not None

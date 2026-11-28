@@ -125,12 +125,15 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
     assert calls["topk_ids"].tolist() == [[2, 1]]
 
 
-def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):
+# a looped model runs layers 1-2 twice: each call stages the next call's layer, not the next layer id
+@pytest.mark.parametrize("order", [None, (0, 1, 2, 1, 2, 3)])
+def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch, order):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    num_layers = 3
+    num_layers = 4
     num_experts = 4
+    calls = order or tuple(range(num_layers))
     layers = [_bf16_offload_layer(layer_id, num_experts, 2, 8, 16) for layer_id in range(num_layers)]
     cache = OffloadMoeCache(
         num_layers=num_layers,
@@ -138,6 +141,7 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
         cache_size=8,
         device=torch.device("cpu"),
         prefill_overlap=True,
+        layer_order=order,
     )
     gate_up_source = list(torch.arange(num_layers * num_experts * 32 * 8, dtype=torch.float32).reshape(
         num_layers * num_experts, 32, 8
@@ -188,6 +192,7 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
                 "w2": w2.clone(),
                 "topk_weights": got_topk_weights,
                 "topk_ids": got_topk_ids.clone(),
+                "staged": list(cache._prefill_buffer_layer),
             }
         )
         return hidden_states + layer_id
@@ -195,20 +200,24 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
     monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
 
     out = hidden_states
-    for layer in layers:
-        out = layer.prefill_forward(out, router_logits)
+    for _ in range(2):  # a second forward restarts the order
+        fused_calls.clear()
+        out = hidden_states
+        for layer_id in calls:
+            out = layers[layer_id].prefill_forward(out, router_logits)
 
-    assert torch.allclose(out, hidden_states + 3)
-    for layer_id in range(num_layers):
-        assert fused_calls[layer_id]["topk_weights"] is topk_weights
-        assert fused_calls[layer_id]["topk_ids"].tolist() == [[2, 1]]
-        assert torch.equal(fused_calls[layer_id]["w1"], gate_up_source[layer_id])
-        assert torch.equal(fused_calls[layer_id]["w2"], down_source[layer_id])
-
-    assert fused_calls[0]["w1_ptr"] == fused_calls[2]["w1_ptr"]
-    assert fused_calls[0]["w2_ptr"] == fused_calls[2]["w2_ptr"]
-    assert fused_calls[0]["w1_ptr"] != fused_calls[1]["w1_ptr"]
-    assert fused_calls[0]["w2_ptr"] != fused_calls[1]["w2_ptr"]
+        assert torch.allclose(out, hidden_states + sum(range(len(calls))))
+        for step, layer_id in enumerate(calls):
+            assert fused_calls[step]["topk_weights"] is topk_weights
+            assert fused_calls[step]["topk_ids"].tolist() == [[2, 1]]
+            assert torch.equal(fused_calls[step]["w1"], gate_up_source[layer_id])
+            assert torch.equal(fused_calls[step]["w2"], down_source[layer_id])
+        for step in range(len(calls) - 1):
+            assert fused_calls[step]["staged"][(step + 1) % 2] == calls[step + 1]  # staged while this call computes
+            assert fused_calls[step]["w1_ptr"] != fused_calls[step + 1]["w1_ptr"]
+            assert fused_calls[step]["w2_ptr"] != fused_calls[step + 1]["w2_ptr"]
+        assert fused_calls[0]["w1_ptr"] == fused_calls[2]["w1_ptr"]
+        assert fused_calls[0]["w2_ptr"] == fused_calls[2]["w2_ptr"]
     prefill_gate_up_buffer, prefill_down_buffer = cache.stage_views(0, 0)
     assert prefill_gate_up_buffer.data_ptr() == cache.bank_caches["gate_up"].data_ptr()
     assert prefill_down_buffer.data_ptr() == cache.bank_caches["down"].data_ptr()

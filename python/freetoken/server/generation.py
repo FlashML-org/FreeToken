@@ -44,6 +44,10 @@ from .reasoning_parser import (
 )
 
 
+#: ``UserReply.error_code`` of the replies that end in-flight requests after a backend worker death.
+BACKEND_FAILED = "backend_failed"
+
+
 class GenerationError(ValueError):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
     chat template the tokenizer cannot render, or a prompt that exceeds the KV budget). Each
@@ -56,6 +60,10 @@ class GenerationError(ValueError):
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
         self.code = code
+
+    @property
+    def server_fault(self) -> bool:
+        return self.code == BACKEND_FAILED
 
 
 # --------------------------------------------------------------------------- #

@@ -101,6 +101,8 @@ class Req:
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
+    # SWA window states (tier 2, ...): per tier, the [lo, hi) position spans of this request's own live rows
+    state_live: tuple = ()
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
     # length just after that token (its index + 1). A client-side rewrite of the echoed tool

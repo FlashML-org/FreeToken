@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import ClassVar, Sequence
 
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.config import KVCacheGroupSpec
+from freetoken.models.config import KVCacheGroupSpec, WindowStateSpec
 from freetoken.utils import align_ceil, div_even
 
 from .base import BaseKVCachePool, WindowPoolSpec
@@ -29,6 +30,21 @@ class _KVGroupStorage:
     dtype: torch.dtype
 
 
+@dataclass
+class _StateTier:
+    """One window state's rows, reached from a full slot like the SWA KV; row 0 is the "no row" sentinel."""
+
+    spec: WindowStateSpec
+    rows: torch.Tensor     # [layers, num_rows, *shape]
+    mapping: torch.Tensor  # full slot -> row, 0 = none
+    free: torch.Tensor
+
+
+def ordered_window_states(model_config) -> tuple[WindowStateSpec, ...]:
+    """The model's window states longest window first: tier 2, 3, ... of the SWA radix tree."""
+    return tuple(sorted(model_config.window_states, key=lambda spec: -spec.window))
+
+
 class HybridSWAKVCache(BaseKVCachePool):
     """SGLang-style wrapper for hybrid full/SWA attention KV storage."""
 
@@ -44,6 +60,8 @@ class HybridSWAKVCache(BaseKVCachePool):
         device: torch.device,
         num_swa_tokens: int | None = None,
         kv_format: KVFormat = NONE,
+        window_states: Sequence[WindowStateSpec] = (),
+        num_state_rows: Sequence[int] = (),
     ) -> None:
         self.kv_format = kv_format
         specs = {group.name: group for group in groups if group.num_layers > 0}
@@ -90,6 +108,12 @@ class HybridSWAKVCache(BaseKVCachePool):
         self._shared_layers = frozenset(layer_id for spec in specs.values() for layer_id, _ in spec.shared_layers)
         if self._swa_paged:
             self._init_swa_paged_state()
+        self.window_states = tuple(window_states)
+        assert len(num_state_rows) == len(self.window_states), "one row count per window state"
+        assert not self.window_states or page_size == 1, "window states are per token"
+        assert all(a.window > b.window for a, b in zip(self.window_states, self.window_states[1:]))
+        self._state_tiers: list[_StateTier] = []
+        self._alloc_state_tiers(num_state_rows)
 
     @staticmethod
     def _allocate_group(
@@ -195,6 +219,62 @@ class HybridSWAKVCache(BaseKVCachePool):
 
     def swa_available_size(self) -> int:
         return int(self._swa_free.numel())
+
+    # ---- window states: tier 2, 3, ... of the SWA radix (tier 1 is the SWA KV above) ----
+
+    def _alloc_state_tiers(self, num_state_rows: Sequence[int]) -> None:
+        n, dev = self._full_num_tokens, self._device
+        self._state_tiers = []
+        for spec, num_rows in zip(self.window_states, num_state_rows):
+            self._state_tiers.append(_StateTier(
+                spec=spec,
+                rows=torch.zeros((len(spec.layer_ids), num_rows, *spec.shape), dtype=spec.dtype or self._dtype, device=dev),
+                mapping=torch.zeros(n + self._page_size, dtype=torch.int64, device=dev),
+                free=torch.arange(1, num_rows, dtype=torch.int32, device=dev),
+            ))
+
+    def _tier(self, level: int) -> _StateTier:
+        assert level >= 2, "tier 1 is the SWA KV (alloc_swa / free_swa)"
+        return self._state_tiers[level - 2]
+
+    def alloc_window(self, level: int, full_indices: torch.Tensor) -> None:
+        """Give each full slot a row of tier ``level`` (1 = the SWA KV); the caller checks ``window_available_size`` first."""
+        if level == 1:
+            return self.alloc_swa(full_indices)
+        tier = self._tier(level)
+        n = int(full_indices.numel())
+        if n == 0:
+            return
+        if n > tier.free.numel():
+            raise RuntimeError(f"{tier.spec.name} rows exhausted: need {n}, have {int(tier.free.numel())}")
+        tier.mapping[full_indices.to(torch.int64)] = tier.free[:n].to(torch.int64)
+        tier.free = tier.free[n:]
+
+    def free_window(self, level: int, full_indices: torch.Tensor) -> None:
+        """Return the tier-``level`` rows behind ``full_indices``; idempotent over the sentinel."""
+        if level == 1:
+            return self.free_swa(full_indices)
+        if full_indices.numel() == 0:
+            return
+        tier = self._tier(level)
+        fi = full_indices.to(torch.int64)
+        rows = tier.mapping[fi]
+        rows = rows[rows > 0]
+        if rows.numel():
+            tier.free = torch.cat([tier.free, rows.to(torch.int32)])
+        tier.mapping[fi] = 0
+
+    def window_available_size(self, level: int) -> int:
+        return self.swa_available_size() if level == 1 else int(self._tier(level).free.numel())
+
+    def window_capacity(self, level: int) -> int:
+        """Allocatable rows of tier ``level`` (the sentinel excluded)."""
+        return (self._swa_num_tokens if level == 1 else int(self._tier(level).rows.shape[1])) - 1
+
+    def state_rows(self, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(rows [layers, num_rows, *shape], full slot -> row mapping)`` of window state ``name``."""
+        tier = next(t for t in self._state_tiers if t.spec.name == name)
+        return tier.rows, tier.mapping
 
     @property
     def swa_paged(self) -> bool:
@@ -309,7 +389,8 @@ class HybridSWAKVCache(BaseKVCachePool):
             dtype=dtype,
         )
 
-    def rebuild(self, num_full_pages: int, num_swa_tokens: int | None = None) -> None:
+    def rebuild(self, num_full_pages: int, num_swa_tokens: int | None = None,
+                num_state_rows: Sequence[int] = ()) -> None:
         """Reallocate both group buffers IN PLACE for new sizes.
 
         ``page_size`` (the full group's inner dim) and group geometry are read from the
@@ -327,6 +408,8 @@ class HybridSWAKVCache(BaseKVCachePool):
         self.full_kv_pool = None
         self.swa_kv_pool = None
         self._storages = {}
+        assert len(num_state_rows) == len(self.window_states), "one row count per window state"
+        self._state_tiers = []
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
@@ -338,6 +421,7 @@ class HybridSWAKVCache(BaseKVCachePool):
             # geometry, atomic with the buffer realloc. The fresh empty SWA radix tree built
             # by CacheManager.rebuild is then consistent by construction (idle-only).
             self._init_swa_paged_state()
+        self._alloc_state_tiers(num_state_rows)
 
     @classmethod
     def window_spec(cls, config) -> WindowPoolSpec | None:
@@ -382,19 +466,32 @@ class HybridSWAKVCache(BaseKVCachePool):
             else:
                 cache_per_page += int(per_token * config.page_size * config.swa_full_tokens_ratio)
                 fixed_cache_size += per_token * _swa_pool_floor(config)  # concurrency floor
+        for spec in ordered_window_states(config.model_config):
+            per_row = _state_row_bytes(config, spec)
+            cache_per_page += 8 * config.page_size  # full slot -> row mapping
+            if config.cache_type != "swa_radix":
+                fixed_cache_size += per_row * _naive_state_num_rows(config, spec)
+            elif swa_pin is not None:
+                fixed_cache_size += per_row * _state_num_rows(config, spec, max(_swa_pool_floor(config), int(swa_pin)) + 1)
+            else:
+                # bounds _state_num_rows over max(floor, ratio x full), as the window pool above does
+                frac = _state_window_share(config, spec)
+                cache_per_page += int(per_row * config.page_size * config.swa_full_tokens_ratio * frac)
+                fixed_cache_size += per_row * (_state_per_req_floor(config, spec) * config.max_running_req
+                                               + math.ceil(frac * _swa_pool_floor(config)) + 2)
         return cache_per_page, fixed_cache_size, config.page_size, 0
 
     def rebuild_from_config(
         self, config, num_pages: int, *, num_swa_pages: int | None = None
     ) -> None:
         # radix sizes the window by ratio (cross-request reuse), naive by concurrency x window.
-        num_swa_tokens = (
-            _swa_paged_num_tokens(config, num_pages + 1, num_swa_pages=num_swa_pages)
-            if config.cache_type == "swa_radix"
-            else _naive_swa_num_tokens(config)
-        )
+        if config.cache_type == "swa_radix":
+            num_swa_tokens = _swa_paged_num_tokens(config, num_pages + 1, num_swa_pages=num_swa_pages)
+        else:
+            num_swa_tokens = _naive_swa_num_tokens(config)
         # +1 for the dummy page (matches create_kvcache_pool)
-        self.rebuild(num_full_pages=num_pages + 1, num_swa_tokens=num_swa_tokens)
+        self.rebuild(num_full_pages=num_pages + 1, num_swa_tokens=num_swa_tokens,
+                     num_state_rows=state_num_rows(config, num_swa_tokens))
 
     def unit_bytes(self) -> tuple[int, int]:
         def group_bytes(group: _KVGroupStorage) -> int:
@@ -404,7 +501,10 @@ class HybridSWAKVCache(BaseKVCachePool):
 
         full = self.full_kv_pool.buffer
         full_tokens = int(full.shape[2]) * int(full.shape[3])
-        return group_bytes(self.full_kv_pool) // full_tokens, group_bytes(self.swa_kv_pool) // self._swa_num_tokens
+        swa = group_bytes(self.swa_kv_pool) // self._swa_num_tokens
+        # the window-state rows grow with the window pool (kv_cost)
+        swa += sum(int(t.rows.numel() * t.rows.element_size()) for t in self._state_tiers) // self._swa_num_tokens
+        return group_bytes(self.full_kv_pool) // full_tokens, swa
 
 
 # ---- SWA pool sizing (pure arithmetic; the pool family's geometry formulas) ----
@@ -431,15 +531,21 @@ def _swa_per_req_swa_floor(config) -> int:
         rows;
 
     Neither is reachable by evict_swa, so the pool must hold both for every running request."""
-    from freetoken.scheduler.cache import _SWA_EVICTION_INTERVAL, _SWA_RETAIN_GAP
+    from freetoken.scheduler.cache import _SWA_EVICTION_INTERVAL
 
     window = next(g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa)
+    return _per_req_floor(config, window, _SWA_EVICTION_INTERVAL)
+
+
+def _per_req_floor(config, window: int, interval: int) -> int:
+    from freetoken.scheduler.cache import _SWA_RETAIN_GAP
+
     ps = config.page_size
     locked = ((window + _SWA_RETAIN_GAP + ps - 1) // ps) * ps
     rows = getattr(config, "decode_rows_per_req", 1)
-    floor = locked + window + _SWA_EVICTION_INTERVAL * rows + rows + 2 * ps
+    floor = locked + window + interval * rows + rows + 2 * ps
     if getattr(config, "special_token_ckpt", False):
-        floor += window + _SWA_RETAIN_GAP + _SWA_EVICTION_INTERVAL * rows
+        floor += window + _SWA_RETAIN_GAP + interval * rows
     return floor
 
 
@@ -449,6 +555,45 @@ def _swa_pool_floor(config) -> int:
     reserves the decode growth of the requests already running, so a full batch can drive the
     pool to zero -- and the alloc_swa that then raises has no handler above it."""
     return config.max_running_req * _swa_per_req_swa_floor(config)
+
+
+def _state_per_req_floor(config, spec: WindowStateSpec) -> int:
+    """One request's non-evictable rows of a window state, as _swa_per_req_swa_floor for the KV."""
+    from freetoken.scheduler.cache import _STATE_EVICTION_INTERVAL
+
+    return _per_req_floor(config, spec.window, _STATE_EVICTION_INTERVAL)
+
+
+def _state_window_share(config, spec: WindowStateSpec) -> float:
+    """Rows of the state per window-pool token: a cached resume point keeps window + retain gap of each."""
+    from freetoken.scheduler.cache import _SWA_RETAIN_GAP
+
+    window = config.model_config.swa_attention_group().sliding_window
+    return (spec.window + _SWA_RETAIN_GAP) / (window + _SWA_RETAIN_GAP)
+
+
+def _state_row_bytes(config, spec: WindowStateSpec) -> int:
+    item = torch.empty((), dtype=spec.dtype or config.dtype).element_size()
+    return len(spec.layer_ids) * math.prod(spec.shape) * item
+
+
+def _state_num_rows(config, spec: WindowStateSpec, num_swa_tokens: int) -> int:
+    """Radix: the running requests' floor + as many cached resume points as the window pool holds (+1 sentinel)."""
+    floor = _state_per_req_floor(config, spec) * config.max_running_req
+    return floor + math.ceil(_state_window_share(config, spec) * (num_swa_tokens - 1)) + 1
+
+
+def _naive_state_num_rows(config, spec: WindowStateSpec) -> int:
+    return (config.max_running_req + 1) * _state_per_req_floor(config, spec) + 1
+
+
+def state_num_rows(config, num_swa_tokens: int) -> tuple[int, ...]:
+    """Row counts of the model's window states, in ``ordered_window_states`` order."""
+    radix = config.cache_type == "swa_radix"
+    return tuple(
+        _state_num_rows(config, spec, num_swa_tokens) if radix else _naive_state_num_rows(config, spec)
+        for spec in ordered_window_states(config.model_config)
+    )
 
 
 def _swa_paged_num_tokens(config, num_full_pages: int, num_swa_pages: int | None = None) -> int:

@@ -105,6 +105,9 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             banks["gate_up_global"] = 2 * I * 4
             banks["down_global"] = H * 4
         return banks
+    if fmt == "mxfp8":
+        # layers/quantization/moe/mxfp8.py: fp8-e4m3 rows + one e8m0 code per 32 inputs
+        return {"gate_up": 2 * I * H, "gate_up_scale": 2 * I * (H // 32), "down": H * I, "down_scale": H * (I // 32)}
     if fmt == "mxfp4_triton":
         # gpt-oss mxfp4 expert banks: transposed split-K blocks/scales + bf16 bias
         return {
@@ -391,6 +394,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((2, 128),),  # sliding and full (NoPE) layers share the same geometry
         aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
         arch_aliases=("MuseGlimmerGGUFForCausalLM",),
+    ),
+    AotModel(
+        name="thinkingmachines/Inkling-2-Mini",
+        architecture="Inkling2LoopForConditionalGeneration",
+        hidden_size=2304,
+        kv_groups=((8, 128),),  # sliding and full (NoPE) layers share the same geometry
+        top_k=8,
+        moe_intermediate_size=1152,
+        # NVFP4 layers 0-19, MXFP8 layers 20-23
+        expert_formats=(*_NVFP4_FORMATS, "mxfp8"),
     ),
     AotModel(
         name="ricursiveAI/Ripple-65B-Preview",

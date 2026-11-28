@@ -29,6 +29,39 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 # the client drops reasoning (Qwen's "<think>\n": the re-render diverges 2 tokens BEFORE P).
 _SWA_RETAIN_GAP = 16
 
+# Decode frees a window state's out-of-window rows on a shorter cadence than the KV's: one row
+# can be wider than a token's whole KV.
+_STATE_EVICTION_INTERVAL = 16
+
+
+Spans = Tuple[Tuple[int, int], ...]
+
+
+def _spans_add(spans: Spans, lo: int, hi: int) -> Spans:
+    out = []
+    for a, b in sorted([*spans, (lo, hi)]):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        elif b > a:
+            out.append((a, b))
+    return tuple(out)
+
+
+def _spans_and(spans: Spans, keep: Spans) -> Spans:
+    out: Spans = ()
+    for a, b in spans:
+        for c, d in keep:
+            if max(a, c) < min(b, d):
+                out = _spans_add(out, max(a, c), min(b, d))
+    return out
+
+
+def _spans_sub(spans: Spans, cut: Spans) -> Spans:
+    out = spans
+    for c, d in cut:
+        out = tuple(piece for a, b in out for piece in ((a, min(b, c)), (max(a, d), b)) if piece[1] > piece[0])
+    return out
+
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
@@ -44,6 +77,9 @@ class CacheManager:
         self.linear_state_pool = linear_state_pool
         self.swa_pool = swa_pool
         self.sliding_window_size = sliding_window_size
+        # The window tiers, longest first: the SWA KV's, then the pool's window states (tier 2, ...).
+        states = getattr(swa_pool, "window_states", ()) if swa_pool is not None else ()
+        self.windows = (sliding_window_size, *(spec.window for spec in states)) if sliding_window_size else ()
         self.is_hybrid = type == "hybrid_radix"
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
@@ -96,7 +132,7 @@ class CacheManager:
             return HybridRadixCache(device, page_size)
         if type == "swa_radix":
             from freetoken.kvcache.swa_radix_cache import SWARadixCache
-            return SWARadixCache(device, page_size, self.sliding_window_size)
+            return SWARadixCache(device, page_size, self.windows)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
     def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
@@ -134,14 +170,17 @@ class CacheManager:
         return self.swa_pool.swa_available_size() + tree
 
     def ensure_swa_slots(self, n: int) -> None:
-        """Free swa-pool slots until >= ``n`` are available by tombstoning LRU tree swa nodes
-        (evict_swa, internal -> tombstone in place / leaf -> free both pools), returning their swa
-        slots to the pool and any deleted-leaf full KV to free_slots."""
-        while self.swa_pool.swa_available_size() < n:
-            ev = self.prefix_cache.evict_swa(n - self.swa_pool.swa_available_size())
-            if ev.swa_indices.numel() == 0:
+        self.ensure_window_rows(1, n)
+
+    def ensure_window_rows(self, level: int, n: int) -> None:
+        """Free tier-``level`` rows until >= ``n`` are available by evicting LRU tree rows of the
+        tier (evict_window: internal -> drop the tier in place / leaf -> free every pool), returning
+        the rows to their pools and any deleted-leaf full KV to free_slots."""
+        while self._pool_available(level) < n:
+            ev = self.prefix_cache.evict_window(level, n - self._pool_available(level))
+            if ev.window_indices[level - 1].numel() == 0:
                 break
-            self.swa_pool.free_swa(ev.swa_indices)
+            self._free_window_rows(ev.window_indices)
             if ev.kv_indices.numel():
                 self._free(ev.kv_indices)
 
@@ -219,8 +258,14 @@ class CacheManager:
             new_evicted = align_down(threshold, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted >= start + _SWA_EVICTION_INTERVAL:
-                self._free_swa(self.page_table[req.table_idx, start:new_evicted])
+                self._pool_free(1, self.page_table[req.table_idx, start:new_evicted])
                 req.swa_evicted_seqlen = new_evicted
+            for level, state_window in enumerate(self.windows[1:], 2):
+                # a state keeps only the rows in front of the anchor, not every row since: a row is wide
+                keep = () if req.toolcall_anchor_len is None else (
+                    (req.toolcall_anchor_len - state_window - _SWA_RETAIN_GAP, req.toolcall_anchor_len),)
+                self._free_state_rows(req, level, (req.device_len - 1) - state_window - self.page_size, keep,
+                                      min_rows=_STATE_EVICTION_INTERVAL)
 
     def free_swa_out_of_window_extend(self, reqs: List[Req]) -> None:
         """Prefill sibling of ``maybe_free_swa_out_of_window``: before allocating a chunk, return
@@ -242,8 +287,28 @@ class CacheManager:
             new_evicted = align_down(req.cached_len - window - self.page_size, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
-                self._free_swa(self.page_table[req.table_idx, start:new_evicted])
+                self._pool_free(1, self.page_table[req.table_idx, start:new_evicted])
                 req.swa_evicted_seqlen = new_evicted
+            for level, state_window in enumerate(self.windows[1:], 2):
+                self._free_state_rows(req, level, req.cached_len - state_window - self.page_size)
+
+    def _state_spans(self, req: Req, level: int) -> Spans:
+        return req.state_live[level - 2] if req.state_live else ()
+
+    def _set_state_spans(self, req: Req, level: int, spans: Spans) -> None:
+        live = list(req.state_live) if req.state_live else [()] * (len(self.windows) - 1)
+        live[level - 2] = spans
+        req.state_live = tuple(live)
+
+    def _free_state_rows(self, req: Req, level: int, below: int, keep: Spans = (), min_rows: int = 1) -> None:
+        """Free the request's own tier-``level`` rows before ``below``, except ``keep``, once there are ``min_rows`` of them."""
+        own = self._state_spans(req, level)
+        dead = _spans_sub(_spans_and(own, ((0, below),)), keep)
+        if sum(b - a for a, b in dead) < min_rows:
+            return
+        for a, b in dead:
+            self._pool_free(level, self.page_table[req.table_idx, a:b])
+        self._set_state_spans(req, level, _spans_sub(own, dead))
 
     def lock(self, handle: BaseCacheHandle) -> None:
         if self.is_swa:
@@ -263,10 +328,25 @@ class CacheManager:
             self.prefix_cache.lock_handle(handle, unlock=True)
 
     def _free_swa(self, indices: torch.Tensor) -> None:
-        """Free the swa-pool slots backing ``indices`` (full-pool slots). Idempotent over the
+        """Free every window tier's rows backing ``indices`` (full-pool slots). Idempotent over the
         0 sentinel, so safe to call on any slots being returned to free_slots."""
         if self.swa_pool is not None and len(indices) > 0:
+            for level in range(1, len(self.windows) + 1):
+                self._pool_free(level, indices)
+
+    def _free_window_rows(self, per_tier: Tuple[torch.Tensor, ...]) -> None:
+        for level, indices in enumerate(per_tier, 1):
+            if len(indices) > 0:
+                self._pool_free(level, indices)
+
+    def _pool_free(self, level: int, indices: torch.Tensor) -> None:
+        if level == 1:
             self.swa_pool.free_swa(indices)
+        else:
+            self.swa_pool.free_window(level, indices)
+
+    def _pool_available(self, level: int) -> int:
+        return self.swa_pool.swa_available_size() if level == 1 else self.swa_pool.window_available_size(level)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
@@ -288,6 +368,28 @@ class CacheManager:
                     self.ensure_swa_slots(len(allocated))
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+            for level, window in enumerate(self.windows[1:], 2):
+                self._alloc_state_rows(reqs, level, window)
+
+    def _alloc_state_rows(self, reqs: List[Req], level: int, window: int) -> None:
+        """Give each new token of a decode step a tier-``level`` row, but only a prefill chunk's
+        tail: the rows the next chunk reads, plus the retain gap before the prompt's end."""
+        spans = []
+        for req in reqs:
+            lo = req.cached_len
+            if req.device_len <= req.prompt_len:
+                extra = _SWA_RETAIN_GAP if req.device_len == req.prompt_len else 0
+                lo = max(lo, req.device_len - window - extra)
+            if req.device_len > lo:
+                spans.append((req, lo))
+        if not spans:
+            return
+        slots = torch.cat([self.page_table[req.table_idx, lo:req.device_len] for req, lo in spans])
+        if self.is_swa:
+            self.ensure_window_rows(level, len(slots))
+        self.swa_pool.alloc_window(level, slots)
+        for req, lo in spans:
+            self._set_state_spans(req, level, _spans_add(self._state_spans(req, level), lo, req.device_len))
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
@@ -426,17 +528,19 @@ class CacheManager:
 
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
         """SWA cache_req: commit the request's full KV prefix into the SWARadixCache (node.value =
-        the canonical full-pool page indices; the swa KV rides along via the full->swa mapping).
-        Tokens < req.swa_evicted_seqlen are marked tombstone on insert. No donate/COW (the swa KV
-        is in the pool already). On any dup/tail free, free both pools (full slot + its swa slot)."""
+        the canonical full-pool page indices; the window rows ride along via the full->row
+        mappings). Tokens < req.swa_evicted_seqlen are marked tombstone on insert. No donate/COW
+        (the rows are in the pools already). On any dup/tail free, free every pool."""
         from freetoken.kvcache.swa_radix_cache import SWACacheHandle
 
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         insert_len = align_down(req.cached_len, self.page_size)
+        # with window states, the insert takes the request's live spans per tier (see _settle_windows)
+        live = self._settle_windows(req, insert_len, old_handle.cached_len) if len(self.windows) > 1 else None
         if not finished and self.prefix_cache.has_locked_tombstone(
-                req.input_ids[:insert_len], old_handle.cached_len):
+                req.input_ids[:insert_len], old_handle.cached_len, live=live):
             # insert would free our copy of a tombstone another request still locks, and the
             # windowed re-match may stop before it (#204). Keep the pages; commit at finish.
             return
@@ -453,10 +557,12 @@ class CacheManager:
             _, freed = self.prefix_cache.insert(
                 req.input_ids[:insert_len], page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
-                update_kv_after_len=old_handle.cached_len)
+                update_kv_after_len=old_handle.cached_len, live=live)
         self.unlock(old_handle)
         self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)
+        for level in range(2, len(self.windows) + 1):  # the tree took or freed every row before insert_len
+            self._set_state_spans(req, level, _spans_and(self._state_spans(req, level), ((insert_len, req.device_len),)))
         if finished:
             # Page-unaligned tail (page_size>1) not inserted. The padded slice reaches to the
             # page-ceil bound: allocate_paged charged a swa slot for EVERY token of the last
@@ -502,6 +608,32 @@ class CacheManager:
                 self.page_table[req.table_idx, : m.cached_len].copy_(m.kv_indices)
             req.cache_handle = SWACacheHandle(m.cached_len, m.node, m.kv_indices)
             self.lock(req.cache_handle)
+
+    def _settle_windows(self, req: Req, insert_len: int, floor: int) -> Tuple[Spans, ...]:
+        """Before a commit with window states: keep the request's own rows of each tier only where
+        a resume point reads them -- the window + retain gap before the prompt's end, the
+        tool-call anchor and ``insert_len`` -- and inside the next longer tier; free the rest. A
+        row anywhere else resumes nothing (a state row needs the KV window too, and a resume
+        needs every tier). Returns each tier's live spans for the insert."""
+        ends = {insert_len, min(req.prompt_len, insert_len)}
+        if req.toolcall_anchor_len is not None and req.toolcall_anchor_len <= insert_len:
+            ends.add(req.toolcall_anchor_len)
+        live: List[Spans] = []
+        for level, window in enumerate(self.windows, 1):
+            # rows past insert_len belong to a decode step already launched: not this commit's
+            own = ((max(req.swa_evicted_seqlen, floor), insert_len),) if level == 1 else _spans_and(
+                self._state_spans(req, level), ((floor, insert_len),))
+            kept = _spans_and(own, tuple((b - window - _SWA_RETAIN_GAP, b) for b in sorted(ends)))
+            if live:
+                kept = _spans_and(kept, live[-1])
+            for a, b in _spans_sub(own, kept):
+                self._pool_free(level, self.page_table[req.table_idx, a:b])
+            live.append(kept)
+            if level == 1 and kept:
+                req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, kept[0][0])
+            elif level > 1:
+                self._set_state_spans(req, level, _spans_sub(self._state_spans(req, level), _spans_sub(own, kept)))
+        return tuple(live)
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
         """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish
@@ -552,6 +684,10 @@ class CacheManager:
                 f"SWA-slot leak/double-free: free({self.swa_pool.swa_available_size()}) + "
                 f"tree({tree_swa}) != capacity({cap})"
             )
+            for level in range(2, len(self.windows) + 1):
+                tree_rows = pc.window_evictable[level - 1] + pc.window_protected[level - 1]
+                free, cap = self.swa_pool.window_available_size(level), self.swa_pool.window_capacity(level)
+                assert free + tree_rows == cap, f"tier-{level} row leak/double-free: free({free}) + tree({tree_rows}) != capacity({cap})"
         else:
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
@@ -611,7 +747,7 @@ class CacheManager:
         if self.is_swa:
             # Evicting KV leaf nodes drops their swa slots too -> return both pools.
             ev = self.prefix_cache.evict_full(need)
-            self._free_swa(ev.swa_indices)
+            self._free_window_rows(ev.window_indices)
             return ev.kv_indices
         if self.is_hybrid:
             # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.

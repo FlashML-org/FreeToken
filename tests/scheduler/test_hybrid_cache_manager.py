@@ -163,6 +163,110 @@ def test_pool_sizing_covers_4mr_floor():
         assert _linear_pool_num_slots(c) >= 4 * mr + 1, (mr, _linear_pool_num_slots(c))
 
 
+def _window_state_cache(monkeypatch, max_running_req: int, window: int = 8):
+    """swa_radix with one window state (Inkling 2's convolution inputs, 3 tokens) at its pool floor, and a
+    ``prefill(uid, ids, chunk)`` that runs a prompt through and commits it, returning (req, hit, rows per chunk)."""
+    from freetoken import core
+    from freetoken.core import Context
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache, _swa_paged_num_tokens, state_num_rows
+    from freetoken.models.config import KVCacheGroupSpec, WindowStateSpec
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=1))
+    groups = (KVCacheGroupSpec(name="full", layer_ids=(1,), num_kv_heads=1, head_dim=8, sliding_window=None),
+              KVCacheGroupSpec(name="swa", layer_ids=(0,), num_kv_heads=1, head_dim=8, sliding_window=window))
+    state = WindowStateSpec(name="conv", shape=(8,), layer_ids=(0, 1), window=3)
+    mc = SimpleNamespace(kv_cache_group_specs=lambda: groups, window_states=(state,),
+                         swa_attention_group=lambda: SimpleNamespace(sliding_window=window))
+    cfg = SimpleNamespace(max_running_req=max_running_req, cache_type="swa_radix", page_size=1, swa_full_tokens_ratio=0.01,
+                          swa_num_pages_override=None, decode_rows_per_req=1, model_config=mc)
+    num_swa = _swa_paged_num_tokens(cfg, 256)
+    kv = HybridSWAKVCache(groups=groups, num_layers=2, num_full_pages=256, page_size=1, dtype=torch.bfloat16,
+                          device=torch.device("cpu"), num_swa_tokens=num_swa, window_states=(state,),
+                          num_state_rows=state_num_rows(cfg, num_swa))
+    pt = torch.zeros(max_running_req + 1, 128, dtype=torch.int32)
+    cm = CacheManager(256, 1, pt, "swa_radix", swa_pool=kv, sliding_window_size=window)
+    tm = TableManager(max_running_reqs=max_running_req, page_table=pt)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=1))
+
+    def prefill(uid, ids, chunk):
+        pm.pending_list = [PendingReq(uid=uid, input_ids=torch.tensor(ids, dtype=torch.int32),
+                                      sampling_params=SamplingParams(max_tokens=32))]
+        hit, spans = None, []
+        while True:
+            batch = pm.schedule_next_batch(chunk)
+            assert batch is not None, "admission waits for window rows"
+            (req,) = batch.reqs
+            hit = req.cache_handle.cached_len if hit is None else hit
+            cm.free_swa_out_of_window_extend(batch.reqs)
+            cm.allocate_paged(batch.reqs)
+            spans.append(cm._state_spans(req, 2))
+            req.complete_one()
+            if req.device_len - 1 == len(ids):
+                cm.cache_req(req, finished=False)
+                return req, hit, spans
+
+    return cm, tm, kv, pt, prefill
+
+
+def test_window_state_radix_at_its_floor_resumes_where_a_request_ended(monkeypatch):
+    """swa_radix with a window state (Inkling 2's convolution inputs) at one running request and
+    the pools at their floor: a prompt prefilled in chunks keeps only each chunk's tail rows, and
+    the next turn resumes where the request ended, reading rows the decode kept; every row goes
+    back once the cache is flushed."""
+    cm, tm, _, _, prefill = _window_state_cache(monkeypatch, max_running_req=1)
+    rows = lambda req: cm._state_spans(req, 2)
+
+    a, _, spans = prefill(0, list(range(1, 41)), chunk=16)
+    # each chunk gets rows for its last 3 tokens only; the last chunk, shorter than the 16-token retain gap, all of them
+    assert spans == [((13, 16),), ((13, 16), (29, 32)), ((29, 40),)]
+    assert rows(a) == ()  # the commit handed the tail to the tree and freed the rest
+    for _ in range(20):
+        a.append_host(torch.tensor([99], dtype=torch.int32))
+        a.decode_batch_idx += 1
+        cm.maybe_free_swa_out_of_window([a])
+        cm.allocate_paged([a])
+        a.complete_one()
+    assert sum(hi - lo for lo, hi in rows(a)) < 3 + 16 + 2  # decode frees behind the window
+    cm.cache_req(a, finished=True)
+    tm.free(a.table_idx)
+
+    b, hit, _ = prefill(1, a.input_ids.tolist() + [7, 8, 9], chunk=64)
+    assert hit == a.cached_len
+    cm.cache_req(b, finished=True)
+    tm.free(b.table_idx)
+    cm.flush()
+    cm.check_integrity()
+
+
+def test_every_request_of_a_decode_batch_keeps_its_window_kv(monkeypatch):
+    """The decode-time free of out-of-window KV uses the KV's window for every request of the batch, not the
+    window state's shorter one: each request still holds the window KV of its last ``window`` tokens."""
+    import freetoken.scheduler.cache as cache_mod
+
+    window = 8
+    monkeypatch.setattr(cache_mod, "_SWA_EVICTION_INTERVAL", 1)
+    cm, _, kv, pt, prefill = _window_state_cache(monkeypatch, max_running_req=2, window=window)
+    reqs = [prefill(0, list(range(1, 41)), chunk=64)[0], prefill(1, list(range(50, 90)), chunk=64)[0]]
+    for _ in range(24):
+        for req in reqs:
+            req.append_host(torch.tensor([99], dtype=torch.int32))
+            req.decode_batch_idx += 1
+        cm.maybe_free_swa_out_of_window(reqs)
+        cm.allocate_paged(reqs)
+        for req in reqs:
+            req.complete_one()
+    for req in reqs:
+        last = pt[req.table_idx, req.device_len - 1 - window : req.device_len - 1].long()
+        assert bool((kv.full_to_swa_index_mapping[last] > 0).all()), req.uid
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, Sequence
 
 from freetoken.utils import Registry
 
@@ -86,7 +86,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
     from .dsv4.v4_cost_model import _dsv4_pool_sizes
-    from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
+    from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens, state_num_rows
     from .dsv4.v4_pool import DSV4PagedKVCache
 
     model_config = config.model_config
@@ -121,6 +121,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         return pool
 
     num_swa_tokens = None
+    num_state_rows: tuple[int, ...] = ()
     # Both the naive and radix SWA paths share the global-paged swa pool; radix sizes it by
     # ratio (cross-request reuse), naive by concurrency x window.
     if model_config.has_swa_attention:
@@ -129,6 +130,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+        num_state_rows = state_num_rows(config, num_swa_tokens)
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
@@ -139,6 +141,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         num_speculative_tokens=getattr(config, "decode_rows_per_req", 1) - 1,
         kv_format=getattr(config, "kv_format", NONE),
+        num_state_rows=num_state_rows,
     )
 
 
@@ -152,19 +155,22 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     num_speculative_tokens: int = 0,
     kv_format: KVFormat = NONE,
+    num_state_rows: Sequence[int] = (),
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
-        from .hybrid_swa_pool import HybridSWAKVCache
+        from .hybrid_swa_pool import HybridSWAKVCache, ordered_window_states
 
         return HybridSWAKVCache(
             groups=model_config.kv_cache_group_specs(),
-            num_layers=model_config.num_layers,
+            num_layers=model_config.kv_layer_count,
             num_full_pages=num_pages,
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
             kv_format=kv_format,
+            window_states=ordered_window_states(model_config),
+            num_state_rows=num_state_rows,
         )
 
     from .mha_pool import MHAKVCache
@@ -283,7 +289,7 @@ def create_kvcache_pool(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=model_config.kv_layer_count,
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,

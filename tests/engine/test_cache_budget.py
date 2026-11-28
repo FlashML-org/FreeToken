@@ -92,6 +92,18 @@ def test_prefill_overlap_false_is_honored():
     assert pages == (2000 - 8 * 100) // 10
 
 
+def test_mixed_formats_floor_the_cache_at_one_layer_of_the_widest():
+    # bf16 layers (4x the nvfp4 slot) stage a whole layer through the shared bank bytes, so 128 slots
+    # of the mean size do not hold one: the plan reaches the floor or refuses, instead of handing the
+    # cache a size it rejects after the banks are loaded
+    plan = dict(per_expert_bytes=10, cache_per_page=1, num_experts=128, total_experts=24 * 128,
+                prefill_overlap=False, kv_reserve_pages=1000, max_slots=24 * 128, min_slots=410)
+    assert plan_cache_budget(budget_bytes=6000, **plan)[0] >= 410
+    with pytest.raises(AssertionError, match="cache budget too small"):
+        plan_cache_budget(budget_bytes=5000, **plan)
+    assert plan_cache_budget(budget_bytes=5000, **{**plan, "min_slots": 0})[0] < 410
+
+
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
     sources = {
         "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)],  # row = 32*8*2 = 512

@@ -1,4 +1,4 @@
-"""MXFP8 (block-32 e8m0) W8A16 linear: kernels vs the dequant reference, plus the
+"""MXFP8 (block-32 e8m0) W8A16 linear and routed experts: kernels vs the dequant reference, plus the
 Gemma (1+w) norm and swigluoai activation the MiniMax-M3 modules ride on."""
 
 from __future__ import annotations
@@ -40,6 +40,48 @@ def test_mxfp8_linear_matches_dequant_reference(M: int, N: int, K: int):
     y_ref = (x.float() @ ref_w.t()).to(torch.bfloat16)
     rel = (y.float() - y_ref.float()).abs().max() / y_ref.float().abs().max().clamp(min=1e-6)
     assert rel.item() < 2e-2, rel.item()
+
+
+# (160, 96): K is a multiple of the 32-wide scale group but not of the K tiles (k-mask + masked scale codes), N not a multiple of the N tiles.
+# 5, 60, 300 and 800 tokens put 2.5, 30, 150 and 400 routes on each expert, one per token block size of the prefill kernel.
+@pytest.mark.parametrize("H,I", [(256, 128), (160, 96)])
+@pytest.mark.parametrize("M", [5, 60, 300, 800])
+@pytest.mark.parametrize("activation,alpha,limit", [("silu", 1.0, float("inf")), ("swiglu_clamp", 1.0, 0.5)])
+def test_mxfp8_moe_matches_dequant_reference(H: int, I: int, M: int, activation: str, alpha: float, limit: float):
+    from freetoken.kernel.triton.mxfp8_linear import mxfp8_dequant
+    from freetoken.kernel.triton.mxfp8_moe import fused_experts_decode_mxfp8, fused_experts_mxfp8
+    from freetoken.layers import gated_act_and_mul
+
+    E, top_k = 4, 2
+    gu, gus = _make_mxfp8(E * 2 * I, H, seed=M)
+    dn, dns = _make_mxfp8(E * H, I, seed=M + 1)
+    banks = (gu.view(E, 2 * I, H), gus.view(E, 2 * I, -1), dn.view(E, H, I), dns.view(E, H, -1))
+    gu_ref = mxfp8_dequant(gu, gus, torch.float32).view(E, 2 * I, H)
+    dn_ref = mxfp8_dequant(dn, dns, torch.float32).view(E, H, I)
+    x = torch.randn(M, H, device=DEV, dtype=torch.bfloat16) * 8
+    ids = torch.stack([torch.randperm(E, device=DEV)[:top_k] for _ in range(M)]).to(torch.int32)
+    w = torch.rand(M, top_k, device=DEV)
+
+    def reference(ids):
+        ref = torch.zeros(M, H, device=DEV)
+        for t, k in zip(*torch.nonzero(ids >= 0, as_tuple=True)):
+            e = ids[t, k]
+            h = (x[t].float() @ gu_ref[e].T).to(x.dtype).view(1, -1)
+            a = torch.empty(1, I, device=DEV, dtype=x.dtype)
+            gated_act_and_mul(activation, h, a, alpha=alpha, limit=limit)
+            ref[t] += w[t, k] * (a[0].float() @ dn_ref[e].T)
+        return ref
+
+    def rel(y, ref):
+        return ((y.float() - ref).abs().max() / ref.abs().max().clamp(min=1e-6)).item()
+
+    ref = reference(ids)
+    assert rel(fused_experts_mxfp8(x, *banks, w, ids, E, activation, alpha, limit), ref) < 2e-2
+    assert rel(fused_experts_decode_mxfp8(x, *banks, w, ids, activation, alpha, limit), ref) < 2e-2
+    # hybrid decode hands the GPU a route split with holes
+    holes = ids.clone()
+    holes[::2, 0] = -1
+    assert rel(fused_experts_decode_mxfp8(x, *banks, w, holes, activation, alpha, limit), reference(holes)) < 2e-2
 
 
 def test_gemma_plus_one_norm_matches_flashinfer_semantics():

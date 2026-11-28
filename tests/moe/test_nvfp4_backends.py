@@ -321,7 +321,7 @@ def test_triton_overlap_prefill_matches_dequant_reference():
         gu_p, gu_s, gu_g, dn_p, dn_s, dn_g = cache.wait_prefill_layer(layer_id)
         ref = _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids)
         out = fused_experts_nvfp4(
-            hidden, gu_p, gu_s, gu_g, dn_p, dn_s, dn_g,
+            hidden.clone(), gu_p, gu_s, gu_g, dn_p, dn_s, dn_g,
             topk_weights, topk_ids, E, "silu", False,
         )
         _assert_close(out, ref)
@@ -355,7 +355,7 @@ def test_triton_swigluoai_matches_dequant_reference():
     ]
     ref = _ref_moe(sources, layer_id, hidden, topk_weights, topk_ids, activation="swigluoai")
     out = fused_experts_nvfp4(
-        hidden, *banks, topk_weights, topk_ids, E, "swigluoai", False, 1.702, 7.0
+        hidden.clone(), *banks, topk_weights, topk_ids, E, "swigluoai", False, 1.702, 7.0
     )
     _assert_close(out, ref)
 
@@ -408,7 +408,7 @@ def test_triton_prefill_routes_to_gluon_on_sm120(monkeypatch, hidden_size, inter
         return gluon_gemm(*args)
 
     monkeypatch.setattr(sm120, "prefill_gemm", counted)
-    out = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
+    out = fused_nvfp4.fused_experts_nvfp4(hidden.clone(), *banks, topk_weights, topk_ids, E)
     assert len(calls) == 2
     monkeypatch.setattr(nvfp4_moe, "_gluon_prefill", lambda device_index: None)
     ref = fused_nvfp4.fused_experts_nvfp4(hidden, *banks, topk_weights, topk_ids, E)
