@@ -73,7 +73,9 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.local_intermediate, cfg.hidden
+        # The checkpoint reader shards whole MXFP4 groups, rounding up per rank.
+        groups_per_rank = (cfg.intermediate // GROUP + cfg.tp_size - 1) // cfg.tp_size
+        i, h = groups_per_rank * GROUP, cfg.hidden
         return {
             "gate_up": BankSpec((h // 2, 2 * i), torch.uint8),
             "gate_up_scale": BankSpec((h // GROUP, 2 * i), torch.uint8),
@@ -89,11 +91,18 @@ class TritonGptossMxfp4MoEKernel(MoEKernel):
             e, n = t.shape[0], t.shape[1]
             return t.reshape(e, n, -1).permute(0, 2, 1)
 
-        out["gate_up"].copy_(blocks_t(fused_piece(pieces, "gate_up")))
-        out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale").permute(0, 2, 1))
-        out["gate_up_bias"].copy_(fused_piece(pieces, "gate_up_bias"))
-        out["down"].copy_(blocks_t(pieces["down"]))
-        out["down_scale"].copy_(pieces["down_scale"].permute(0, 2, 1))
+        def copy_padded(role, t, dim):
+            dst = out[role]
+            # The last rank's checkpoint slice may have fewer groups than its bank.
+            if t.shape[dim] < dst.shape[dim]:
+                dst.zero_()
+            dst.narrow(dim, 0, t.shape[dim]).copy_(t)
+
+        copy_padded("gate_up", blocks_t(fused_piece(pieces, "gate_up")), 2)
+        copy_padded("gate_up_scale", fused_piece(pieces, "gate_up_scale").permute(0, 2, 1), 2)
+        copy_padded("gate_up_bias", fused_piece(pieces, "gate_up_bias"), 1)
+        copy_padded("down", blocks_t(pieces["down"]), 1)
+        copy_padded("down_scale", pieces["down_scale"].permute(0, 2, 1), 1)
         out["down_bias"].copy_(pieces["down_bias"])
         return {}
 
