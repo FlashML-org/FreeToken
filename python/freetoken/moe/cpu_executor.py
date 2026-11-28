@@ -65,6 +65,7 @@ _ACT_IDS = {
     "gpt_oss_swiglu": 3,
     "swigluoai": 3,
     "swiglu_clamp": 4,
+    "softcap_swiglu": 5,
 }
 
 

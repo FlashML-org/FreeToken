@@ -76,7 +76,7 @@ struct DownRoute {
 };
 
 // g[i] for i in [i0, i1) from the gate row i and the up row I + i; dot(row) is the row's GEMV.
-// ACT_SWIGLUOAI and ACT_SWIGLU_CLAMP clamp both inputs; the other kinds go through act_apply.
+// ACT_SWIGLUOAI and ACT_SWIGLU_CLAMP clamp both inputs, ACT_SOFTCAP_SWIGLU tanh-caps them; the other kinds go through act_apply.
 template <class RowDot>
 inline void gated_rows(const MoeParams& p, int i0, int i1, float w_in, bf16_t* g, RowDot dot) {
   const bool clamped = p.act == ACT_SWIGLUOAI || p.act == ACT_SWIGLU_CLAMP;
@@ -86,7 +86,9 @@ inline void gated_rows(const MoeParams& p, int i0, int i1, float w_in, bf16_t* g
     // gate = row i, up = row I+i
     float gate = dot(i) * w_in;
     float up = dot(p.I + i) * w_in;
-    if (clamped) {
+    if (p.act == ACT_SOFTCAP_SWIGLU) {
+      g[i] = f32_to_bf16(alpha * std::tanh(gate / alpha) / (1.0f + std::exp(-gate)) * (lim * std::tanh(up / lim)));
+    } else if (clamped) {
       // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
       // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
       // (GLM-5.3) does not. lim == +inf: no clamp.
