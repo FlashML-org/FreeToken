@@ -740,6 +740,11 @@ class Engine:
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
+        # copies of the loaded weights that a block's decode reads, made before the free memory sizes any pool
+        for op in iter_ops(self.model):
+            prepare = getattr(op, "prepare_decode_weights", None)
+            if callable(prepare):
+                prepare()
 
     def _load_weight_state_dict(
         self, config: EngineConfig, host_keys: frozenset[str], staged_keys: frozenset[str]

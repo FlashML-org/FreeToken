@@ -17,6 +17,13 @@ def call_if_main(name: str = "__main__", discard: bool | None = None):
             return lambda f: (f() and None) or f
 
 
+def opt_in_env(value: str | None) -> tuple[str, bool]:
+    """An opt-in switch's environment value as (text, on): the value stripped and lowercased, "" when unset, and on
+    only for 1, true, yes or on. A caller that logs its decision stays silent for "" (nobody asked)."""
+    text = (value or "").strip().lower()
+    return text, text in ("1", "true", "yes", "on")
+
+
 def div_even(a: int, b: int, allow_replicate: bool = False) -> int:
     """Divides two integers. If allow_replicate=True, allows b > a when b % a == 0, returning 1."""
     if allow_replicate and b > a:

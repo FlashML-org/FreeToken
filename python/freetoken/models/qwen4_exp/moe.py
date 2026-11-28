@@ -25,5 +25,10 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
+    def prepare_decode_weights(self) -> None:
+        """This forward never takes the router fold or the shared expert's ninth route, so the load makes no route
+        copy (none of the KV pool goes to it) and logs no route line, whatever the switches say."""
+        self._shared_route = None
+
 
 __all__ = ["Qwen4ExpMoE"]

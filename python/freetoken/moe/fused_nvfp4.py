@@ -30,27 +30,37 @@ def _fused_experts_decode_nvfp4(
     apply_router_weight_on_input: bool,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    shared: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Shared decode body (gemm1 -> act -> gemm2 -> sum-reduce); ``gemm_fn`` is either
     the marlin-style int32 GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm_marlin`) or the original LUT-gather
-    GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm`), both with the same calling convention."""
+    GEMV (:func:`freetoken.kernel.nvfp4_moe.decode_gemm`), both with the same calling convention.
+
+    ``shared`` holds one expert outside the bank by the bank's roles (``gate_up``, ``gate_up_scale``, ...), each with
+    a slot's shape and strides: the last column of ``topk_ids`` / ``topk_weights`` is then that expert's route, its id
+    unread (marlin GEMV only)."""
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
+    route = {}
+    if shared is not None:
+        assert gemm_fn is nvfp4_moe.decode_gemm_marlin, "only the marlin decode GEMV takes an expert outside the bank"
+        route = dict(gate_up=dict(shared=(shared["gate_up"], shared["gate_up_scale"], shared["gate_up_global"])),
+                     down=dict(shared=(shared["down"], shared["down_scale"], shared["down_global"])))
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     gemm_fn(
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
-        ic1, topk_weights, topk_ids, apply_router_weight_on_input, False,
+        ic1, topk_weights, topk_ids, apply_router_weight_on_input, False, **route.get("gate_up", {}),
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     gemm_fn(
         ic2, down_packed, down_scale, down_global,
-        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True,
+        ic3, topk_weights, topk_ids, not apply_router_weight_on_input, True, **route.get("down", {}),
     )
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
@@ -71,14 +81,16 @@ def fused_experts_decode_nvfp4_marlin(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    shared: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV."""
+    """Decode inline-NVFP4 MoE using the Marlin-style int32 wide-load GEMV; ``shared`` as in
+    :func:`_fused_experts_decode_nvfp4`."""
     return _fused_experts_decode_nvfp4(
         nvfp4_moe.decode_gemm_marlin,
         hidden_states, gate_up_packed, gate_up_scale, gate_up_global,
         down_packed, down_scale, down_global,
         topk_weights, topk_ids, activation, apply_router_weight_on_input,
-        act_alpha, act_limit,
+        act_alpha, act_limit, shared,
     )
 
 
