@@ -366,3 +366,49 @@ def test_cpu_fp8_block_graph_replay_and_recapture(monkeypatch, kernel_io):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             graph.reset()
     ex.raise_if_unhealthy()
+
+
+
+
+@pytest.mark.parametrize(
+    "text, dirs",
+    [
+        ("0::/\n", [""]),  # a container with its own cgroup namespace
+        ("0::/system.slice/ft.service\n", ["system.slice/ft.service", "system.slice", ""]),
+        ("5:cpu,cpuacct:/docker/abc\n0::/user.slice\n", ["user.slice", ""]),  # only the 0:: line is cgroup v2
+        ("5:cpu,cpuacct:/docker/abc\n", [""]),
+        ("0::/../ft.service\n", [""]),  # a cgroup outside this namespace has no path under the mount
+    ],
+)
+def test_cgroup_v2_dirs_walk_from_the_process_cgroup_to_the_root(text, dirs):
+    from freetoken.moe.cpu_executor import _cgroup_v2_dirs
+
+    assert _cgroup_v2_dirs(text) == dirs
+
+
+@pytest.mark.parametrize(
+    "cores, proc_cgroup, files, requested, threads",
+    [
+        (64, "0::/\n", {"cpu.max": "6144000 100000"}, 0, 58),  # 61.44 CPUs: three stay free beside the pool
+        # the smallest quota on the way to the root decides, not the nearest, and "max" sets none
+        (64, "0::/a/b/c\n", {"a/b/c/cpu.max": "max 100000", "a/b/cpu.max": "1600000 100000", "a/cpu.max": "800000 100000"}, 0, 5),
+        (64, "0::/docker/abc\n", {"cpu.max": "800000 100000"}, 0, 5),  # the mount shows only the root: its file decides
+        (64, "5:cpu,cpuacct:/\n", {"cpu/cpu.cfs_quota_us": "800000", "cpu/cpu.cfs_period_us": "100000"}, 0, 5),  # v1
+        (64, "0::/\n", {"cpu.max": "6144000 100000"}, 63, 63),  # an explicit count is honored
+    ],
+)
+def test_auto_cpu_pool_fits_the_cgroup_cpu_quota(tmp_path, monkeypatch, cores, proc_cgroup, files, requested, threads):
+    from freetoken.moe import cpu_executor
+
+    (tmp_path / "proc_cgroup").write_text(proc_cgroup)
+    for rel, text in files.items():
+        (tmp_path / "sys" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "sys" / rel).write_text(text + "\n")
+    monkeypatch.setattr(cpu_executor, "_PROC_CGROUP", str(tmp_path / "proc_cgroup"))
+    monkeypatch.setattr(cpu_executor, "_CGROUP_ROOT", str(tmp_path / "sys"))
+    monkeypatch.setattr(cpu_executor, "physical_core_cpus", lambda: list(range(cores)))  # stands in for the host's topology
+
+    n, core_ids = cpu_executor.resolve_threads_and_affinity(requested)
+    assert (n, len(core_ids)) == (threads, threads)
+    if not requested:
+        assert core_ids == list(range(threads))

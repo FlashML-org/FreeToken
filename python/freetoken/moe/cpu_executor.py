@@ -112,6 +112,61 @@ def physical_core_cpus() -> list[int]:
     return reps or allowed or [0]
 
 
+# CPUs of a cgroup quota left beside the pool for the server's other threads. Measured on an EPYC 7B13 (quota 61.44)
+# and an EPYC 9755 (46.08): hybrid decode was throttled with 2.08 CPUs left, and not with 2.44 or 3.08.
+_QUOTA_SPARE = 3
+_PROC_CGROUP = "/proc/self/cgroup"
+_CGROUP_ROOT = "/sys/fs/cgroup"  # v2: <cgroup>/cpu.max; v1: cpu/cpu.cfs_quota_us (-1 without a quota), cpu.cfs_period_us
+
+
+def _cgroup_v2_dirs(proc_cgroup: str) -> list[str]:
+    """Paths under the cgroup v2 mount for a /proc/self/cgroup text: the process's cgroup, then each parent up to the root ("")."""
+    for line in proc_cgroup.splitlines():
+        if line.startswith("0::"):
+            parts = [p for p in line[3:].split("/") if p]
+            if ".." in parts:  # the cgroup is outside this cgroup namespace, so only the mount root can be read
+                break
+            return ["/".join(parts[:i]) for i in range(len(parts), -1, -1)]
+    return [""]
+
+
+def cgroup_cpu_quota() -> float | None:
+    """CPUs of run time per scheduler period: the smallest quota of this process's cgroup and its parents, or None without one."""
+    try:
+        with open(_PROC_CGROUP) as f:
+            dirs = _cgroup_v2_dirs(f.read())
+    except OSError:
+        dirs = [""]
+    quotas: list[float] = []
+    is_v2 = False
+    for d in dirs:
+        # A level without the file (the real root, a path the mount does not show) sets no quota: the others decide.
+        try:
+            with open(os.path.join(_CGROUP_ROOT, d, "cpu.max")) as f:
+                quota, period = f.read().split()  # "<quota> <period>", or "max <period>"
+            if quota != "max":
+                quotas.append(int(quota) / int(period))
+            is_v2 = True
+        except (OSError, ValueError, ZeroDivisionError):
+            continue
+    if is_v2:
+        return min(quotas, default=None)
+    try:
+        with open(f"{_CGROUP_ROOT}/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open(f"{_CGROUP_ROOT}/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+    except (OSError, ValueError):
+        return None
+    return quota / period if quota > 0 and period > 0 else None
+
+
+def quota_cpus(cpus: int) -> int:
+    """``cpus`` capped at the whole CPUs of the cgroup CPU quota, and at least 1."""
+    quota = cgroup_cpu_quota()
+    return cpus if quota is None else max(1, min(cpus, int(quota)))
+
+
 def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
     """Spin only if each pool thread owns a distinct CPU and two CPUs stay free for the main and CUDA callback threads."""
     if not _SPIN_WAIT or not hasattr(os, "sched_getaffinity"):
@@ -128,7 +183,8 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
     bandwidth-bound GEMV: SMT siblings only contend for a core's load ports and the
-    spin-barrier degrades badly when oversubscribed). An explicit count is honored,
+    spin-barrier degrades badly when oversubscribed), and no more threads than the
+    cgroup CPU quota leaves room for. An explicit count is honored,
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
     """
@@ -145,6 +201,16 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
             order = [0]
         core_ids = [order[i % len(order)] for i in range(n)]
         return n, core_ids
+    # The pool spins, so one larger than the quota can be throttled in most scheduler periods. The main and CUDA callback
+    # threads (the two _spin_wait_ok keeps cores for) and the rest of the server need about two and a half CPUs of it.
+    quota = cgroup_cpu_quota()
+    fit = len(reps) if quota is None else max(1, int(quota) - _QUOTA_SPARE)
+    if fit < len(reps):
+        logger.info_rank0(
+            f"CPU MoE pool: {fit} of {len(reps)} physical cores, to fit the cgroup CPU quota of "
+            f"{quota:.2f} CPUs (--moe-cpu-threads sets the count)"
+        )
+        reps = reps[:fit]
     return len(reps), list(reps)
 
 
@@ -326,7 +392,7 @@ class CpuMoeExecutor:
         self.spin_wait = _spin_wait_ok(core_ids, coord_core)
         self._ext.set_spin_wait(self.spin_wait)
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        spare = quota_cpus(len(physical_core_cpus())) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(
