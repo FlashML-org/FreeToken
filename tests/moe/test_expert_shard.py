@@ -291,6 +291,15 @@ def test_placement_rejects_what_cannot_be_served():
     doubled = dataclasses.replace(p, pools=(p.pools[0], dataclasses.replace(p.pools[1], interval=p.pools[0].interval)))
     with pytest.raises(ValueError, match="exactly once"):
         doubled.validate(256)
+    # banks are bound to their GPUs' node: two GPUs of one node put every expert there, in either pool
+    from freetoken.moe.shared_banks import check_node_memory
+
+    experts, node_ram = 137 << 30, lambda node: 125 << 30
+    for mode in ("rank", "numa"):
+        one_node = plan_expert_placement(2048, [0, 0], mode=mode)
+        with pytest.raises(ValueError, match="137.0 GiB of expert banks to NUMA node 0"):
+            check_node_memory(one_node, [experts // len(one_node.banks)] * len(one_node.banks), node_ram)
+        check_node_memory(plan_expert_placement(2048, [0, 1], mode=mode), [experts // 2] * 2, node_ram)
 
 
 # --- placed host banks: a shard packed into private or NUMA-shared banks (moe/shared_banks.py) ---

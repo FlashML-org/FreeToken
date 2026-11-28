@@ -211,6 +211,18 @@ def numa_nodes() -> list[int]:
         return []
 
 
+def node_memory_bytes(node: int) -> int | None:
+    """NUMA ``node``'s total RAM; None when the host does not say."""
+    try:
+        with open(f"/sys/devices/system/node/node{node}/meminfo") as f:
+            for line in f:  # "Node 0 MemTotal:       131504972 kB"
+                if "MemTotal:" in line:
+                    return int(line.split()[-2]) * 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def node_physical_cores() -> dict[int | None, list[int]]:
     """One logical CPU per physical core in this process's affinity, by NUMA node (key None without NUMA info)."""
     from freetoken.moe.cpu_executor import physical_core_cpus
@@ -242,5 +254,5 @@ def _parse_cpulist(text: str) -> set[int]:
 
 __all__ = [
     "CpuPoolSpec", "ExpertPlacement", "HostBankSpec", "PoolMode",
-    "gpu_numa_node", "node_physical_cores", "numa_nodes", "plan_expert_placement",
+    "gpu_numa_node", "node_memory_bytes", "node_physical_cores", "numa_nodes", "plan_expert_placement",
 ]

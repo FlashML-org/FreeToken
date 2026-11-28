@@ -152,6 +152,27 @@ def _raise_any(group, failure: BaseException | None) -> None:
         raise RuntimeError(f"another rank's expert bank load failed: {errors[0]}")
 
 
+def check_node_memory(placement, bank_bytes: list[int], node_bytes: Callable[[int], int | None] | None = None) -> None:
+    """Refuse banks that outgrow their NUMA node's RAM. They are bound to it (MPOL_BIND), so instead of spilling to
+    another node the kernel would kill a rank partway through the load."""
+    from freetoken.moe.placement import node_memory_bytes
+
+    need: dict[int, int] = {}
+    ranks: dict[int, list[int]] = {}
+    for bank, nbytes in zip(placement.banks, bank_bytes, strict=True):
+        if bank.node is not None:
+            need[bank.node] = need.get(bank.node, 0) + nbytes
+            ranks.setdefault(bank.node, []).extend(bank.ranks)
+    for node in sorted(need):
+        room = (node_bytes or node_memory_bytes)(node)
+        if room is not None and need[node] > room:
+            raise ValueError(
+                f"--moe-host-pool {placement.mode} binds {need[node] / 2**30:.1f} GiB of expert banks to NUMA node {node}, "
+                f"the node of ranks {sorted(ranks[node])}'s GPUs, but the node has {room / 2**30:.1f} GiB of RAM; each node "
+                "holds the expert slices of its own GPUs, so serve from GPUs on several NUMA nodes or from more GPUs"
+            )
+
+
 def load_placed_expert_banks(placement, rank: int, method, read_pieces: Callable | None, *, num_experts: int, num_layers: int,
                              device: torch.device, timeout: float = 3 * 3600):
     """This rank's host banks under ``placement``; a collective over the default process group.
@@ -181,6 +202,7 @@ def load_placed_expert_banks(placement, rank: int, method, read_pieces: Callable
     E, L, world = num_experts, num_layers, placement.world_size
     configs = [slicing.config_at(bank.interval.width) for bank in placement.banks]
     layouts = [{role: spec for role, spec in kernel.layout(cfg).items() if not spec.resident} for cfg in configs]
+    check_node_memory(placement, [arena_bytes(layout, E, L) for layout in layouts])  # every rank, before any bank exists
 
     created, failure = {}, None
     try:
@@ -275,5 +297,5 @@ def load_placed_expert_banks(placement, rank: int, method, read_pieces: Callable
 
 
 __all__ = [
-    "SharedBank", "SharedBankArena", "arena_bytes", "attach_arena", "bind_to_node", "load_placed_expert_banks",
+    "SharedBank", "SharedBankArena", "arena_bytes", "attach_arena", "bind_to_node", "check_node_memory", "load_placed_expert_banks",
 ]
