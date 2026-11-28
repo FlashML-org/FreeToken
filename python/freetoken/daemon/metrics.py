@@ -3,11 +3,12 @@ telemetry is not this daemon's job.
 
 RAM = summed PSS across the serve process group (shared pages counted once, the honest number).
 VRAM = per-process GPU memory for those pids, via ``pynvml`` if importable (optional), else
-parsed from ``nvidia-smi``, else 0. All best-effort and off the event loop — a missing GPU or
-absent NVML returns 0, never an error."""
+parsed from ``nvidia-smi``, else the kernel's DRM fdinfo (AMD), else 0. All best-effort and off
+the event loop — a missing GPU or absent NVML returns 0, never an error."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
@@ -55,8 +56,37 @@ def vram_bytes_for_pids(pids: list[int]) -> int:
     if usage is None:
         usage = _smi_process_vram()
     if not usage:
-        return 0
+        return _drm_fdinfo_vram(want)
     return sum(nbytes for p, nbytes in usage.items() if p in want)
+
+
+_PROC = "/proc"
+
+
+def _drm_fdinfo_vram(pids: set[int]) -> int:
+    """VRAM held by ``pids`` per the kernel's DRM fdinfo, which amdgpu fills in for ROCm processes."""
+    clients: dict[tuple[str, str], int] = {}
+    for pid in pids:
+        fdinfo = os.path.join(_PROC, str(pid), "fdinfo")
+        try:
+            fds = os.listdir(fdinfo)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                with open(os.path.join(fdinfo, fd), encoding="utf-8", errors="replace") as fh:
+                    fields = dict(line.split(":", 1) for line in fh if ":" in line)
+            except OSError:
+                continue
+            # drm-memory-<region> is the older spelling of drm-resident-<region>
+            vram = (fields.get("drm-resident-vram") or fields.get("drm-memory-vram") or "").split()
+            if "drm-client-id" not in fields or not vram or not vram[0].isdigit():
+                continue
+            unit = {"KiB": 1 << 10, "MiB": 1 << 20}.get(vram[1], 1) if len(vram) > 1 else 1
+            # forked children and dup'ed fds repeat one client; count it once per device
+            key = (fields.get("drm-pdev", "").strip(), fields["drm-client-id"].strip())
+            clients[key] = int(vram[0]) * unit
+    return sum(clients.values())
 
 
 # NVML is initialized ONCE and held for the daemon's life — nvmlInit()+nvmlShutdown() on every
