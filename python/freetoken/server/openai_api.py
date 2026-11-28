@@ -160,6 +160,7 @@ async def handle_chat_completion(
     state: Any,
     model_sampling: dict[str, Any],
 ):
+    entered = time.perf_counter()
     if req.function_call is not None:
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
@@ -213,6 +214,9 @@ async def handle_chat_completion(
         err = await prerender_error(spec, state)
         if err is not None:
             return create_error_response(str(err), code=err.code)
+    if getattr(state.config, "enable_timings_report", False):
+        arrived = request.scope.get("state", {}).get("arrived_at") if request is not None else None
+        spec.stamps = [arrived if arrived is not None else entered, entered, time.perf_counter()]
 
     try:
         uid = await submit_generation(spec, state)
@@ -294,6 +298,8 @@ async def stream_chat_completion_chunks(
 
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
+    # when the first piece of text went out, for timings' reply_ms
+    first_out: float | None = None
     events = generate_events(uid, spec, state, source="/v1/chat/completions", usage=usage)
     while True:
         try:
@@ -307,6 +313,10 @@ async def stream_chat_completion_chunks(
                 {"error": {"message": str(exc), "type": _reply_error_type(exc.code), "code": exc.code}}
             )
             break
+        if first_out is None and (
+            isinstance(ev, ToolCallStart) or (isinstance(ev, (ReasoningDelta, ContentDelta)) and ev.text)
+        ):
+            first_out = time.perf_counter()
         if isinstance(ev, ReasoningDelta):
             yield emit(
                 _chat_chunk(
@@ -400,7 +410,7 @@ async def stream_chat_completion_chunks(
         elif isinstance(ev, GenDone):
             timings = ev.timings
             done = _chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": ev.finish_reason}])
-            if not include_usage and (t := timings_block(state, timings)) is not None:
+            if not include_usage and (t := timings_block(state, timings, first_out)) is not None:
                 done["timings"] = t
             yield emit(done)
 
@@ -413,7 +423,7 @@ async def stream_chat_completion_chunks(
             "choices": [],
             "usage": _reported_usage(state, usage),
         }
-        if (t := timings_block(state, timings)) is not None:
+        if (t := timings_block(state, timings, first_out)) is not None:
             final["timings"] = t
         yield _sse(final)
 

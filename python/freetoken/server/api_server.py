@@ -491,6 +491,25 @@ def install_api_key(app: FastAPI, api_key: str | None) -> None:
     logger.info("API key required on every route except /health")
 
 
+class _ArrivalStampMiddleware:
+    """Stamps the clock reading at which a request reached the app, before its body is read and parsed (the
+    timings' parse_ms)."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            scope.setdefault("state", {})["arrived_at"] = time.perf_counter()
+        await self.app(scope, receive, send)
+
+
+def install_arrival_stamp(app: FastAPI, enabled: bool) -> None:
+    """Under --enable-timings-report; run it last, so that it is the outermost middleware."""
+    if enabled:
+        app.add_middleware(_ArrivalStampMiddleware)
+
+
 app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifespan)
 register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
@@ -1071,6 +1090,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # bad path is reported at boot rather than silently on the first request.
     install_cors(app, config.cors_origins)
     init_request_logging()
+    install_arrival_stamp(app, getattr(config, "enable_timings_report", False))
     # Hide the frequent health/stats/requests/cache-status polling of the desktop app (and of
     # the shell's status bar) from uvicorn's access log; non-polling access lines are
     # unaffected. See access_log_filter.py; toggle back on with LOG_LEVEL=DEBUG.

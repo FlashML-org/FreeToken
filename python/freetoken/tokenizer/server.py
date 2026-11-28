@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import time
 from typing import Any, List
 
 import torch
@@ -98,6 +99,7 @@ def _tokenize_requests(
     backend: List[UserMsg] = []
     errors: List[UserReply] = []
     for msg in messages:
+        start = time.perf_counter()
         try:
             user_msg = tokenize_manager.tokenize([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
@@ -123,6 +125,8 @@ def _tokenize_requests(
                 )
             )
             continue
+        if msg.stamps is not None:
+            user_msg.stamps = [*msg.stamps, start, time.perf_counter()]
         backend.append(user_msg)
     return backend, errors
 

@@ -562,6 +562,8 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
+            if msg.stamps is not None:
+                msg.stamps.append(time.perf_counter())
             logger.debug_rank0("Received user msg: %s", msg)
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is not None and msg.uid in tombstones:

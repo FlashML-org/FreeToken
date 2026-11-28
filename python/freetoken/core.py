@@ -52,6 +52,9 @@ class ReqStats:
     prompt_n: int = 0                    # prompt tokens actually computed
     draft_n: int = 0                     # drafted tokens summed over verify steps
     draft_n_accepted: int = 0            # accepted drafts that were committed, after stop truncation
+    # before the queue, under --enable-timings-report: arrived, handler entry, pre-check rendered (API server),
+    # tokenize start and end (tokenizer worker), received (scheduler)
+    stamps: list[float] | None = None
 
     def stamp_token(self, now: float) -> None:
         if self.first_token_at is None:
@@ -64,6 +67,7 @@ class ReqStats:
         if self.first_chunk_at is None or self.first_token_at is None:
             return None
         return {
+            **self._pre_queue_spans(),
             "queue_ms": (self.first_chunk_at - self.enqueued_at) * 1000.0
             if self.enqueued_at is not None else 0.0,
             "cache_n": self.cache_n,
@@ -74,6 +78,23 @@ class ReqStats:
             "predicted_ms": max((self.last_token_at - self.first_token_at) * 1000.0, 0.001),
             "draft_n": self.draft_n,
             "draft_n_accepted": self.draft_n_accepted,
+        }
+
+    def _pre_queue_spans(self) -> dict:
+        """The spans before the waiting queue, in order, and the first token's clock reading, from which the API
+        server takes the time the token needed to reach the stream. Empty without the stamps."""
+        if self.stamps is None or len(self.stamps) != 6 or self.enqueued_at is None:
+            return {}
+        # perf_counter readings from three processes; they compare on Linux, where perf_counter is CLOCK_MONOTONIC
+        arrived, handler, rendered, encode_start, encode_end, received = self.stamps
+        return {
+            "parse_ms": (handler - arrived) * 1000.0,
+            "render_ms": (rendered - handler) * 1000.0,
+            "to_worker_ms": (encode_start - rendered) * 1000.0,
+            "tokenize_ms": (encode_end - encode_start) * 1000.0,
+            "to_scheduler_ms": (received - encode_end) * 1000.0,
+            "admit_ms": (self.enqueued_at - received) * 1000.0,
+            "first_token_t": self.first_token_at,
         }
 
 

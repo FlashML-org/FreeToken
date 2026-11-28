@@ -134,9 +134,15 @@ like llama-swap and Open Web UI show per-request prefill/decode rates. All spans
 measured in the scheduler: `queue_ms` covers admission to the first prefill chunk,
 `prompt_ms` the first chunk to the first sampled token (chunk gaps included),
 `predicted_ms` the first to the last committed token; `prompt_n` counts only the
-evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
-streams the object rides the final chunk; a multi-prompt `/v1/completions` request
-reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
+evaluated tokens and the decode rates divide by `predicted_n - 1`, as in
+llama.cpp. A chat completion also splits the time before the queue into spans that
+follow each other: `parse_ms` (arrival to the handler, the body read and parsed),
+`render_ms` (handler to submit: request checks and, on a stream, the template
+pre-check), `to_worker_ms`, `tokenize_ms` (the tokenizer worker's template render
+and encode), `to_scheduler_ms` and `admit_ms`; a streamed one adds `reply_ms`,
+from the first sampled token to the stream's first piece of text. On streams the
+object rides the final chunk; a multi-prompt `/v1/completions` request reports the
+first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
 (llama.cpp emits no timings there either). A streaming chat completion, completion or
 Responses request may set the llama.cpp top-level body field `"timings_per_token": true`
 to carry the block with growing values on every chunk that follows an ack: text and

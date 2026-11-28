@@ -268,6 +268,39 @@ def test_timings_block_rates_survive_the_edge_shapes():
     assert t["draft_n"] == 64 and t["draft_n_accepted"] == 40
 
 
+def test_timings_split_the_time_before_the_queue_across_the_processes():
+    """The handler's stamps ride TokenizeMsg to the tokenizer worker, which adds its encode, and UserMsg over the
+    wire to the scheduler, which adds the receipt; the spans follow each other from arrival to the first chunk."""
+    import torch
+
+    from freetoken.core import ReqStats, SamplingParams
+    from freetoken.message import BaseBackendMsg, TokenizeMsg, UserMsg
+    from freetoken.tokenizer.server import _tokenize_requests
+
+    class Manager:
+        def tokenize(self, msgs):
+            return [UserMsg(uid=m.uid, input_ids=torch.arange(3, dtype=torch.int32), sampling_params=m.sampling_params)
+                    for m in msgs]
+
+    plain = TokenizeMsg(uid=1, text="a", sampling_params=SamplingParams())
+    stamped = TokenizeMsg(uid=2, text="a", sampling_params=SamplingParams(), stamps=[1.0, 1.002, 1.005])
+    (bare, sent), _ = _tokenize_requests(Manager(), [plain, stamped], None)
+    assert bare.stamps is None and len(sent.stamps) == 5 and 1.005 < sent.stamps[3] <= sent.stamps[4]
+    got = BaseBackendMsg.decoder(sent.encoder())
+    got.stamps[3:] = [1.010, 1.030]  # the encode, here 20 ms
+    got.stamps.append(1.031)         # the scheduler's receipt
+    stats = ReqStats(enqueued_at=1.0315, stamps=got.stamps)
+    stats.first_chunk_at, stats.first_token_at, stats.last_token_at = 1.032, 1.300, 1.400
+    t = timings_block(_timings_state(), stats.finish(10), first_out=1.304)
+    spans = ("parse_ms", "render_ms", "to_worker_ms", "tokenize_ms", "to_scheduler_ms", "admit_ms", "queue_ms",
+             "prompt_ms", "reply_ms")
+    assert [round(t[k], 3) for k in spans] == [2.0, 3.0, 5.0, 20.0, 1.0, 0.5, 0.5, 268.0, 4.0]
+    assert sum(t[k] for k in spans) == pytest.approx((1.304 - 1.0) * 1000.0)
+    # a request without stamps keeps the plain block
+    assert "tokenize_ms" not in timings_block(_timings_state(), ReqStats(enqueued_at=1.0, first_chunk_at=1.1,
+                                                                          first_token_at=1.2, last_token_at=1.3).finish(2))
+
+
 def test_gen_done_and_result_carry_the_scheduler_timings():
     raw = _sched_timings(queue_ms=5.0, prompt_n=7, prompt_ms=70.0, predicted_n=5, predicted_ms=80.0)
     st = FakeState([

@@ -152,7 +152,12 @@ class GenResult:
     timings: dict[str, Any] | None = None
 
 
-def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
+_PRE_QUEUE_SPANS = ("parse_ms", "render_ms", "to_worker_ms", "tokenize_ms", "to_scheduler_ms", "admit_ms")
+
+
+def timings_block(
+    state: Any, timings: dict[str, Any] | None, first_out: float | None = None
+) -> dict[str, Any] | None:
     """llama.cpp's per-request timings object (server_slot_stats::to_json, b10408+) as
     frontends like llama-swap read it, plus queue_ms as a FreeToken extension. The spans
     and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack
@@ -163,7 +168,15 @@ def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] 
     divide by predicted_n - 1 steps (the first token rides the last prompt batch),
     matching llama.cpp's arithmetic. Values are not rounded. Off unless
     --enable-timings-report: usage.prompt_tokens - prompt_n would otherwise still
-    reveal the prefix-cache hit that --enable-cache-report hides."""
+    reveal the prefix-cache hit that --enable-cache-report hides.
+
+    A request whose handler stamped its arrival (chat completions) also gets the
+    time before the queue, in spans that follow each other: parse_ms (arrival to the
+    handler), render_ms (a stream's template pre-check, prerender_error), to_worker_ms (to
+    the tokenizer worker), tokenize_ms (the worker's template render and encode),
+    to_scheduler_ms and admit_ms (to the waiting queue); and with ``first_out``, the
+    clock reading at which a stream wrote its first piece of text, reply_ms from the
+    first sampled token to that write."""
     if timings is None:
         return None
     config = getattr(state, "config", None) if state is not None else None
@@ -189,6 +202,10 @@ def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] 
     if timings.get("draft_n", 0) > 0:
         block["draft_n"] = timings["draft_n"]
         block["draft_n_accepted"] = timings["draft_n_accepted"]
+    if "tokenize_ms" in timings:
+        block.update({k: timings[k] for k in _PRE_QUEUE_SPANS})
+        if first_out is not None:
+            block["reply_ms"] = (first_out - timings["first_token_t"]) * 1000.0
     return block
 
 
@@ -204,6 +221,8 @@ class GenSpec:
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
     inline_system_policy: str | None = None
+    # perf_counter readings at arrival, handler entry and after the stream's pre-check render (TokenizeMsg.stamps)
+    stamps: list[float] | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -371,6 +390,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             tools=spec.template_tools,
             images=images,
             inline_system_policy=spec.inline_system_policy,
+            stamps=spec.stamps,
         )
     )
     return uid

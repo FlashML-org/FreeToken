@@ -79,6 +79,8 @@ class UserMsg(BaseBackendMsg):
     # precomputed [3, len(input_ids)] mrope positions and decode delta; None for text-only requests and 1-D rope models
     mrope_positions: torch.Tensor | None = None
     mrope_delta: int = 0
+    # TokenizeMsg.stamps with the tokenize start and end added
+    stamps: List[float] | None = None
 
 
 @dataclass
