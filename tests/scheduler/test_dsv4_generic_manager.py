@@ -151,6 +151,38 @@ def test_capability_surface_matches_scheduler_expectations():
     assert pool.sliding_window_size == P
 
 
+def test_prefill_chunk_budget_follows_the_pool_across_a_rebuild():
+    """The manager must report the pool's LIVE chunk cap, not the one it had at construction.
+
+    ``Scheduler.rebuild_cache`` recomputes ``prefill_budget`` from
+    ``cache_manager.prefill_chunk_budget`` after a runtime resize, so a value snapshotted in
+    ``CacheManager.__init__`` makes the rebuild write back the number it already had. Growing
+    the pool then leaves prompts chunked against the old, smaller cap; shrinking it leaves a cap
+    too LARGE for the pool, and the next long prompt is chunked past what ``_alloc_window`` can
+    satisfy.
+
+    ``test_rebuild_cache_refreshes_prefill_budget`` covers the scheduler half with a
+    ``SimpleNamespace`` manager whose cap the test sets by hand, so it cannot see this: the gap
+    is between a real manager and its real pool.
+    """
+    cm, pool, _ = _stack(num_pages=32)
+    before = cm.prefill_chunk_budget
+    assert before == pool.prefill_chunk_budget > 0
+
+    # What POST /v1/cache/rebuild does: resize the window pool in place. _init_paged_state
+    # recomputes the pool's cap from the new window-slot count.
+    pool.rebuild(dsv4_pool_sizes(num_pages=96 + 1, args=_args(), swa_ratio=1.0, P=P))
+    grown = pool.prefill_chunk_budget
+    assert grown > before, "inert test: the rebuild did not move the pool's cap"
+    assert cm.prefill_chunk_budget == grown
+
+    # Shrink is the dangerous direction: a stale cap is then too large for the pool.
+    pool.rebuild(dsv4_pool_sizes(num_pages=24 + 1, args=_args(), swa_ratio=1.0, P=P))
+    shrunk = pool.prefill_chunk_budget
+    assert shrunk < before, "inert test: the shrink did not move the pool's cap"
+    assert cm.prefill_chunk_budget == shrunk
+
+
 def test_chunk_boundaries_stay_page_aligned_under_unaligned_budget():
     """Chunk continuations resume the compressor carry, so every minted chunk must END
     page-aligned -- even when the binding cap is an unaligned token-budget leftover. A leftover
