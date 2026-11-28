@@ -1,5 +1,8 @@
 """Rejection sampler and verify-row sampling: greedy prefix match, per-row sampling params and per-row penalties."""
 
+import json
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -151,3 +154,136 @@ def test_reject_with_draft_probs_commits_the_target_distribution():
     assert torch.equal(emitted[greedy], (drafts[greedy] == argmax[:k]).cumprod(dim=1).sum(dim=1))
     committed = torch.arange(k + 1, device=device) <= emitted[greedy].unsqueeze(1)
     assert torch.equal(out[greedy][committed], argmax.expand(int(greedy.sum()), -1)[committed])
+
+
+# a byte-level vocabulary small enough to walk by hand, with every byte the schema's keys need; 12 and 13 end a
+# reply, 14 is a thinking close tag
+_JSON_TOKENS = [b"{", b"}", b'"a"', b'"b"', b":", b",", b"1", b"23", b" ", b'"', b"x", b'x"', None, None, None, b"{}", b"a", b"b"]
+_JSON_EOS, _JSON_CLOSE = (12, 13), 14
+_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {"a": {"type": "integer", "minimum": 0, "maximum": 99}, "b": {"type": "string", "maxLength": 3}},
+    "required": ["a"],
+}
+
+
+def _json_grammar():
+    from freetoken.grammar.matcher import Vocab
+
+    return Vocab(_JSON_TOKENS, len(_JSON_TOKENS), _JSON_EOS).grammar(json.dumps(_JSON_SCHEMA))
+
+
+def _logits_after(prefix, salt=0):
+    """The fake target's logits after ``prefix``: random, but a function of the prefix alone."""
+    g = torch.Generator().manual_seed(hash((salt, *prefix)) % 2**31)
+    return torch.randn(len(_JSON_TOKENS), generator=g) * 4
+
+
+def _check_reply(tokens):
+    """The reply's text against the schema, by json.loads and the schema's own rules."""
+    assert tokens[-1] in _JSON_EOS
+    doc = json.loads(b"".join(_JSON_TOKENS[t] for t in tokens[:-1]))
+    assert set(doc) <= {"a", "b"} and isinstance(doc["a"], int) and 0 <= doc["a"] <= 99
+    assert "b" not in doc or (isinstance(doc["b"], str) and len(doc["b"]) <= 3)
+
+
+@pytest.mark.parametrize("salt", range(8))
+def test_masked_verify_rows_commit_what_masked_decode_steps_commit(salt, monkeypatch):
+    """Greedy, a json_schema request commits the same reply under k drafts as one token a step: row j is masked from
+    the state its drafts d1..dj reach, and a draft the mask forbids (drafts here are the unmasked argmax) is rejected
+    as a mismatch is. The reply parses and validates."""
+    from freetoken.engine.sample import BatchSamplingArgs
+    from freetoken.grammar.matcher import GrammarPlan, Matcher
+    from freetoken.spec.rejection import reject
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda name: nullcontext())
+    grammar, sampler, k = _json_grammar(), _sampler(torch.device("cpu"), len(_JSON_TOKENS)), 3
+    one = Matcher(grammar)
+    plain = []
+    while not plain or plain[-1] not in _JSON_EOS:
+        args = BatchSamplingArgs(temperatures=None, grammar=GrammarPlan([one], 1))
+        token = int(sampler.sample(_logits_after(plain, salt).unsqueeze(0), args)[0])
+        plain.append(token)
+        one.advance([token])
+        assert len(plain) < 200
+    _check_reply(plain)
+
+    spec, rejected = Matcher(grammar), 0
+    committed = []
+    while not committed or committed[-1] not in _JSON_EOS:
+        drafts = []
+        for _ in range(k):
+            drafts.append(int(_logits_after(committed + drafts, salt + 100).argmax()))
+        rows = torch.stack([_logits_after(committed + drafts[:j], salt) for j in range(k + 1)])
+        args = BatchSamplingArgs(temperatures=None, grammar=GrammarPlan([spec], k + 1))
+        out, emitted = reject(rows, torch.tensor([drafts]), args, sampler)
+        step = out[0, : int(emitted) + 1].tolist()
+        rejected += int(emitted) < k
+        if any(t in _JSON_EOS for t in step):
+            step = step[: next(i for i, t in enumerate(step) if t in _JSON_EOS) + 1]
+        committed += step
+        spec.advance(step)
+        assert len(committed) < 200
+    assert committed == plain and rejected
+
+
+def test_a_draft_the_schema_forbids_is_rejected_where_the_logits_favor_it():
+    from freetoken.engine.sample import BatchSamplingArgs
+    from freetoken.grammar.matcher import GrammarPlan, Matcher
+    from freetoken.spec.rejection import reject
+
+    grammar = _json_grammar()
+    vocab, k = len(_JSON_TOKENS), 3
+    # the logits favor '{', 'x', ':' then '}'; after '{' only a key or ' ' may follow
+    logits = torch.full((k + 1, vocab), -10.0)
+    for row, t in enumerate([0, 10, 4, 1]):
+        logits[row, t] = 10.0
+    logits[1, 2] = 5.0  # the best allowed token at row 1: '"a"'
+    args = BatchSamplingArgs(temperatures=None, grammar=GrammarPlan([Matcher(grammar)], k + 1))
+    out, emitted = reject(logits, torch.tensor([[0, 10, 4]]), args, _sampler(torch.device("cpu"), vocab))
+    assert int(emitted) == 1 and out[0, :2].tolist() == [0, 2]
+    # unconstrained, the same drafts all pass
+    out, emitted = reject(logits, torch.tensor([[0, 10, 4]]), BatchSamplingArgs(temperatures=None), _sampler(torch.device("cpu"), vocab))
+    assert int(emitted) == 3
+
+
+def test_a_thinking_span_stays_free_until_its_close_tag_even_inside_the_drafts():
+    from freetoken.engine.sample import BatchSamplingArgs
+    from freetoken.grammar.matcher import GrammarPlan, Matcher
+    from freetoken.spec.rejection import reject
+
+    grammar = _json_grammar()
+    vocab, k = len(_JSON_TOKENS), 3
+    # every row prefers 'x' (not JSON), then '{'
+    logits = torch.full((k + 1, vocab), -10.0)
+    logits[:, 10] = 10.0
+    logits[:, 0] = 5.0
+    sampler = _sampler(torch.device("cpu"), vocab)
+    thinking = Matcher(grammar, close=(_JSON_CLOSE,), thinking=True)
+    args = BatchSamplingArgs(temperatures=None, grammar=GrammarPlan([thinking], k + 1))
+    # rows 0 and 1 think freely; the close tag drafted at slot 2 constrains row 2 (after it) and row 3
+    out, emitted = reject(logits, torch.tensor([[10, _JSON_CLOSE, 0]]), args, sampler)
+    assert out[0].tolist()[:2] == [10, 10] and int(emitted) == 1
+    logits[1, _JSON_CLOSE] = 20.0
+    out, emitted = reject(logits, torch.tensor([[10, _JSON_CLOSE, 0]]), args, sampler)
+    # row 3 reads '{': a key or a space, not the 'x' its logits favor
+    assert int(emitted) == 3 and out[0].tolist()[:3] == [10, _JSON_CLOSE, 0] and int(out[0, 3]) in (2, 8)
+    thinking.advance([10, _JSON_CLOSE])
+    assert thinking.key > 0
+
+
+def test_unconstrained_rows_sample_from_the_unmasked_logits(monkeypatch):
+    """No plan, or a plan whose requests are all free, hands back the very logits tensor: nothing is copied or masked;
+    in a mixed batch only the constrained request's row changes."""
+    from freetoken.engine.sample import BatchSamplingArgs
+    from freetoken.grammar.matcher import GrammarPlan, Matcher
+
+    grammar = _json_grammar()
+    logits = torch.zeros(2, len(_JSON_TOKENS))
+    logits[:, 10] = 10.0
+    assert GrammarPlan([None, None], 1).apply(logits) is logits
+    assert GrammarPlan([Matcher(grammar, close=(_JSON_CLOSE,), thinking=True), None], 1).apply(logits) is logits
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda name: nullcontext())
+    sampler = _sampler(torch.device("cpu"), len(_JSON_TOKENS))
+    tokens = sampler.sample(logits, BatchSamplingArgs(temperatures=None, grammar=GrammarPlan([Matcher(grammar), None], 1)))
+    assert int(tokens[0]) != 10 and int(tokens[1]) == 10

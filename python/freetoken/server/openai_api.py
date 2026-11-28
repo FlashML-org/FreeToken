@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
+from freetoken.grammar.json_schema import SchemaError, compile_schema, parse_response_format
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 
@@ -164,11 +167,10 @@ async def handle_chat_completion(
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
-    if _response_format_unsupported(req.response_format):
-        return create_error_response(
-            "response_format json_object/json_schema is not supported (no constrained decoding)",
-            param="response_format",
-        )
+    try:
+        schema = _response_schema(req, tools=_should_parse_tools(req))
+    except SchemaError as exc:
+        return create_error_response(str(exc), param="response_format")
     if req.n != 1:
         return create_error_response("Only n=1 is supported", param="n")
     # Case/whitespace and the "off" disable synonym stay accepted here because
@@ -206,6 +208,10 @@ async def handle_chat_completion(
         )
     except ValueError as exc:
         return create_error_response(str(exc))
+    # the full compile comes after every cheaper 400 and before a stream starts
+    if schema is not None and (refusal := await _schema_refusal(schema)) is not None:
+        return create_error_response(refusal, param="response_format")
+    spec.sampling_params.json_schema = schema
 
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
@@ -429,6 +435,10 @@ async def handle_completion(
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
+    try:
+        schema = _response_schema(req)
+    except SchemaError as exc:
+        return create_error_response(str(exc), param="response_format")
     if req.n != 1:
         return create_error_response("Only n=1 is supported", param="n")
     try:  # surfaces an out-of-range max_tokens as a 400 rather than a 500 from the worker
@@ -450,14 +460,17 @@ async def handle_completion(
     assert isinstance(prompts, list)
     if not prompts:
         return create_error_response("prompt must not be empty", param="prompt")
+    if req.stream and len(prompts) != 1:
+        return create_error_response("Streaming completions only support a single text prompt")
+    # the full compile comes after every cheaper 400 and before a stream starts
+    if schema is not None and (refusal := await _schema_refusal(schema)) is not None:
+        return create_error_response(refusal, param="response_format")
     if req.stream:
-        if len(prompts) != 1:
-            return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
             TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(
                 req, model_sampling, default_max_tokens=default_max_tokens,
-                timings_per_token=timings_pt,
+                timings_per_token=timings_pt, json_schema=schema,
             ))
         )
         chunks = stream_completion_chunks(uid, req, state)
@@ -481,7 +494,7 @@ async def handle_completion(
                 text=prompt,
                 sampling_params=_resolve_sampling(
                     req, model_sampling, default_max_tokens=default_max_tokens,
-                    timings_per_token=timings_pt,
+                    timings_per_token=timings_pt, json_schema=schema,
                 ),
             )
         )
@@ -625,8 +638,9 @@ def _resolve_sampling(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     timings_per_token: bool = False,
+    json_schema: str | None = None,
 ) -> SamplingParams:
-    return resolve_sampling(
+    params = resolve_sampling(
         temperature=req.temperature,
         top_k=req.top_k,
         top_p=req.top_p,
@@ -639,6 +653,8 @@ def _resolve_sampling(
         frequency_penalty=req.frequency_penalty,
         timings_per_token=timings_per_token,
     )
+    params.json_schema = json_schema
+    return params
 
 
 def _tools_for_template(req: ChatCompletionRequest) -> list[dict[str, Any]] | None:
@@ -735,9 +751,64 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
     return usage
 
 
-def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
-    # We have no constrained/guided decoding; only plain text ('text' or unset) is honored.
-    return response_format is not None and response_format.get("type") not in (None, "text")
+def _response_schema(req: ChatCompletionRequest | CompletionRequest, tools: bool = False) -> str | None:
+    """The json_schema text the request's response_format enforces (freetoken.grammar), None for plain text; raises
+    SchemaError for a format or schema outside what the decoder enforces."""
+    schema = parse_response_format(req.response_format)
+    if schema is None:
+        return None
+    # the grammar's end state allows only end-of-sequence, and its masks exclude every tool-call token
+    if req.ignore_eos:
+        raise SchemaError("response_format json_schema cannot be combined with ignore_eos")
+    if tools:
+        raise SchemaError("response_format json_schema cannot be combined with tools (use tool_choice none)")
+    return schema
+
+
+# schema text -> why its automaton is refused, None when it compiles; the last _SCHEMA_VERDICTS_KEPT schemas
+_SCHEMA_VERDICTS: OrderedDict[str, str | None] = OrderedDict()
+_SCHEMA_VERDICTS_KEPT = 64
+# schema text -> the verdict of a compile still running, so concurrent first sends of a schema share one compile
+_SCHEMA_COMPILING: dict[str, concurrent.futures.Future] = {}
+
+
+def _schema_verdict(schema: str) -> str | None:
+    try:
+        compile_schema(json.loads(schema))
+    except SchemaError as exc:
+        return str(exc)
+    return None
+
+
+def _schema_verdict_into(schema: str, future: concurrent.futures.Future) -> None:
+    try:
+        future.set_result(_schema_verdict(schema))
+    except BaseException as exc:  # noqa: BLE001 -- handed to every request waiting on this compile
+        future.set_exception(exc)
+
+
+async def _schema_refusal(schema: str) -> str | None:
+    """Why the schema's full automaton is refused (over the state cap), None when it compiles. Compiled here, off the
+    event loop, before a stream starts, so a refused schema is a 400 on streams too and never reaches the scheduler's
+    thread; the automaton itself is dropped (the scheduler compiles its own)."""
+    if schema in _SCHEMA_VERDICTS:
+        _SCHEMA_VERDICTS.move_to_end(schema)
+        return _SCHEMA_VERDICTS[schema]
+    future = _SCHEMA_COMPILING.get(schema)
+    if future is None:
+        future = _SCHEMA_COMPILING[schema] = concurrent.futures.Future()
+        # running: a waiter that is cancelled (a dropped client) cannot cancel the compile the others wait on
+        future.set_running_or_notify_cancel()
+        asyncio.get_running_loop().run_in_executor(None, _schema_verdict_into, schema, future)
+    try:
+        verdict = await asyncio.wrap_future(future)
+    finally:
+        if future.done() and _SCHEMA_COMPILING.get(schema) is future:
+            del _SCHEMA_COMPILING[schema]
+    _SCHEMA_VERDICTS[schema] = verdict
+    while len(_SCHEMA_VERDICTS) > _SCHEMA_VERDICTS_KEPT:
+        _SCHEMA_VERDICTS.popitem(last=False)
+    return verdict
 
 
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
@@ -751,8 +822,6 @@ def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
         return "suffix is not supported"
     if req.logit_bias is not None:
         return "logit_bias is not supported"
-    if _response_format_unsupported(req.response_format):
-        return "response_format json_object/json_schema is not supported (no constrained decoding)"
     return None
 
 

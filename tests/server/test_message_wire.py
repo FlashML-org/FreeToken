@@ -138,6 +138,15 @@ def test_terminal_replies_carry_scheduler_timings_over_the_wire():
     assert plain.timings is None
 
 
+def test_a_json_schema_crosses_both_hops_as_its_text():
+    """The schema rides SamplingParams as text, so a property named like the wire's tag key stays a property."""
+    params = SamplingParams(json_schema='{"type":"object","properties":{"__type__":{"type":"string"}}}')
+    tok = TokenizeMsg(uid=3, text="hi", sampling_params=params)
+    assert BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(tok)).sampling_params == params
+    msg = UserMsg(uid=3, input_ids=torch.arange(4, dtype=torch.int32), sampling_params=params)
+    assert BaseBackendMsg.decoder(msg.encoder()).sampling_params == params
+
+
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
     """Tool JSON Schemas and chat_template_kwargs are free-form client data. A field literally
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --

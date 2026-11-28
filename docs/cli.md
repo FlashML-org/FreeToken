@@ -143,6 +143,44 @@ to carry the block with growing values on every chunk that follows an ack: text 
 reasoning deltas, tool-argument fragments, and the finish chunk (or the usage chunk
 with `include_usage`). Without the server flag the field is ignored.
 
+A chat completion or completion request may set `"response_format": {"type": "json_schema",
+"json_schema": {"name": ..., "schema": {...}}}`. Every token of the reply is then sampled from
+the tokens that keep the text a prefix of a JSON document the schema accepts, and the
+end-of-sequence token is allowed only once the document is complete, so a reply that is not
+cut by `max_tokens` or a stop string parses and validates. Under speculative decoding each
+verify row is masked from the state its drafts reach, and a draft the schema forbids is
+rejected as a mismatch is. A prompt that leaves thinking open (`<think>` with a reasoning
+parser) thinks freely; the schema applies from the close tag on. The schema is compiled to a
+byte automaton twice. The endpoint compiles it first, on a worker thread, after its other
+request checks, and a schema needing more than 50,000 automaton states is a 400 there, before a
+stream starts; requests that send a new schema at the same time share one compile, and the
+verdicts of the last 64 schemas are kept. A schema that compiles is compiled again on the
+scheduler's thread when the request arrives, so the other requests wait for it once per schema
+(0.3 to 1.6 s for schemas of five to seven properties with nested arrays and objects, on a
+laptop CPU; the last 8 schemas are kept), and each state's token mask is computed the first
+time a reply reaches it.
+A tokenizer whose token bytes cannot be read is refused on the first such request, and the
+later ones are refused from that answer. Without such a request, a step does one `None` check
+more, allocates nothing and captures no other graph. What is enforced:
+
+- `type` (one or a list), `enum` and `const`, `properties` and `required` (properties are
+  written in the schema's order; extra properties are never written, whatever
+  `additionalProperties` says), `items` with `minItems` / `maxItems`, `minLength` /
+  `maxLength`, integer `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum`,
+  number bounds as an integral `minimum` >= 0 and an integral `maximum`, `anyOf`, `oneOf` whose
+  branches have different JSON types, `allOf` of one schema, and `$ref` into `$defs` or
+  `definitions` that does not recurse. `format` is an annotation and is not enforced.
+- Any other keyword (`pattern`, `multipleOf`, `minProperties`, `uniqueItems`, ...) is a 400,
+  as are `json_object`, a schema with no type, and `json_schema` with `ignore_eos` or with
+  tools (unless `tool_choice` is `none`).
+- Whitespace between tokens is at most 16 bytes a gap, numbers have no exponent and at most 19
+  integer and 15 fraction digits, and strings carry no escaped surrogates: the reply is one
+  of the texts the schema accepts, not every one.
+
+Without speculative decoding the scheduler overlaps a step with the last one's results; a
+constrained request sits out a launch while its previous token is in flight; the rest of the
+batch launches as usual.
+
 ### Image input
 
 Experimental. Needs a checkpoint whose family registers a vision encoder ([models.md](models.md#image-input) lists them and how each one

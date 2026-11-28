@@ -71,6 +71,7 @@ def _setup():
         _match_stop_str=lambda _req: None,
         _pending_abort_acks=set(),
         _last_data=None,
+        _grammars={},
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
     stub._commit_tokens = lambda req, tokens: Scheduler._commit_tokens(stub, req, tokens)
