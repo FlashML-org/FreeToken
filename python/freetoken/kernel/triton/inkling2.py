@@ -24,12 +24,19 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.e4m3_compat import e4m3_u8_to_f32
+from freetoken.kernel.triton.kv_rows import kv_scale_args, kv_tile, stage_tile
+from freetoken.kvcache.format import NONE, KVFormat
+
 _LOG2E = 1.4426950408889634
-
-
-@functools.cache
-def _num_sms(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+_DECODE_MIN_BLOCK_KV = 32
+# a long request takes splits of at least this many keys
+_DECODE_MIN_SPLIT_LEN = 512
+_DECODE_MAX_SPLITS = 64
+# stage 1 CTAs one SM holds for every KV format on sm_120 (8-bit: 3, bf16: 4)
+_DECODE_CTAS_PER_SM = 3
+# stage 2 holds at most this many fp32 partial elements per program
+_DECODE_STAGE2_ELEMS = 2048
 
 
 @triton.jit
@@ -46,10 +53,192 @@ def _gate_bf16(out, gate_ptr, mask):
 
 
 @triton.jit
-def _extend_attention_kernel(
+def _e4m3_bf16_bits(codes):
+    # moves sign and exponent+mantissa into bf16 bits: the value comes out scaled by 2^-120
+    return tl.inline_asm_elementwise(
+        """{
+        .reg .b32 a, b, s;
+        prmt.b32 a, 0, $2, 0x5040;
+        shr.b32 b, a, 4;
+        and.b32 s, a, 0x80008000;
+        and.b32 b, b, 0x07F007F0;
+        or.b32 $0, b, s;
+        prmt.b32 a, 0, $2, 0x7060;
+        shr.b32 b, a, 4;
+        and.b32 s, a, 0x80008000;
+        and.b32 b, b, 0x07F007F0;
+        or.b32 $1, b, s;
+        }""",
+        "=r,=r,r", [codes], dtype=tl.bfloat16, is_pure=True, pack=4,
+    )
+
+
+@triton.jit
+def _int8_bf16_bits(codes):
+    # 1024 + 128 + x in fp16, minus 1152, then the fp16 bits shifted into bf16: the value comes out scaled by 2^-112
+    return tl.inline_asm_elementwise(
+        """{
+        .reg .b32 u, a, h, s, m, c;
+        mov.b32 m, 0x64646464;
+        mov.b32 c, 0x64806480;
+        xor.b32 u, $2, 0x80808080;
+        prmt.b32 a, u, m, 0x5140;
+        sub.rn.f16x2 h, a, c;
+        and.b32 s, h, 0x80008000;
+        shr.b32 h, h, 3;
+        and.b32 h, h, 0x0FFF0FFF;
+        or.b32 $0, h, s;
+        prmt.b32 a, u, m, 0x5342;
+        sub.rn.f16x2 h, a, c;
+        and.b32 s, h, 0x80008000;
+        shr.b32 h, h, 3;
+        and.b32 h, h, 0x0FFF0FFF;
+        or.b32 $1, h, s;
+        }""",
+        "=r,=r,r", [codes], dtype=tl.bfloat16, is_pure=True, pack=4,
+    )
+
+
+@triton.jit
+def _stage_bf16(x):
+    # keeps the decode in the load layout: once per CTA, handed to the MMA through shared memory
+    return tl.inline_asm_elementwise("mov.b32 $0, $1;", "=r,r", [x], dtype=tl.bfloat16, is_pure=False, pack=2)
+
+
+@triton.jit
+def _extend_kv_tile(ptrs, FMT: tl.constexpr, BIT_DECODE: tl.constexpr):
+    """A K or V cache tile as the dot takes it; with BIT_DECODE an 8-bit tile is scaled by 2^-120 (fp8) or 2^-112 (int8)."""
+    if FMT == "none":
+        tile = tl.load(ptrs)
+    elif BIT_DECODE:
+        codes = tl.load(ptrs).to(tl.uint8, bitcast=True)
+        if FMT == "fp8_per_token_head":
+            tile = _stage_bf16(_e4m3_bf16_bits(codes))
+        else:
+            tile = _stage_bf16(_int8_bf16_bits(codes))
+    else:
+        codes = tl.load(ptrs)
+        if FMT == "fp8_per_token_head":
+            x = e4m3_u8_to_f32(codes)
+        else:
+            x = codes.to(tl.float32)
+        tile = stage_tile(x).to(tl.bfloat16)
+    return tile
+
+
+@triton.jit
+def _extend_attend_tile(
+    q, m_i, l_i, acc, k, v, sk, sv, start, offs, key_hi, q_pos, bias_rows,
+    KIND: tl.constexpr, SCALED: tl.constexpr, SLIDING_WINDOW: tl.constexpr, REL_EXTENT: tl.constexpr,
+):
+    """One key tile of the keys start + offs: KIND 0 has no bias and no mask, 1 a bias and no mask, 2 a bias and the key / causal / window masks."""
+    if KIND != 0:
+        keys = start + offs
+        bias_ptrs = (bias_rows + (q_pos - start))[:, None] - offs[None, :]
+    if KIND == 1:
+        bias = tl.load(bias_ptrs)
+    elif KIND == 2:
+        dist = q_pos[:, None] - keys[None, :]
+        key_ok = keys < key_hi
+        if SLIDING_WINDOW > 0:
+            vis = (dist.to(tl.uint32, bitcast=True) < SLIDING_WINDOW) & key_ok[None, :]
+        else:
+            vis = (dist >= 0) & key_ok[None, :]
+        if SLIDING_WINDOW > 0 and SLIDING_WINDOW <= REL_EXTENT:
+            in_ext = vis
+        else:
+            in_ext = (dist.to(tl.uint32, bitcast=True) < REL_EXTENT) & key_ok[None, :]
+        bias = tl.load(bias_ptrs, mask=in_ext, other=0.0)
+    s = tl.dot(q, k)
+    if SCALED:
+        s = s * sk[None, :]
+    else:
+        s = s * sk
+    if KIND != 0:
+        s = s + bias.to(tl.float32) * 1.4426950408889634
+    if KIND == 2:
+        s = tl.where(vis, s, -float("inf"))
+    m_new = tl.maximum(m_i, tl.max(s, axis=1))
+    alpha = tl.math.exp2(m_i - m_new)
+    p = tl.math.exp2(s - m_new[:, None])
+    l_i = l_i * alpha + tl.sum(p, axis=1)
+    if SCALED:
+        p = p * sv[None, :]
+    else:
+        p = p * sv
+    acc = tl.dot(p.to(tl.bfloat16), v, acc * alpha[:, None])
+    return m_new, l_i, acc
+
+
+@triton.jit
+def _extend_keys(
+    q, m_i, l_i, acc, lo, hi, key_hi, k_base, v_base, ks_base, vs_base, kv_idx, ext_base, stride_k, stride_v,
+    stride_kss, stride_vss, k_mul, v_mul, zero_ptr, zero_ref, first, kv_head, q_start, prefix_len, row_first, row_last,
+    row_lo, bias_ptr, stride_bt, stride_bh,
+    CACHE: tl.constexpr, KIND: tl.constexpr, BLOCK: tl.constexpr, STAGES: tl.constexpr, FMT: tl.constexpr,
+    BIT_DECODE: tl.constexpr, GROUP: tl.constexpr, BLOCK_M: tl.constexpr, D: tl.constexpr, SLIDING_WINDOW: tl.constexpr,
+    REL_EXTENT: tl.constexpr,
+):
+    """Keys [lo, hi) of one source: the cache prefix through kv_idx, or this chunk's rows ext_base + key. key_hi bounds the valid keys of masked tiles."""
+    # a runtime zero keeps the row state and address offsets of each key loop out of the other loops' registers
+    zero = tl.load(zero_ptr, volatile=True) - zero_ref
+    r = tl.arange(0, BLOCK_M) + zero
+    head = kv_head * GROUP + r % GROUP
+    rows = tl.minimum(tl.maximum(q_start + first + r // GROUP, row_first), row_last)
+    q_pos = prefix_len + rows - q_start
+    bias_rows = bias_ptr + (rows - row_lo) * stride_bt + head * stride_bh
+    offs = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK) + zero, BLOCK), BLOCK)
+    offs_d = tl.max_contiguous(tl.multiple_of(tl.arange(0, D) + zero, D), D)
+    SCALED: tl.constexpr = CACHE and FMT != "none"
+    for start in tl.range(lo, hi, BLOCK, num_stages=STAGES):
+        keys = start + offs
+        if CACHE:
+            if KIND == 2:
+                kv_rows = tl.load(kv_idx + tl.minimum(keys, key_hi - 1)).to(tl.int64)
+            else:
+                kv_rows = tl.load(kv_idx + keys).to(tl.int64)
+        elif KIND == 2:
+            kv_rows = ext_base + tl.minimum(keys, key_hi - 1)
+        else:
+            kv_rows = ext_base + keys
+        if SCALED:
+            sk = tl.load(ks_base + kv_rows * stride_kss) * k_mul
+            sv = tl.load(vs_base + kv_rows * stride_vss) * v_mul
+        else:
+            sk = k_mul
+            sv = v_mul
+        if CACHE:
+            k = _extend_kv_tile(k_base + kv_rows[None, :] * stride_k + offs_d[:, None], FMT, BIT_DECODE)
+            v = _extend_kv_tile(v_base + kv_rows[:, None] * stride_v + offs_d[None, :], FMT, BIT_DECODE)
+        else:
+            k = tl.load(k_base + kv_rows[None, :] * stride_k + offs_d[:, None])
+            v = tl.load(v_base + kv_rows[:, None] * stride_v + offs_d[None, :])
+        m_i, l_i, acc = _extend_attend_tile(q, m_i, l_i, acc, k, v, sk, sv, start, offs, key_hi, q_pos, bias_rows, KIND,
+                                            SCALED, SLIDING_WINDOW, REL_EXTENT)
+    return m_i, l_i, acc
+
+
+@triton.jit
+def _extend_ranges(src_lo, src_hi, vis_lo, far_end, band_lo, band_hi, BLOCK_N: tl.constexpr, BLOCK_NB: tl.constexpr,
+                   BLOCK_NE: tl.constexpr):
+    """Tiles of the source keys [src_lo, src_hi): no-bias [s, a) below far_end, masked [a, b) up to band_lo, bias-only [b, c) below band_hi, masked [c, src_hi). Each range starts its tiles at its own lower bound."""
+    s = tl.minimum(tl.maximum(src_lo, vis_lo), src_hi)
+    a = s + tl.maximum(tl.minimum(far_end, src_hi) - s, 0) // BLOCK_N * BLOCK_N
+    b = a + (tl.maximum(tl.minimum(band_lo, src_hi) - a, 0) + BLOCK_NE - 1) // BLOCK_NE * BLOCK_NE
+    b = tl.minimum(b, src_hi)
+    c = b + tl.maximum(tl.minimum(band_hi, src_hi) - b, 0) // BLOCK_NB * BLOCK_NB
+    return s, a, b, c
+
+
+@triton.jit
+def _extend_attention_split_kernel(
     q_ptr,
-    k_ptr,
-    v_ptr,
+    k_extend_ptr,
+    v_extend_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     o_ptr,
     gate_ptr,
     bias_ptr,
@@ -63,10 +252,16 @@ def _extend_attention_kernel(
     qk_scale,
     stride_qt,
     stride_qh,
-    stride_ks,
-    stride_kh,
-    stride_vs,
-    stride_vh,
+    stride_ket,
+    stride_keh,
+    stride_vet,
+    stride_veh,
+    stride_kcs,
+    stride_kch,
+    stride_vcs,
+    stride_vch,
+    stride_kss,
+    stride_vss,
     stride_ot,
     stride_gt,
     stride_bt,
@@ -76,78 +271,149 @@ def _extend_attention_kernel(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_NB: tl.constexpr,
+    BLOCK_NE: tl.constexpr,
+    FAR_STAGES: tl.constexpr,
+    BAND_STAGES: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     REL_EXTENT: tl.constexpr,
+    KV_FMT: tl.constexpr,
+    BIT_DECODE: tl.constexpr,
 ):
-    seq_id = tl.program_id(0)
-    q_head = tl.program_id(1)
-    block_m = tl.program_id(2)
-    kv_head = q_head // GROUP
+    """One program owns BLOCK_M rows = BLOCK_M // GROUP tokens x the GROUP q heads of one KV head, so each K/V tile is read and decoded once per KV head.
+
+    The prefix comes from the cache, this chunk's keys from its own K/V rows. Per source the keys split into tiles with no bias and no mask (BLOCK_N, out of every row's extent), with a bias and no mask (BLOCK_NB) and masked ones (BLOCK_NE)."""
+    TOKENS: tl.constexpr = BLOCK_M // GROUP
+    block_m_id = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    seq_id = tl.program_id(2)
 
     q_start = tl.load(qo_indptr_ptr + seq_id)
     q_len = tl.load(qo_indptr_ptr + seq_id + 1) - q_start
-    first = block_m * BLOCK_M
-    # rows of this launch's bias window only: [row_lo, row_hi) of the batch
-    if first >= q_len or q_start + first >= row_hi or q_start + first + BLOCK_M <= row_lo:
+    first = block_m_id * TOKENS
+    if first >= q_len or q_start + first >= row_hi or q_start + tl.minimum(q_len, first + TOKENS) <= row_lo:
         return
     kv_start = tl.load(kv_indptr_ptr + seq_id)
-    kv_len = tl.load(kv_indptr_ptr + seq_id + 1) - kv_start
     prefix_len = tl.load(prefix_lens_ptr + seq_id)
+    zero_ptr = qo_indptr_ptr + seq_id
 
-    offs_m = first + tl.arange(0, BLOCK_M)
-    rows = q_start + offs_m
-    mask_m = (offs_m < q_len) & (rows >= row_lo) & (rows < row_hi)
-    offs_n = tl.arange(0, BLOCK_N)
+    # rows outside the launch read the nearest valid row and are never stored
+    row_first = tl.maximum(q_start + first, row_lo)
+    row_last = tl.minimum(tl.minimum(q_start + q_len, row_hi) - 1, q_start + first + TOKENS - 1)
+    r = tl.arange(0, BLOCK_M)
+    head = kv_head * GROUP + r % GROUP
+    rows = tl.minimum(tl.maximum(q_start + first + r // GROUP, row_first), row_last)
     offs_d = tl.arange(0, D)
-    q_pos = prefix_len + offs_m
-
-    q = tl.load(q_ptr + rows[:, None] * stride_qt + q_head * stride_qh + offs_d[None, :], mask=mask_m[:, None], other=0.0)
+    q = tl.load(q_ptr + rows[:, None] * stride_qt + head[:, None] * stride_qh + offs_d[None, :])
+    if BIT_DECODE and KV_FMT != "none":
+        # with q at 2^64 the products of the 2^-120 / 2^-112 scaled codes stay clear of fp32 subnormals
+        q = (q.to(tl.float32) * 18446744073709551616.0).to(tl.bfloat16)
+        if KV_FMT == "fp8_per_token_head":
+            K_MUL = 72057594037927936.0  # 2^56
+            V_MUL = 1.2676506002282294e30  # 2^100
+        else:
+            K_MUL = 281474976710656.0  # 2^48
+            V_MUL = 4.951760157141521e27  # 2^92
+        E_K = 5.421010862427522e-20  # 2^-64
+        # acc holds the output at 2^-20, so p * v_scale * V_MUL stays inside the bf16 range
+        E_V = 9.5367431640625e-07
+    else:
+        K_MUL = 1.0
+        V_MUL = 1.0
+        E_K = 1.0
+        E_V = 1.0
     # the sink starts the running max with one unit of mass, so no row is ever empty
-    m_i = tl.load(sink_ptr + rows * stride_st + q_head, mask=mask_m, other=0.0).to(tl.float32) * 1.4426950408889634
+    m_i = tl.load(sink_ptr + rows * stride_st + head).to(tl.float32) * 1.4426950408889634
     l_i = tl.full((BLOCK_M,), 1.0, dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
-    bias_rows = bias_ptr + (rows - row_lo)[:, None] * stride_bt + q_head * stride_bh
 
-    hi = tl.minimum(kv_len, prefix_len + tl.minimum(q_len, first + BLOCK_M))
+    kc_base = k_cache_ptr + kv_head * stride_kch
+    vc_base = v_cache_ptr + kv_head * stride_vch
+    ks_base = k_scale_ptr + kv_head
+    vs_base = v_scale_ptr + kv_head
+    ke_base = k_extend_ptr + kv_head * stride_keh
+    ve_base = v_extend_ptr + kv_head * stride_veh
+    kv_idx = kv_indices_ptr + kv_start
+
+    p0 = prefix_len + row_first - q_start
+    p1 = prefix_len + row_last - q_start
+    end = p1 + 1
     if SLIDING_WINDOW > 0:
-        lo = tl.maximum(prefix_len + first - SLIDING_WINDOW + 1, 0) // BLOCK_N * BLOCK_N
+        vis_lo = tl.maximum(p0 - SLIDING_WINDOW + 1, 0)
+        far_end = vis_lo
+        reach = tl.minimum(SLIDING_WINDOW, REL_EXTENT)
     else:
-        # key blocks at least REL_EXTENT behind every row of the block: no bias, no mask
-        lo = tl.maximum(prefix_len + first - REL_EXTENT + 1, 0) // BLOCK_N * BLOCK_N
-        for start_n in tl.range(0, lo, BLOCK_N):
-            slots = tl.load(kv_indices_ptr + kv_start + start_n + offs_n).to(tl.int64)
-            k = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None])
-            s = tl.dot(q, k) * qk_scale
-            m_new = tl.maximum(m_i, tl.max(s, axis=1))
-            alpha = tl.math.exp2(m_i - m_new)
-            p = tl.math.exp2(s - m_new[:, None])
-            v = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_d[None, :])
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            l_i = l_i * alpha + tl.sum(p, axis=1)
-            m_i = m_new
-    for start_n in tl.range(lo, hi, BLOCK_N):
-        k_pos = start_n + offs_n
-        mask_n = k_pos < kv_len
-        dist = q_pos[:, None] - k_pos[None, :]
-        mask = mask_m[:, None] & mask_n[None, :] & (dist >= 0)
-        if SLIDING_WINDOW > 0:
-            mask = mask & (dist < SLIDING_WINDOW)
-        slots = tl.load(kv_indices_ptr + kv_start + k_pos, mask=mask_n, other=0).to(tl.int64)
-        k = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None], mask=mask_n[None, :], other=0.0)
-        s = tl.dot(q, k) * qk_scale
-        bias = tl.load(bias_rows + dist, mask=mask & (dist < REL_EXTENT), other=0.0)
-        s = s + bias.to(tl.float32) * 1.4426950408889634
-        s = tl.where(mask, s, -float("inf"))
-        m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.math.exp2(m_i - m_new)
-        p = tl.math.exp2(s - m_new[:, None])
-        v = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_d[None, :], mask=mask_n[:, None], other=0.0)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_new
+        vis_lo = 0
+        far_end = tl.maximum(p0 - REL_EXTENT + 1, 0)
+        reach = REL_EXTENT
+    # keys every row of the program sees with a bias
+    band_lo = p1 - reach + 1
+    band_hi = p0 + 1
+    ck = qk_scale * K_MUL
+    ek = qk_scale * E_K
+    # the pipeliner cannot predicate the staged decode's inline asm on every arch
+    CACHE_FAR: tl.constexpr = FAR_STAGES if KV_FMT == "none" else 1
+    CACHE_BAND: tl.constexpr = BAND_STAGES if KV_FMT == "none" else 1
 
-    out = _gate_bf16(acc / l_i[:, None], gate_ptr + rows[:, None] * stride_gt + q_head * D + offs_d[None, :], mask_m[:, None])
-    tl.store(o_ptr + rows[:, None] * stride_ot + q_head * D + offs_d[None, :], out.to(o_ptr.dtype.element_ty), mask=mask_m[:, None])
+    s0, a, b, c = _extend_ranges(0, prefix_len, vis_lo, far_end, band_lo, band_hi, BLOCK_N, BLOCK_NB, BLOCK_NE)
+    if SLIDING_WINDOW == 0:
+        m_i, l_i, acc = _extend_keys(
+            q, m_i, l_i, acc, s0, a, prefix_len, kc_base, vc_base, ks_base, vs_base, kv_idx, 0, stride_kcs, stride_vcs,
+            stride_kss, stride_vss, ck, V_MUL, zero_ptr, q_start, first, kv_head, q_start, prefix_len, row_first,
+            row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+            True, 0, BLOCK_N, CACHE_FAR, KV_FMT, BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+    m_i, l_i, acc = _extend_keys(
+        q, m_i, l_i, acc, a, b, prefix_len, kc_base, vc_base, ks_base, vs_base, kv_idx, 0, stride_kcs, stride_vcs,
+        stride_kss, stride_vss, ck, V_MUL, zero_ptr, q_start, first, kv_head, q_start, prefix_len, row_first,
+        row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+        True, 2, BLOCK_NE, 1, KV_FMT, BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+    m_i, l_i, acc = _extend_keys(
+        q, m_i, l_i, acc, b, c, prefix_len, kc_base, vc_base, ks_base, vs_base, kv_idx, 0, stride_kcs, stride_vcs,
+        stride_kss, stride_vss, ck, V_MUL, zero_ptr, q_start, first, kv_head, q_start, prefix_len, row_first,
+        row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+        True, 1, BLOCK_NB, CACHE_BAND, KV_FMT, BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+    m_i, l_i, acc = _extend_keys(
+        q, m_i, l_i, acc, c, prefix_len, prefix_len, kc_base, vc_base, ks_base, vs_base, kv_idx, 0, stride_kcs,
+        stride_vcs, stride_kss, stride_vss, ck, V_MUL, zero_ptr, q_start, first, kv_head, q_start, prefix_len,
+        row_first, row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+        True, 2, BLOCK_NE, 1, KV_FMT, BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+
+    # this chunk's keys [prefix_len, end) are rows q_start - prefix_len + key of k_extend / v_extend
+    s0, a, b, c = _extend_ranges(prefix_len, end, vis_lo, far_end, band_lo, band_hi, BLOCK_N, BLOCK_NB, BLOCK_NE)
+    eb = q_start - prefix_len
+    if SLIDING_WINDOW == 0:
+        m_i, l_i, acc = _extend_keys(
+            q, m_i, l_i, acc, s0, a, end, ke_base, ve_base, ks_base, vs_base, kv_idx, eb, stride_ket, stride_vet,
+            stride_kss, stride_vss, ek, E_V, zero_ptr, q_start, first, kv_head, q_start, prefix_len, row_first,
+            row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+            False, 0, BLOCK_N, FAR_STAGES, "none", BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+    m_i, l_i, acc = _extend_keys(
+        q, m_i, l_i, acc, a, b, end, ke_base, ve_base, ks_base, vs_base, kv_idx, eb, stride_ket, stride_vet,
+        stride_kss, stride_vss, ek, E_V, zero_ptr, q_start, first, kv_head, q_start, prefix_len, row_first,
+        row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+        False, 2, BLOCK_NE, 1, "none", BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+    m_i, l_i, acc = _extend_keys(
+        q, m_i, l_i, acc, b, c, end, ke_base, ve_base, ks_base, vs_base, kv_idx, eb, stride_ket, stride_vet,
+        stride_kss, stride_vss, ek, E_V, zero_ptr, q_start, first, kv_head, q_start, prefix_len, row_first,
+        row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+        False, 1, BLOCK_NB, BAND_STAGES, "none", BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+    m_i, l_i, acc = _extend_keys(
+        q, m_i, l_i, acc, c, end, end, ke_base, ve_base, ks_base, vs_base, kv_idx, eb, stride_ket, stride_vet,
+        stride_kss, stride_vss, ek, E_V, zero_ptr, q_start, first, kv_head, q_start, prefix_len, row_first,
+        row_last, row_lo, bias_ptr, stride_bt, stride_bh,
+        False, 2, BLOCK_NE, 1, "none", BIT_DECODE, GROUP, BLOCK_M, D, SLIDING_WINDOW, REL_EXTENT)
+
+    o = (acc / (l_i * E_V)[:, None]).to(tl.bfloat16).to(tl.float32)
+    zero = tl.load(zero_ptr, volatile=True) - q_start
+    r = tl.arange(0, BLOCK_M) + zero
+    tok = first + r // GROUP
+    head = kv_head * GROUP + r % GROUP
+    rows = q_start + tok
+    mask_m = (r < TOKENS * GROUP) & (tok < q_len) & (rows >= row_lo) & (rows < row_hi)
+    offs_d = tl.max_contiguous(tl.multiple_of(tl.arange(0, D) + zero, D), D)
+    cols = head[:, None] * D + offs_d[None, :]
+    g = tl.load(gate_ptr + rows[:, None] * stride_gt + cols, mask=mask_m[:, None], other=0.0).to(tl.float32)
+    tl.store(o_ptr + rows[:, None] * stride_ot + cols, (o * tl.sigmoid(g)).to(o_ptr.dtype.element_ty), mask=mask_m[:, None])
 
 
 def extend_attention(
@@ -166,55 +432,78 @@ def extend_attention(
     sliding_window: int | None,
     rel_extent: int,
     out: torch.Tensor,
+    k_extend: torch.Tensor,
+    v_extend: torch.Tensor,
     row_lo: int = 0,
     row_hi: int | None = None,
+    kv_format: KVFormat = NONE,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill / extend attention of the query rows ``[row_lo, row_hi)`` (default all).
 
-    ``q`` ``[T, Hq, D]``; the K/V caches are flat ``[slots, Hkv, D]`` and already hold this
-    chunk's rows. ``bias`` ``[row_hi - row_lo, Hq, rel_extent]`` holds the window's rows;
-    ``sinks`` ``[T, Hq]`` fp32; ``gate`` / ``out`` ``[T, Hq * D]``. Query positions are
-    ``prefix_len + row-in-request``.
+    ``q`` ``[T, Hq, D]``; the prefix comes from the flat ``[slots, Hkv, D]`` K/V caches, this chunk's keys from its bf16 rows ``k_extend`` / ``v_extend`` ``[T, Hkv, D]``. ``bias`` ``[row_hi - row_lo, Hq, rel_extent]`` holds the window's rows; ``sinks`` ``[T, Hq]`` fp32; ``gate`` / ``out`` ``[T, Hq * D]``. Query positions are ``prefix_len + row-in-request``.
     """
     T, Hq, D = q.shape
     Hkv = k_cache.shape[1]
+    G = Hq // Hkv
     row_hi = T if row_hi is None else row_hi
     assert bias.shape == (row_hi - row_lo, Hq, rel_extent) and bias.stride(-1) == 1, bias.shape
     assert sinks.shape == (T, Hq) and sinks.stride(-1) == 1
     assert gate.shape == out.shape == (T, Hq * D) and gate.stride(-1) == 1 and out.stride(-1) == 1
-    # full layers stream the whole prefix, SWA ones a 1K window (measured on sm_120)
-    block_m, block_n, num_warps, num_stages = (64, 128, 8, 2) if sliding_window else (128, 64, 8, 3)
-    grid = (qo_indptr.numel() - 1, Hq, triton.cdiv(max_q_len, block_m))
-    _extend_attention_kernel[grid](
-        q, k_cache, v_cache, out, gate, bias, sinks,
+    assert k_extend.shape == v_extend.shape == (T, Hkv, D) and k_extend.stride(-1) == v_extend.stride(-1) == 1
+    # 128 rows = 42 tokens x 3 heads; 64-key tiles out of the bias extent, 32 in it, 16 at the masked edges (sm_120).
+    # three stages on the far keys spill next to an 8-bit cache decode
+    block_m, block_n, block_nb, block_ne = 128, 64, 32, 16
+    far_stages = 1 if kv_format.quantized else 3
+    grid = (triton.cdiv(max_q_len, block_m // G), Hkv, qo_indptr.numel() - 1)
+    k_scale, v_scale, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
+    _extend_attention_split_kernel[grid](
+        q, k_extend, v_extend, k_cache, v_cache, k_scale, v_scale, out, gate, bias, sinks,
         qo_indptr, kv_indptr, kv_indices, prefix_lens,
         row_lo, row_hi, sm_scale * _LOG2E,
-        q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), v_cache.stride(0), v_cache.stride(1),
+        q.stride(0), q.stride(1), k_extend.stride(0), k_extend.stride(1), v_extend.stride(0), v_extend.stride(1),
+        k_cache.stride(0), k_cache.stride(1), v_cache.stride(0), v_cache.stride(1), stride_kss, stride_vss,
         out.stride(0), gate.stride(0), bias.stride(0), bias.stride(1), sinks.stride(0),
-        GROUP=Hq // Hkv, D=D, BLOCK_M=block_m, BLOCK_N=block_n,
-        SLIDING_WINDOW=sliding_window or 0, REL_EXTENT=rel_extent,
-        num_warps=num_warps, num_stages=num_stages,
+        GROUP=G, D=D, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_NB=block_nb, BLOCK_NE=block_ne,
+        FAR_STAGES=far_stages, BAND_STAGES=3, SLIDING_WINDOW=sliding_window or 0, REL_EXTENT=rel_extent,
+        KV_FMT=kv_format.name, BIT_DECODE=torch.version.hip is None,
+        num_warps=8, num_stages=1,
     )
     return out
 
 
 @triton.jit
+def _request_split_log2(keys, max_kv_splits, short_splits, MIN_SPLIT_LEN: tl.constexpr, MIN_BLOCK_KV: tl.constexpr):
+    """log2 of the request's split count: the largest power of two <= its length rule, within [1, max_kv_splits]."""
+    by_len = tl.maximum(tl.cdiv(keys, MIN_SPLIT_LEN), tl.minimum(short_splits, tl.cdiv(keys, MIN_BLOCK_KV)))
+    n = tl.minimum(by_len, max_kv_splits)
+    return (n >= 2).to(tl.int32) + (n >= 4).to(tl.int32) + (n >= 8).to(tl.int32) + (n >= 16).to(tl.int32) + (n >= 32).to(tl.int32) + (n >= 64).to(tl.int32)
+
+
+@triton.jit(do_not_specialize=["max_kv_splits", "short_splits"])
 def _decode_attention_stage1(
     q_ptr,
     k_ptr,
     v_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     bias_ptr,
     kv_indptr_ptr,
     kv_indices_ptr,
     part_acc_ptr,
     part_ml_ptr,
     qk_scale,
+    max_kv_splits,
+    short_splits,
     stride_qt,
     stride_qh,
     stride_ks,
     stride_kh,
     stride_vs,
     stride_vh,
+    stride_kss,
+    stride_vss,
     stride_bt,
     stride_bh,
     GROUP: tl.constexpr,
@@ -222,9 +511,11 @@ def _decode_attention_stage1(
     HQ: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    MIN_SPLIT_LEN: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     REL_EXTENT: tl.constexpr,
+    KV_FMT: tl.constexpr,
 ):
     b = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -237,13 +528,22 @@ def _decode_attention_stage1(
         lo = tl.maximum(q_pos - SLIDING_WINDOW + 1, 0)
     else:
         lo = 0
-    per = tl.cdiv(tl.cdiv(kv_len - lo, NUM_SPLITS), BLOCK_N) * BLOCK_N
+    lg = _request_split_log2(kv_len - lo, max_kv_splits, short_splits, MIN_SPLIT_LEN, MIN_BLOCK_KV)
+    kv_splits = 1 << lg
+    per = tl.cdiv((kv_len - lo + kv_splits - 1) >> lg, MIN_BLOCK_KV) * MIN_BLOCK_KV
     s_lo = lo + split * per
     s_hi = tl.minimum(s_lo + per, kv_len)
 
     offs_g = tl.arange(0, GROUP_PAD)
     mask_g = offs_g < GROUP
     heads = kv_head * GROUP + offs_g
+    if split >= kv_splits or s_lo >= kv_len:
+        # stage 2 drops a split by its m = -inf
+        part = (b * HQ + heads) * max_kv_splits + split
+        tl.store(part_ml_ptr + part * 2, tl.full((GROUP_PAD,), -float("inf"), tl.float32), mask=mask_g)
+        tl.store(part_ml_ptr + part * 2 + 1, tl.zeros((GROUP_PAD,), tl.float32), mask=mask_g)
+        return
+
     offs_d = tl.arange(0, D)
     offs_n = tl.arange(0, BLOCK_N)
     q = tl.load(q_ptr + b * stride_qt + heads[:, None] * stride_qh + offs_d[None, :], mask=mask_g[:, None], other=0.0)
@@ -256,8 +556,11 @@ def _decode_attention_stage1(
         k_pos = start + offs_n
         mask_n = k_pos < s_hi
         slots = tl.load(kv_indices_ptr + kv_start + k_pos, mask=mask_n, other=0).to(tl.int64)
-        k = tl.load(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None], mask=mask_n[None, :], other=0.0)
-        s = tl.dot(q, k) * qk_scale
+        k = kv_tile(k_ptr + slots[None, :] * stride_ks + kv_head * stride_kh + offs_d[:, None], mask_n[None, :], KV_FMT)
+        s = tl.dot(q, k)
+        if KV_FMT != "none":
+            s = s * tl.load(k_scale_ptr + slots * stride_kss + kv_head, mask=mask_n, other=0.0)[None, :]
+        s = s * qk_scale
         dist = q_pos - k_pos
         bias = tl.load(bias_rows + dist[None, :], mask=mask_g[:, None] & (mask_n & (dist < REL_EXTENT))[None, :], other=0.0)
         s = s + bias.to(tl.float32) * 1.4426950408889634
@@ -266,51 +569,86 @@ def _decode_attention_stage1(
         m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
         alpha = tl.math.exp2(m_i - m_safe)
         p = tl.math.exp2(s - m_safe[:, None])
-        v = tl.load(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_d[None, :], mask=mask_n[:, None], other=0.0)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        v = kv_tile(v_ptr + slots[:, None] * stride_vs + kv_head * stride_vh + offs_d[None, :], mask_n[:, None], KV_FMT)
+        if KV_FMT == "none":
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        else:
+            scale_v = tl.load(v_scale_ptr + slots * stride_vss + kv_head, mask=mask_n, other=0.0)
+            acc = acc * alpha[:, None] + tl.dot((p * scale_v[None, :]).to(v.dtype), v)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    part = (b * HQ + heads) * NUM_SPLITS + split
+    part = (b * HQ + heads) * max_kv_splits + split
     tl.store(part_acc_ptr + part[:, None] * D + offs_d[None, :], acc, mask=mask_g[:, None])
     tl.store(part_ml_ptr + part * 2, m_i, mask=mask_g)
     tl.store(part_ml_ptr + part * 2 + 1, l_i, mask=mask_g)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_kv_splits"])
 def _decode_attention_stage2(
     part_acc_ptr,
     part_ml_ptr,
     sink_ptr,
     gate_ptr,
     o_ptr,
+    max_kv_splits,
     stride_st,
     stride_gt,
     stride_ot,
     HQ: tl.constexpr,
     D: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
+    SPLIT_TILE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    TWO_ROUNDS: tl.constexpr,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
-    offs_s = tl.arange(0, NUM_SPLITS)
-    offs_d = tl.arange(0, D)
-    part = (b * HQ + h) * NUM_SPLITS + offs_s
-    m_s = tl.load(part_ml_ptr + part * 2)
-    l_s = tl.load(part_ml_ptr + part * 2 + 1)
+    offs_d = tl.program_id(2) * BLOCK_DV + tl.arange(0, BLOCK_DV)
     sink = tl.load(sink_ptr + b * stride_st + h).to(tl.float32) * 1.4426950408889634
-    m = tl.maximum(sink, tl.max(m_s, axis=0))
-    w = tl.math.exp2(m_s - m)  # an empty split carries m = -inf, so weight 0
-    acc = tl.sum(tl.load(part_acc_ptr + part[:, None] * D + offs_d[None, :]) * w[:, None], axis=0)
-    l = tl.math.exp2(sink - m) + tl.sum(l_s * w, axis=0)
+    # the first round's acc rows load without waiting for m; a row that no split wrote gets weight 0
+    FIRST: tl.constexpr = SPLIT_TILE // 2 if TWO_ROUNDS else SPLIT_TILE
+    offs_a = tl.arange(0, FIRST)
+    part_a = (b * HQ + h) * max_kv_splits + offs_a
+    valid_a = offs_a < max_kv_splits
+    m_a = tl.load(part_ml_ptr + part_a * 2, mask=valid_a, other=-float("inf"))
+    l_a = tl.load(part_ml_ptr + part_a * 2 + 1, mask=valid_a, other=0.0)
+    acc_a = tl.load(part_acc_ptr + part_a[:, None] * D + offs_d[None, :], mask=valid_a[:, None], other=0.0)
+    m = tl.maximum(sink, tl.max(m_a, axis=0))
+    if TWO_ROUNDS:
+        # short requests leave second-round splits empty: read their acc rows only where m says they ran
+        part_b = part_a + FIRST
+        m_b = tl.load(part_ml_ptr + part_b * 2)
+        l_b = tl.load(part_ml_ptr + part_b * 2 + 1)
+        acc_b = tl.load(part_acc_ptr + part_b[:, None] * D + offs_d[None, :], mask=(m_b > -float("inf"))[:, None], other=0.0)
+        m = tl.maximum(m, tl.max(m_b, axis=0))
+    w_a = tl.math.exp2(m_a - m)
+    acc = tl.sum(tl.where(w_a[:, None] > 0, acc_a * w_a[:, None], 0.0), axis=0)
+    l = tl.math.exp2(sink - m) + tl.sum(l_a * w_a, axis=0)
+    if TWO_ROUNDS:
+        w_b = tl.math.exp2(m_b - m)
+        acc += tl.sum(acc_b * w_b[:, None], axis=0)
+        l += tl.sum(l_b * w_b, axis=0)
     out = _gate_bf16(acc / l, gate_ptr + b * stride_gt + h * D + offs_d, offs_d < D)
     tl.store(o_ptr + b * stride_ot + h * D + offs_d, out.to(o_ptr.dtype.element_ty))
 
 
-def decode_num_splits(batch: int, num_kv_heads: int, device_index: int) -> int:
-    """KV splits per (request, KV head): enough programs to fill the GPU twice, at most 32."""
-    want = triton.cdiv(2 * _num_sms(device_index), max(1, batch * num_kv_heads))
-    return max(1, min(32, triton.next_power_of_2(want)))
+@functools.cache
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _pow2_floor(n: int) -> int:
+    return 1 << (max(1, n).bit_length() - 1)
+
+
+def _decode_split_caps(B: int, Hkv: int, window: int | None, device_index: int) -> tuple[int, int]:
+    """(grid splits, short-request splits), both powers of two: short requests stay within one round of stage 1 CTAs; when that leaves fewer than 8 splits per request, long requests may take two rounds."""
+    slots = _DECODE_CTAS_PER_SM * _num_sms(device_index)
+    short = _pow2_floor(min(_DECODE_MAX_SPLITS, slots // (B * Hkv)))
+    if window:
+        short = min(short, _pow2_floor(triton.cdiv(window, _DECODE_MIN_BLOCK_KV)))
+        return short, short
+    return (short if short >= 8 else _pow2_floor(2 * slots // (B * Hkv))), short
 
 
 def decode_attention(
@@ -326,25 +664,31 @@ def decode_attention(
     sliding_window: int | None,
     rel_extent: int,
     out: torch.Tensor,
+    kv_format: KVFormat = NONE,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """One query row per request (the request's newest key): split-K over the KV range."""
+    """One query row per request (the request's newest key): split-K over the KV range, each request taking splits by its own length up to caps set by the batch, so a captured graph serves any length."""
     B, Hq, D = q.shape
     Hkv = k_cache.shape[1]
     group = Hq // Hkv
-    splits = decode_num_splits(B, Hkv, q.device.index)
-    part_acc = torch.empty((B * Hq * splits, D), dtype=torch.float32, device=q.device)
-    part_ml = torch.empty((B * Hq * splits, 2), dtype=torch.float32, device=q.device)
-    _decode_attention_stage1[(B, Hkv, splits)](
-        q, k_cache, v_cache, bias, kv_indptr, kv_indices, part_acc, part_ml, sm_scale * _LOG2E,
+    cap, short = _decode_split_caps(B, Hkv, sliding_window, q.device.index)
+    part_acc = torch.empty((B * Hq * cap, D), dtype=torch.float32, device=q.device)
+    part_ml = torch.empty((B * Hq * cap, 2), dtype=torch.float32, device=q.device)
+    k_scale, v_scale, stride_kss, stride_vss = kv_scale_args(kv_format, k_cache, v_cache, k_scale, v_scale, q)
+    _decode_attention_stage1[(B, Hkv, cap)](
+        q, k_cache, v_cache, k_scale, v_scale, bias, kv_indptr, kv_indices, part_acc, part_ml, sm_scale * _LOG2E, cap, short,
         q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), v_cache.stride(0), v_cache.stride(1),
-        bias.stride(0), bias.stride(1),
+        stride_kss, stride_vss, bias.stride(0), bias.stride(1),
         GROUP=group, GROUP_PAD=max(16, triton.next_power_of_2(group)), HQ=Hq, D=D, BLOCK_N=32,
-        NUM_SPLITS=splits, SLIDING_WINDOW=sliding_window or 0, REL_EXTENT=rel_extent,
-        num_warps=4, num_stages=2,
+        MIN_BLOCK_KV=_DECODE_MIN_BLOCK_KV, MIN_SPLIT_LEN=_DECODE_MIN_SPLIT_LEN, SLIDING_WINDOW=sliding_window or 0,
+        REL_EXTENT=rel_extent, KV_FMT=kv_format.name, num_warps=4, num_stages=2,
     )
-    _decode_attention_stage2[(B, Hq)](
-        part_acc, part_ml, sinks, gate, out, sinks.stride(0), gate.stride(0), out.stride(0),
-        HQ=Hq, D=D, NUM_SPLITS=splits, num_warps=4,
+    tile = triton.next_power_of_2(cap)
+    block_dv = max(32, min(D, _DECODE_STAGE2_ELEMS // tile))
+    _decode_attention_stage2[(B, Hq, triton.cdiv(D, block_dv))](
+        part_acc, part_ml, sinks, gate, out, cap, sinks.stride(0), gate.stride(0), out.stride(0),
+        HQ=Hq, D=D, SPLIT_TILE=tile, BLOCK_DV=block_dv, TWO_ROUNDS=cap > short, num_warps=4,
     )
     return out
 
@@ -801,7 +1145,6 @@ __all__ = [
     "EPI_RMS_NORM",
     "attn_res",
     "decode_attention",
-    "decode_num_splits",
     "extend_attention",
     "gate_combine",
     "gate_inputs",

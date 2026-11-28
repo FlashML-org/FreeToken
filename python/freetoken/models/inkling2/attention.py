@@ -95,10 +95,10 @@ class Inkling2Attention(BaseOP):
         v = self._conv(vs[:, :kv], self.v_conv, v_dyn, state, visit, "v", EPI_RMS_NORM, self.args.rms_norm_eps)
 
         kvcache = ctx.kv_cache
-        assert not kvcache.kv_format.quantized, "inkling2 attention reads bf16 KV only"
         kvcache.store_kv(k, v, batch.out_loc, visit)
         k_cache = kvcache.k_cache(visit).view(-1, Hkv, D)
         v_cache = kvcache.v_cache(visit).view(-1, Hkv, D)
+        quant = dict(kv_format=kvcache.kv_format, k_scale=kvcache.k_scale(visit), v_scale=kvcache.v_scale(visit))
         indices = md.swa_indices if self.is_swa and md.swa_indices is not None else md.indices
         gate = qs[:, self._gate_off : self._gate_off + self._qo]
         out = torch.empty((T, Hq * D), dtype=xq.dtype, device=xq.device)
@@ -109,13 +109,15 @@ class Inkling2Attention(BaseOP):
                 bias = torch.matmul(rel[lo * Hq : hi * Hq], self.rel_proj).view(hi - lo, Hq, self.rel_extent)
                 extend_attention(
                     q, k_cache, v_cache, gate, bias, sinks, md.cu_seqlens_q_gpu, md.indptr, indices, md.prefix_lens,
-                    md.max_q_len, self._sm_scale, self.sliding_window, self.rel_extent, out, row_lo=lo, row_hi=hi,
+                    md.max_q_len, self._sm_scale, self.sliding_window, self.rel_extent, out, row_lo=lo, row_hi=hi, **quant,
+                    k_extend=k.view(T, Hkv, D), v_extend=v.view(T, Hkv, D),
                 )
                 del bias  # else the next table is built while this one is still live
         else:
             bias = torch.matmul(rel, self.rel_proj).view(T, Hq, self.rel_extent)
             decode_attention(
                 q, k_cache, v_cache, gate, bias, sinks, md.indptr, indices, self._sm_scale, self.sliding_window, self.rel_extent, out,
+                **quant,
             )
         return self.o_proj.forward(out)
 
