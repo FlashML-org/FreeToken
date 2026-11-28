@@ -291,7 +291,7 @@ def _extend_attention_split_kernel(
     q_start = tl.load(qo_indptr_ptr + seq_id)
     q_len = tl.load(qo_indptr_ptr + seq_id + 1) - q_start
     first = block_m_id * TOKENS
-    if first >= q_len or q_start + first >= row_hi or q_start + first + TOKENS <= row_lo:
+    if first >= q_len or q_start + first >= row_hi or q_start + tl.minimum(q_len, first + TOKENS) <= row_lo:
         return
     kv_start = tl.load(kv_indptr_ptr + seq_id)
     prefix_len = tl.load(prefix_lens_ptr + seq_id)

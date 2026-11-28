@@ -106,7 +106,8 @@ def test_extend_attention_over_a_cached_prefix(window, kv_format, prefix, T):
 
 @pytest.mark.parametrize("kv_format", ["none", "fp8_per_token_head", "int8_per_token_head"])
 @pytest.mark.parametrize("window", [None, 300])
-def test_extend_attention_batches_requests(window, kv_format):
+@pytest.mark.parametrize("splits", [(), (60, 100)])
+def test_extend_attention_batches_requests(window, kv_format, splits):
     torch.manual_seed(4)
     # (prefix, chunk): a fresh prompt, a chunk shorter than one 42-token tile, a long prefix
     reqs = [(0, 50), (5, 17), (1100, 90)]
@@ -125,10 +126,14 @@ def test_extend_attention_batches_requests(window, kv_format):
     bias = torch.randn(T, HQ, E, device=DEV).bfloat16()
     sinks = torch.randn(T, HQ, device=DEV) + 6
     out = torch.empty(T, HQ * D, device=DEV, dtype=torch.bfloat16)
-    extend_attention(
-        q, k_cache, v_cache, gate, bias, sinks, qo_indptr, kv_indptr, slots, torch.tensor([p for p, _ in reqs], **i32),
-        max(t for _, t in reqs), D**-0.5, window, E, out, **quant,
-    )
+    # request 0 (rows 0..49) ends inside a tile that reaches past split 60; split 100 cuts request 2
+    bounds = [0, *splits, T]
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        extend_attention(
+            q, k_cache, v_cache, gate, bias[lo:hi].clone(), sinks, qo_indptr, kv_indptr, slots,
+            torch.tensor([p for p, _ in reqs], **i32), max(t for _, t in reqs), D**-0.5, window, E, out,
+            row_lo=lo, row_hi=hi, **quant,
+        )
     for i, (p, t) in enumerate(reqs):
         rows = slots[kv_indptr[i] : kv_indptr[i + 1]].long()
         lo, hi = int(qo_indptr[i]), int(qo_indptr[i + 1])
