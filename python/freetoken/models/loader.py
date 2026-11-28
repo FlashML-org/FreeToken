@@ -10,6 +10,7 @@ from typing import Iterable, Iterator
 
 import torch
 from freetoken.utils import div_ceil, download_hf_weight
+from freetoken.utils.direct_io import drop_page_cache
 
 SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj")
 SPLIT_DIM_1 = (".o_proj", ".down_proj")
@@ -76,18 +77,6 @@ def safetensors_weight_map(folder: str) -> dict[str, str]:
             if name != "__metadata__":
                 weight_map[name] = os.path.basename(path)
     return weight_map
-
-
-def drop_page_cache(path: str) -> None:
-    """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
 
 
 def iter_root_safetensor_files_from_index(
@@ -308,6 +297,7 @@ def iter_stacked_experts(
 
 __all__ = [
     "MergeRule",
+    "drop_page_cache",
     "iter_root_safetensor_files_from_index",
     "iter_weight_files",
     "safetensors_weight_map",
