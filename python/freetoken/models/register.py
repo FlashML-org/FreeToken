@@ -587,9 +587,12 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
 
 
 def checkpoint_quant_config(
-    model_path: str, hf_config: Any, spec: ModelSpec, *, online: str | None = None, online_modules: tuple[str, ...] = ()
+    model_path: str, hf_config: Any, spec: ModelSpec, *, online: str | None = None, online_modules: tuple[str, ...] = (),
+    expert_activation_scales: bool = False,
 ):
     """The checkpoint's QuantConfig under the family's naming, serving its bf16 layers (those ``online_modules`` names, when given) as the ``online`` kind.
+
+    ``expert_activation_scales``: its NVFP4 experts take the activation scales the checkpoint stores for them (--moe-expert-activation-scales).
 
     A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
     from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig, QuantKind
@@ -603,6 +606,8 @@ def checkpoint_quant_config(
         quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
     else:
         quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+    if expert_activation_scales:
+        quant = quant.with_expert_activation_scales()
     return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 

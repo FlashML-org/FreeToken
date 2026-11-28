@@ -30,6 +30,8 @@ class MoEConfig:
     interleaved: bool = False
     # dynamic fp8 activation quant block of a W4A8 expert kernel, set by the quant dialect; None = no activation quant
     act_block: int | None = None
+    # the static activation scales come from --moe-expert-activation-scales, over a config that declares 16-bit activations
+    expert_activation_scales: bool = False
     has_bias: bool = False
     apply_router_weight_on_input: bool = False
     strategy: str = "resident"

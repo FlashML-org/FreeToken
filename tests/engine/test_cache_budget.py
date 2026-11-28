@@ -149,6 +149,7 @@ def _dsv4_adjust_cfg(**over):
         moe_cache_size = 0
         moe_cache_rate = None
         moe_strategy = "offload"
+        moe_expert_activation_scales = False
         max_running_req = 1
         cuda_graph_max_bs = 1
         cuda_graph_bs = [1]
@@ -581,6 +582,9 @@ def test_moe_pool_flags_and_decode_batch_clamp():
             "--moe-cache-scope", "per-layer", "--moe-cache-split", "profile:/p.json",
         ])
         assert (args.moe_cache_mem, args.moe_cache_scope, args.moe_cache_split) == (3 << 29, "per-layer", "profile:/p.json")
+        assert args.moe_expert_activation_scales is False
+        args, _ = parse_args(["--model", "/models/anon", "--moe-expert-activation-scales"])
+        assert args.moe_expert_activation_scales is True
         for bad in (["--moe-cache-mem", "12"], ["--moe-cache-mem", "1GiB", "--moe-cache-size", "512"]):
             with pytest.raises(SystemExit):
                 parse_args(["--model", "/models/anon", *bad])

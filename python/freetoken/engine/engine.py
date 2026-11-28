@@ -543,6 +543,8 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        if config.moe_expert_activation_scales:
+            _log_expert_activation_scales(self.model)
         self._load_weights(config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
@@ -1877,6 +1879,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_locked_max_fetch": 8,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_expert_activation_scales": False,
     "expert_load": "auto",
 }
 
@@ -1983,6 +1986,31 @@ def meta_offload_layer_methods(config: EngineConfig, decode_target: str) -> list
 def offload_expert_method(config: EngineConfig):
     """The (most common) offload expert method of ``config``'s model; see ``offload_expert_methods``."""
     return offload_expert_methods(config)[0]
+
+
+def _log_expert_activation_scales(model) -> None:
+    """Say what --moe-expert-activation-scales changed: the prefill forwards from the engage length on, and only where the
+    W4A4 kernel was bound for experts whose checkpoint declares 16-bit activations."""
+    methods = [layer.quant_method for layer in iter_moe_layers(model) if getattr(layer, "quant_method", None) is not None]
+    kernels = sorted({method.kernel.name for method in methods})
+    tokens = sorted({method.kernel.a4_min_tokens(method.cfg) for method in methods if method.cfg.expert_activation_scales} if kernels == ["w4a4"] else ())
+    if tokens:
+        logger.info_rank0(
+            f"--moe-expert-activation-scales: prefill forwards of at least {' to '.join(str(t) for t in sorted({tokens[0], tokens[-1]}))} "
+            "tokens run the experts on 4-bit activations (w4a4 kernel, under the checkpoint's stored input_scale; "
+            "FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS sets the length). Shorter prefill forwards, every decode step and the "
+            "dense layers are unchanged"
+        )
+    elif kernels == ["w4a4"]:
+        logger.warning_rank0(
+            "--moe-expert-activation-scales changes nothing here: the checkpoint declares its experts' activation scales, "
+            "and the w4a4 kernel serves them without the flag"
+        )
+    else:
+        logger.warning_rank0(
+            f"--moe-expert-activation-scales changes nothing here: the experts are served by {', '.join(kernels) or 'no quantized kernel'} "
+            "(the w4a4 kernel takes NVFP4 experts on sm_120)"
+        )
 
 
 def _adjust_config(config: EngineConfig):
@@ -2311,4 +2339,6 @@ def _adjust_config(config: EngineConfig):
     ]
     if is_moe:
         resolved.insert(0, f"moe_strategy={config.moe_strategy!r}")
+    if is_moe and config.moe_expert_activation_scales:
+        resolved.append("moe_expert_activation_scales=True")
     logger.info_rank0(f"Resolved config: {', '.join(resolved)}")

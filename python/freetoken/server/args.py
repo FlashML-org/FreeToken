@@ -991,6 +991,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-expert-activation-scales",
+        action="store_true",
+        dest="moe_expert_activation_scales",
+        default=ServerArgs.moe_expert_activation_scales,
+        help=(
+            "Changes the output text. Serve NVFP4 experts under the static activation scales "
+            "(input_scale) the checkpoint stores for them even where its quantization config declares 16-bit "
+            "activations (W4A16). On sm_120 a prefill forward of at least 2048 tokens (the "
+            "FREETOKEN_NVFP4_ACT_SCALES_MIN_TOKENS environment variable sets the length) then runs the W4A4 expert "
+            "kernel; shorter prefill forwards and every decode step keep the W4A16 kernels, so a prompt prefilled in "
+            "shorter chunks is unchanged. Long prefills can vary in the last bits from run to run."
+        ),
+    )
+
+    parser.add_argument(
         "--speculative-algorithm",
         "--spec-algo",
         type=str,
