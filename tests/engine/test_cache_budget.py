@@ -60,6 +60,17 @@ def test_small_cache_disables_prefill_overlap():
     assert size == 12
 
 
+def test_budget_below_the_overlap_floor_disables_prefill_overlap():
+    # 2*num_experts slots (800 B) + the KV reserve (100 B) exceed the 700 B budget, but
+    # num_experts slots fit beside the reserve: plan without overlap instead of asserting.
+    size, pages, overlap = plan_cache_budget(
+        budget_bytes=700, per_expert_bytes=100, cache_per_page=10,
+        num_experts=4, total_experts=50, prefill_overlap=True,
+        kv_reserve_pages=10, max_slots=50,
+    )
+    assert (size, pages, overlap) == (6, 10, False)
+
+
 def test_insufficient_kv_memory_raises():
     with pytest.raises(AssertionError, match="not enough memory"):
         plan_cache_budget(
