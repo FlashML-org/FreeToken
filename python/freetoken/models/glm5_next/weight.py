@@ -3,7 +3,9 @@
 Supported checkpoints, all in the multimodal-wrapper layout (``model.language_model.*``):
 NVFP4 exports (ModelOpt tensor kinds from LibertAIDAI, compressed-tensors kinds from
 RedHatAI, selected by ``quantization_config``) and the zai-org block-fp8 release. Not
-supported: text-only key layouts, TP > 1, resident routed experts.
+supported: text-only key layouts, resident routed experts. Every rank reads whole tensors;
+under --tp > 1 the parallel plan (multi.py) cuts its part of each, and serves bf16 dense
+weights only.
 
 Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces; every
 other projection loads as stored (bf16, or fp8 codes with their block scales) with keys
@@ -40,6 +42,7 @@ from tqdm import tqdm
 
 from .args import Glm5NextArgs
 from .config import parse_config
+from .multi import KDA_CONV, KDA_IN_PROJ
 
 # Checkpoint prefix (multimodal wrapper) -> model prefix.
 _CKPT = "model.language_model"
@@ -91,9 +94,6 @@ def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
     method = str(get("quant_method") or "").lower()
     return _NVFP4_CT_SOURCE_SPEC if method == "compressed-tensors" else _NVFP4_SOURCE_SPEC
 
-# KDA in_proj fusion order; MUST match Glm5NextKDA._in_proj_split.
-_KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
-
 # zai-org fp8 release: fp8 codes + fp32 128x128 block scales per expert projection
 _FP8_EXPERT_RE = re.compile(
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
@@ -118,16 +118,13 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
-    # One fused input GEMM: q|k|v|b|f_a|g_a (output-axis concat).
-    parts = [reader.get(f"{src}.{p}.weight") for p in _KDA_IN_PROJ]
+    # One fused input GEMM: q|k|v|b|f_a|g_a (output-axis concat, in multi.KDA_IN_PROJ's order).
+    parts = [reader.get(f"{src}.{p}.weight") for p, _, _ in KDA_IN_PROJ]
     if any(p.dtype == torch.float8_e4m3fn for p in parts):
         raise NotImplementedError("fp8 KDA input projections are not fused by this reader")
     yield f"{dst}.in_proj.weight", torch.cat([p.to(torch.bfloat16) for p in parts], dim=0)
     # One merged depthwise conv over the q|k|v stream (channel-axis concat).
-    conv = torch.cat(
-        [reader.get(f"{src}.{p}_conv1d.weight").to(torch.bfloat16) for p in ("q", "k", "v")],
-        dim=0,
-    )
+    conv = torch.cat([reader.get(f"{src}.{p}.weight").to(torch.bfloat16) for p, _, _ in KDA_CONV], dim=0)
     yield f"{dst}.conv1d.weight", conv
     for p in ("f_b_proj", "g_b_proj", "o_proj"):
         yield from _proj(reader, f"{src}.{p}", f"{dst}.{p}")
@@ -176,11 +173,6 @@ def iter_weights(
         "GLM-5.3 routed experts only serve from the offload cache; they are loaded from their expert pieces."
     )
     assert include_non_moe
-    if get_tp_info().size > 1:
-        # The loader emits full fused KDA/DSA tensors; TP sharding (per-head q|k|v|b
-        # splits, replicated f_a|g_a, row-parallel o_proj) is not implemented yet --
-        # same status as every other linear-hybrid / offload-family model in tree.
-        raise NotImplementedError("glm5_next weight loading currently supports TP=1 only")
     config = parse_config(cached_load_hf_config(model_path))
     args: Glm5NextArgs = config.glm5_args
     folder = download_hf_weight(model_path)

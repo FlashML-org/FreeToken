@@ -6,9 +6,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from freetoken.distributed import DistributedCommunicator
+from freetoken.distributed.plan import ExpertGroup
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
-from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
+from freetoken.layers import BaseOP, LinearReplicated, OffloadMoELayer
 from freetoken.mm import MM_PAD_SHIFT_VALUE
 
 from .args import DeepseekV4Args
@@ -72,15 +74,21 @@ class Gate(BaseOP):
 class Expert(BaseOP):
     """Dense SwiGLU expert (the shared expert; routed experts are offloaded FP4)."""
 
-    def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, *, quant_config=None, prefix: str = ""):
-        self.w1 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
-        self.w2 = LinearRowParallel(inter_dim, dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w2")
-        self.w3 = LinearColParallelMerged(dim, [inter_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
+    def __init__(self, dim: int, inter_dim: int, swiglu_limit: float, *, tp: int = 1, quant_config=None, prefix: str = ""):
+        # under TP this rank keeps 1/tp of the intermediate dim and returns a partial sum (models/deepseek_v4/multi.py)
+        self.tp = tp
+        local = inter_dim // tp
+        self.w1 = LinearReplicated(dim, local, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w1")
+        self.w2 = LinearReplicated(local, dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w2")
+        self.w3 = LinearReplicated(dim, local, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.w3")
         self.swiglu_limit = swiglu_limit
+        self._comm = DistributedCommunicator()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
+        """``reduce=False`` returns this rank's partial sum, for a caller that folds it into a later all-reduce."""
         h = fused_swiglu(self.w1.forward(x), self.w3.forward(x), self.swiglu_limit, x.dtype)
-        return self.w2.forward(h)
+        out = self.w2.forward(h)
+        return self._comm.all_reduce(out) if reduce and self.tp > 1 else out
 
 
 class DSV4OffloadMoELayer(OffloadMoELayer):
@@ -89,7 +97,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
     below the route crossover) and slot-cache / cpu / hybrid decode paths
     (per-route dequant GEMV)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", expert_group: ExpertGroup | None = None, quant_config=None, prefix: str = ""):
         super().__init__(
             layer_id=layer_id,
             num_experts=args.n_routed_experts,
@@ -103,6 +111,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             limit=args.swiglu_limit,
             strategy=strategy,
             decode_target=decode_target,
+            expert_group=expert_group,
             quant_config=quant_config,
             prefix=prefix,
         )
@@ -147,11 +156,19 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
 class MoE(BaseOP):
     """Sparse MoE: hash/score router -> offloaded MXFP4 routed experts + shared expert."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(
+        self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu",
+        expert_group: ExpertGroup | None = None, tp: int = 1, quant_config=None, prefix: str = "",
+    ):
         self.dim = args.dim
+        # under TP the shared expert's partial sum joins the routed experts' all-reduce: one per layer
+        self.fold_shared = tp > 1
+        self._comm = DistributedCommunicator()
         self.gate = Gate(layer_id, args)
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit, quant_config=quant_config, prefix=f"{prefix}.shared_experts")
-        self.experts = DSV4OffloadMoELayer(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.experts")
+        self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit, tp=tp, quant_config=quant_config, prefix=f"{prefix}.shared_experts")
+        self.experts = DSV4OffloadMoELayer(
+            layer_id, args, strategy=strategy, decode_target=decode_target, expert_group=expert_group, quant_config=quant_config, prefix=f"{prefix}.experts",
+        )
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
@@ -160,10 +177,14 @@ class MoE(BaseOP):
         # Shared expert enqueued before routed_forward: hybrid decode blocks on the
         # CPU pool inside routed_forward, so this GEMM must already be on the stream
         # to overlap the CPU overflow compute.
-        shared = self.shared_experts.forward(x)
+        reduce = not self.fold_shared
+        shared = self.shared_experts.forward(x, reduce=reduce)
         # routed_forward may mutate the ids in place (offload decode slot remap);
         # indices.to(int32) always copies (int64 source), so no clone needed here.
         routed = self.experts.routed_forward(
-            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+            x, weights.float().contiguous(), indices.to(torch.int32).contiguous(), reduce=reduce
         )
-        return (routed + shared).view(shape)
+        out = routed + shared
+        if self.fold_shared:
+            out = self._comm.all_reduce(out)
+        return out.view(shape)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from freetoken.env import ENV
@@ -25,10 +26,23 @@ else:
     PyNCCLCommunicator = Any
 
 
+def _nccl_ldflags() -> list[str]:
+    """Link the NCCL that torch loads. pip's nvidia-nccl ships only ``libnccl.so.2``, with no ``libnccl.so`` for
+    ``-lnccl`` to find, so link that file by name from the package; a system NCCL keeps ``-lnccl``."""
+    try:
+        import nvidia.nccl
+    except ImportError:
+        return ["-lnccl"]
+    lib = next((os.path.join(d, "lib") for d in nvidia.nccl.__path__ if os.path.exists(os.path.join(d, "lib", "libnccl.so.2"))), None)
+    if lib is None:
+        return ["-lnccl"]
+    return [f"-L{lib}", "-l:libnccl.so.2", f"-Wl,-rpath,{lib}"]
+
+
 @functools.cache
 def _load_nccl_module() -> Module:
     # TODO(ROCm): NCCL -> RCCL migration for multi-GPU tensor parallelism on AMD.
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=_nccl_ldflags())
 
 
 @functools.cache

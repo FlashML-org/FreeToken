@@ -92,6 +92,10 @@ class EngineConfig:
     # (layer, step) and sizes the staging (that many rows of the widest expert, per bank).
     moe_locked_fetch: float = -1.0
     moe_locked_max_fetch: int = 8
+    # --moe-host-pool, where --tp > 1 splits the routed experts: "rank" keeps a host bank and a CPU pool per rank;
+    # "numa" keeps one host bank per NUMA node (the slices of the node's GPUs, bound to the node and shared by them) and
+    # one CPU pool there.
+    moe_host_pool: str = "rank"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

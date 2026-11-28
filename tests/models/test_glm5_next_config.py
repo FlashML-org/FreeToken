@@ -343,3 +343,53 @@ def test_ingest_global_reciprocal():
     g = torch.tensor(4.0)
     assert _ingest_global(_NVFP4_CT_SOURCE_SPEC, g).item() == 0.25
     assert _ingest_global(_NVFP4_SOURCE_SPEC, g).item() == 4.0
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_kda_fused_projections_cut_like_their_parts(tp):
+    """--tp cuts KDA's fused in_proj and conv1d segment by segment: the cut equals each checkpoint projection cut on its own
+    (by head, or whole for f_a / g_a) and fused, and the op splits it back into those projections."""
+    from itertools import islice
+    from types import SimpleNamespace
+
+    import torch
+    from freetoken.distributed.plan import ParallelArgs
+    from freetoken.models.glm5_next.kda import Glm5NextKDA
+    from freetoken.models.glm5_next.multi import KDA_CONV, KDA_IN_PROJ, build_parallel_plan
+    from freetoken.models.glm5_next.weight import _CKPT, _iter_kda_layer
+
+    heads, head_dim, hidden, kernel = 8, 4, 16, 4
+    rows = {"proj": heads * head_dim, "heads": heads, "head_dim": head_dim}
+    src = f"{_CKPT}.layers.0.self_attn"
+    # every row of every projection holds its own value (exact in bf16)
+    parts = {
+        name: (40 * i + torch.arange(rows[kind], dtype=torch.float32))[:, None].expand(rows[kind], hidden).clone()
+        for i, (name, kind, _) in enumerate(KDA_IN_PROJ)
+    }
+    convs = {
+        name: (40 * i + torch.arange(rows[kind], dtype=torch.float32))[:, None, None].expand(rows[kind], 1, kernel).clone()
+        for i, (name, kind, _) in enumerate(KDA_CONV)
+    }
+    tensors = {f"{src}.{name}.weight": t for name, t in {**parts, **convs}.items()}
+    (in_proj_name, in_proj), (conv_name, conv) = islice(_iter_kda_layer(SimpleNamespace(get=tensors.__getitem__), 0), 2)
+
+    args = SimpleNamespace(
+        num_heads=8, linear_num_heads=heads, linear_head_dim=head_dim, hidden_size=hidden,
+        linear_conv_kernel_dim=kernel, linear_lower_bound=-5.0, norm_eps=1e-5,
+    )
+    model_config = SimpleNamespace(glm5_args=args, moe_intermediate_size=64, n_shared_experts=1, intermediate_size=64, vocab_size=64)
+    for rank in range(tp):
+        plan = build_parallel_plan(model_config, ParallelArgs(rank, tp))
+
+        def mine(t, split):
+            return t.chunk(tp)[rank] if split else t
+
+        cut = plan.shard(in_proj_name, in_proj)
+        op = Glm5NextKDA(SimpleNamespace(glm5_args=args, quant=None, parallel_plan=plan), layer_id=0)
+        assert sum(op._in_proj_split) == cut.shape[0]
+        for piece, (name, _, split) in zip(cut.split(op._in_proj_split), KDA_IN_PROJ):
+            assert torch.equal(piece, mine(parts[name], split).to(piece.dtype)), (rank, name)
+        conv_cut = plan.shard(conv_name, conv)
+        assert op._stream_split[0] == op.conv_dim == conv_cut.shape[0]
+        for piece, (name, _, split) in zip(conv_cut.split(op.proj_size), KDA_CONV):
+            assert torch.equal(piece, mine(convs[name], split).to(piece.dtype)), (rank, name)

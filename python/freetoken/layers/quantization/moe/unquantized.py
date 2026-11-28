@@ -7,15 +7,20 @@ import torch
 from ..registry import LayerKind, register_method
 from ..scheme import QuantKind
 from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .shard import COLS, GATE_UP_ROWS, IntermediateAxis
 
 
 class FusedMoEKernel(MoEKernel):
     name = "fused"
     cpu_format = "bf16"
+    shards = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = gated_epilogue_reason(cfg)
         return f"bf16 fused MoE: {reason}" if reason else None
+
+    def bank_axes(self, cfg: MoEConfig) -> dict[str, IntermediateAxis]:
+        return {"gate_up": GATE_UP_ROWS, "down": COLS}
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i = cfg.local_intermediate

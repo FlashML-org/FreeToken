@@ -176,8 +176,9 @@ class LinearRowParallel(_LinearTPImpl):
             quant_config=quant_config, prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
+        """``reduce=False`` returns this rank's partial sum, for a caller that folds it into a later all-reduce."""
         y = self.quant_method.apply(self, x)
-        if self._tp_size > 1:
+        if reduce and self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y

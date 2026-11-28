@@ -7,7 +7,7 @@ import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Callable, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -46,7 +46,9 @@ from freetoken.kvcache.linear_state_pool import (
 logger = init_logger(__name__)
 
 def _disable_unsafe_cpu_moe_graphs(config: EngineConfig, executor, dtype, tp_cpu_group) -> None:
-    safe = torch.tensor([executor.graph_capture_safe(dtype)], dtype=torch.int32)
+    """Collective over the TP ranks; ``executor`` None is a rank whose CPU expert pool runs in another rank, which has no
+    CPU IO of its own to capture."""
+    safe = torch.tensor([executor.graph_capture_safe(dtype) if executor is not None else 1], dtype=torch.int32)
     if config.tp_info.size > 1:
         torch.distributed.all_reduce(safe, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group)
     if not safe.item():
@@ -513,6 +515,8 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        # what the family's layers split by under --tp > 1
+        self.parallel_plan = _build_parallel_plan(config)
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -538,6 +542,9 @@ class Engine:
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
+
+        # the routed experts split across the ranks (the plan's expert group), their input all-reduced by attention
+        self.split_experts = self._place_experts(config) if self.parallel_plan is not None and self.parallel_plan.experts is not None else None
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -651,6 +658,8 @@ class Engine:
         # re-point here (and again on any table realloc). The graph-input snapshot that reads
         # through them belongs to the attention backend, built later in init_capture_graph.
         self.kv_cache.attach_page_table(self.page_table)
+        if self.parallel_plan is not None:
+            self.parallel_plan.bind(self.model, self.kv_cache)
 
         # ======================= Attention backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -691,6 +700,21 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+
+    def _place_experts(self, config: EngineConfig):
+        """Place the plan's expert group (``moe/split_experts.py``) and give this rank's slice to the MoE layers built next."""
+        from freetoken.moe.split_experts import SplitExperts
+
+        plan = self.parallel_plan
+        # the kernel the sharded layers will bind: a provisional whole-width shard selects among the kernels that serve one
+        plan.place_experts(0, plan.experts.intermediate)
+        model = _meta_model(config, config.model_config.decode_target)
+        split = SplitExperts.place(
+            config, plan.experts, shared_offload_method(model), offload_layer_methods(model),
+            device=self.device, cpu_group=self.tp_cpu_group,
+        )
+        plan.place_experts(split.shard.start, split.shard.stop)
+        return split
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -750,17 +774,16 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
+        weights = load_weight(
+            config.model_path,
+            self.device,
+            include_moe_experts=not getattr(config.model_config, "is_moe", False),
+            include_vision=bool(config.active_encoders),
+        )
+        if (plan := self.parallel_plan) is not None:
+            weights = ((name, plan.shard(name, tensor)) for name, tensor in weights)
         return _materialize_loaded_weight_state_dict(
-            model_state,
-            load_weight(
-                config.model_path,
-                self.device,
-                include_moe_experts=not getattr(config.model_config, "is_moe", False),
-                include_vision=bool(config.active_encoders),
-            ),
-            device=self.device,
-            host_keys=host_keys,
-            staged_keys=staged_keys,
+            model_state, weights, device=self.device, host_keys=host_keys, staged_keys=staged_keys
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
@@ -810,7 +833,8 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None, min_slots=0) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None, slot_sources=None,
+                                     min_slots=0) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
@@ -825,7 +849,7 @@ class Engine:
         cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        per_expert_bytes = expert_bytes_per_slot(banks.sources)
+        per_expert_bytes = expert_bytes_per_slot(banks.sources if slot_sources is None else slot_sources)
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -874,7 +898,10 @@ class Engine:
         else:
             reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
             cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
-            _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
+            _check_pin_budget(
+                config, reserved=reserved, bank_bytes=lambda: self._pinned_bank_bytes(config, method, layer_methods),
+                hint=self.split_experts.pin_hint() if self.split_experts else None,
+            )
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
             requested_residency = None
             if split_residency:
@@ -890,18 +917,23 @@ class Engine:
             config.moe_cache_split, config.model_path,
             config.model_config.num_moe_layers, config.model_config.num_experts,
         )
+        if self.split_experts and (layer_methods is not None or requested_residency is not None):
+            raise ValueError("routed experts split across GPUs are served from pinned banks of one format; no mixed formats or OS-locked layers")
         try:
             with _weight_load_context():
-                banks = load_expert_banks(
-                    config.model_path,
-                    config.model_config,
-                    method=method,
-                    device=self.device,
-                    dummy=config.use_dummy_weight,
-                    parallel=expert_parallel,
-                    layer_residency=requested_residency,
-                    layer_methods=layer_methods,
-                )
+                if self.split_experts:
+                    banks = self.split_experts.load_banks(config, method, self.device)
+                else:
+                    banks = load_expert_banks(
+                        config.model_path,
+                        config.model_config,
+                        method=method,
+                        device=self.device,
+                        dummy=config.use_dummy_weight,
+                        parallel=expert_parallel,
+                        layer_residency=requested_residency,
+                        layer_methods=layer_methods,
+                    )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
         banks, probed, staging = settle_banks(config, banks, probe=probe, has_locked=split_residency)
@@ -910,11 +942,12 @@ class Engine:
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
         from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_bank_bytes, layer_slot_bytes
 
-        self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
+        source_runs, slot_sources = self.split_experts.slot_rows(config, method, banks) if self.split_experts else (None, banks.sources)
+        self._moe_layer_slot_bytes = layer_slot_bytes(slot_sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
         locked_fetch = staging is not None
         layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers) if locked_fetch else banks.layer_tags
-        self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
+        self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(slot_sources, layer_tags), self._moe_layer_slot_bytes)
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
@@ -936,8 +969,10 @@ class Engine:
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto:
             # experts of several formats: the cache must still stage one whole layer of each through the shared bank bytes
-            floor = stage_floor(layer_bank_bytes(banks.sources), pools, config.model_config.num_experts, self._moe_expert_counts)
-            size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap, min_slots=floor)
+            floor = stage_floor(layer_bank_bytes(slot_sources), pools, config.model_config.num_experts, self._moe_expert_counts)
+            size, pages, overlap = self._resolve_auto_moe_cache_size(
+                config, banks, method, max_slots=size_cap, slot_sources=slot_sources, min_slots=floor
+            )
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             if config.num_page_override is None:
@@ -954,7 +989,7 @@ class Engine:
                 f"num_pages={pages} (prefill_overlap={overlap})"
             )
         elif config.moe_cache_mem is not None:
-            per_slot = expert_bytes_per_slot(banks.sources)
+            per_slot = expert_bytes_per_slot(slot_sources)
             size = min(config.moe_cache_mem // per_slot, size_cap)
             # per_slot is a mean over layers, so with pools of different slot sizes the split can exceed the budget: shrink until it fits
             while size > 0 and self._moe_pool_bytes(split_slots(size, pools, self._moe_expert_counts)) > config.moe_cache_mem:
@@ -1018,7 +1053,10 @@ class Engine:
         cache.cpu_layer_ids = cpu_layer_ids
         if locked_fetch:
             cache.locked_hybrid = cpu_layer_ids
-        cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
+        cache.set_bank_sources(
+            banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes,
+            source_runs=source_runs,
+        )
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
@@ -1033,6 +1071,13 @@ class Engine:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self.moe_offload_cache = cache
         return cache
+
+    def _pinned_bank_bytes(self, config: EngineConfig, method, layer_methods=None) -> int | None:
+        """Host bytes of the expert banks this process pins. Split experts pin the whole bank they fetch from, their NUMA
+        node's under --moe-host-pool numa, which is wider than the GPU slice the layers' layout describes."""
+        if self.split_experts:
+            return self.split_experts.pinned_bank_bytes(config, method)
+        return _bank_bytes(config, method, layer_methods)
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
@@ -1050,12 +1095,10 @@ class Engine:
         )
         if config.moe_strategy == "cpu" and not split_residency:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
-            from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
-
             budget = _pin_budget_bytes(self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
-                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config, method)
+                bank_bytes = self._pinned_bank_bytes(config, method)
             if bank_bytes and bank_bytes > budget:
                 split_residency = True
                 logger.info_rank0(
@@ -1093,6 +1136,18 @@ class Engine:
         """
         if config.moe_hybrid_max_fetch >= 0:
             return  # explicit fixed cap
+        if self.split_experts and self.split_experts.shares_cpu_pools:
+            # ranks sharing a node's CPU pool must split the routes the same way: rank 0 (which always runs a pool)
+            # decides; a rank with its own pool covers its whole slice either way, so it resolves its own fraction
+            if config.tp_info.rank == 0:
+                self._resolve_hybrid_fetch_local(cache)
+            decision = [(cache.hybrid_max_fetch, cache.hybrid_fetch_fraction)]
+            torch.distributed.broadcast_object_list(decision, src=0, group=self.tp_cpu_group)
+            cache.hybrid_max_fetch, cache.hybrid_fetch_fraction = decision[0]
+            return
+        self._resolve_hybrid_fetch_local(cache)
+
+    def _resolve_hybrid_fetch_local(self, cache) -> None:
         from freetoken.moe.bench_profile import fetch_fraction
 
         cache.hybrid_max_fetch = 1
@@ -1152,6 +1207,18 @@ class Engine:
         """
         from freetoken.moe.cpu_executor import CpuMoeExecutor
 
+        # Match GraphRunner's explicit-size precedence, including an empty list.
+        if config.cuda_graph_bs is not None:
+            graph_enabled = bool(config.cuda_graph_bs)
+        else:
+            graph_enabled = config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
+        pool_cores = None
+        if self.split_experts:
+            pool_cores = self.split_experts.attach_cpu_pool(cache)
+            if pool_cores is None:  # this rank's NUMA node's pool runs in another rank
+                if graph_enabled:  # the pool owners' graph-safety vote is collective: join it
+                    _disable_unsafe_cpu_moe_graphs(config, None, self.dtype, self.tp_cpu_group)
+                return
         sample = layers[0]
         required = ("top_k", "activation", "apply_router_weight_on_input")
         if not all(hasattr(sample, attr) for attr in required):
@@ -1163,11 +1230,6 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
         max_tokens *= config.decode_rows_per_req
-        # Match GraphRunner's explicit-size precedence, including an empty list.
-        if config.cuda_graph_bs is not None:
-            graph_enabled = bool(config.cuda_graph_bs)
-        else:
-            graph_enabled = config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1183,6 +1245,7 @@ class Engine:
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             layer_formats=layer_formats,
+            core_ids=list(pool_cores) if pool_cores is not None else None,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1821,16 +1884,17 @@ def _pin_hint(reserved: int) -> str:
     )
 
 
-def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None, layer_methods=None) -> None:
-    """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
+def _check_pin_budget(config: EngineConfig, *, reserved: int, bank_bytes: Callable[[], int | None], hint: str | None = None) -> None:
+    """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read; ``bank_bytes()`` sizes
+    the banks this process pins, ``hint`` replaces the default advice."""
     if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
         return
     budget = _pin_budget_bytes(reserved)
-    bank_bytes = _bank_bytes(config, method, layer_methods) if budget is not None else None
+    bank_bytes = bank_bytes() if budget is not None else None
     if bank_bytes and bank_bytes > budget:
         raise ValueError(
             f"expert banks need {bank_bytes / 2**30:.1f} GiB of pinned host RAM but the pin budget is "
-            f"{budget / 2**30:.1f} GiB (WSL caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {_pin_hint(reserved)}"
+            f"{budget / 2**30:.1f} GiB (WSL caps CUDA pinning; FREETOKEN_PIN_BUDGET_GB overrides); {hint or _pin_hint(reserved)}"
         )
 
 
@@ -1950,6 +2014,28 @@ def _check_layer_formats(banks, layer_methods) -> None:
             f"expert banks of MoE layers {bad[:8]} were packed as {[have[l] for l in bad[:8]]} but the model binds "
             f"{[want[l] for l in bad[:8]]}; reconvert the checkpoint or select those kernels"
         )
+
+
+def _build_parallel_plan(config: EngineConfig):
+    """The family's ParallelPlan for --tp > 1, checked against the checkpoint before anything is allocated.
+
+    It is installed on ``config.model_config`` (like ``moe_strategy``), where the model's layers read it as they are built.
+    """
+    if config.tp_info.size == 1:
+        return None
+    from freetoken.distributed.plan import ParallelArgs
+    from freetoken.models.register import build_parallel_plan
+
+    args = ParallelArgs(config.tp_info.rank, config.tp_info.size)
+    plan = build_parallel_plan(config.model_config, args)
+    if plan is None:
+        return None
+    if plan.dense != config.tp_info:
+        raise ValueError(f"the plan splits the dense layers over {plan.dense}, not the TP group {config.tp_info}")
+    if not config.use_dummy_weight:
+        plan.validate_checkpoint(config.model_path)
+    object.__setattr__(config.model_config, "parallel_plan", plan)
+    return plan
 
 
 def _meta_model(config: EngineConfig, decode_target: str):

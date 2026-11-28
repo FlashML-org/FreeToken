@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
+    from freetoken.distributed.plan import ParallelArgs, ParallelPlan
+
     from .config import ModelConfig
 
 
@@ -36,6 +38,9 @@ class ModelSpec:
     encoders: tuple[EncoderSpec, ...] = ()
     # speculative method -> "module:Class" of the family's draft for it
     spec_drafts: tuple[tuple[str, str], ...] = ()
+    # builder in the family's ``multi.py`` of the plan its layers split by under --tp > 1 (distributed/plan.py); None: the
+    # family's layers read the TP group on their own
+    parallel_plan: str | None = None
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -274,6 +279,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         ),
         mm_processor=_DSV4_PROCESSOR,
         encoders=_DSV4_ENCODERS,
+        parallel_plan="build_parallel_plan",
     ),
     # llama.cpp deepseek4 GGUF (unsloth DeepSeek-V4-Flash-0731-GGUF and the Vision-Exp
     # release + its deepseek4v mmproj): the same model classes with every tensor in its
@@ -542,12 +548,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GLM5_NEXT_PACKED,
         mm_processor=_GLM5_NEXT_PROCESSOR,
         encoders=_GLM5_NEXT_ENCODERS,
+        parallel_plan="build_parallel_plan",
     ),
     # Text-only sibling (the text_config's own architectures entry).
     "Glm5NextForCausalLM": ModelSpec(
         "freetoken.models.glm5_next",
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
+        parallel_plan="build_parallel_plan",
     ),
     "Inkling2LoopForConditionalGeneration": ModelSpec(
         "freetoken.models.inkling2",
@@ -570,6 +578,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the MLA kv_b ships as two per-head tensors (attn_k_b transposed + attn_v_b), quantized in
         # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
         unquantized_modules=("*.self_attn.kv_b_proj",),
+        parallel_plan="build_gguf_parallel_plan",
     ),
 }
 
@@ -606,10 +615,18 @@ def checkpoint_quant_config(
     return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 
+def build_parallel_plan(model_config: ModelConfig, args: "ParallelArgs") -> "ParallelPlan | None":
+    """The family's plan for ``args``; None for a family that registers none."""
+    spec = get_model_spec(model_config.architectures[0])
+    if spec.parallel_plan is None:
+        return None
+    return _load_attr(f"{spec.module}.multi", spec.parallel_plan)(model_config, args)
+
+
 def get_model_class(model_architecture: str, model_config: ModelConfig):
     spec = get_model_spec(model_architecture)
     model_cls = _load_attr(spec.module, spec.model_cls)
     return model_cls(model_config)
 
 
-__all__ = ["ModelSpec", "checkpoint_quant_config", "get_model_spec", "get_model_class"]
+__all__ = ["ModelSpec", "build_parallel_plan", "checkpoint_quant_config", "get_model_spec", "get_model_class"]

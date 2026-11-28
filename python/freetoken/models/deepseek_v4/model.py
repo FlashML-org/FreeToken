@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed.plan import ParallelPlan
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNorm, VocabParallelEmbedding
@@ -46,12 +47,16 @@ from .moe import Expert, Gate  # noqa: F401
 class Block(BaseOP):
     """Decoder block with manifold-constrained Hyper-Connections (4 residual streams)."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", quant_config=None, prefix: str = ""):
+    def __init__(self, layer_id: int, args: DeepseekV4Args, *, strategy: str = "offload", decode_target: str = "gpu", plan: ParallelPlan | None = None, quant_config=None, prefix: str = ""):
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
         self.dim = args.dim
-        self.attn = Attention(layer_id, args, quant_config=quant_config, prefix=f"{prefix}.attn")
-        self.ffn = MoE(layer_id, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.ffn")
+        tp = plan.dense.size if plan is not None else 1
+        self.attn = Attention(layer_id, args, tp=tp, quant_config=quant_config, prefix=f"{prefix}.attn")
+        self.ffn = MoE(
+            layer_id, args, strategy=strategy, decode_target=decode_target, expert_group=plan.experts if plan is not None else None,
+            tp=tp, quant_config=quant_config, prefix=f"{prefix}.ffn",
+        )
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult
@@ -125,13 +130,13 @@ class Block(BaseOP):
 
 
 class Transformer(BaseOP):
-    def __init__(self, args: DeepseekV4Args, quant_config=None, *, strategy: str = "offload", decode_target: str = "gpu", prefix: str = ""):
+    def __init__(self, args: DeepseekV4Args, quant_config=None, *, strategy: str = "offload", decode_target: str = "gpu", plan: ParallelPlan | None = None, prefix: str = ""):
         self.args = args
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
         self.embed = VocabParallelEmbedding(args.vocab_size, args.dim, quant_config=quant_config, prefix=f"{prefix}.embed")
-        self.layers = OPList([Block(i, args, strategy=strategy, decode_target=decode_target, quant_config=quant_config, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
+        self.layers = OPList([Block(i, args, strategy=strategy, decode_target=decode_target, plan=plan, quant_config=quant_config, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = ParallelLMHead(args.vocab_size, args.dim, quant_config=quant_config, prefix=f"{prefix}.head")
         hc_dim = hc_mult * args.dim
@@ -236,7 +241,9 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def __init__(self, config):
         self._config = config
         self._args: DeepseekV4Args = config.dsv4_args
-        self.model = Transformer(self._args, config.quant, strategy=config.moe_strategy, decode_target=config.decode_target, prefix="model")
+        self.model = Transformer(
+            self._args, config.quant, strategy=config.moe_strategy, decode_target=config.decode_target, plan=config.parallel_plan, prefix="model",
+        )
         self._bound = False
         # Vision (DeepSeek-V4-Flash-Vision-Exp). config.is_multimodal is the engine's
         # resolved gate, so a text-only process never builds weights the loader skips.

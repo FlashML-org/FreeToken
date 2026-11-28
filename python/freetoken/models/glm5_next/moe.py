@@ -15,10 +15,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Tuple
 
 import torch
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.triton.moe_router import fused_topk_sigmoid
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
 
 from .mlp import Glm5NextGatedMLP
+from .multi import dense_tp, routed_expert_group
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -47,14 +49,20 @@ class Glm5NextSparseBlock(BaseOP):
             limit=config.swiglu_limit,
             quant_config=config.quant,
             prefix=f"{prefix}.experts",
+            expert_group=routed_expert_group(config),
         )
+        tp = dense_tp(config)
         self.shared_experts = Glm5NextGatedMLP(
             config.hidden_size,
             config.moe_intermediate_size * max(1, config.n_shared_experts),
             swiglu_limit=config.swiglu_limit,
+            tp=tp,
             quant_config=config.quant,
             prefix=f"{prefix}.shared_experts",
         )
+        # under --tp N the shared expert's partial sum joins the routed experts' all-reduce: one per layer
+        self.fold_shared = tp > 1
+        self._comm = DistributedCommunicator()
 
     def _route(self, hidden_states: torch.Tensor) -> TopK:
         logits = torch.mm(hidden_states, self.gate.weight.t(), out_dtype=torch.float32)
@@ -73,9 +81,12 @@ class Glm5NextSparseBlock(BaseOP):
         hidden_states = hidden_states.view(-1, hidden_dim)
         topk_weights, topk_ids = self._route(hidden_states)
         # Routed kernels may overwrite hidden_states; shared experts need the original input.
-        shared = self.shared_experts.forward(hidden_states)
-        out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
+        reduce = not self.fold_shared
+        shared = self.shared_experts.forward(hidden_states, reduce=reduce)
+        out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids, reduce=reduce)
         out = out + shared
+        if self.fold_shared:
+            out = self._comm.all_reduce(out)
         return out.view(num_tokens, hidden_dim)
 
 

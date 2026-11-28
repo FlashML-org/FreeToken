@@ -65,6 +65,31 @@ def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mm
     return buf
 
 
+# a shard whose wanted tensors fill this share of its data is read whole, in one sweep; below it only their bytes are read
+_WHOLE_SHARD = 0.9
+# unwanted bytes between two wanted tensors that are read through rather than splitting the read
+_RANGE_GAP = 1 << 20
+
+
+def _shard_runs(path: str, names: list[str]) -> tuple[dict, int, list[tuple[int, int, list[str]]]]:
+    """The shard's header, its data base, and the file spans ``[start, end)`` to read with the wanted tensors in each."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    base, size = 8 + n, os.path.getsize(path)
+    spans = sorted((*hdr[name]["data_offsets"], name) for name in names)
+    if sum(e - b for b, e, _ in spans) >= _WHOLE_SHARD * (size - base):
+        return hdr, base, [(0, size, list(names))]
+    runs: list[list] = []
+    for b, e, name in spans:
+        if runs and b - runs[-1][1] <= _RANGE_GAP:
+            runs[-1][1] = max(runs[-1][1], e)
+            runs[-1][2].append(name)
+        else:
+            runs.append([b, e, [name]])
+    return hdr, base, [(base + b, base + e, names_) for b, e, names_ in runs]
+
+
 def iter_expert_tensors_parallel(
     model_path: str,
     is_expert: Callable[[str], bool],
@@ -76,18 +101,20 @@ def iter_expert_tensors_parallel(
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     """Parallel O_DIRECT analog of a model's serial expert ``iter_weights``.
 
-    Common scaffolding for the "parallel" load path: reads every shard that holds >=1 expert
-    tensor (``is_expert(name)`` is the model's per-model predicate) with chunked
-    multi-threaded O_DIRECT, parses the safetensors header, and yields ``(name, tensor)``
-    in checkpoint dtype/shape for the expert tensors.
+    Common scaffolding for the "parallel" load path: reads the expert tensors (``is_expert(name)``
+    is the model's per-model predicate) with chunked multi-threaded O_DIRECT, parses the
+    safetensors headers, and yields ``(name, tensor)`` in checkpoint dtype/shape. A shard whose
+    expert tensors fill most of it is read whole; otherwise only their byte ranges are read
+    (coalesced across small gaps), so a reader of some layers reads just those layers' bytes.
 
-    A background reader PREFETCHES the next ``prefetch`` shards (each chunked O_DIRECT)
+    A background reader PREFETCHES the next ``prefetch`` reads (each chunked O_DIRECT)
     while the consumer places the current one, so the disk stays busy during placement
     instead of idling between shards (the gap that made the naive sequential version slow).
-    Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
+    Peak host memory is ~(prefetch+1) reads + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
     """
     from freetoken.models.loader import safetensors_weight_map
+    from freetoken.moe.host_banks import read_range_into
     from freetoken.utils.hf import download_hf_weight
 
     model_path = download_hf_weight(model_path)  # resolve hub id -> local (parity w/ serial)
@@ -96,7 +123,7 @@ def iter_expert_tensors_parallel(
     for name, shard in weight_map.items():
         if is_expert(name):
             shards.setdefault(shard, []).append(name)
-    shard_list = sorted(shards)
+    plans = {shard: _shard_runs(os.path.join(model_path, shard), names) for shard, names in sorted(shards.items())}
 
     q: queue.Queue = queue.Queue(maxsize=max(1, prefetch))
     _DONE = object()
@@ -104,19 +131,22 @@ def iter_expert_tensors_parallel(
 
     def _reader():
         try:
-            for shard in shard_list:
+            for shard, (hdr, base, runs) in plans.items():
                 path = os.path.join(model_path, shard)
-                if drop_cache:
-                    try:
-                        fd = os.open(path, os.O_RDONLY)
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        os.close(fd)
-                    except OSError:
-                        pass
-                buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
-                n = struct.unpack("<Q", bytes(buf[:8]))[0]
-                hdr = json.loads(bytes(buf[8:8 + n]))
-                q.put((buf, hdr, 8 + n, shards[shard], os.path.getsize(path)))
+                for start, end, names in runs:
+                    if start == 0 and end == os.path.getsize(path):
+                        if drop_cache:
+                            try:
+                                fd = os.open(path, os.O_RDONLY)
+                                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                                os.close(fd)
+                            except OSError:
+                                pass
+                        buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
+                    else:
+                        buf = mmap.mmap(-1, -(-(end - start) // _ODIRECT_BLK) * _ODIRECT_BLK)
+                        read_range_into(buf, path, file_offset=start, nbytes=end - start, workers=workers, chunk=chunk, drop_cache=drop_cache)
+                    q.put((buf, start, hdr, base, names, end - start))
         except BaseException as e:  # surface reader errors to the consumer
             err.append(e)
         finally:
@@ -126,22 +156,21 @@ def iter_expert_tensors_parallel(
 
     th = threading.Thread(target=_reader, name="expert-prefetch", daemon=True)
     th.start()
-    bar = byte_bar(sum(os.path.getsize(os.path.join(model_path, s)) for s in shard_list),
-                   "Loading experts (parallel)")
+    bar = byte_bar(sum(end - start for _, _, runs in plans.values() for start, end, _ in runs), "Loading experts (parallel)")
     try:
         while True:
             item = q.get()
             if item is _DONE:
                 break
-            buf, hdr, base, names, shard_sz = item
+            buf, start, hdr, base, names, nbytes = item
             mv = memoryview(buf)
             for name in names:
                 meta = hdr[name]
                 b, e = meta["data_offsets"]
-                t = torch.frombuffer(mv[base + b: base + e], dtype=_ST_DTYPE[meta["dtype"]])
+                t = torch.frombuffer(mv[base + b - start: base + e - start], dtype=_ST_DTYPE[meta["dtype"]])
                 yield name, (t.view(*meta["shape"]) if meta["shape"] else t)
-            bar.update(shard_sz)
-            del mv, buf  # freed once the consumer drops the last yielded tensor of this shard
+            bar.update(nbytes)
+            del mv, buf  # freed once the consumer drops the last yielded tensor of this read
     finally:
         bar.close()
         th.join()

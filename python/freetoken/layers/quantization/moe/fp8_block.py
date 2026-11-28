@@ -21,6 +21,7 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "fp8_block"
     supports_inactive_slots = True
+    shards = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
@@ -35,8 +36,12 @@ class TritonFp8BlockMoEKernel(MoEKernel):
             return "fp8 block MoE kernel cannot apply the router weight on the input"
         return None
 
+    def shard_alignment(self, cfg: MoEConfig) -> int:
+        # whole scale blocks; the padded scale banks are not byte runs of a wider bank, so no bank_axes
+        return BLOCK
+
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h, b = cfg.intermediate, cfg.hidden, BLOCK
+        i, h, b = cfg.local_intermediate, cfg.hidden, BLOCK
         return {
             "gate_up": BankSpec((2 * i, h), FP8),
             "gate_up_scale": BankSpec((2 * i // b, _pad_scale(2 * i // b, h // b)), torch.bfloat16),

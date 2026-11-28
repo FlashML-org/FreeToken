@@ -320,6 +320,8 @@ class ModelConfig:
     moe_strategy: str = "fused"
     # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
     decode_target: str = "gpu"
+    # the family's ParallelPlan (distributed/plan.py) under --tp > 1, set by the engine before construction; None: one GPU, or a family whose layers read the TP group on their own
+    parallel_plan: Any | None = None
     # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
     quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----
