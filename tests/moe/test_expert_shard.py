@@ -223,7 +223,8 @@ def test_kernel_shard_outputs_sum_to_full(fmt, is_prefill):
         banks = {role: t.to(device) for role, t in banks.items()}
         layer = SimpleNamespace(activation="silu", alpha=1.0, limit=None, apply_router_weight_on_input=False,
                                 top_k=TOPK, quant_method=SimpleNamespace(cfg=slicing.config_at(view.width)))
-        return slicing.kernel.apply(layer, x, weights, ids, ExpertView(banks, n=E), is_prefill=is_prefill).float()
+        # a prefill kernel may overwrite its input with the output, and every shard reads the same x
+        return slicing.kernel.apply(layer, x.clone(), weights, ids, ExpertView(banks, n=E), is_prefill=is_prefill).float()
 
     full = run(Interval(0, i))
     total = sum(run(v) for v in Interval.split(i, 4, align=slicing.alignment))
