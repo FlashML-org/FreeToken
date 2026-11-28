@@ -280,6 +280,21 @@ def test_pure_text_streams_and_matches_non_stream(family):
     assert full.tool_calls == []
 
 
+# Formats without a plain open/close block pair, where the text between calls is not split out the same way.
+_NO_BLOCK_PAIR = {"gpt_oss", "llama3", "mistral"}
+
+
+@pytest.mark.parametrize("family", sorted(set(CALL_BLOCKS) - _NO_BLOCK_PAIR))
+def test_text_between_tool_calls_matches_non_stream(family):
+    block = CALL_BLOCKS[family]
+    text = f"First I read it. {block}\nThen the second one.\n{block}\nDone."
+    events = _stream_events(_random_chunks(text, 1), family)
+    full = _full_result(text, family)
+    assert len(_calls(events)) == len(full.tool_calls) == 2
+    # Streamed whitespace after a call still follows chunk boundaries; the words must agree.
+    assert _content(events).split() == full.content.split()
+
+
 # --------------------------------------------------------------------------- #
 # Axis 2: reasoning delivery at every API entry point
 # --------------------------------------------------------------------------- #
